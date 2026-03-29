@@ -664,6 +664,10 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
+        // 立即更新 next_run 时间，防止重复调度
+        const nextRun = computeNextRun(currentTask);
+        updateTaskAfterRun(currentTask.id, nextRun, 'Scheduled');
+
         if (currentTask.execution_type === 'script') {
           if (!hasScriptCapacity()) {
             logger.debug(
