@@ -22,12 +22,16 @@ import {
   addGroupMember,
   getAllTasks,
   cleanupOldTaskRunLogs,
+  cleanupStaleRunningLogs,
+  deleteGroupData,
   ensureChatExists,
   getDueTasks,
   getTaskById,
   getUserById,
   getUserHomeGroup,
   logTaskRun,
+  logTaskRunStart,
+  updateTaskRunLog,
   setRegisteredGroup,
   updateChatName,
   updateTaskAfterRun,
@@ -35,6 +39,7 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
+import { removeFlowArtifacts } from './file-manager.js';
 import { hasScriptCapacity, runScript } from './script-runner.js';
 import type { StreamEvent } from './stream-event.types.js';
 import { ExecutionMode, RegisteredGroup, ScheduledTask } from './types.js';
@@ -196,15 +201,15 @@ function computeNextRun(task: ScheduledTask): string | null {
     });
     return interval.next().toISOString();
   } else if (task.schedule_type === 'interval') {
-    const ms = parseInt(task.schedule_value, 10);
+    const ms = Number(task.schedule_value);
+    if (!Number.isFinite(ms) || ms <= 0) return null;
     const anchor = task.next_run
       ? new Date(task.next_run).getTime()
       : Date.now();
-    let nextTime = anchor + ms;
-    while (nextTime <= Date.now()) {
-      nextTime += ms;
-    }
-    return new Date(nextTime).toISOString();
+    const now = Date.now();
+    const elapsed = now - anchor;
+    const periods = elapsed > 0 ? Math.ceil(elapsed / ms) : 1;
+    return new Date(anchor + periods * ms).toISOString();
   }
   // 'once' tasks have no next run
   return null;
@@ -227,14 +232,19 @@ function isTaskStillActive(taskId: string, label?: string): boolean {
 }
 
 async function runTask(
-  task: ScheduledTask,
+  staleTask: ScheduledTask,
   deps: SchedulerDependencies,
   options?: RunTaskOptions,
 ): Promise<void> {
-  if (!options?.manualRun && !isTaskStillActive(task.id, 'task')) return;
+  if (!options?.manualRun && !isTaskStillActive(staleTask.id, 'task')) return;
+
+  // Refresh task from DB to avoid stale closure data
+  const task = getTaskById(staleTask.id);
+  if (!task) return;
 
   runningTaskIds.add(task.id);
   const startTime = Date.now();
+  const runLogId = logTaskRunStart(task.id);
 
   // Ensure task has a dedicated workspace (Agent tasks only)
   const workspace = ensureTaskWorkspace(task, deps);
@@ -246,9 +256,7 @@ async function runTask(
       { taskId: task.id, workspaceJid: workspace.jid },
       'Workspace group not found after creation',
     );
-    logTaskRun({
-      task_id: task.id,
-      run_at: new Date().toISOString(),
+    updateTaskRunLog(runLogId, {
       duration_ms: Date.now() - startTime,
       status: 'error',
       result: null,
@@ -286,17 +294,15 @@ async function runTask(
           },
           'Billing access denied, blocking scheduled task',
         );
-        logTaskRun({
-          task_id: task.id,
-          run_at: new Date().toISOString(),
+        updateTaskRunLog(runLogId, {
           duration_ms: Date.now() - startTime,
           status: 'error',
           result: null,
           error: `计费限制: ${reason}`,
         });
         runningTaskIds.delete(task.id);
-        // Still compute next run so the task isn't stuck
-        const nextRun = computeNextRun(task);
+        // Still compute next run so the task isn't stuck (but preserve for manual runs)
+        const nextRun = options?.manualRun ? task.next_run : computeNextRun(task);
         updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
         return;
       }
@@ -333,6 +339,24 @@ async function runTask(
   // Track the time of last meaningful output from the agent.
   // duration_ms should measure actual work time, not include idle wait.
   let lastOutputTime = startTime;
+  let runLogFinalized = false;
+
+  const finalizeRunLog = () => {
+    if (runLogFinalized) return;
+    runLogFinalized = true;
+    runningTaskIds.delete(task.id);
+    const durationMs = lastOutputTime - startTime;
+    updateTaskRunLog(runLogId, {
+      duration_ms: durationMs,
+      status: error ? 'error' : 'success',
+      result,
+      error,
+    });
+    // Send _close sentinel so the idle agent process exits promptly,
+    // freeing the queue slot for the next run.
+    if (idleTimer) clearTimeout(idleTimer);
+    deps.queue.closeStdin(effectiveJid);
+  };
 
   // Use persistent session for task workspace
   const sessions = deps.getSessions();
@@ -399,6 +423,11 @@ async function runTask(
           error = streamedOutput.error || 'Unknown error';
           lastOutputTime = Date.now();
         }
+        // Finalize run log on first non-stream output (success/error/closed).
+        // Don't wait for the process to exit — idle timeout can be very long.
+        if (streamedOutput.status !== 'stream') {
+          finalizeRunLog();
+        }
       },
       ownerHomeFolder,
     );
@@ -413,6 +442,9 @@ async function runTask(
       result = output.result;
       lastOutputTime = Date.now();
     }
+
+    // Finalize if not already done by onOutput callback
+    finalizeRunLog();
 
     logger.info(
       { taskId: task.id, durationMs: lastOutputTime - startTime },
@@ -440,19 +472,10 @@ async function runTask(
         /* ignore */
       }
     }
+
+    // Safety net: finalize run log if not already done by onOutput callback
+    finalizeRunLog();
   }
-
-  // Use lastOutputTime instead of Date.now() to exclude idle wait time
-  const durationMs = lastOutputTime - startTime;
-
-  logTaskRun({
-    task_id: task.id,
-    run_at: new Date().toISOString(),
-    duration_ms: durationMs,
-    status: error ? 'error' : 'success',
-    result,
-    error,
-  });
 
   // manualRun: preserve original next_run schedule
   const nextRun = options?.manualRun ? task.next_run : computeNextRun(task);
@@ -463,18 +486,40 @@ async function runTask(
       ? result.slice(0, 200)
       : 'Completed';
   updateTaskAfterRun(task.id, nextRun, resultSummary);
+
+  // Auto-cleanup once-task workspace after completion
+  if (task.schedule_type === 'once' && !options?.manualRun && task.workspace_jid && task.workspace_folder) {
+    setTimeout(() => {
+      try {
+        const groups = deps.registeredGroups();
+        if (groups[task.workspace_jid!]) {
+          deleteGroupData(task.workspace_jid!, task.workspace_folder!);
+          delete groups[task.workspace_jid!];
+          removeFlowArtifacts(task.workspace_folder!);
+          logger.info({ taskId: task.id, folder: task.workspace_folder }, 'Cleaned up once-task workspace');
+        }
+      } catch (err) {
+        logger.error({ taskId: task.id, err }, 'Failed to cleanup once-task workspace');
+      }
+    }, 60_000);
+  }
 }
 
 async function runScriptTask(
-  task: ScheduledTask,
+  staleTask: ScheduledTask,
   deps: SchedulerDependencies,
   groupJid: string,
   manualRun = false,
 ): Promise<void> {
-  if (!manualRun && !isTaskStillActive(task.id, 'script task')) return;
+  if (!manualRun && !isTaskStillActive(staleTask.id, 'script task')) return;
+
+  // Refresh task from DB to avoid stale closure data
+  const task = getTaskById(staleTask.id);
+  if (!task) return;
 
   runningTaskIds.add(task.id);
   const startTime = Date.now();
+  const runLogId = logTaskRunStart(task.id);
 
   logger.info(
     { taskId: task.id, group: task.group_folder, executionType: 'script' },
@@ -500,16 +545,14 @@ async function runScriptTask(
             },
             'Billing access denied, blocking script task',
           );
-          logTaskRun({
-            task_id: task.id,
-            run_at: new Date().toISOString(),
+          updateTaskRunLog(runLogId, {
             duration_ms: Date.now() - startTime,
             status: 'error',
             result: null,
             error: `计费限制: ${reason}`,
           });
           runningTaskIds.delete(task.id);
-          const nextRun = computeNextRun(task);
+          const nextRun = manualRun ? task.next_run : computeNextRun(task);
           updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
           return;
         }
@@ -525,9 +568,7 @@ async function runScriptTask(
       { taskId: task.id },
       'Script task has no script_command, skipping',
     );
-    logTaskRun({
-      task_id: task.id,
-      run_at: new Date().toISOString(),
+    updateTaskRunLog(runLogId, {
       duration_ms: Date.now() - startTime,
       status: 'error',
       result: null,
@@ -581,9 +622,7 @@ async function runScriptTask(
 
   const durationMs = Date.now() - startTime;
 
-  logTaskRun({
-    task_id: task.id,
-    run_at: new Date().toISOString(),
+  updateTaskRunLog(runLogId, {
     duration_ms: durationMs,
     status: error ? 'error' : 'success',
     result,
@@ -610,6 +649,45 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
     return;
   }
   schedulerRunning = true;
+
+  // Clean up stale state from previous process crash
+  runningTaskIds.clear();
+  try {
+    const cleaned = cleanupStaleRunningLogs();
+    if (cleaned > 0) {
+      logger.info({ cleaned }, 'Cleaned up stale running task logs from previous session');
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to cleanup stale running task logs');
+  }
+
+  // Clean up orphaned workspaces from completed once-tasks
+  // (covers the case where process restarted before setTimeout cleanup fired)
+  try {
+    const allTasks = getAllTasks();
+    const groups = deps.registeredGroups();
+    let cleaned = 0;
+    for (const t of allTasks) {
+      if (
+        t.schedule_type === 'once' &&
+        t.status === 'completed' &&
+        t.workspace_jid &&
+        t.workspace_folder &&
+        groups[t.workspace_jid]
+      ) {
+        deleteGroupData(t.workspace_jid, t.workspace_folder);
+        delete groups[t.workspace_jid];
+        removeFlowArtifacts(t.workspace_folder);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      logger.info({ cleaned }, 'Cleaned up orphaned once-task workspaces from previous session');
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to cleanup orphaned once-task workspaces');
+  }
+
   logger.info('Scheduler loop started');
 
   const loop = async () => {
@@ -718,6 +796,8 @@ export function triggerTaskNow(
   if (!task) return { success: false, error: 'Task not found' };
   if (task.status === 'completed')
     return { success: false, error: 'Task already completed' };
+  if (task.status === 'paused')
+    return { success: false, error: '任务已暂停，请先恢复后再运行' };
   if (runningTaskIds.has(taskId))
     return { success: false, error: 'Task is already running' };
 

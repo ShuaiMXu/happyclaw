@@ -7,7 +7,7 @@ import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 import { sdkQuery } from '../sdk-query.js';
 import { GROUPS_DIR } from '../config.js';
-import { removeFlowArtifacts } from './groups.js';
+import { removeFlowArtifacts } from '../file-manager.js';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { TaskCreateSchema, TaskPatchSchema } from '../schemas.js';
@@ -55,7 +55,9 @@ tasksRoutes.get('/', authMiddleware, (c) => {
       return false;
     return true;
   });
-  return c.json({ tasks, runningTaskIds: getRunningTaskIds() });
+  const visibleTaskIds = new Set(tasks.map((t) => t.id));
+  const filteredRunningIds = getRunningTaskIds().filter((id) => visibleTaskIds.has(id));
+  return c.json({ tasks, runningTaskIds: filteredRunningIds });
 });
 
 tasksRoutes.post('/', authMiddleware, async (c) => {
@@ -144,7 +146,7 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
       return c.json({ error: 'Invalid cron expression' }, 400);
     }
   } else if (schedule_type === 'interval') {
-    nextRun = new Date(Date.now() + parseInt(schedule_value, 10)).toISOString();
+    nextRun = new Date(Date.now() + Number(schedule_value)).toISOString();
   } else {
     // once — use the target time from schedule_value
     nextRun = new Date(schedule_value).toISOString();
@@ -268,6 +270,16 @@ tasksRoutes.delete('/:id', authMiddleware, (c) => {
       );
     }
   }
+  // Only admin can delete script tasks
+  if (existing.execution_type === 'script' && authUser.role !== 'admin') {
+    return c.json({ error: '只有管理员可以删除脚本类型任务' }, 403);
+  }
+
+  // Prevent deleting a running task
+  if (getRunningTaskIds().includes(id)) {
+    return c.json({ error: '任务正在运行中，请先等待完成或停止任务' }, 409);
+  }
+
   // Clean up dedicated workspace if exists
   if (existing.workspace_jid && existing.workspace_folder) {
     const wsGroup = getRegisteredGroup(existing.workspace_jid);
@@ -314,6 +326,11 @@ tasksRoutes.post('/:id/run', authMiddleware, (c) => {
         403,
       );
     }
+  }
+
+  // Only admin can run script tasks
+  if (existing.execution_type === 'script' && authUser.role !== 'admin') {
+    return c.json({ error: '只有管理员可以运行脚本类型任务' }, 403);
   }
 
   const deps = getWebDeps();
@@ -463,6 +480,8 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
       const result = await sdkQuery(parsePrompt, { model, timeout: 60_000 });
 
       if (!result) {
+        const cur = getTaskById(taskId);
+        if (!cur || cur.status !== 'parsing') return;
         updateTask(taskId, {
           status: 'paused',
           prompt: description,
@@ -473,6 +492,8 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
 
       const parsed = parseAiResult(result, description);
       if (!parsed || !parsed.schedule_value) {
+        const cur = getTaskById(taskId);
+        if (!cur || cur.status !== 'parsing') return;
         updateTask(taskId, {
           status: 'paused',
           prompt: description,
@@ -489,12 +510,14 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
             .next()
             .toISOString();
         } else if (parsed.schedule_type === 'interval') {
-          nextRun = new Date(Date.now() + parseInt(parsed.schedule_value, 10)).toISOString();
+          nextRun = new Date(Date.now() + Number(parsed.schedule_value)).toISOString();
         } else {
           nextRun = new Date(parsed.schedule_value).toISOString();
         }
       } catch {
         // Invalid schedule, keep paused
+        const cur = getTaskById(taskId);
+        if (!cur || cur.status !== 'parsing') return;
         updateTask(taskId, {
           status: 'paused',
           prompt: parsed.prompt,
@@ -503,6 +526,8 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
         return;
       }
 
+      const cur = getTaskById(taskId);
+      if (!cur || cur.status !== 'parsing') return;
       updateTask(taskId, {
         prompt: parsed.prompt,
         schedule_type: parsed.schedule_type as 'cron' | 'interval' | 'once',
@@ -517,7 +542,10 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
       );
     } catch (err) {
       logger.error({ taskId, err }, 'AI task background parse failed');
-      updateTask(taskId, { status: 'paused' });
+      const cur = getTaskById(taskId);
+      if (cur && cur.status === 'parsing') {
+        updateTask(taskId, { status: 'paused' });
+      }
     }
   })().catch((err) => logger.error({ taskId, err }, 'Unhandled AI task parse error'));
 

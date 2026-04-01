@@ -29,16 +29,19 @@ export interface McpContext {
 }
 
 function writeIpcFile(dir: string, data: object): string {
-  fs.mkdirSync(dir, { recursive: true });
-
   const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
   const filepath = path.join(dir, filename);
-
-  // Atomic write: temp file then rename
   const tempPath = `${filepath}.tmp`;
-  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
-  fs.renameSync(tempPath, filepath);
-
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    // Atomic write: temp file then rename
+    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+    fs.renameSync(tempPath, filepath);
+  } catch (err) {
+    // Clean up temp file on failure
+    try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+    throw new Error(`IPC 写入失败 (${dir}): ${err instanceof Error ? err.message : String(err)}`);
+  }
   return filename;
 }
 

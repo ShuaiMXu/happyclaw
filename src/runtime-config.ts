@@ -3295,6 +3295,7 @@ export function getUserDingTalkConfig(
 ): UserDingTalkConfig | null {
   const filePath = path.join(userImDir(userId), 'dingtalk.json');
   try {
+    if (!fs.existsSync(filePath)) return null;
     const content = fs.readFileSync(filePath, 'utf-8');
     const parsed = JSON.parse(content) as Record<string, unknown>;
     if (parsed.version !== 1) return null;
