@@ -310,6 +310,26 @@ function buildVolumeMounts(
     });
   }
 
+  // Shared lark-cli config — mount read-only to all containers so member bots
+  // can use the same Feishu identity as the admin.
+  // Files must be readable by UID 1000 (node user) at the host path.
+  const larkCliConfigDir = path.join(os.homedir(), '.lark-cli');
+  const larkCliShareDir = path.join(os.homedir(), '.local', 'share', 'lark-cli');
+  if (fs.existsSync(larkCliConfigDir)) {
+    mounts.push({
+      hostPath: larkCliConfigDir,
+      containerPath: '/home/node/.lark-cli',
+      readonly: true,
+    });
+  }
+  if (fs.existsSync(larkCliShareDir)) {
+    mounts.push({
+      hostPath: larkCliShareDir,
+      containerPath: '/home/node/.local/share/lark-cli',
+      readonly: true,
+    });
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // Sub-agents get their own IPC subdirectory under agents/{agentId}/
   // Isolated tasks get their own IPC subdirectory under tasks-run/{taskRunId}/
