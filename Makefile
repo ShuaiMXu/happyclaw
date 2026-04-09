@@ -51,12 +51,12 @@ build-web: ## 仅编译前端
 start: ensure-latest-sdk ## 一键启动生产环境
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-docker-image
-ifeq ($(HAS_BUN),1)
 	@NEED_SYNC=0; \
 	for target in src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts src/image-detector.ts container/agent-runner/src/image-detector.ts src/channel-prefixes.ts container/agent-runner/src/channel-prefixes.ts; do \
 	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
 	done; \
 	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
+ifeq ($(HAS_BUN),1)
 	@NEED_WEB=0; \
 	if [ ! -f web/dist/index.html ]; then NEED_WEB=1; \
 	else \
@@ -128,7 +128,11 @@ typecheck-agent-runner:
 	cd container/agent-runner && $(RUN) tsc --noEmit
 
 test: ## 运行单元测试
+ifeq ($(HAS_BUN),1)
 	bun test
+else
+	$(RUN) vitest run
+endif
 
 format: ## 格式化代码
 	$(PKG) run format
@@ -172,6 +176,8 @@ sync-types: ## 同步 shared/ 下的类型定义到各子项目
 
 update-sdk: ## 更新 agent-runner 的 Claude Agent SDK 到最新版本
 	cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build
+	@# npm/bun update 会将 "*" 回写为具体版本，还原它
+	@sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json
 	@echo "SDK updated. Run 'make typecheck' to verify."
 
 ensure-latest-sdk: ## 启动前自动检测并更新 SDK（有新版才更新）
@@ -180,6 +186,7 @@ ensure-latest-sdk: ## 启动前自动检测并更新 SDK（有新版才更新）
 	if [ "$$LOCAL" != "$$LATEST" ]; then \
 		echo "🔄 Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
 		cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build; \
+		sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json; \
 		echo "✅ SDK 更新完成（内置 Claude Code 版本随之更新）"; \
 	else \
 		echo "✅ Claude Agent SDK 已是最新 ($$LOCAL)"; \

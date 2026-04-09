@@ -13,6 +13,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import type { ProviderWithHealth, ProviderHealthStatus } from './types';
+import { UsageBars } from './UsageBars';
 
 interface ProviderListProps {
   providers: ProviderWithHealth[];
@@ -257,6 +258,11 @@ export function ProviderList({
                       <Activity className="w-3 h-3 inline mr-0.5" />
                       {health.activeSessionCount} 活跃会话
                     </div>
+                  )}
+
+                  {/* OAuth 用量 */}
+                  {provider.hasClaudeOAuthCredentials && (
+                    <UsageBars providerId={provider.id} />
                   )}
                 </div>
               );

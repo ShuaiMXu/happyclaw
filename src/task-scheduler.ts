@@ -39,11 +39,13 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
+import { resolveTaskOwner } from './task-utils.js';
 import { removeFlowArtifacts } from './file-manager.js';
 import { hasScriptCapacity, runScript } from './script-runner.js';
 import type { StreamEvent } from './stream-event.types.js';
 import { ExecutionMode, RegisteredGroup, ScheduledTask } from './types.js';
 import { checkBillingAccessFresh, isBillingEnabled } from './billing.js';
+import { stripAgentInternalTags } from './utils.js';
 
 /**
  * Resolve the actual group JID to send a task to.
@@ -115,21 +117,22 @@ function ensureTaskWorkspace(
 
   const executionMode = resolveTaskExecutionMode(task, deps);
 
+  const sourceGroup = Object.values(deps.registeredGroups()).find(
+    (g) => g.folder === task.group_folder,
+  );
+  const ownerId = resolveTaskOwner(task, sourceGroup);
+
   const group: RegisteredGroup = {
     name,
     folder,
     added_at: new Date().toISOString(),
     executionMode,
-    created_by: task.created_by,
+    created_by: ownerId,
   };
 
   setRegisteredGroup(jid, group);
   ensureChatExists(jid);
   updateChatName(jid, name);
-  // Resolve owner: prefer task.created_by, fallback to source group's owner
-  const ownerId = task.created_by
-    || Object.values(deps.registeredGroups()).find((g) => g.folder === task.group_folder)?.created_by
-    || null;
   if (ownerId) {
     addGroupMember(folder, ownerId, 'owner', ownerId);
   }
@@ -146,12 +149,12 @@ function ensureTaskWorkspace(
   task.workspace_folder = folder;
 
   logger.info(
-    { taskId: task.id, folder, jid, executionMode },
+    { taskId: task.id, folder, jid, executionMode, ownerId },
     'Created task workspace',
   );
 
   // Notify frontend via WebSocket so sidebar refreshes (scoped to task owner)
-  deps.onWorkspaceCreated?.(jid, folder, name, task.created_by ?? undefined);
+  deps.onWorkspaceCreated?.(jid, folder, name, ownerId);
 
   return { jid, folder };
 }
@@ -167,6 +170,7 @@ export interface SchedulerDependencies {
     groupFolder: string,
     displayName?: string,
     taskRunId?: string,
+    selectedProviderId?: string | null,
   ) => void;
   sendMessage: (
     jid: string,
@@ -177,6 +181,17 @@ export interface SchedulerDependencies {
   onWorkspaceCreated?: (jid: string, folder: string, name: string, userId?: string) => void;
   /** Store task prompt as a user-visible message in the workspace chat */
   storePromptMessage?: (chatJid: string, senderId: string, senderName: string, text: string) => void;
+  /** Store task result in workspace chat and push to owner's IM channels */
+  storeResultAndNotify?: (
+    chatJid: string,
+    text: string,
+    options: {
+      ownerId?: string;
+      notifyChannels?: string[] | null;
+      sourceKind?: ContainerOutput['sourceKind'];
+      skipStore?: boolean;
+    },
+  ) => Promise<void>;
   assistantName: string;
   dailySummaryDeps?: DailySummaryDeps;
 }
@@ -262,6 +277,8 @@ async function runTask(
       result: null,
       error: `Workspace group not found: ${workspace.jid}`,
     });
+    const nextRun = options?.manualRun ? task.next_run : computeNextRun(task);
+    updateTaskAfterRun(task.id, nextRun, `Error: Workspace group not found: ${workspace.jid}`);
     runningTaskIds.delete(task.id);
     return;
   }
@@ -344,7 +361,8 @@ async function runTask(
   const finalizeRunLog = () => {
     if (runLogFinalized) return;
     runLogFinalized = true;
-    runningTaskIds.delete(task.id);
+    // 注意：runningTaskIds.delete() 不在此处调用，
+    // 必须等到 updateTaskAfterRun() ��新 next_run 后才能释放防重复屏障（#363）
     const durationMs = lastOutputTime - startTime;
     updateTaskRunLog(runLogId, {
       duration_ms: durationMs,
@@ -400,7 +418,7 @@ async function runTask(
         isScheduledTask: true,
         taskRunId: options?.taskRunId,
       },
-      (proc, identifier) =>
+      (proc, identifier, selectedProviderId) =>
         deps.onProcess(
           effectiveJid,
           proc,
@@ -408,6 +426,7 @@ async function runTask(
           workspace.folder,
           identifier,
           options?.taskRunId,
+          selectedProviderId,
         ),
       async (streamedOutput: ContainerOutput) => {
         // Broadcast stream events to WebSocket clients viewing the task workspace
@@ -456,7 +475,6 @@ async function runTask(
     lastOutputTime = Date.now();
     logger.error({ taskId: task.id, error }, 'Task failed');
   } finally {
-    runningTaskIds.delete(task.id);
     // Clean up isolated task IPC directory
     if (options?.taskRunId) {
       const taskRunDir = path.join(
@@ -485,7 +503,32 @@ async function runTask(
     : result
       ? result.slice(0, 200)
       : 'Completed';
-  updateTaskAfterRun(task.id, nextRun, resultSummary);
+  try {
+    updateTaskAfterRun(task.id, nextRun, resultSummary);
+  } finally {
+    runningTaskIds.delete(task.id);
+  }
+
+  if (deps.storeResultAndNotify && (result || error)) {
+    const text = error
+      ? `执行出错: ${error}`
+      : stripAgentInternalTags(result!);
+
+    if (text) {
+      try {
+        await deps.storeResultAndNotify(workspace.jid, text, {
+          ownerId: workspaceGroup.created_by || undefined,
+          notifyChannels: task.notify_channels,
+          sourceKind: 'sdk_final',
+        });
+      } catch (err) {
+        logger.error(
+          { taskId: task.id, err },
+          'Failed to store/notify task result',
+        );
+      }
+    }
+  }
 
   // Auto-cleanup once-task workspace after completion
   if (task.schedule_type === 'once' && !options?.manualRun && task.workspace_jid && task.workspace_folder) {
@@ -574,6 +617,8 @@ async function runScriptTask(
       result: null,
       error: 'script_command is empty',
     });
+    const nextRun = manualRun ? task.next_run : computeNextRun(task);
+    updateTaskAfterRun(task.id, nextRun, 'Error: script_command is empty');
     runningTaskIds.delete(task.id);
     return;
   }
@@ -601,8 +646,28 @@ async function runScriptTask(
       const text = error
         ? `[脚本] 执行失败: ${error}${result ? `\n输出:\n${result.slice(0, 500)}` : ''}`
         : `[脚本] ${result!.slice(0, 1000)}`;
+      const fullText = `${deps.assistantName}: ${text}`;
 
-      await deps.sendMessage(groupJid, `${deps.assistantName}: ${text}`, { source: 'scheduled_task' });
+      await deps.sendMessage(groupJid, fullText, { source: 'scheduled_task' });
+
+      if (deps.storeResultAndNotify) {
+        const groups = deps.registeredGroups();
+        const group = groups[groupJid];
+        if (group?.created_by) {
+          try {
+            await deps.storeResultAndNotify(groupJid, fullText, {
+              ownerId: group.created_by,
+              notifyChannels: task.notify_channels,
+              skipStore: true,
+            });
+          } catch (notifyErr) {
+            logger.error(
+              { taskId: task.id, err: notifyErr },
+              'Failed to notify script task result to IM',
+            );
+          }
+        }
+      }
     }
 
     logger.info(
@@ -616,8 +681,6 @@ async function runScriptTask(
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
     logger.error({ taskId: task.id, error }, 'Script task failed');
-  } finally {
-    runningTaskIds.delete(task.id);
   }
 
   const durationMs = Date.now() - startTime;
@@ -636,7 +699,80 @@ async function runScriptTask(
     : result
       ? result.slice(0, 200)
       : 'Completed';
-  updateTaskAfterRun(task.id, nextRun, resultSummary);
+  try {
+    updateTaskAfterRun(task.id, nextRun, resultSummary);
+  } finally {
+    runningTaskIds.delete(task.id);
+  }
+}
+
+/**
+ * Group context mode: inject task prompt as a regular message into the source workspace.
+ * The message is processed by the existing message pipeline (IPC if running, new container if idle).
+ */
+async function runGroupModeTask(
+  task: ScheduledTask,
+  deps: SchedulerDependencies,
+  targetGroupJid: string,
+  manualRun = false,
+): Promise<void> {
+  const startTime = Date.now();
+  runningTaskIds.add(task.id);
+  let resultSummary = '已注入到源工作区';
+
+  try {
+    // Resolve task owner for sender attribution
+    const owner = task.created_by ? getUserById(task.created_by) : null;
+    const senderName = owner?.display_name || owner?.username || '定时任务';
+
+    if (!deps.storePromptMessage) {
+      throw new Error('storePromptMessage dependency not available');
+    }
+
+    // Store prompt as a user message in the source workspace chat
+    deps.storePromptMessage(
+      targetGroupJid,
+      owner?.id || 'system',
+      senderName,
+      task.prompt,
+    );
+
+    // Trigger normal message processing for the source workspace
+    deps.queue.enqueueMessageCheck(targetGroupJid);
+
+    logger.info(
+      { taskId: task.id, targetGroupJid, contextMode: 'group' },
+      'Group-mode task injected into source workspace',
+    );
+
+    logTaskRun({
+      task_id: task.id,
+      run_at: new Date().toISOString(),
+      duration_ms: Date.now() - startTime,
+      status: 'success',
+      result: '已注入到源工作区',
+      error: null,
+    });
+  } catch (err) {
+    resultSummary = `Error: ${err instanceof Error ? err.message : String(err)}`;
+    logger.error({ taskId: task.id, error: resultSummary }, 'Group-mode task injection failed');
+
+    logTaskRun({
+      task_id: task.id,
+      run_at: new Date().toISOString(),
+      duration_ms: Date.now() - startTime,
+      status: 'error',
+      result: null,
+      error: resultSummary,
+    });
+  } finally {
+    try {
+      const nextRun = manualRun ? task.next_run : computeNextRun(task);
+      updateTaskAfterRun(task.id, nextRun, resultSummary);
+    } finally {
+      runningTaskIds.delete(task.id);
+    }
+  }
 }
 
 let schedulerRunning = false;
@@ -761,9 +897,16 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
               'Unhandled error in runScriptTask',
             );
           });
+        } else if (currentTask.context_mode === 'group') {
+          // Group mode: inject prompt into source workspace as a regular message
+          runGroupModeTask(currentTask, deps, targetGroupJid).catch((err) => {
+            logger.error(
+              { taskId: currentTask.id, err },
+              'Unhandled error in runGroupModeTask',
+            );
+          });
         } else {
-          // Each agent task has a dedicated workspace; use workspace JID or
-          // fallback to targetGroupJid for queue serialization key
+          // Isolated mode (default): each agent task has a dedicated workspace
           const taskQueueJid = currentTask.workspace_jid
             ? `${currentTask.workspace_jid}#task:${currentTask.id}`
             : `${targetGroupJid}#task:${currentTask.id}`;
@@ -811,6 +954,10 @@ export function triggerTaskNow(
       return { success: false, error: 'Script concurrency limit reached' };
     runScriptTask(task, deps, targetGroupJid, true).catch((err) =>
       logger.error({ taskId, err }, 'Manual script task failed'),
+    );
+  } else if (task.context_mode === 'group') {
+    runGroupModeTask(task, deps, targetGroupJid, true).catch((err) =>
+      logger.error({ taskId, err }, 'Manual group-mode task failed'),
     );
   } else {
     const opts: RunTaskOptions = { manualRun: true, taskRunId: task.id };

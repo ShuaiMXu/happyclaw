@@ -71,8 +71,9 @@ import {
   getAgent,
   isGroupShared,
   getUserById,
+  updateAgentContextInfo,
 } from './db.js';
-import { isSessionExpired } from './auth.js';
+import { isSessionExpired, verifySessionToken } from './auth.js';
 import type {
   NewMessage,
   WsMessageOut,
@@ -424,6 +425,7 @@ async function handleAgentConversationMessage(
     false,
     { attachments: attachmentsStr },
   );
+  updateAgentContextInfo(agentId, { last_active_at: timestamp });
 
   // Broadcast new_message with agentId so frontend routes to agent tab
   broadcastNewMessage(
@@ -537,10 +539,16 @@ function setupWebSocket(server: any): WebSocketServer {
       return;
     }
 
-    // Verify session cookie
+    // Verify session cookie (HMAC signature + DB lookup)
     const cookies = parseCookie(request.headers.cookie);
-    const token =
+    const rawCookie =
       cookies[SESSION_COOKIE_NAME_SECURE] || cookies[SESSION_COOKIE_NAME_PLAIN];
+    if (!rawCookie) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const token = verifySessionToken(rawCookie);
     if (!token) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();

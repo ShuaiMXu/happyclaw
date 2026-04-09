@@ -38,6 +38,8 @@ interface GroupState {
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   restarting: boolean;
+  /** Provider profile ID selected for the current active runner (null = default/override). */
+  selectedProviderId: string | null;
   /** True when a _drain sentinel has been written for the current active runner. */
   drainSentinelWritten: boolean;
   /** True when messages have been IPC-injected into the running agent via sendMessage().
@@ -94,6 +96,7 @@ export class GroupQueue {
         retryCount: 0,
         retryTimer: null,
         restarting: false,
+        selectedProviderId: null,
         drainSentinelWritten: false,
         hasIpcInjectedMessages: false,
       };
@@ -402,19 +405,23 @@ export class GroupQueue {
   registerProcess(
     groupJid: string,
     proc: ChildProcess,
-    containerName: string | null,
-    groupFolder?: string,
-    displayName?: string,
-    agentId?: string,
-    taskRunId?: string,
+    opts: {
+      containerName: string | null;
+      groupFolder?: string;
+      displayName?: string;
+      agentId?: string;
+      taskRunId?: string;
+      selectedProviderId?: string | null;
+    },
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
-    state.containerName = containerName;
-    state.displayName = displayName || null;
-    if (groupFolder) state.groupFolder = groupFolder;
-    state.agentId = agentId || null;
-    state.taskRunId = taskRunId || null;
+    state.containerName = opts.containerName;
+    state.displayName = opts.displayName || null;
+    if (opts.groupFolder) state.groupFolder = opts.groupFolder;
+    state.agentId = opts.agentId || null;
+    state.taskRunId = opts.taskRunId || null;
+    state.selectedProviderId = opts.selectedProviderId ?? null;
   }
 
   /**
@@ -617,6 +624,27 @@ export class GroupQueue {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Signal a specific group's active container to gracefully exit.
+   * Used by provider switch: after the container exits, processGroupMessages
+   * will automatically restart it (picking up the new provider via override).
+   * Uses _drain (not _close) so the current query finishes before exit.
+   */
+  requestGracefulRestart(groupJid: string): boolean {
+    const state = this.groups.get(groupJid);
+    if (!state?.active || !state.groupFolder) return false;
+    const written = this.writeDrainSentinel(state as ActiveGroupState);
+    if (written) {
+      // Ensure close handler triggers a new run even if no messages are pending
+      state.pendingMessages = true;
+      logger.info(
+        { groupJid, groupFolder: state.groupFolder },
+        'Sent drain signal for provider switch',
+      );
+    }
+    return written;
   }
 
   /**
@@ -1227,6 +1255,8 @@ export class GroupQueue {
       pendingTasks: number;
       containerName: string | null;
       displayName: string | null;
+      groupFolder: string | null;
+      selectedProviderId: string | null;
     }>;
   } {
     const groups: Array<{
@@ -1236,6 +1266,8 @@ export class GroupQueue {
       pendingTasks: number;
       containerName: string | null;
       displayName: string | null;
+      groupFolder: string | null;
+      selectedProviderId: string | null;
     }> = [];
 
     for (const [jid, state] of this.groups) {
@@ -1246,6 +1278,8 @@ export class GroupQueue {
         pendingTasks: state.pendingTasks.length,
         containerName: state.containerName,
         displayName: state.displayName,
+        groupFolder: state.groupFolder,
+        selectedProviderId: state.selectedProviderId,
       });
     }
 

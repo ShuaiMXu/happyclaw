@@ -6,6 +6,7 @@ import type { Permission } from './types.js';
 import { MAX_GROUP_NAME_LEN } from './web-context.js';
 
 export const TaskPatchSchema = z.object({
+  chat_jid: z.string().min(1).optional(),
   prompt: z.string().optional(),
   schedule_type: z.enum(['cron', 'interval', 'once']).optional(),
   schedule_value: z.string().optional(),
@@ -192,7 +193,7 @@ export const GroupPatchSchema = z.object({
   name: z.string().min(1).max(MAX_GROUP_NAME_LEN).optional(),
   is_pinned: z.boolean().optional(),
   activation_mode: z
-    .enum(['auto', 'always', 'when_mentioned', 'disabled'])
+    .enum(['auto', 'always', 'when_mentioned', 'owner_mentioned', 'disabled'])
     .optional(),
   execution_mode: z.enum(['container', 'host']).optional(),
 });
@@ -229,13 +230,12 @@ export const SystemSettingsSchema = z.object({
   loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),
   maxConcurrentScripts: z.number().int().min(1).max(50).optional(),
   scriptTimeout: z.number().int().min(5000).max(600000).optional(),
-  skillAutoSyncEnabled: z.boolean().optional(),
-  skillAutoSyncIntervalMinutes: z.number().int().min(1).max(1440).optional(),
   billingEnabled: z.boolean().optional(),
   billingMode: z.literal('wallet_first').optional(),
   billingMinStartBalanceUsd: z.number().min(0).max(1000000).optional(),
   billingCurrency: z.string().min(1).max(10).optional(),
   billingCurrencyRate: z.number().min(0.0001).max(1000000).optional(),
+  externalClaudeDir: z.string().max(512).optional(),
 });
 
 export const AppearanceConfigSchema = z.object({
@@ -710,12 +710,14 @@ export const DingTalkConfigSchema = z
     clientSecret: z.string().max(2000).optional(),
     clearClientSecret: z.boolean().optional(),
     enabled: z.boolean().optional(),
+    streamingMode: z.enum(['card', 'text']).optional(),
   })
   .refine(
     (data) =>
       typeof data.clientId === 'string' ||
       typeof data.clientSecret === 'string' ||
       data.clearClientSecret === true ||
-      typeof data.enabled === 'boolean',
+      typeof data.enabled === 'boolean' ||
+      typeof data.streamingMode === 'string',
     { message: 'At least one config field must be provided' },
   );

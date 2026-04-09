@@ -60,6 +60,7 @@ import {
   getAppearanceConfig,
   saveAppearanceConfig,
   getSystemSettings,
+  getEffectiveExternalDir,
   saveSystemSettings,
   getUserFeishuConfig,
   saveUserFeishuConfig,
@@ -73,7 +74,13 @@ import {
   saveUserDingTalkConfig,
   updateAllSessionCredentials,
 } from '../runtime-config.js';
-import type { ClaudeOAuthCredentials } from '../runtime-config.js';
+import type {
+  ClaudeOAuthCredentials,
+  CachedOAuthUsage,
+  OAuthUsageResponse,
+  OAuthUsageBucket,
+} from '../runtime-config.js';
+import { parseOAuthUsageBucket } from '../runtime-config.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
@@ -83,6 +90,8 @@ import {
   clearBillingEnabledCache,
 } from '../billing.js';
 import { providerPool } from '../provider-pool.js';
+import fs from 'fs';
+import path from 'path';
 
 const configRoutes = new Hono<{ Variables: Variables }>();
 
@@ -194,6 +203,83 @@ setInterval(() => {
     if (flow.expiresAt < now) oauthFlows.delete(key);
   }
 }, 60_000);
+
+// --- OAuth Usage Cache ---
+
+const OAUTH_USAGE_API = 'https://api.anthropic.com/api/oauth/usage';
+const USAGE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
+const usageCache = new Map<string, CachedOAuthUsage>();
+const inFlightUsageRequests = new Map<string, Promise<CachedOAuthUsage>>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of usageCache) {
+    if (now - entry.fetchedAt >= USAGE_CACHE_TTL_MS) {
+      usageCache.delete(key);
+    }
+  }
+}, 5 * 60_000);
+
+async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
+  const cached = usageCache.get(providerId);
+  if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) {
+    return cached;
+  }
+
+  // Deduplicate concurrent requests for the same provider
+  const inFlight = inFlightUsageRequests.get(providerId);
+  if (inFlight) return inFlight;
+
+  const providers = getProviders();
+  const provider = providers.find((p) => p.id === providerId);
+  if (!provider) {
+    throw new Error('Provider not found');
+  }
+  if (!provider.claudeOAuthCredentials) {
+    throw new Error('Provider has no OAuth credentials');
+  }
+
+  const requestPromise = (async () => {
+    try {
+      const resp = await fetch(OAUTH_USAGE_API, {
+        headers: {
+          Authorization: `Bearer ${provider.claudeOAuthCredentials!.accessToken}`,
+          'anthropic-beta': 'oauth-2025-04-20',
+        },
+      });
+
+      if (!resp.ok) {
+        // Return stale cache if available, otherwise throw
+        if (cached) {
+          const stale: CachedOAuthUsage = {
+            ...cached,
+            error: `HTTP ${resp.status}`,
+          };
+          usageCache.set(providerId, stale);
+          return stale;
+        }
+        throw new Error(`Usage API returned ${resp.status}`);
+      }
+
+      const raw = (await resp.json()) as Record<string, unknown>;
+      const data: OAuthUsageResponse = {
+        five_hour: parseOAuthUsageBucket(raw.five_hour),
+        seven_day: parseOAuthUsageBucket(raw.seven_day),
+        seven_day_opus: parseOAuthUsageBucket(raw.seven_day_opus),
+        seven_day_sonnet: parseOAuthUsageBucket(raw.seven_day_sonnet),
+      };
+
+      const result: CachedOAuthUsage = { data, fetchedAt: Date.now() };
+      usageCache.set(providerId, result);
+      return result;
+    } finally {
+      inFlightUsageRequests.delete(providerId);
+    }
+  })();
+
+  inFlightUsageRequests.set(providerId, requestPromise);
+  return requestPromise;
+}
 
 // --- Routes ---
 
@@ -472,6 +558,24 @@ configRoutes.get(
     const balancing = getBalancingConfig();
     providerPool.refreshFromConfig(enabledProviders, balancing);
     return c.json({ statuses: providerPool.getHealthStatuses() });
+  },
+);
+
+// ─── GET /claude/providers/:id/usage — OAuth 用量数据 ─────
+configRoutes.get(
+  '/claude/providers/:id/usage',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    try {
+      const usage = await fetchOAuthUsage(id);
+      return c.json(usage);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      logger.warn({ err, providerId: id }, 'Failed to fetch OAuth usage');
+      return c.json({ error: msg }, 400);
+    }
   },
 );
 
@@ -1114,6 +1218,73 @@ configRoutes.put(
   },
 );
 
+// ─── External Claude resources (admin only) ─────────────────────────
+
+configRoutes.get('/external-resources', authMiddleware, systemConfigMiddleware, (c) => {
+  // 仅 admin 可查看宿主机资源，普通用户不允许看到宿主机任何内容
+  const user = c.get('user') as AuthUser;
+  if (user.role !== 'admin') {
+    return c.json({ dir: '', rules: [], claudeMd: null });
+  }
+  const effectiveDir = getEffectiveExternalDir();
+
+  const result: {
+    dir: string;
+    rules: Array<{ name: string; size: number }>;
+    claudeMd: string | null;
+  } = { dir: effectiveDir, rules: [], claudeMd: null };
+
+  // Rules
+  const rulesDir = path.join(effectiveDir, 'rules');
+  try {
+    if (fs.existsSync(rulesDir)) {
+      for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
+        if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+        try {
+          const st = fs.statSync(path.join(rulesDir, entry.name));
+          result.rules.push({ name: entry.name, size: st.size });
+        } catch { /* skip */ }
+      }
+    }
+  } catch { /* ignore */ }
+
+  // CLAUDE.md
+  const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
+  try {
+    if (fs.existsSync(claudeMdPath)) {
+      const content = fs.readFileSync(claudeMdPath, 'utf-8');
+      result.claudeMd = content.length > 10000 ? content.slice(0, 10000) + '\n...(截断)' : content;
+    }
+  } catch { /* ignore */ }
+
+  return c.json(result);
+});
+
+// Read a single rule file content (admin only)
+configRoutes.get('/external-resources/rule', authMiddleware, systemConfigMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  if (user.role !== 'admin') {
+    return c.text('Forbidden', 403);
+  }
+  const name = c.req.query('name');
+  if (!name || name.includes('/') || name.includes('..')) {
+    return c.text('Invalid name', 400);
+  }
+  const effectiveDir = getEffectiveExternalDir();
+  const filePath = path.join(effectiveDir, 'rules', name);
+  try {
+    const resolved = fs.realpathSync(filePath);
+    // 确保解析后的路径仍在 rules 目录内
+    if (!resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))) {
+      return c.text('Forbidden', 403);
+    }
+    const content = fs.readFileSync(resolved, 'utf-8');
+    return c.text(content);
+  } catch {
+    return c.text('Not found', 404);
+  }
+});
+
 // ─── Per-user IM connection status ──────────────────────────────────
 
 configRoutes.get('/user-im/status', authMiddleware, (c) => {
@@ -1727,6 +1898,7 @@ configRoutes.get('/user-im/dingtalk', authMiddleware, (c) => {
         hasClientSecret: false,
         clientSecretMasked: null,
         enabled: false,
+        streamingMode: 'card',
         updatedAt: null,
         connected,
       });
@@ -1740,6 +1912,7 @@ configRoutes.get('/user-im/dingtalk', authMiddleware, (c) => {
           config.clientSecret.slice(-4)
         : null,
       enabled: config.enabled ?? false,
+      streamingMode: config.streamingMode ?? 'card',
       updatedAt: config.updatedAt,
       connected,
     });
@@ -1780,6 +1953,7 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
     clientId: current?.clientId || '',
     clientSecret: current?.clientSecret || '',
     enabled: current?.enabled ?? true,
+    streamingMode: current?.streamingMode ?? 'card',
   };
 
   if (typeof validation.data.clientId === 'string') {
@@ -1795,6 +1969,9 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
     next.enabled = validation.data.enabled;
   } else if (!current && (next.clientId || next.clientSecret)) {
     next.enabled = true;
+  }
+  if (typeof validation.data.streamingMode === 'string') {
+    next.streamingMode = validation.data.streamingMode;
   }
 
   try {
@@ -1817,6 +1994,7 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
         ? saved.clientSecret.slice(0, 4) + '***' + saved.clientSecret.slice(-4)
         : null,
       enabled: saved.enabled ?? false,
+      streamingMode: saved.streamingMode ?? 'card',
       updatedAt: saved.updatedAt,
       connected,
     });

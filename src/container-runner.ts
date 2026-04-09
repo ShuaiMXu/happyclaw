@@ -26,6 +26,7 @@ import {
   getEnabledProviders,
   getBalancingConfig,
   getSystemSettings,
+  getEffectiveExternalDir,
   mergeClaudeEnvConfig,
   resolveProviderById,
   shellQuoteEnvLines,
@@ -49,6 +50,74 @@ import {
 } from './agent-output-parser.js';
 
 /**
+ * 宿主机的 ~/.claude.json 路径。
+ * 所有工作区共享此文件，确保 deviceId (userID) 一致。
+ * 即使 HappyClaw 项目删除重建，此文件始终存在于宿主机上。
+ */
+function getHostClaudeJsonPath(): string {
+  return path.join(os.homedir(), '.claude.json');
+}
+
+/**
+ * 确保宿主机 ~/.claude.json 存在。
+ * 如不存在则创建空 JSON，Claude Code 首次运行时会自动生成 userID。
+ */
+function ensureHostClaudeJson(): string {
+  const p = getHostClaudeJsonPath();
+  try {
+    fs.writeFileSync(p, '{}', { mode: 0o600, flag: 'wx' });
+  } catch (err: any) {
+    if (err.code !== 'EEXIST') throw err;
+  }
+  return p;
+}
+
+/**
+ * 为 Docker 容器生成精简版 .claude.json。
+ * 宿主机 ~/.claude.json 中的 cachedGrowthBookFeatures 含 tengu_bridge_repl_v2 等
+ * feature flags，SDK 初始化时会据此尝试建立 bridge 连接，在容器网络环境中无法完成
+ * 导致进程挂起。剥离该字段后其余内容原样保留（oauthAccount、userID 等）。
+ */
+function getContainerClaudeJsonPath(): string {
+  const containerJsonDir = path.join(DATA_DIR, 'config');
+  fs.mkdirSync(containerJsonDir, { recursive: true });
+  const containerJsonPath = path.join(containerJsonDir, 'container-claude-json.json');
+
+  try {
+    const hostJson = JSON.parse(fs.readFileSync(getHostClaudeJsonPath(), 'utf-8'));
+    const stripped = { ...hostJson };
+    delete stripped.cachedGrowthBookFeatures;
+    stripped.autoUpdates = false;
+    fs.writeFileSync(containerJsonPath, JSON.stringify(stripped, null, 2) + '\n', { mode: 0o644 });
+  } catch {
+    fs.writeFileSync(containerJsonPath, '{"hasCompletedOnboarding":true,"autoUpdates":false}\n', { mode: 0o644 });
+  }
+
+  return containerJsonPath;
+}
+
+/**
+ * 确保 localPath 是指向 targetPath 的 symlink。
+ * 如果 localPath 是普通文件或指向错误目标的 symlink，替换它。
+ */
+function ensureSymlinkTo(localPath: string, targetPath: string): void {
+  try {
+    const st = fs.lstatSync(localPath);
+    if (st.isSymbolicLink() && fs.readlinkSync(localPath) === targetPath) {
+      return; // 已经是正确的 symlink
+    }
+    fs.unlinkSync(localPath); // 普通文件或错误 symlink，删除
+  } catch {
+    // 文件不存在，继续创建
+  }
+  try {
+    fs.symlinkSync(targetPath, localPath);
+  } catch (err) {
+    logger.warn({ err, localPath, targetPath }, 'Failed to create symlink for .claude.json, deviceId may differ');
+  }
+}
+
+/**
  * Required env flags for settings.json — 每次容器/进程启动时强制写入，不可被用户覆盖。
  * 合并模式：仅覆盖这些 key，保留用户自定义的其他 key。
  */
@@ -56,6 +125,11 @@ const REQUIRED_SETTINGS_ENV: Record<string, string> = {
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
   CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+  // 禁用 SDK 附件注入（token_usage, changed_files, todo_reminders 等 20+ 种动态消息）。
+  // 这些附件在每次 query() 时动态生成但不持久化到 JSONL，导致跨进程的消息数组
+  // 前缀不匹配，prompt cache 永远失效（cache_read 始终 = 11224 静态 system prompt）。
+  // 禁用后历史消息的缓存前缀跨 query() 保持一致，实现 1M 上下文下的增量缓存。
+  CLAUDE_CODE_DISABLE_ATTACHMENTS: '1',
 };
 
 /** Read existing settings.json, deep-merge required env keys and mcpServers, write only if changed */
@@ -154,8 +228,20 @@ interface ResolvedProvider {
 }
 
 /**
+ * One-time provider overrides per group folder.
+ * Set by switchProvider(), consumed (and deleted) by trySelectPoolProvider().
+ */
+const providerOverrides = new Map<string, string>();
+
+export function setProviderOverride(groupFolder: string, providerId: string): void {
+  providerOverrides.set(groupFolder, providerId);
+}
+
+/**
  * Try to select a provider from the pool. Returns profileId + resolved config,
- * or null if pool mode is off (≤1 enabled) / group has provider override / selection fails.
+ * or null if no providers are enabled / group has env-level provider override / selection fails.
+ * For single-provider setups, returns the provider for display without pool balancing.
+ * One-time overrides (from switchProvider) are consumed on use.
  */
 function trySelectPoolProvider(
   groupFolder: string,
@@ -168,9 +254,43 @@ function trySelectPoolProvider(
   );
   if (hasOverride) return null;
 
+  // Check one-time override (consumed on use)
+  const overrideProviderId = providerOverrides.get(groupFolder);
+  if (overrideProviderId) {
+    providerOverrides.delete(groupFolder);
+    try {
+      const resolved = resolveProviderById(overrideProviderId);
+      providerPool.acquireSession(overrideProviderId);
+      logger.info(
+        { groupFolder, providerId: overrideProviderId },
+        'Using one-time provider override',
+      );
+      return {
+        profileId: overrideProviderId,
+        resolved: { config: resolved.config, customEnv: resolved.customEnv },
+      };
+    } catch (err) {
+      logger.warn({ err, providerId: overrideProviderId }, 'Provider override failed, falling back to pool');
+    }
+  }
+
   // Refresh pool state from V4 config
   const enabledProviders = getEnabledProviders();
-  if (enabledProviders.length <= 1) return null; // No pool needed for 0-1 providers
+  if (enabledProviders.length === 0) return null;
+
+  // Single provider: return its ID for display, acquire session for consistency
+  if (enabledProviders.length === 1) {
+    try {
+      const resolved = resolveProviderById(enabledProviders[0].id);
+      providerPool.acquireSession(enabledProviders[0].id);
+      return {
+        profileId: enabledProviders[0].id,
+        resolved: { config: resolved.config, customEnv: resolved.customEnv },
+      };
+    } catch {
+      return null;
+    }
+  }
 
   const balancing = getBalancingConfig();
   providerPool.refreshFromConfig(enabledProviders, balancing);
@@ -279,6 +399,25 @@ function buildVolumeMounts(
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
     readonly: false,
+  });
+
+  // 清理 session 目录中 SDK 遗留的 .claude.json（含 cachedGrowthBookFeatures，会导致初始化挂起）。
+  // 精简版（不含 feature flags）约 200-400B，SDK 写回的完整版通常 > 10KB。
+  const STRIPPED_CLAUDE_JSON_MAX_SIZE = 500;
+  const sessionClaudeJson = path.join(groupSessionsDir, '.claude.json');
+  try {
+    const st = fs.lstatSync(sessionClaudeJson);
+    if (!st.isSymbolicLink() && st.size > STRIPPED_CLAUDE_JSON_MAX_SIZE) {
+      fs.unlinkSync(sessionClaudeJson);
+    }
+  } catch { /* not found, ok */ }
+
+  // 挂载精简版 .claude.json（剥离 cachedGrowthBookFeatures），保留 deviceId 一致性
+  const containerJson = getContainerClaudeJsonPath();
+  mounts.push({
+    hostPath: containerJson,
+    containerPath: '/home/node/.claude.json',
+    readonly: true,
   });
 
   // Skills：以只读卷挂载宿主机目录（由 entrypoint 创建符号链接）
@@ -439,6 +578,39 @@ function buildVolumeMounts(
         readonly: true,
       });
     }
+
+    // External Claude dir: mount skills (admin only, fallback to ~/.claude)
+    const effectiveExtDir = getEffectiveExternalDir();
+    {
+      const extSkillsDir = path.join(effectiveExtDir, 'skills');
+      if (fs.existsSync(extSkillsDir)) {
+        mounts.push({
+          hostPath: extSkillsDir,
+          containerPath: '/workspace/external-skills',
+          readonly: true,
+        });
+      }
+      // rules 和 CLAUDE.md 已在上方通过 hostRulesDir/hostClaudeMd 挂载（当 effectiveExtDir === hostClaudeDir 时）
+      // 仅在 externalClaudeDir 显式设置且不同于 ~/.claude 时才额外挂载
+      if (effectiveExtDir !== hostClaudeDir) {
+        const extRulesDir = path.join(effectiveExtDir, 'rules');
+        if (fs.existsSync(extRulesDir) && !fs.existsSync(hostRulesDir)) {
+          mounts.push({
+            hostPath: extRulesDir,
+            containerPath: '/workspace/.claude/rules',
+            readonly: true,
+          });
+        }
+        const extClaudeMd = path.join(effectiveExtDir, 'CLAUDE.md');
+        if (fs.existsSync(extClaudeMd) && !fs.existsSync(hostClaudeMd)) {
+          mounts.push({
+            hostPath: extClaudeMd,
+            containerPath: '/workspace/CLAUDE.md',
+            readonly: true,
+          });
+        }
+      }
+    }
   }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
@@ -477,7 +649,7 @@ function buildContainerArgs(
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
-  onProcess: (proc: ChildProcess, containerName: string) => void,
+  onProcess: (proc: ChildProcess, containerName: string, selectedProviderId: string | null) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
@@ -543,7 +715,7 @@ export async function runContainerAgent(
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
-      onProcess(container, containerName);
+      onProcess(container, containerName, selectedProfileId);
 
       const stdoutState = createStdoutParserState();
       const stderrState = createStderrState();
@@ -786,7 +958,7 @@ export function killProcessTree(
 export async function runHostAgent(
   group: RegisteredGroup,
   input: ContainerInput,
-  onProcess: (proc: ChildProcess, identifier: string) => void,
+  onProcess: (proc: ChildProcess, identifier: string, selectedProviderId: string | null) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
@@ -921,15 +1093,20 @@ export async function runHostAgent(
     : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
 
+  // Symlink .claude.json 到宿主机 ~/.claude.json，确保 deviceId 一致
+  const localJson = path.join(groupSessionsDir, '.claude.json');
+  ensureSymlinkTo(localJson, ensureHostClaudeJson());
+
   // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
   // Load user's global MCP servers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const hostMcpServers = group.created_by ? loadUserMcpServers(group.created_by) : {};
   ensureSettingsJson(settingsFile, hostMcpServers);
 
-  // 4. Skills 自动链接到 session 目录
-  // 链接顺序：项目级 → 用户级(覆盖同名项目级)
-  // 用户的所有 skills 在所有工作区中生效
+  // 4. Skills / Rules / CLAUDE.md 自动链接到 session 目录
+  const effectiveExtDir = getEffectiveExternalDir();
+
+  // 4a. Skills 链接（外部→项目级→用户级，后者覆盖前者）
   try {
     const skillsDir = path.join(groupSessionsDir, 'skills');
     fs.mkdirSync(skillsDir, { recursive: true });
@@ -962,6 +1139,9 @@ export async function runHostAgent(
       }
     };
 
+    // 外部 skills（最低优先级）
+    // 宿主机 skills（最低优先级）
+    linkSkillEntries(path.join(effectiveExtDir, 'skills'));
     // 项目级 skills
     const projectRoot = process.cwd();
     linkSkillEntries(path.join(projectRoot, 'container', 'skills'));
@@ -975,6 +1155,52 @@ export async function runHostAgent(
       { folder: group.folder, err },
       '宿主机模式 skills 符号链接失败',
     );
+  }
+
+  // 4b. Rules 自动链接到 session 目录
+  try {
+    const rulesDir = path.join(groupSessionsDir, 'rules');
+    fs.mkdirSync(rulesDir, { recursive: true });
+    // 清空已有符号链接
+    for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
+      const p = path.join(rulesDir, entry.name);
+      try {
+        if (entry.isSymbolicLink() || entry.isFile()) {
+          fs.rmSync(p, { force: true });
+        }
+      } catch { /* ignore */ }
+    }
+    const linkRuleEntries = (sourceDir: string) => {
+      if (!fs.existsSync(sourceDir)) return;
+      for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+        if (!entry.isFile() && !entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        const linkPath = path.join(rulesDir, entry.name);
+        try {
+          if (fs.existsSync(linkPath)) {
+            fs.rmSync(linkPath, { recursive: true, force: true });
+          }
+          fs.symlinkSync(path.join(sourceDir, entry.name), linkPath);
+        } catch { /* ignore */ }
+      }
+    };
+    // 外部 rules（最低优先级）
+    linkRuleEntries(path.join(effectiveExtDir, 'rules'));
+  } catch (err) {
+    logger.warn(
+      { folder: group.folder, err },
+      '宿主机模式 rules 符号链接失败',
+    );
+  }
+
+  // 4c. 全局 CLAUDE.md ���接（用户级，不覆盖已有文件）
+  {
+    const extClaudeMd = path.join(effectiveExtDir, 'CLAUDE.md');
+    const sessionClaudeMd = path.join(groupSessionsDir, 'CLAUDE.md');
+    try {
+      if (fs.existsSync(extClaudeMd) && !fs.existsSync(sessionClaudeMd)) {
+        fs.symlinkSync(extClaudeMd, sessionClaudeMd);
+      }
+    } catch { /* ignore */ }
   }
 
   // 5. 构建环境变量
@@ -1140,7 +1366,7 @@ export async function runHostAgent(
       });
 
       const processId = `host-${group.folder}-${Date.now()}`;
-      onProcess(proc, processId);
+      onProcess(proc, processId, hostSelectedProfileId);
 
       const stdoutState = createStdoutParserState();
       const stderrState = createStderrState();

@@ -5,6 +5,7 @@ import { ScheduledTask, TaskRunLog, useTasksStore } from '../../stores/tasks';
 import { showToast } from '../../utils/toast';
 import { INTERVAL_UNITS, formatInterval, decomposeInterval, toggleNotifyChannel } from '../../utils/task-utils';
 import { useConnectedChannels } from '../../hooks/useConnectedChannels';
+import { ChannelBadge, CHANNEL_LABEL } from '../settings/channel-meta';
 
 const CHANNEL_LABELS: Record<string, string> = {
   feishu: '飞书',
@@ -46,6 +47,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
   const { updateTask, loadLogs, logs } = useTasksStore();
 
   const connectedChannels = useConnectedChannels();
+  const groupNames = useTasksStore((s) => s.groupNames);
   const taskLogs = logs[task.id] || [];
   const [logsLoading, setLogsLoading] = useState(false);
 
@@ -70,6 +72,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
     schedule_type: task.schedule_type,
     schedule_value: task.schedule_value,
     notify_channels: task.notify_channels ?? null,
+    chat_jid: task.chat_jid,
   });
 
   // Interval editing: decompose ms into number + unit
@@ -89,6 +92,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
         schedule_type: task.schedule_type,
         schedule_value: task.schedule_value,
         notify_channels: task.notify_channels ?? null,
+        chat_jid: task.chat_jid,
       });
       const decomposed = decomposeInterval(task.schedule_value);
       setIntervalNum(decomposed.num);
@@ -117,6 +121,8 @@ export function TaskDetail({ task }: TaskDetailProps) {
       const newChannels = JSON.stringify(editForm.notify_channels);
       if (oldChannels !== newChannels)
         fields.notify_channels = editForm.notify_channels;
+      if (editForm.chat_jid !== task.chat_jid)
+        fields.chat_jid = editForm.chat_jid;
 
       if (Object.keys(fields).length > 0) {
         await updateTask(task.id, fields);
@@ -137,6 +143,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
       schedule_type: task.schedule_type,
       schedule_value: task.schedule_value,
       notify_channels: task.notify_channels ?? null,
+      chat_jid: task.chat_jid,
     });
     const decomposed = decomposeInterval(task.schedule_value);
     setIntervalNum(decomposed.num);
@@ -429,6 +436,36 @@ export function TaskDetail({ task }: TaskDetailProps) {
             </div>
           </div>
         )}
+
+        <div>
+          <div className="text-xs text-muted-foreground mb-1">消息目标</div>
+          {editing ? (
+            <select
+              value={editForm.chat_jid}
+              onChange={(e) =>
+                setEditForm({ ...editForm, chat_jid: e.target.value })
+              }
+              className="w-full text-sm text-foreground bg-card px-2 py-1 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
+            >
+              {Object.entries(groupNames).map(([jid, name]) => {
+                const channelType = jid.split(':')[0];
+                const channelLabel = CHANNEL_LABEL[channelType] || (channelType === 'web' ? 'Web' : channelType);
+                const shortId = jid.split(':').slice(1).join(':');
+                return (
+                  <option key={jid} value={jid}>
+                    [{channelLabel}] {name} ({shortId})
+                  </option>
+                );
+              })}
+            </select>
+          ) : (
+            <div className="text-sm text-foreground inline-flex items-center gap-1.5">
+              <ChannelBadge channelType={task.chat_jid.split(':')[0]} />
+              <span>{groupNames[task.chat_jid] || task.chat_jid}</span>
+              <span className="text-xs text-muted-foreground">({task.chat_jid.split(':').slice(1).join(':')})</span>
+            </div>
+          )}
+        </div>
 
         {task.workspace_folder && (
           <div>

@@ -33,12 +33,13 @@ import {
   getWebDeps,
 } from '../web-context.js';
 import { getRunningTaskIds } from '../task-scheduler.js';
+import { getChannelType, extractChatId } from '../im-channel.js';
 
 const tasksRoutes = new Hono<{ Variables: Variables }>();
 
 // --- Routes ---
 
-tasksRoutes.get('/', authMiddleware, (c) => {
+tasksRoutes.get('/', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const allGroups = getAllRegisteredGroups();
   const tasks = getAllTasks().filter((task) => {
@@ -57,7 +58,37 @@ tasksRoutes.get('/', authMiddleware, (c) => {
   });
   const visibleTaskIds = new Set(tasks.map((t) => t.id));
   const filteredRunningIds = getRunningTaskIds().filter((id) => visibleTaskIds.has(id));
-  return c.json({ tasks, runningTaskIds: filteredRunningIds });
+
+  // Build jid → name mapping for all registered groups (including IM channels)
+  const groupNames: Record<string, string> = {};
+  for (const [jid, group] of Object.entries(allGroups)) {
+    if (canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
+      groupNames[jid] = group.name || jid;
+    }
+  }
+
+  // Enrich Feishu group names with real chat names from API.
+  // Only enrich JIDs actually referenced by visible tasks to avoid N+1 calls
+  // against Feishu Open API when the user has many registered groups.
+  const deps = getWebDeps();
+  if (deps?.getFeishuChatInfo) {
+    const referencedJids = new Set(tasks.map((t) => t.chat_jid));
+    const feishuJids = Object.keys(groupNames).filter(
+      (jid) => referencedJids.has(jid) && getChannelType(jid) === 'feishu',
+    );
+    const enrichPromises = feishuJids.map(async (jid) => {
+      try {
+        const chatId = extractChatId(jid);
+        const info = await deps.getFeishuChatInfo!(authUser.id, chatId);
+        if (info?.name) groupNames[jid] = info.name;
+      } catch (err) {
+        logger.debug({ jid, err }, 'feishu chat name enrichment failed');
+      }
+    });
+    await Promise.allSettled(enrichPromises);
+  }
+
+  return c.json({ tasks, runningTaskIds: filteredRunningIds, groupNames });
 });
 
 tasksRoutes.post('/', authMiddleware, async (c) => {
@@ -217,8 +248,21 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     return c.json({ error: '只有管理员可以设置宿主机执行模式' }, 403);
   }
 
+  // Validate chat_jid if being changed
+  const patchData = { ...validation.data } as typeof validation.data & { group_folder?: string };
+  if (validation.data.chat_jid !== undefined) {
+    const targetGroup = getRegisteredGroup(validation.data.chat_jid);
+    if (!targetGroup) {
+      return c.json({ error: '目标群组不存在' }, 404);
+    }
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, targetGroup)) {
+      return c.json({ error: '无权访问目标群组' }, 403);
+    }
+    // Keep group_folder in sync with chat_jid
+    patchData.group_folder = targetGroup.folder;
+  }
+
   // Auto-recalculate next_run when schedule changes (avoid pulling cron-parser into frontend)
-  const patchData = { ...validation.data };
   if (patchData.schedule_type !== undefined || patchData.schedule_value !== undefined) {
     const schedType = patchData.schedule_type ?? existing.schedule_type;
     const schedValue = patchData.schedule_value ?? existing.schedule_value;

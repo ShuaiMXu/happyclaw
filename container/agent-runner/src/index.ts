@@ -1435,12 +1435,14 @@ async function runQuery(
       const sdkUsage = resultMsg.usage as Record<string, number> | undefined;
       const sdkModelUsage = resultMsg.modelUsage as Record<string, Record<string, number>> | undefined;
       if (sdkUsage) {
-        const modelUsageSummary: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }> = {};
+        const modelUsageSummary: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; costUSD: number }> = {};
         if (sdkModelUsage && Object.keys(sdkModelUsage).length > 0) {
           for (const [model, mu] of Object.entries(sdkModelUsage)) {
             modelUsageSummary[model] = {
               inputTokens: mu.inputTokens || 0,
               outputTokens: mu.outputTokens || 0,
+              cacheReadInputTokens: mu.cacheReadInputTokens || 0,
+              cacheCreationInputTokens: mu.cacheCreationInputTokens || 0,
               costUSD: mu.costUSD || 0,
             };
           }
@@ -1449,6 +1451,8 @@ async function runQuery(
           modelUsageSummary[CLAUDE_MODEL] = {
             inputTokens: sdkUsage.input_tokens || 0,
             outputTokens: sdkUsage.output_tokens || 0,
+            cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
+            cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
             costUSD: (resultMsg.total_cost_usd as number) || 0,
           };
         }
@@ -1621,6 +1625,8 @@ async function main(): Promise<void> {
       '[定时任务 - 以下内容由系统自动发送，并非来自用户或群组的直接消息。]',
       '',
       '重要：你正在定时任务模式下运行。你的最终输出不会自动发送给用户。你必须使用 mcp__happyclaw__send_message 工具来发送消息，否则用户将收不到任何内容。',
+      '',
+      '注意：只在完成任务后调用一次 send_message 发送最终结果，不要发送中间状态或重复消息。',
     ];
     const scheduledTaskPrefix = scheduledTaskPrefixLines.join('\n');
     prompt = scheduledTaskPrefix + '\n\n' + prompt;
