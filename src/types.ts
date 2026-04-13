@@ -222,7 +222,6 @@ export interface ApiToken {
   created_at: string;
   last_used_at: string | null;
   last_used_ip: string | null;
-  revoked_at: string | null;
 }
 
 export interface ApiTokenPublic {
@@ -233,7 +232,6 @@ export interface ApiTokenPublic {
   created_at: string;
   last_used_at: string | null;
   last_used_ip: string | null;
-  revoked_at: string | null;
 }
 
 export interface UserPublic {

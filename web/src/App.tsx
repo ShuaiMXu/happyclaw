@@ -6,6 +6,7 @@ import { SetupPage } from './pages/SetupPage';
 import { SetupProvidersPage } from './pages/SetupProvidersPage';
 import { SetupChannelsPage } from './pages/SetupChannelsPage';
 import { MemoryPage } from './pages/MemoryPage';
+import { WikiPage } from './pages/WikiPage';
 import { SkillsPage } from './pages/SkillsPage';
 import { McpServersPage } from './pages/McpServersPage';
 import { AgentDefinitionsPage } from './pages/AgentDefinitionsPage';
@@ -63,6 +64,7 @@ export function App() {
           <Route path="/usage" element={<Navigate to="/settings?tab=usage" replace />} />
           <Route path="/billing" element={<Suspense fallback={null}><BillingPage /></Suspense>} />
           <Route path="/memory" element={<MemoryPage />} />
+          <Route path="/wiki" element={<WikiPage />} />
           <Route path="/skills" element={<SkillsPage />} />
           <Route path="/mcp-servers" element={<McpServersPage />} />
           <Route path="/agent-definitions" element={<AgentDefinitionsPage />} />

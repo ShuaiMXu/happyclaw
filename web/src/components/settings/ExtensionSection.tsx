@@ -11,7 +11,6 @@ interface ApiTokenPublic {
   created_at: string;
   last_used_at: string | null;
   last_used_ip: string | null;
-  revoked_at: string | null;
 }
 
 interface ApiTokenCreateResponse extends ApiTokenPublic {
@@ -76,7 +75,7 @@ export function ExtensionSection() {
     refresh();
   }, [refresh]);
 
-  const activeToken = tokens.find((t) => !t.revoked_at);
+  const activeToken = tokens[0];
 
   const copy = useCallback(async (text: string, field: string) => {
     try {
@@ -116,12 +115,12 @@ export function ExtensionSection() {
 
   const handleRevoke = useCallback(
     async (id: string) => {
-      if (!confirm('确定要吊销这个 Token 吗？扩展将立即失效。')) return;
+      if (!confirm('确定要删除这个 Token 吗？扩展将立即失效。')) return;
       try {
         await api.delete(`/api/user/tokens/${id}`);
         await refresh();
       } catch (err) {
-        const message = err instanceof Error ? err.message : '吊销失败';
+        const message = err instanceof Error ? err.message : '删除失败';
         setError(message);
       }
     },
@@ -275,27 +274,20 @@ export function ExtensionSection() {
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-mono text-foreground">{t.token_prefix}…</span>
-                    {t.revoked_at && (
-                      <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
-                        已吊销
-                      </span>
-                    )}
                   </div>
                   <div className="mt-0.5 text-xs text-muted-foreground">
                     创建于 {formatDate(t.created_at)} · 最近使用 {formatDate(t.last_used_at)}
                     {t.last_used_ip && ` · IP ${t.last_used_ip}`}
                   </div>
                 </div>
-                {!t.revoked_at && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleRevoke(t.id)}
-                    className="shrink-0 text-destructive hover:bg-destructive/10"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </Button>
-                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => handleRevoke(t.id)}
+                  className="shrink-0 text-destructive hover:bg-destructive/10"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </Button>
               </div>
             ))}
           </div>
@@ -345,7 +337,7 @@ export function ExtensionSection() {
             {stats?.wiki?.wiki_initialized ? '立即编译新素材' : '初始化并编译'}
           </Button>
           <a
-            href="/memory"
+            href="/wiki"
             className="text-sm text-primary hover:text-primary/80 inline-flex items-center gap-1"
           >
             打开知识库

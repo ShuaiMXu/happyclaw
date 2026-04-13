@@ -335,7 +335,7 @@ knowledgeRoutes.post('/ingest', async (c) => {
     prompt,
     schedule_type: 'once',
     schedule_value: runAt,
-    context_mode: 'isolated',
+    context_mode: 'group',
     execution_type: 'agent',
     execution_mode: home.executionMode ?? null,
     script_command: null,
@@ -398,6 +398,170 @@ knowledgeRoutes.post('/package', async (c) => {
     })),
     clip_count: clips.length,
   });
+});
+
+// ─── Wiki browser (entities + topics) ────────────────────────────────────────
+
+type WikiCategory = 'entities' | 'topics';
+const WIKI_CATEGORIES: WikiCategory[] = ['entities', 'topics'];
+
+interface WikiFileMeta {
+  category: WikiCategory;
+  name: string; // filename without .md
+  path: string; // `wiki/entities/xxx.md` relative to workspace
+  title: string;
+  tags: string[];
+  updated: string | null;
+}
+
+/** Minimal YAML frontmatter parser for llm-wiki pages (flat keys + list values). */
+function parseFrontmatter(md: string): { fm: Record<string, unknown>; body: string } {
+  if (!md.startsWith('---\n')) return { fm: {}, body: md };
+  const end = md.indexOf('\n---\n', 4);
+  if (end < 0) return { fm: {}, body: md };
+  const raw = md.slice(4, end);
+  const body = md.slice(end + 5);
+  const fm: Record<string, unknown> = {};
+  for (const line of raw.split('\n')) {
+    const m = line.match(/^([\w-]+):\s*(.*)$/);
+    if (!m) continue;
+    const [, key, rawVal] = m;
+    const val = rawVal.trim();
+    if (val.startsWith('[') && val.endsWith(']')) {
+      fm[key] = val
+        .slice(1, -1)
+        .split(',')
+        .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+        .filter(Boolean);
+    } else {
+      fm[key] = val.replace(/^["']|["']$/g, '');
+    }
+  }
+  return { fm, body };
+}
+
+function firstHeading(body: string): string | null {
+  const m = body.match(/^#\s+(.+)$/m);
+  return m ? m[1].trim() : null;
+}
+
+function extractWikilinks(body: string): string[] {
+  const out = new Set<string>();
+  const re = /\[\[([^\]|]+?)(?:\|[^\]]+)?\]\]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) {
+    out.add(m[1].trim());
+  }
+  return [...out];
+}
+
+function safeWikiPath(workspaceDir: string, relPath: string): string | null {
+  const normalized = path.normalize(relPath);
+  if (normalized.startsWith('..') || path.isAbsolute(normalized)) return null;
+  if (!normalized.startsWith('wiki/')) return null;
+  if (!normalized.endsWith('.md')) return null;
+  const abs = path.join(workspaceDir, normalized);
+  if (!abs.startsWith(workspaceDir + path.sep)) return null;
+  return abs;
+}
+
+function readWikiFileMeta(
+  workspaceDir: string,
+  category: WikiCategory,
+  filename: string,
+): WikiFileMeta | null {
+  const rel = `wiki/${category}/${filename}`;
+  const abs = safeWikiPath(workspaceDir, rel);
+  if (!abs || !fs.existsSync(abs)) return null;
+  const stat = fs.statSync(abs);
+  const raw = fs.readFileSync(abs, 'utf-8');
+  const { fm, body } = parseFrontmatter(raw);
+  const name = filename.replace(/\.md$/, '');
+  const tags = Array.isArray(fm.tags) ? (fm.tags as string[]) : [];
+  const updatedFm = typeof fm.updated === 'string' ? fm.updated : null;
+  return {
+    category,
+    name,
+    path: rel,
+    title: firstHeading(body) || name,
+    tags,
+    updated: updatedFm || stat.mtime.toISOString().slice(0, 10),
+  };
+}
+
+function listWikiCategory(workspaceDir: string, category: WikiCategory): WikiFileMeta[] {
+  const dir = path.join(workspaceDir, 'wiki', category);
+  if (!fs.existsSync(dir)) return [];
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md'));
+  return files
+    .map((f) => readWikiFileMeta(workspaceDir, category, f))
+    .filter((m): m is WikiFileMeta => m !== null)
+    .sort((a, b) => (b.updated || '').localeCompare(a.updated || ''));
+}
+
+// GET /api/knowledge/wiki/tree — list entities + topics
+knowledgeRoutes.get('/wiki/tree', async (c) => {
+  const user = c.get('user');
+  const home = getUserHomeGroup(user.id);
+  if (!home) return c.json({ entities: [], topics: [], initialized: false });
+  const workspaceDir = path.join(GROUPS_DIR, home.folder);
+  return c.json({
+    initialized: fs.existsSync(path.join(workspaceDir, '.wiki-schema.md')),
+    entities: listWikiCategory(workspaceDir, 'entities'),
+    topics: listWikiCategory(workspaceDir, 'topics'),
+  });
+});
+
+// GET /api/knowledge/wiki/file?path=wiki/entities/xxx.md
+knowledgeRoutes.get('/wiki/file', async (c) => {
+  const user = c.get('user');
+  const home = getUserHomeGroup(user.id);
+  if (!home) return c.json({ error: 'No home workspace' }, 404);
+  const rel = c.req.query('path') || '';
+  const workspaceDir = path.join(GROUPS_DIR, home.folder);
+  const abs = safeWikiPath(workspaceDir, rel);
+  if (!abs || !fs.existsSync(abs)) return c.json({ error: 'Not found' }, 404);
+
+  const raw = fs.readFileSync(abs, 'utf-8');
+  const { fm, body } = parseFrontmatter(raw);
+  const outlinks = extractWikilinks(body);
+  const stat = fs.statSync(abs);
+  return c.json({
+    path: rel,
+    title: firstHeading(body) || rel.split('/').pop()!.replace(/\.md$/, ''),
+    frontmatter: fm,
+    body,
+    outlinks,
+    updated: stat.mtime.toISOString(),
+  });
+});
+
+// GET /api/knowledge/wiki/backlinks?name=xxx — who references [[name]]
+knowledgeRoutes.get('/wiki/backlinks', async (c) => {
+  const user = c.get('user');
+  const home = getUserHomeGroup(user.id);
+  if (!home) return c.json({ backlinks: [] });
+  const name = (c.req.query('name') || '').trim();
+  if (!name) return c.json({ backlinks: [] });
+
+  const workspaceDir = path.join(GROUPS_DIR, home.folder);
+  const needle = name.toLowerCase();
+  const hits: Array<{ path: string; title: string; category: WikiCategory }> = [];
+  for (const category of WIKI_CATEGORIES) {
+    const dir = path.join(workspaceDir, 'wiki', category);
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.md')) continue;
+      const abs = path.join(dir, f);
+      const content = fs.readFileSync(abs, 'utf-8');
+      const links = extractWikilinks(content).map((l) => l.toLowerCase());
+      if (links.includes(needle)) {
+        const meta = readWikiFileMeta(workspaceDir, category, f);
+        if (meta) hits.push({ path: meta.path, title: meta.title, category });
+      }
+    }
+  }
+  return c.json({ backlinks: hits });
 });
 
 export default knowledgeRoutes;

@@ -42,7 +42,7 @@ export const requireApiToken =
     }
 
     const record = findApiTokenByHash(hashApiToken(bearer));
-    if (!record || record.revoked_at) {
+    if (!record) {
       return c.json({ error: 'Invalid API token' }, 401);
     }
     if (record.scope !== scope) {

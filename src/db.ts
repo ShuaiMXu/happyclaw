@@ -1315,7 +1315,6 @@ export function initDatabase(): void {
       created_at TEXT NOT NULL,
       last_used_at TEXT,
       last_used_ip TEXT,
-      revoked_at TEXT,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_user_api_tokens_user ON user_api_tokens(user_id);
@@ -1340,7 +1339,18 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE knowledge_clips ADD COLUMN ingested_at TEXT');
   }
 
-  const SCHEMA_VERSION = '37';
+  // v37 → v38: Hard-delete API tokens on revoke; drop unused revoked_at column.
+  if (
+    db
+      .prepare("PRAGMA table_info('user_api_tokens')")
+      .all()
+      .some((c: any) => c.name === 'revoked_at')
+  ) {
+    db.exec('DELETE FROM user_api_tokens WHERE revoked_at IS NOT NULL');
+    db.exec('ALTER TABLE user_api_tokens DROP COLUMN revoked_at');
+  }
+
+  const SCHEMA_VERSION = '38';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -2170,6 +2180,18 @@ export function updateTaskAfterRun(
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
+}
+
+/**
+ * Placeholder update when the scheduler picks up a task: clears `next_run` to
+ * prevent re-pickup during the poll window, but does NOT mark the task as
+ * `completed` — that must wait for `updateTaskAfterRun()` after the agent
+ * actually finishes. See scheduler race fix for once-tasks.
+ */
+export function markTaskScheduled(id: string, nextRun: string | null): void {
+  db.prepare(
+    'UPDATE scheduled_tasks SET next_run = ?, last_result = ? WHERE id = ?',
+  ).run(nextRun, 'Scheduled', id);
 }
 
 export function logTaskRun(log: TaskRunLog): void {
@@ -3597,7 +3619,6 @@ function rowToApiTokenPublic(row: any): ApiTokenPublic {
     created_at: row.created_at,
     last_used_at: row.last_used_at,
     last_used_ip: row.last_used_ip,
-    revoked_at: row.revoked_at,
   };
 }
 
@@ -3641,11 +3662,8 @@ export function listApiTokensByUser(userId: string): ApiTokenPublic[] {
 
 export function revokeApiToken(id: string, userId: string): boolean {
   const result = db
-    .prepare(
-      `UPDATE user_api_tokens SET revoked_at = ?
-       WHERE id = ? AND user_id = ? AND revoked_at IS NULL`,
-    )
-    .run(new Date().toISOString(), id, userId);
+    .prepare('DELETE FROM user_api_tokens WHERE id = ? AND user_id = ?')
+    .run(id, userId);
   return result.changes > 0;
 }
 
