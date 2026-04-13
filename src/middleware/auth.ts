@@ -25,12 +25,19 @@ export const authMiddleware = async (c: any, next: any) => {
   // Accept either cookie name — the browser will send whichever was set
   const rawCookie =
     cookies[SESSION_COOKIE_NAME_SECURE] || cookies[SESSION_COOKIE_NAME_PLAIN];
-  if (!rawCookie) {
+
+  // Also accept Bearer token from Authorization header (for Chrome Extension / API clients)
+  const authHeader = c.req.header('authorization');
+  const bearerToken = authHeader?.startsWith('Bearer ')
+    ? authHeader.slice(7).trim()
+    : undefined;
+
+  if (!rawCookie && !bearerToken) {
     return c.json({ error: 'Unauthorized' }, 401);
   }
 
   // Verify HMAC signature (also accepts legacy unsigned tokens for migration)
-  const token = verifySessionToken(rawCookie);
+  const token = verifySessionToken(rawCookie || bearerToken || '');
   if (!token) {
     return c.json({ error: 'Unauthorized' }, 401);
   }

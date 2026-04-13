@@ -581,6 +581,37 @@ authRoutes.get('/me', authMiddleware, (c) => {
   return c.json({ user: userPublic, appearance });
 });
 
+// Generate API token for external clients (Chrome Extension, etc.)
+// Creates a long-lived session token (365 days)
+authRoutes.post('/api-token', authMiddleware, async (c) => {
+  const user = c.get('user');
+  const ip = getClientIp(c.req.raw);
+  const ua = c.req.header('user-agent') || '';
+  const now = new Date().toISOString();
+  const sessionId = generateSessionToken();
+  const signedToken = signSessionToken(sessionId);
+  // 365-day expiry for API tokens
+  const expiresAt = new Date(
+    Date.now() + 365 * 24 * 60 * 60 * 1000,
+  ).toISOString();
+
+  createUserSession({
+    id: sessionId,
+    user_id: user.id,
+    ip_address: ip,
+    user_agent: `API-Token: ${ua}`,
+    created_at: now,
+    expires_at: expiresAt,
+    last_active_at: now,
+  });
+
+  return c.json({
+    token: signedToken,
+    expires_at: expiresAt,
+    note: '请妥善保管此 Token，它等同于登录凭据。可在设置页的「会话管理」中撤销。',
+  });
+});
+
 authRoutes.put('/profile', authMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const validation = ProfileUpdateSchema.safeParse(body);

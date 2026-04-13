@@ -54,6 +54,8 @@ import agentDefinitionsRoutes from './routes/agent-definitions.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import bugReportRoutes from './routes/bug-report.js';
+import knowledgeRoutes from './routes/knowledge.js';
+import userTokensRoutes from './routes/user-tokens.js';
 import {
   checkBillingAccess,
   formatBillingAccessDeniedMessage,
@@ -127,11 +129,16 @@ function releaseTerminalOwnership(ws: WebSocket, groupJid: string): void {
 // --- CORS Middleware ---
 const CORS_ALLOWED_ORIGINS = process.env.CORS_ALLOWED_ORIGINS || '';
 const CORS_ALLOW_LOCALHOST = process.env.CORS_ALLOW_LOCALHOST !== 'false'; // default: true
+const CORS_ALLOW_EXTENSIONS = process.env.CORS_ALLOW_EXTENSIONS !== 'false'; // default: true
 
 function isAllowedOrigin(origin: string | undefined): string | null {
   if (!origin) return null; // same-origin requests
   // 环境变量设为 '*' 时允许所有来源
   if (CORS_ALLOWED_ORIGINS === '*') return origin;
+  // Chrome/Firefox/Edge 扩展 origin（安全性由 Bearer token 层面保证，非 CORS）
+  if (CORS_ALLOW_EXTENSIONS && origin.startsWith('chrome-extension://')) {
+    return origin;
+  }
   // 允许 localhost / 127.0.0.1 的任意端口（开发 & 自托管场景，可通过 CORS_ALLOW_LOCALHOST=false 关闭）
   if (CORS_ALLOW_LOCALHOST) {
     try {
@@ -181,6 +188,8 @@ app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
 app.route('/api/billing', billingRoutes);
 app.route('/api/bug-report', bugReportRoutes);
+app.route('/api/knowledge', knowledgeRoutes);
+app.route('/api/user/tokens', userTokensRoutes);
 
 // --- POST /api/messages ---
 

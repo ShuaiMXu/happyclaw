@@ -1283,5 +1283,230 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     ),
   );
 
+  // ─── Knowledge Base Tools (home containers only) ─────────────────────────
+
+  if (ctx.isHome) {
+    const KNOWLEDGE_DIR = path.join(ctx.workspaceIpc, 'knowledge');
+
+    // --- knowledge_search ---
+    tools.push(
+      tool(
+        'knowledge_search',
+        `Search the user's knowledge base (collected web clips, notes, etc.).
+
+Returns results at different detail levels:
+- l0: title + tags + one-line summary (~50 tokens each) — use for broad scanning
+- l1: title + 300-char summary + truncated content (~500 tokens each) — default
+- l2: full content — use only when you need the complete text
+
+Use this to find relevant material when creating content (blogs, videos, reports).`,
+        {
+          query: z.string().describe('Search query (keywords or phrases)'),
+          category: z
+            .string()
+            .optional()
+            .describe('Filter by category name (optional)'),
+          limit: z
+            .number()
+            .optional()
+            .describe('Max results (default 10, max 50)'),
+          level: z
+            .enum(['l0', 'l1', 'l2'])
+            .optional()
+            .describe('Detail level: l0 (index), l1 (summary, default), l2 (full)'),
+        },
+        async (args) => {
+          try {
+            const requestId = `ks_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            const result = await pollIpcResult(
+              KNOWLEDGE_DIR,
+              {
+                type: 'knowledge_search',
+                requestId,
+                query: args.query,
+                category: args.category,
+                limit: Math.min(args.limit || 10, 50),
+                level: args.level || 'l1',
+              },
+              'knowledge_result',
+              15_000,
+            );
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `知识库搜索失败：${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+    );
+
+    // --- knowledge_get ---
+    tools.push(
+      tool(
+        'knowledge_get',
+        'Get the full content of a specific knowledge clip by ID. Use after knowledge_search to load the complete text.',
+        {
+          clip_id: z.string().describe('The clip ID to retrieve'),
+        },
+        async (args) => {
+          try {
+            const requestId = `kg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            const result = await pollIpcResult(
+              KNOWLEDGE_DIR,
+              {
+                type: 'knowledge_get',
+                requestId,
+                clipId: args.clip_id,
+              },
+              'knowledge_result',
+              15_000,
+            );
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `知识库读取失败：${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+    );
+
+    // --- knowledge_add ---
+    tools.push(
+      tool(
+        'knowledge_add',
+        `Save content to the user's knowledge base. Use when the user asks to save/collect information, or when processing /save commands.`,
+        {
+          title: z.string().describe('Title of the content'),
+          content: z.string().describe('The content to save (Markdown supported)'),
+          url: z.string().optional().describe('Source URL (if applicable)'),
+          category: z
+            .string()
+            .optional()
+            .describe('Category name (will create if not exists)'),
+          tags: z
+            .array(z.string())
+            .optional()
+            .describe('Tags for categorization'),
+          summary: z
+            .string()
+            .optional()
+            .describe('Brief summary (auto-generated if omitted)'),
+          source_type: z
+            .enum(['web_clip', 'selection', 'full_page', 'manual', 'im_save'])
+            .optional()
+            .describe('How the content was collected'),
+        },
+        async (args) => {
+          try {
+            const requestId = `ka_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            const result = await pollIpcResult(
+              KNOWLEDGE_DIR,
+              {
+                type: 'knowledge_add',
+                requestId,
+                title: args.title,
+                content: args.content,
+                url: args.url,
+                category: args.category,
+                tags: args.tags,
+                summary: args.summary,
+                sourceType: args.source_type || 'manual',
+              },
+              'knowledge_result',
+              15_000,
+            );
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `知识库保存失败：${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+    );
+
+    // --- knowledge_list_categories ---
+    tools.push(
+      tool(
+        'knowledge_list_categories',
+        "List all knowledge categories in the user's knowledge base.",
+        {},
+        async () => {
+          try {
+            const requestId = `kl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            const result = await pollIpcResult(
+              KNOWLEDGE_DIR,
+              {
+                type: 'knowledge_list_categories',
+                requestId,
+              },
+              'knowledge_result',
+              15_000,
+            );
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify(result, null, 2),
+                },
+              ],
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `知识库分类列表获取失败：${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+    );
+  }
+
   return tools;
 }

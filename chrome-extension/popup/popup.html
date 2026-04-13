@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HappyClaw 知识收藏</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- 主视图 -->
+  <div id="main-view" class="view">
+    <header class="header">
+      <div class="header-left">
+        <img class="logo" src="../icons/icon48.png" width="24" height="24" alt="HappyClaw">
+        <h1 class="title">HappyClaw</h1>
+      </div>
+      <div class="header-right">
+        <span id="status-dot" class="status-dot disconnected" title="未连接"></span>
+        <button id="btn-settings" class="icon-btn" title="设置">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- 快速保存区域 -->
+    <section class="quick-save">
+      <div class="page-info" id="page-info">
+        <div class="page-title" id="page-title">加载中...</div>
+        <div class="page-url" id="page-url"></div>
+      </div>
+      <div class="selection-preview" id="selection-preview" style="display:none">
+        <div class="selection-label">选中的文本</div>
+        <div class="selection-text" id="selection-text"></div>
+      </div>
+      <div class="save-row">
+        <select id="category-select" class="category-select">
+          <option value="">选择分类...</option>
+        </select>
+        <button id="btn-quick-save" class="btn btn-primary">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
+            <polyline points="17,21 17,13 7,13 7,21"/>
+            <polyline points="7,3 7,8 15,8"/>
+          </svg>
+          保存
+        </button>
+      </div>
+      <div class="tags-row">
+        <input type="text" id="tags-input" class="tags-input" placeholder="标签（逗号分隔）">
+      </div>
+    </section>
+
+    <!-- 分类列表 -->
+    <section class="categories-section">
+      <div class="section-header">
+        <h2 class="section-title">分类</h2>
+        <button id="btn-add-category" class="icon-btn" title="新建分类">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="12" y1="8" x2="12" y2="16"/>
+            <line x1="8" y1="12" x2="16" y2="12"/>
+          </svg>
+        </button>
+      </div>
+      <div id="categories-list" class="categories-list">
+        <div class="loading">加载中...</div>
+      </div>
+    </section>
+
+    <!-- 新建分类表单 -->
+    <div id="category-form" class="category-form" style="display:none">
+      <input type="text" id="cat-name" class="input" placeholder="分类名称" maxlength="30">
+      <input type="text" id="cat-desc" class="input" placeholder="描述（可选）" maxlength="100">
+      <div class="color-picker">
+        <span class="color-label">颜色</span>
+        <div class="color-options" id="color-options">
+          <button class="color-dot selected" data-color="#14b8a6" style="background:#14b8a6"></button>
+          <button class="color-dot" data-color="#f59e0b" style="background:#f59e0b"></button>
+          <button class="color-dot" data-color="#ef4444" style="background:#ef4444"></button>
+          <button class="color-dot" data-color="#8b5cf6" style="background:#8b5cf6"></button>
+          <button class="color-dot" data-color="#3b82f6" style="background:#3b82f6"></button>
+          <button class="color-dot" data-color="#ec4899" style="background:#ec4899"></button>
+          <button class="color-dot" data-color="#10b981" style="background:#10b981"></button>
+          <button class="color-dot" data-color="#6366f1" style="background:#6366f1"></button>
+        </div>
+      </div>
+      <div class="form-actions">
+        <button id="btn-cancel-cat" class="btn btn-ghost">取消</button>
+        <button id="btn-save-cat" class="btn btn-primary">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 设置视图 -->
+  <div id="settings-view" class="view" style="display:none">
+    <header class="header">
+      <div class="header-left">
+        <button id="btn-back" class="icon-btn" title="返回">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="15,18 9,12 15,6"/>
+          </svg>
+        </button>
+        <h1 class="title">设置</h1>
+      </div>
+    </header>
+
+    <section class="settings-form">
+      <div class="form-group">
+        <label class="label" for="server-url">服务器地址</label>
+        <input type="url" id="server-url" class="input" placeholder="https://your-happyclaw.example.com">
+        <p class="hint">HappyClaw 服务的完整 URL（不含尾部斜杠）</p>
+      </div>
+      <div class="form-group">
+        <label class="label" for="api-token">API Token</label>
+        <div class="token-row">
+          <input type="password" id="api-token" class="input" placeholder="输入 API Token">
+          <button id="btn-toggle-token" class="icon-btn" title="显示/隐藏">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+              <circle cx="12" cy="12" r="3"/>
+            </svg>
+          </button>
+        </div>
+        <p class="hint">用于身份验证的令牌</p>
+      </div>
+      <div class="form-group">
+        <button id="btn-test-conn" class="btn btn-secondary btn-full">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 11.08V12a10 10 0 11-5.93-9.14"/>
+            <polyline points="22,4 12,14.01 9,11.01"/>
+          </svg>
+          测试连接
+        </button>
+        <div id="conn-result" class="conn-result" style="display:none"></div>
+      </div>
+      <div class="form-group">
+        <button id="btn-save-settings" class="btn btn-primary btn-full">保存设置</button>
+      </div>
+    </section>
+
+    <section class="settings-info">
+      <p class="info-text">HappyClaw 知识收藏 v1.0.1</p>
+      <p class="info-text">快捷键: Ctrl+Shift+S 快速保存</p>
+    </section>
+  </div>
+
+  <!-- Toast 通知 -->
+  <div id="toast" class="toast" style="display:none"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
