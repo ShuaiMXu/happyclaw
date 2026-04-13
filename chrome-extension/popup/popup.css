@@ -545,6 +545,19 @@ body::-webkit-scrollbar-thumb {
   border: 1px solid rgba(239, 68, 68, 0.2);
 }
 
+.autosave-hint {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  text-align: center;
+  margin-bottom: 8px;
+  transition: color 0.2s;
+}
+
+.autosave-hint.autosave-ok {
+  color: var(--brand-500);
+  font-weight: 500;
+}
+
 .settings-info {
   padding: 16px;
   border-top: 1px solid var(--border);
