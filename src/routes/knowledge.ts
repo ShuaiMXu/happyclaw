@@ -190,11 +190,33 @@ knowledgeRoutes.patch('/clips/:id', async (c) => {
   if (!parsed.success) {
     return c.json({ error: parsed.error.message }, 400);
   }
+  const oldMirrorPath = getKnowledgeClipMirrorPath(id);
   const updated = updateKnowledgeClip(id, user.id, parsed.data);
   if (!updated) {
     return c.json({ error: 'Clip not found' }, 404);
   }
-  return c.json(updated);
+
+  // Refresh the markdown mirror so edits propagate to the llm-wiki ingest pipeline.
+  // If title changed the slugged filename changes too — remove the stale file.
+  const mirror = mirrorClipToWorkspace({
+    clipId: updated.id,
+    userId: user.id,
+    title: updated.title,
+    url: updated.url,
+    content: updated.content,
+    summary: updated.summary,
+    sourceType: updated.source_type,
+    tags: updated.tags,
+    savedAt: updated.created_at,
+  });
+  if (mirror) {
+    if (oldMirrorPath && oldMirrorPath !== mirror.relativePath) {
+      removeClipMirror(user.id, oldMirrorPath);
+    }
+    setKnowledgeClipMirrorPath(updated.id, mirror.relativePath);
+  }
+
+  return c.json({ ...updated, raw_md_path: mirror?.relativePath || oldMirrorPath });
 });
 
 // Delete clip
@@ -218,7 +240,11 @@ knowledgeRoutes.post('/clips/batch-delete', async (c) => {
   if (!Array.isArray(ids) || ids.length === 0) {
     return c.json({ error: '"ids" must be a non-empty array' }, 400);
   }
+  const mirrorPaths = ids
+    .map((id) => (typeof id === 'string' ? getKnowledgeClipMirrorPath(id) : null))
+    .filter((p): p is string => !!p);
   const count = batchDeleteKnowledgeClips(ids, user.id);
+  for (const p of mirrorPaths) removeClipMirror(user.id, p);
   return c.json({ deleted: count });
 });
 

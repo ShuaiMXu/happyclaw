@@ -726,29 +726,31 @@ export const DingTalkConfigSchema = z
 
 export const KnowledgeCategoryCreateSchema = z.object({
   name: z.string().min(1).max(100),
-  description: z.string().max(500).optional(),
+  description: z.string().max(500).nullable().optional(),
   color: z
     .string()
     .regex(/^#[0-9a-fA-F]{6}$/)
+    .nullable()
     .optional(),
 });
 
 export const KnowledgeCategoryUpdateSchema = z.object({
   name: z.string().min(1).max(100).optional(),
-  description: z.string().max(500).optional(),
+  description: z.string().max(500).nullable().optional(),
   color: z
     .string()
     .regex(/^#[0-9a-fA-F]{6}$/)
+    .nullable()
     .optional(),
   sort_order: z.number().int().min(0).optional(),
 });
 
 export const KnowledgeClipCreateSchema = z.object({
   title: z.string().min(1).max(500),
-  url: z.string().max(2000).optional(),
+  url: z.string().max(2000).nullable().optional(),
   content: z.string().min(1).max(500_000),
-  summary: z.string().max(5000).optional(),
-  category_id: z.string().optional(),
+  summary: z.string().max(5000).nullable().optional(),
+  category_id: z.string().nullable().optional(),
   source_type: z
     .enum(['web_clip', 'selection', 'full_page', 'manual', 'im_save'])
     .optional(),

@@ -5789,8 +5789,8 @@ function parseClipRow(row: any): KnowledgeClip {
 export function createKnowledgeCategory(data: {
   user_id: string;
   name: string;
-  description?: string;
-  color?: string;
+  description?: string | null;
+  color?: string | null;
 }): KnowledgeCategory {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -5830,7 +5830,12 @@ export function getKnowledgeCategories(userId: string): KnowledgeCategory[] {
 export function updateKnowledgeCategory(
   id: string,
   userId: string,
-  data: { name?: string; description?: string; color?: string; sort_order?: number },
+  data: {
+    name?: string;
+    description?: string | null;
+    color?: string | null;
+    sort_order?: number;
+  },
 ): KnowledgeCategory | null {
   const existing = db
     .prepare('SELECT * FROM knowledge_categories WHERE id = ? AND user_id = ?')
@@ -5869,11 +5874,11 @@ export function deleteKnowledgeCategory(id: string, userId: string): boolean {
 
 export function createKnowledgeClip(data: {
   user_id: string;
-  category_id?: string;
+  category_id?: string | null;
   title: string;
-  url?: string;
+  url?: string | null;
   content: string;
-  summary?: string;
+  summary?: string | null;
   source_type?: string;
   tags?: string[];
   metadata?: Record<string, unknown>;
