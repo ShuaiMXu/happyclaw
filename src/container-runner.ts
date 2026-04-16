@@ -13,7 +13,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR } from './config.js';
+import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { logger } from './logger.js';
 import {
   loadMountAllowlist,
@@ -36,6 +36,10 @@ import { providerPool } from './provider-pool.js';
 import { isApiError } from './agent-output-parser.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
 import { loadUserMcpServers } from './mcp-utils.js';
+import {
+  checkHostCapabilities,
+  logCapabilityPreflight,
+} from './agent-capabilities.js';
 import { MessageSourceKind, RegisteredGroup, StreamEvent } from './types.js';
 import {
   attachStderrHandler,
@@ -507,6 +511,11 @@ function buildVolumeMounts(
     containerOverride,
     resolvedProvider?.customEnv,
   );
+  // SystemSettings.autoCompactWindow > 0 时注入到容器，让 agent-runner 通过 query() settings 传给 SDK
+  const sysAutoCompact = getSystemSettings().autoCompactWindow;
+  if (sysAutoCompact > 0) {
+    envLines.push(`AUTO_COMPACT_WINDOW=${sysAutoCompact}`);
+  }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -629,8 +638,12 @@ function buildVolumeMounts(
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  tz: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+
+  // Set timezone so container Node.js processes use local time (Asia/Shanghai)
+  args.push('-e', `TZ=${tz}`);
 
   // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {
@@ -682,7 +695,7 @@ export async function runContainerAgent(
       ? `-${input.agentId.replace(/[^a-zA-Z0-9-]/g, '-')}`
       : '';
     const containerName = `happyclaw-${safeName}${agentSuffix}-${Date.now()}`;
-    const containerArgs = buildContainerArgs(mounts, containerName);
+    const containerArgs = buildContainerArgs(mounts, containerName, TIMEZONE);
 
     logger.debug(
       {
@@ -1050,7 +1063,9 @@ export async function runHostAgent(
     }
   }
 
-  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+  // Always store logs in data/groups/{folder}/logs/, not in customCwd
+  const logsBaseDir = path.join(defaultGroupDir, 'logs');
+  fs.mkdirSync(logsBaseDir, { recursive: true });
   fs.mkdirSync(path.join(DATA_DIR, 'memory', group.folder), {
     recursive: true,
   });
@@ -1141,6 +1156,9 @@ export async function runHostAgent(
 
     // 外部 skills（最低优先级）
     // 宿主机 skills（最低优先级）
+    // Builtin skills (lowest priority, e.g. feishu-cli builtin — mirrors /opt/builtin-skills in container)
+    const builtinSkillsDir = path.join(DATA_DIR, 'builtin-skills');
+    linkSkillEntries(builtinSkillsDir);
     linkSkillEntries(path.join(effectiveExtDir, 'skills'));
     // 项目级 skills
     const projectRoot = process.cwd();
@@ -1241,6 +1259,12 @@ export async function runHostAgent(
       }
     }
 
+    // SystemSettings.autoCompactWindow > 0 时注入到 host 进程，agent-runner 通过 query() settings 传给 SDK
+    const hostAutoCompact = getSystemSettings().autoCompactWindow;
+    if (hostAutoCompact > 0) {
+      hostEnv['AUTO_COMPACT_WINDOW'] = String(hostAutoCompact);
+    }
+
     // 路径映射
     hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
     // Per-user global memory
@@ -1270,6 +1294,13 @@ export async function runHostAgent(
     // 通过 IS_SANDBOX 标记告知 CLI 当前运行在受控环境中以绕过此限制
     if (typeof process.getuid === 'function' && process.getuid() === 0) {
       hostEnv['IS_SANDBOX'] = '1';
+    }
+
+    // 5b. Host capability preflight — detect external tools & inject env vars
+    const capResult = await checkHostCapabilities();
+    logCapabilityPreflight(group.name, capResult);
+    for (const [key, value] of Object.entries(capResult.envVars)) {
+      if (!hostEnv[key]) hostEnv[key] = value;
     }
 
     // 6. 编译检查
@@ -1347,7 +1378,7 @@ export async function runHostAgent(
       'Spawning host agent',
     );
 
-    const logsDir = path.join(groupDir, 'logs');
+    const logsDir = logsBaseDir;
 
     const hostResult = await new Promise<ContainerOutput>((resolve) => {
       let settled = false;

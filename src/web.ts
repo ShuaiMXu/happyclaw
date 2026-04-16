@@ -34,7 +34,11 @@ import {
 } from './schemas.js';
 
 // Middleware
-import { authMiddleware } from './middleware/auth.js';
+import {
+  authMiddleware,
+  getAllCookieValues,
+  tryVerifyAny,
+} from './middleware/auth.js';
 
 // Route modules
 import authRoutes from './routes/auth.js';
@@ -74,8 +78,10 @@ import {
   isGroupShared,
   getUserById,
   updateAgentContextInfo,
+  updateChatName,
 } from './db.js';
-import { isSessionExpired, verifySessionToken } from './auth.js';
+import { markdownToPlainText } from './im-utils.js';
+import { isSessionExpired } from './auth.js';
 import type {
   NewMessage,
   WsMessageOut,
@@ -384,6 +390,26 @@ async function handleWebUserMessage(
   return { ok: true, messageId, timestamp };
 }
 
+// --- Auto-title for conversations ---
+
+/** Extract a short title from the first user message content. */
+function generateAutoTitle(content: string): string | null {
+  const trimmed = content.trim();
+  if (!trimmed || trimmed.startsWith('/')) return null;
+
+  const text = markdownToPlainText(trimmed)
+    .replace(/\n+/g, ' ')
+    .trim();
+
+  if (!text) return null;
+
+  const firstLine = text.split('\n')[0].trim();
+  if (!firstLine) return null;
+
+  if (firstLine.length <= 20) return firstLine;
+  return firstLine.slice(0, 20) + '…';
+}
+
 // --- Agent Conversation Message Handler ---
 
 async function handleAgentConversationMessage(
@@ -435,6 +461,16 @@ async function handleAgentConversationMessage(
     { attachments: attachmentsStr },
   );
   updateAgentContextInfo(agentId, { last_active_at: timestamp });
+
+  // Auto-title: generate title from first user message
+  if (agent.title_source === 'auto_pending') {
+    const autoTitle = generateAutoTitle(content);
+    if (autoTitle) {
+      updateAgentContextInfo(agentId, { name: autoTitle, title_source: 'auto' });
+      updateChatName(virtualChatJid, autoTitle);
+      broadcastAgentStatus(chatJid, agentId, agent.status as import('./types.js').AgentStatus, autoTitle, agent.prompt);
+    }
+  }
 
   // Broadcast new_message with agentId so frontend routes to agent tab
   broadcastNewMessage(
@@ -548,21 +584,26 @@ function setupWebSocket(server: any): WebSocketServer {
       return;
     }
 
-    // Verify session cookie (HMAC signature + DB lookup)
-    const cookies = parseCookie(request.headers.cookie);
-    const rawCookie =
-      cookies[SESSION_COOKIE_NAME_SECURE] || cookies[SESSION_COOKIE_NAME_PLAIN];
-    if (!rawCookie) {
+    // Verify session cookie (HMAC signature + DB lookup).
+    // WebSocket upgrade cannot return Set-Cookie, so legacy cookies are
+    // accepted here but upgraded on the next HTTP request instead.
+    const cookieHeader = request.headers.cookie as string | undefined;
+    let allCookieValues = getAllCookieValues(cookieHeader, SESSION_COOKIE_NAME_SECURE);
+    if (allCookieValues.length === 0) {
+      allCookieValues = getAllCookieValues(cookieHeader, SESSION_COOKIE_NAME_PLAIN);
+    }
+    if (allCookieValues.length === 0) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
-    const token = verifySessionToken(rawCookie);
-    if (!token) {
+    const verifyResult = tryVerifyAny(allCookieValues);
+    if (!verifyResult) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
+    const token = verifyResult.token;
 
     const session = getCachedSessionWithUser(token);
     if (!session) {

@@ -24,6 +24,7 @@ import { AgentTabBar } from './AgentTabBar';
 import { ImBindingDialog } from './ImBindingDialog';
 import { TopicSidebar } from './TopicSidebar';
 import { showToast } from '../../utils/toast';
+import { CHANNEL_LABEL } from '../settings/channel-meta';
 
 /** Sentinel value for binding the main conversation (vs. a specific agent) */
 const MAIN_BINDING = '__main__' as const;
@@ -69,7 +70,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
   // null = dialog closed; MAIN_BINDING = main conversation; other = agent id
   const [bindingAgentId, setBindingAgentId] = useState<string | null>(null);
-  const [showNewConversation, setShowNewConversation] = useState(false);
   const [renameTarget, setRenameTarget] = useState<{ agentId: string; name: string } | null>(null);
   const [topicFilter, setTopicFilter] = useState('');
   const [isDesktop, setIsDesktop] = useState(() =>
@@ -77,7 +77,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       ? window.matchMedia('(min-width: 1024px)').matches
       : true,
   );
-  const [imStatus, setImStatus] = useState<{ feishu: boolean; telegram: boolean } | null>(null);
+  const [imStatus, setImStatus] = useState<Record<string, boolean> | null>(null);
   const [imBannerDismissed, setImBannerDismissed] = useState(() =>
     localStorage.getItem('im-banner-dismissed') === '1',
   );
@@ -148,7 +148,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     if (!isOwnHome) { setImStatus(null); return; }
     let active = true;
     const fetchStatus = () => {
-      api.get<{ feishu: boolean; telegram: boolean }>('/api/config/user-im/status')
+      api.get<Record<string, boolean>>('/api/config/user-im/status')
         .then((data) => { if (active) setImStatus(data); })
         .catch(() => {});
     };
@@ -504,21 +504,17 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 </span>
               </>
             )}
-            {isOwnHome && imStatus && (imStatus.feishu || imStatus.telegram) && (
+            {isOwnHome && imStatus && Object.entries(imStatus).some(([, v]) => v) && (
               <>
                 <span className="text-muted-foreground/40">·</span>
-                {imStatus.feishu && (
-                  <span className="inline-flex items-center gap-0.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                    飞书
-                  </span>
-                )}
-                {imStatus.telegram && (
-                  <span className="inline-flex items-center gap-0.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                    Telegram
-                  </span>
-                )}
+                {Object.entries(imStatus)
+                  .filter(([, connected]) => connected)
+                  .map(([channel]) => (
+                    <span key={channel} className="inline-flex items-center gap-0.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                      {CHANNEL_LABEL[channel] ?? channel}
+                    </span>
+                  ))}
               </>
             )}
           </div>
@@ -564,10 +560,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       </div>
 
       {/* IM channel setup banner for home container without IM */}
-      {isOwnHome && imStatus && !imStatus.feishu && !imStatus.telegram && !imBannerDismissed && (
+      {isOwnHome && imStatus && !Object.values(imStatus).some(Boolean) && !imBannerDismissed && (
         <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-sm">
           <Link className="w-4 h-4 flex-shrink-0" />
-          <span className="flex-1 min-w-0">未配置 IM 渠道，飞书 / Telegram 消息无法与主工作区互通</span>
+          <span className="flex-1 min-w-0">未配置 IM 渠道（飞书 / Telegram / Discord / QQ / 微信 / 钉钉），消息无法与主工作区互通</span>
           <button
             onClick={() => navigate('/setup/channels')}
             className="flex-shrink-0 px-3 py-1 text-xs font-medium rounded-md bg-amber-600 text-white hover:bg-amber-700 transition-colors cursor-pointer"
@@ -603,7 +599,11 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             deleteAgentAction(groupJid, id);
           }}
           onRenameAgent={(id, currentName) => setRenameTarget({ agentId: id, name: currentName })}
-          onCreateConversation={() => setShowNewConversation(true)}
+          onCreateConversation={() => {
+            createConversation(groupJid, '').then((agent) => {
+              if (agent) setActiveAgentTab(groupJid, agent.id);
+            });
+          }}
           onBindIm={setBindingAgentId}
           onBindMainIm={!isHome ? () => setBindingAgentId(MAIN_BINDING) : undefined}
           onReorder={(orderedIds) => reorderConversations(groupJid, orderedIds)}
@@ -982,19 +982,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           onClose={() => setBindingAgentId(null)}
         />
       )}
-
-      <PromptDialog
-        open={showNewConversation}
-        title="新建对话"
-        label="对话名称"
-        placeholder="输入对话名称"
-        onConfirm={(name) => {
-          createConversation(groupJid, name).then((agent) => {
-            if (agent) setActiveAgentTab(groupJid, agent.id);
-          });
-        }}
-        onClose={() => setShowNewConversation(false)}
-      />
 
       <PromptDialog
         open={renameTarget !== null}

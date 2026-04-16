@@ -66,6 +66,8 @@ export interface DingTalkConnectOpts {
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
+  /** Resolve registered group for a jid (should return { activation_mode?: string }) */
+  resolveRegisteredGroup?: (jid: string) => { activation_mode?: string } | undefined;
 }
 
 export interface DingTalkConnection {
@@ -200,7 +202,7 @@ function parseDingTalkChatId(
   if (chatId.startsWith('cid')) {
     return { type: 'group', conversationId: chatId };
   }
-  return null;
+return null;
 }
 
 // ─── Factory Function ───────────────────────────────────────────
@@ -234,6 +236,48 @@ export function createDingTalkConnection(
 
   // Sender staff ID per chat (enterprise staff ID for batchSend API)
   const lastSenderStaffIds = new Map<string, string>();
+
+  // Group name cache: openConversationId → { name, expiresAt }
+  // TTL: 1 hour to avoid hitting API on every message
+  const groupNameCache = new Map<
+    string,
+    { name: string; expiresAt: number }
+  >();
+  const GROUP_NAME_CACHE_TTL = 60 * 60 * 1000;
+
+  // ── Streaming card helper (shared between sendMessage fallback and createStreamingSession) ──
+
+  async function buildStreamingCard(
+    chatId: string,
+    onCardCreated?: (messageId: string) => void,
+    fallbackSend?: (text: string) => Promise<void>,
+  ): Promise<import('./dingtalk-streaming-card.js').DingTalkStreamingCardController | undefined> {
+    const parsed = parseDingTalkChatId(chatId);
+    if (!parsed) return undefined;
+
+    const { DingTalkStreamingCardController } =
+      await import('./dingtalk-streaming-card.js');
+
+    const jidKey =
+      parsed.type === 'c2c'
+        ? `dingtalk:c2c:${parsed.conversationId}`
+        : `dingtalk:group:${parsed.conversationId}`;
+    const target =
+      parsed.type === 'c2c'
+        ? {
+            type: 'user' as const,
+            userId: lastSenderStaffIds.get(jidKey) ?? parsed.conversationId,
+          }
+        : {
+            type: 'group' as const,
+            openConversationId: parsed.conversationId,
+          };
+
+    return new DingTalkStreamingCardController(config, target, {
+      onCardCreated,
+      ...(fallbackSend ? { fallbackSend } : {}),
+    });
+  }
 
   // Ack reaction per chat (emoji reaction on user's message to confirm receipt)
   const ackReactionByChat = new Map<
@@ -374,6 +418,51 @@ export function createDingTalkConnection(
       if (bodyStr) req.write(bodyStr);
       req.end();
     });
+  }
+
+  /**
+   * Fetch real group name by openConversationId via sceneGroups/query API.
+   * Caches result for GROUP_NAME_CACHE_TTL (1 hour) to avoid repeated API calls.
+   * @returns group title (name), or null on failure
+   */
+  async function fetchGroupNameByOpenConversationId(
+    openConversationId: string,
+  ): Promise<string | null> {
+    // Check cache first
+    const now = Date.now();
+    const cached = groupNameCache.get(openConversationId);
+    if (cached && now < cached.expiresAt) {
+      return cached.name;
+    }
+
+    // Evict expired entries on cache miss
+    for (const [key, val] of groupNameCache) {
+      if (now >= val.expiresAt) groupNameCache.delete(key);
+    }
+
+    try {
+      const data = await apiRequest<{
+        title?: string;
+      }>('POST', '/v1.0/im/sceneGroups/query', {
+        openConversationId,
+      });
+
+      const title = data?.title?.trim();
+      if (title) {
+        groupNameCache.set(openConversationId, {
+          name: title,
+          expiresAt: now + GROUP_NAME_CACHE_TTL,
+        });
+        return title;
+      }
+    } catch (err) {
+      logger.warn(
+        { err, openConversationId },
+        'DingTalk fetchGroupNameByOpenConversationId failed',
+      );
+    }
+
+    return null;
   }
 
   // ─── Ack Reaction (Emoji on user's message) ───────────────
@@ -1263,7 +1352,8 @@ export function createDingTalkConnection(
         : `dingtalk:c2c:${data.senderId}`;
       const senderName = data.senderNick || '钉钉用户';
       const chatName = isGroup
-        ? `钉钉群 ${conversationId.slice(0, 8)}`
+        ? (await fetchGroupNameByOpenConversationId(conversationId)) ||
+          `钉钉群 ${conversationId.slice(0, 8)}`
         : senderName;
 
       // Store last message ID for reply context
@@ -1501,47 +1591,43 @@ export function createDingTalkConnection(
         return;
       }
 
+      // ── Store metadata early (chats table only — no user isolation concern) ──
+      storeChatMetadata(jid, new Date().toISOString());
+
       // ── Authorization check ──
       if (opts.isChatAuthorized && !opts.isChatAuthorized(jid)) {
         logger.debug({ jid }, 'DingTalk chat not authorized');
         return;
       }
 
+      // ── Auto-register / update group name after authorization ──
+      // buildOnNewChat handles both new group registration AND existing group
+      // name updates (with proper created_by guard — no cross-user pollution)
+      opts.onNewChat(jid, chatName);
+
       // ── Group mention check ──
-      // 钉钉 Stream 只收到 @bot 消息，所以 shouldProcessGroupMessage（"bot 未被
-      // @mention 时是否放行"）语义上对钉钉不完全适用。但 owner_mentioned 模式下
-      // 它返回 false，会在 Gate 1 误丢所有群消息，导致 isGroupOwnerMessage 永远
-      // 不会执行。修复：当 shouldProcessGroupMessage 返回 false 且
-      // isGroupOwnerMessage 回调存在时，不立即丢弃，让 Gate 2 做 sender 过滤。
-      if (
-        isGroup &&
-        opts.shouldProcessGroupMessage &&
-        !opts.shouldProcessGroupMessage(jid, data.senderId) &&
-        !opts.isGroupOwnerMessage
-      ) {
-        logger.debug(
-          { jid },
-          'DingTalk group message dropped (mention required)',
-        );
-        return;
-      }
-      // owner_mentioned 模式：即使被 @mention，非 owner 的消息也丢弃
-      if (
-        isGroup &&
-        opts.isGroupOwnerMessage &&
-        !opts.isGroupOwnerMessage(jid, data.senderId)
-      ) {
-        logger.debug(
-          { jid, senderId: data.senderId },
-          'DingTalk group message dropped (owner_mentioned mode)',
-        );
-        return;
+      // Gate 1: 非 owner_mentioned 模式下，根据 shouldProcessGroupMessage 决定是否放行
+      // Gate 2: owner_mentioned 模式下，检查发送者是否为 owner
+      if (isGroup && opts.shouldProcessGroupMessage) {
+        const shouldProcess = opts.shouldProcessGroupMessage(jid, data.senderId);
+        if (!shouldProcess) {
+          // 非 owner_mentioned 模式：直接丢弃（Gate 1）
+          // owner_mentioned 模式：交给 Gate 2 检查 owner
+          const group = opts.resolveRegisteredGroup?.(jid);
+          const mode = group?.activation_mode ?? 'auto';
+          if (mode !== 'owner_mentioned') {
+            logger.debug({ jid }, 'DingTalk group message dropped (mention required)');
+            return;
+          }
+          // owner_mentioned 模式：Gate 2 检查 sender
+          if (opts.isGroupOwnerMessage && !opts.isGroupOwnerMessage(jid, data.senderId)) {
+            logger.debug({ jid, senderId: data.senderId }, 'DingTalk group message dropped (owner_mentioned mode)');
+            return;
+          }
+        }
       }
 
       // ── Authorized: process message ──
-      storeChatMetadata(jid, new Date().toISOString());
-      updateChatName(jid, chatName);
-      opts.onNewChat(jid, chatName);
 
       // Handle slash commands
       const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
@@ -1741,6 +1827,7 @@ export function createDingTalkConnection(
       sessionWebhookExpiry.clear();
       lastSenderIds.clear();
       lastSenderStaffIds.clear();
+      groupNameCache.clear();
       logger.info('DingTalk bot disconnected');
     },
 
@@ -1772,10 +1859,29 @@ export function createDingTalkConnection(
       if (parsed.type === 'c2c') {
         const senderStaffId = lastSenderStaffIds.get(jidKey);
         if (!senderStaffId) {
-          logger.error(
+          // No senderStaffId available (e.g. proactive notification without prior
+          // incoming message). Fall back to AI Card which uses conversationId directly.
+          logger.warn(
             { chatId, jidKey },
-            'DingTalk sendMessage: no senderStaffId found for C2C chat',
+            'DingTalk sendMessage: no senderStaffId for C2C, trying AI Card',
           );
+          try {
+            const card = await buildStreamingCard(chatId);
+            if (card) {
+              card.append(text);
+              await card.complete(text);
+              logger.info(
+                { chatId },
+                'DingTalk C2C message sent via AI Card fallback',
+              );
+              return;
+            }
+          } catch (cardErr) {
+            logger.error(
+              { chatId, cardErr },
+              'DingTalk sendMessage: AI Card fallback also failed',
+            );
+          }
           return;
         }
         const plainText = markdownToPlainText(text);
@@ -2073,35 +2179,8 @@ export function createDingTalkConnection(
       | import('./dingtalk-streaming-card.js').DingTalkStreamingCardController
       | undefined
     > {
-      const parsed = parseDingTalkChatId(chatId);
-      if (!parsed) return undefined;
-
-      const { DingTalkStreamingCardController } =
-        await import('./dingtalk-streaming-card.js');
-
-      // For C2C: use senderStaffId (enterprise staff ID) instead of encrypted senderId.
-      // DingTalk Stream SDK returns senderId in encrypted format ($:LWCP_v1:$xxx)
-      // which the AI Card deliver API rejects with "spaceId is illegal".
-      const jidKey =
-        parsed.type === 'c2c'
-          ? `dingtalk:c2c:${parsed.conversationId}`
-          : `dingtalk:group:${parsed.conversationId}`;
-      const target =
-        parsed.type === 'c2c'
-          ? {
-              type: 'user' as const,
-              userId: lastSenderStaffIds.get(jidKey) ?? parsed.conversationId,
-            }
-          : {
-              type: 'group' as const,
-              openConversationId: parsed.conversationId,
-            };
-
-      return new DingTalkStreamingCardController(config, target, {
-        onCardCreated,
-        fallbackSend: async (text: string) => {
-          await connection.sendMessage(chatId, text);
-        },
+      return buildStreamingCard(chatId, onCardCreated, async (text: string) => {
+        await connection.sendMessage(chatId, text);
       });
     },
   };

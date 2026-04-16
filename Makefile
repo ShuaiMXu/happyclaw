@@ -1,7 +1,8 @@
 .PHONY: dev dev-backend dev-web build build-backend build-web start \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
-       format format-check install clean reset-init update-sdk ensure-latest-sdk sync-types \
-       backup restore help _ensure-docker-image
+       format format-check install install-host-tools clean reset-init update-sdk ensure-latest-sdk sync-types \
+       backup restore help _ensure-docker-image logs status stop \
+       _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale
 
 # ─── Runtime Detection ──────────────────────────────────────
 # 优先使用 bun（跳过编译、启动更快），fallback 到 npm + tsx + node
@@ -11,12 +12,10 @@ ifeq ($(HAS_BUN),1)
   PKG     := bun
   RUN     := bun
   RUNNER  := bun src/index.ts
-  PKG_PFX  = cd $(1) && bun install
 else
   PKG     := npm
   RUN     := npx
   RUNNER  := npx tsx src/index.ts
-  PKG_PFX  = npm --prefix $(1) install
 endif
 
 # ─── Development ─────────────────────────────────────────────
@@ -48,15 +47,38 @@ build-web: ## 仅编译前端
 
 # ─── Production ──────────────────────────────────────────────
 
-start: ensure-latest-sdk ## 一键启动生产环境
+start: ensure-latest-sdk ## 一键启动生产环境（前台阻塞运行）
+	@# 检查端口是否被占用
+	@if lsof -ti:3000 -sTCP:LISTEN >/dev/null 2>&1; then \
+	  echo "❌ 端口 3000 已被占用，请先停掉旧进程：make stop"; \
+	  lsof -ti:3000 -sTCP:LISTEN | xargs ps -fp 2>/dev/null | tail -1; \
+	  exit 1; \
+	fi
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-docker-image
+	@$(MAKE) _check-sync
+ifeq ($(HAS_BUN),1)
+	@$(MAKE) _build-web-if-stale
+	@$(MAKE) _build-ar-if-stale
+	@echo "⚡ Bun 模式：直接运行 TypeScript，跳过后端编译"
+	bun src/index.ts
+else
+	@$(MAKE) _build-backend-if-stale
+	@$(MAKE) _build-web-if-stale
+	@$(MAKE) _build-ar-if-stale
+	node dist/index.js
+endif
+
+# ─── Internal build checks ────────────────────────────────────
+
+_check-sync: ## (内部) 检测 shared/ 类型变更并同步
 	@NEED_SYNC=0; \
 	for target in src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts src/image-detector.ts container/agent-runner/src/image-detector.ts src/channel-prefixes.ts container/agent-runner/src/channel-prefixes.ts; do \
 	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
 	done; \
 	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
-ifeq ($(HAS_BUN),1)
+
+_build-web-if-stale: ## (内部) 前端变更时重新编译
 	@NEED_WEB=0; \
 	if [ ! -f web/dist/index.html ]; then NEED_WEB=1; \
 	else \
@@ -65,7 +87,9 @@ ifeq ($(HAS_BUN),1)
 	  done; \
 	  if [ "$$NEED_WEB" = "0" ] && [ -n "$$(find web/src/ -newer web/dist/index.html \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) 2>/dev/null | head -1)" ]; then NEED_WEB=1; fi; \
 	fi; \
-	if [ "$$NEED_WEB" = "1" ]; then echo "🔨 检测到前端变更，重新编译前端..."; cd web && bun run build; else echo "✅ 前端无变更，跳过编译"; fi
+	if [ "$$NEED_WEB" = "1" ]; then echo "🔨 检测到前端变更，重新编译前端..."; cd web && $(PKG) run build; else echo "✅ 前端无变更，跳过编译"; fi
+
+_build-ar-if-stale: ## (内部) agent-runner 变更时重新编译
 	@NEED_AR=0; \
 	if [ ! -f container/agent-runner/dist/.tsbuildinfo ]; then NEED_AR=1; \
 	else \
@@ -74,15 +98,9 @@ ifeq ($(HAS_BUN),1)
 	  done; \
 	  if [ "$$NEED_AR" = "0" ] && [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/.tsbuildinfo -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_AR=1; fi; \
 	fi; \
-	if [ "$$NEED_AR" = "1" ]; then echo "🔨 检测到 agent-runner 变更，重新编译..."; cd container/agent-runner && bun run build; else echo "✅ agent-runner 无变更，跳过编译"; fi
-	@echo "⚡ Bun 模式：直接运行 TypeScript，跳过后端编译"
-	bun src/index.ts
-else
-	@NEED_SYNC=0; \
-	for target in src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts src/image-detector.ts container/agent-runner/src/image-detector.ts src/channel-prefixes.ts container/agent-runner/src/channel-prefixes.ts; do \
-	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
-	done; \
-	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
+	if [ "$$NEED_AR" = "1" ]; then echo "🔨 检测到 agent-runner 变更，重新编译..."; cd container/agent-runner && $(PKG) run build; else echo "✅ agent-runner 无变更，跳过编译"; fi
+
+_build-backend-if-stale: ## (内部) 后端变更时重新编译（Node 模式）
 	@NEED_BACKEND=0; \
 	if [ ! -f dist/index.js ]; then NEED_BACKEND=1; \
 	else \
@@ -91,27 +109,34 @@ else
 	  done; \
 	  if [ "$$NEED_BACKEND" = "0" ] && [ -n "$$(find src/ -newer dist/index.js -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_BACKEND=1; fi; \
 	fi; \
-	if [ "$$NEED_BACKEND" = "1" ]; then echo "🔨 检测到后端源码变更，重新编译后端..."; npm run build; else echo "✅ 后端无变更，跳过编译"; fi
-	@NEED_WEB=0; \
-	if [ ! -f web/dist/index.html ]; then NEED_WEB=1; \
+	if [ "$$NEED_BACKEND" = "1" ]; then echo "🔨 检测到后端源码变更，重新编译后端..."; $(PKG) run build; else echo "✅ 后端无变更，跳过编译"; fi
+
+logs: ## 实时查看日志（需配合手动后台运行：make start > /tmp/happyclaw.log 2>&1 &）
+	@tail -f /tmp/happyclaw.log
+
+stop: ## 停止占用 3000 端口的服务（前台运行时请直接 Ctrl+C）
+	@-lsof -ti:3000 -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null && echo "✅ 已停止 HappyClaw (端口 3000)" || echo "⚠️  端口 3000 未被占用，无需停止"
+
+status: ## 查看服务运行状态
+	@echo "=== HappyClaw 服务状态 ==="
+	@if lsof -ti:3000 -sTCP:LISTEN >/dev/null 2>&1; then \
+	  echo "✅ 后端进程: 运行中 (端口 3000)"; \
+	  curl -s http://localhost:3000/api/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"   健康状态: {d.get('status','unknown')}\")" 2>/dev/null || echo "   健康状态: 无法获取"; \
 	else \
-	  for f in web/package.json web/vite.config.ts web/index.html web/tsconfig.json; do \
-	    if [ -f "$$f" ] && [ "$$f" -nt web/dist/index.html ]; then NEED_WEB=1; break; fi; \
-	  done; \
-	  if [ "$$NEED_WEB" = "0" ] && [ -n "$$(find web/src/ -newer web/dist/index.html \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) 2>/dev/null | head -1)" ]; then NEED_WEB=1; fi; \
-	fi; \
-	if [ "$$NEED_WEB" = "1" ]; then echo "🔨 检测到前端变更，重新编译前端..."; cd web && npm run build; else echo "✅ 前端无变更，跳过编译"; fi
-	@NEED_AR=0; \
-	if [ ! -f container/agent-runner/dist/.tsbuildinfo ]; then NEED_AR=1; \
+	  echo "❌ 后端进程: 未运行 (端口 3000 未占用)"; \
+	fi
+	@echo ""
+	@echo "=== 日志文件 ==="
+	@if [ -f /tmp/happyclaw.log ]; then \
+	  echo "✅ /tmp/happyclaw.log 存在 ($(wc -l < /tmp/happyclaw.log) 行)"; \
+	  echo "   最近 3 行:"; \
+	  tail -3 /tmp/happyclaw.log | sed 's/^/   /'; \
 	else \
-	  for f in container/agent-runner/package.json container/agent-runner/tsconfig.json; do \
-	    if [ -f "$$f" ] && [ "$$f" -nt container/agent-runner/dist/.tsbuildinfo ]; then NEED_AR=1; break; fi; \
-	  done; \
-	  if [ "$$NEED_AR" = "0" ] && [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/.tsbuildinfo -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_AR=1; fi; \
-	fi; \
-	if [ "$$NEED_AR" = "1" ]; then echo "🔨 检测到 agent-runner 变更，重新编译..."; cd container/agent-runner && npm run build; else echo "✅ agent-runner 无变更，跳过编译"; fi
-	node dist/index.js
-endif
+	  echo "⚠️  /tmp/happyclaw.log 不存在（未用后台模式启动）"; \
+	fi
+	@echo ""
+	@echo "=== Docker 容器 ==="
+	@docker ps --filter "name=happyclaw" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "   Docker 未运行或无 HappyClaw 容器"
 
 # ─── Quality ─────────────────────────────────────────────────
 
@@ -194,6 +219,9 @@ ensure-latest-sdk: ## 启动前自动检测并更新 SDK（有新版才更新）
 
 # ─── Setup ───────────────────────────────────────────────────
 
+install-host-tools: ## 安装宿主机模式所需的外部工具（feishu-cli、agent-browser、uv）+ 刷新 builtin-skills 缓存
+	@./scripts/install-host-tools.sh
+
 install: ## 安装全部依赖并编译 agent-runner
 	$(PKG) install
 	@# node-pty 的 spawn-helper 预构建二进制可能缺少可执行权限，导致 PTY 模式失败
@@ -201,13 +229,14 @@ install: ## 安装全部依赖并编译 agent-runner
 	cd container/agent-runner && $(PKG) install
 	cd container/agent-runner && $(PKG) run build
 	cd web && $(PKG) install
+	@# 更新目录 mtime 以配合 start 中的依赖变更检测（[ package.json -nt node_modules ]）
 	@touch node_modules web/node_modules container/agent-runner/node_modules
 
 clean: ## 清理构建产物
 	rm -rf dist
 	rm -rf web/dist
 	rm -rf container/agent-runner/dist
-	rm -f .build-sentinel
+	rm -f .build-sentinel .docker-build-sentinel
 
 reset-init: ## 完全重置为首装状态（清空所有运行时数据）
 	rm -rf data store groups

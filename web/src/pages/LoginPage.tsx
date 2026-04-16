@@ -4,6 +4,7 @@ import { Loader2, Globe, Sparkles } from 'lucide-react';
 import { useAuthStore } from '../stores/auth';
 import { LogoLoading } from '../components/common/LogoLoading';
 import { api } from '../api/client';
+import { extractErrorMessage } from '../utils/error';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -80,13 +81,7 @@ export function LoginPage() {
       const mustChange = useAuthStore.getState().user?.must_change_password;
       navigate(mustChange ? '/settings' : '/chat');
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : typeof err === 'object' && err !== null && 'message' in err
-            ? String((err as { message: unknown }).message)
-            : '登录失败',
-      );
+      setError(extractErrorMessage(err) || '登录失败');
     } finally {
       setLoading(false);
     }
@@ -133,13 +128,7 @@ export function LoginPage() {
       const mustChange = useAuthStore.getState().user?.must_change_password;
       navigate(mustChange ? '/settings' : '/setup/channels');
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : typeof err === 'object' && err !== null && 'message' in err
-            ? String((err as { message: unknown }).message)
-            : '注册失败',
-      );
+      setError(extractErrorMessage(err) || '注册失败');
     } finally {
       setLoading(false);
     }
@@ -258,7 +247,7 @@ export function LoginPage() {
                 </p>
 
                 {error && (
-                  <div className="mb-4 p-3 bg-error-bg border border-error/30 rounded-lg text-left">
+                  <div role="alert" className="mb-4 p-3 bg-error-bg border border-error/30 rounded-lg text-left">
                     <p className="text-sm text-error">{error}</p>
                   </div>
                 )}

@@ -150,7 +150,7 @@ function getNewMessagesStmt(jidCount: number): any {
        WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
          AND chat_jid IN (${placeholders})
          AND is_from_me = 0
-         AND COALESCE(source_kind, '') != 'user_command'
+         AND COALESCE(source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
        ORDER BY timestamp ASC, id ASC`,
     );
     _newMsgStmtCache.set(jidCount, s);
@@ -2438,7 +2438,7 @@ function parseGroupRow(
   };
 }
 
-const VALID_ACTIVATION_MODES = new Set([
+export const VALID_ACTIVATION_MODES = new Set([
   'auto',
   'always',
   'when_mentioned',
@@ -4380,7 +4380,11 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.root_message_id === 'string' ? row.root_message_id : null,
     title_source:
       typeof row.title_source === 'string'
-        ? (row.title_source as 'manual' | 'feishu_root')
+        ? (row.title_source as
+            | 'manual'
+            | 'feishu_root'
+            | 'auto'
+            | 'auto_pending')
         : null,
     last_active_at:
       typeof row.last_active_at === 'string' ? row.last_active_at : null,

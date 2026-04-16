@@ -730,6 +730,9 @@ pre code.hljs {
    Scoped orange theme: override tokens inside .landing-page
    so buttons, links, badges, icons all render orange
    regardless of the global theme setting.
+
+   注意：登录页作为品牌入口固定使用橙色配色，不随用户主题
+   偏好切换。这是产品决策，不要将这些 token 改回依赖 :root。
    ===================================================== */
 
 /* Landing-page scoped orange tokens (light mode) */
@@ -756,6 +759,8 @@ pre code.hljs {
   --glass-border: rgba(237, 227, 216, 0.60);
   --glass-shadow: 0 8px 32px rgba(180, 120, 60, 0.06);
   --glass-inner-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.7);
+  --glass-blur: 20px;
+  --glass-saturate: 1.8;
   --error: #dc2626;
   --error-bg: #fee2e2;
 }
@@ -827,7 +832,9 @@ pre code.hljs {
 
 .landing-aurora-blob {
   position: absolute;
-  border-radius: 30% 70% 70% 30% / 30% 30% 70% 70%;
+  /* border-radius 保持静态值，避免 keyframes 中 animate border-radius
+     触发 paint —— 配合 100px blur + 大尺寸元素会在低端设备掉帧。
+     每个 blob 的具体 border-radius 在下面的 .landing-aurora-blob-N 中设置 */
 }
 
 /* Blob 1: warm peach-orange — top left */
@@ -835,6 +842,7 @@ pre code.hljs {
   width: 70vw; height: 65vh;
   top: -20%; left: -15%;
   background: rgba(251, 146, 60, 0.12);
+  border-radius: 30% 70% 70% 30% / 30% 30% 70% 70%;
   animation: aurora-morph-1 20s ease-in-out infinite;
 }
 
@@ -843,6 +851,7 @@ pre code.hljs {
   width: 60vw; height: 55vh;
   bottom: -15%; right: -10%;
   background: rgba(167, 139, 250, 0.10);
+  border-radius: 50% 50% 30% 70% / 40% 60% 40% 60%;
   animation: aurora-morph-2 25s ease-in-out infinite;
 }
 
@@ -851,6 +860,7 @@ pre code.hljs {
   width: 50vw; height: 45vh;
   top: 35%; left: 25%;
   background: rgba(56, 189, 248, 0.08);
+  border-radius: 40% 60% 50% 50% / 60% 40% 60% 40%;
   animation: aurora-morph-3 22s ease-in-out infinite;
 }
 
@@ -859,6 +869,7 @@ pre code.hljs {
   width: 45vw; height: 40vh;
   top: -10%; right: 5%;
   background: rgba(251, 113, 133, 0.08);
+  border-radius: 50% 50% 30% 70% / 40% 60% 40% 60%;
   animation: aurora-morph-2 28s ease-in-out infinite reverse;
 }
 
@@ -895,43 +906,37 @@ pre code.hljs {
   }
 }
 
+/* Aurora keyframes 只 animate transform（composite layer），
+   border-radius 保持静态，避免触发 paint。 */
 @keyframes aurora-morph-1 {
   0%, 100% {
-    border-radius: 30% 70% 70% 30% / 30% 30% 70% 70%;
     transform: translate(0, 0) rotate(0deg) scale(1);
   }
   33% {
-    border-radius: 60% 40% 30% 70% / 60% 30% 70% 40%;
     transform: translate(5%, 8%) rotate(60deg) scale(1.1);
   }
   66% {
-    border-radius: 40% 60% 60% 40% / 50% 60% 40% 50%;
     transform: translate(-3%, -5%) rotate(120deg) scale(0.95);
   }
 }
 
 @keyframes aurora-morph-2 {
   0%, 100% {
-    border-radius: 50% 50% 30% 70% / 40% 60% 40% 60%;
     transform: translate(0, 0) rotate(0deg) scale(1);
   }
   33% {
-    border-radius: 30% 70% 50% 50% / 70% 30% 70% 30%;
     transform: translate(-6%, 4%) rotate(-90deg) scale(1.05);
   }
   66% {
-    border-radius: 70% 30% 70% 30% / 30% 70% 30% 70%;
     transform: translate(4%, -6%) rotate(-180deg) scale(0.9);
   }
 }
 
 @keyframes aurora-morph-3 {
   0%, 100% {
-    border-radius: 40% 60% 50% 50% / 60% 40% 60% 40%;
     transform: translate(0, 0) rotate(0deg) scale(1);
   }
   50% {
-    border-radius: 60% 40% 40% 60% / 40% 60% 40% 60%;
     transform: translate(3%, -4%) rotate(45deg) scale(1.08);
   }
 }

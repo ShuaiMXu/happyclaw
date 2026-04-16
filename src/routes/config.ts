@@ -14,7 +14,9 @@ import {
   deleteChatHistory,
   getRegisteredGroup,
   setRegisteredGroup,
+  updateChatName,
   getAgent,
+  VALID_ACTIVATION_MODES,
 } from '../db.js';
 import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
 import {
@@ -24,6 +26,7 @@ import {
   QQConfigSchema,
   WeChatConfigSchema,
   DingTalkConfigSchema,
+  DiscordConfigSchema,
   RegistrationConfigSchema,
   AppearanceConfigSchema,
   SystemSettingsSchema,
@@ -72,6 +75,8 @@ import {
   saveUserWeChatConfig,
   getUserDingTalkConfig,
   saveUserDingTalkConfig,
+  getUserDiscordConfig,
+  saveUserDiscordConfig,
   updateAllSessionCredentials,
 } from '../runtime-config.js';
 import type {
@@ -101,7 +106,7 @@ const configRoutes = new Hono<{ Variables: Variables }>();
  */
 function countOtherEnabledImChannels(
   userId: string,
-  excludeChannel: 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk',
+  excludeChannel: 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord',
 ): number {
   let count = 0;
   if (excludeChannel !== 'feishu' && getUserFeishuConfig(userId)?.enabled)
@@ -112,6 +117,8 @@ function countOtherEnabledImChannels(
     count++;
   if (excludeChannel !== 'qq' && getUserQQConfig(userId)?.enabled) count++;
   if (excludeChannel !== 'dingtalk' && getUserDingTalkConfig(userId)?.enabled)
+    count++;
+  if (excludeChannel !== 'discord' && getUserDiscordConfig(userId)?.enabled)
     count++;
   return count;
 }
@@ -1295,6 +1302,7 @@ configRoutes.get('/user-im/status', authMiddleware, (c) => {
     qq: deps?.isUserQQConnected?.(user.id) ?? false,
     wechat: deps?.isUserWeChatConnected?.(user.id) ?? false,
     dingtalk: deps?.isUserDingTalkConnected?.(user.id) ?? false,
+    discord: deps?.isUserDiscordConnected?.(user.id) ?? false,
   });
 });
 
@@ -1860,6 +1868,37 @@ configRoutes.get('/user-im/qq/paired-chats', authMiddleware, (c) => {
   return c.json({ chats });
 });
 
+// Rename a QQ paired chat
+configRoutes.put('/user-im/qq/paired-chats/:jid', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const jid = decodeURIComponent(c.req.param('jid'));
+
+  if (!jid.startsWith('qq:')) {
+    return c.json({ error: 'Invalid QQ chat JID' }, 400);
+  }
+
+  const groups = deps?.getRegisteredGroups() ?? {};
+  const group = groups[jid];
+  if (!group) {
+    return c.json({ error: 'Chat not found' }, 404);
+  }
+  if (group.created_by !== user.id) {
+    return c.json({ error: 'Not authorized to rename this chat' }, 403);
+  }
+
+  const body = await c.req.json<{ name?: string }>();
+  const name = (body.name ?? '').trim();
+  if (!name) {
+    return c.json({ error: 'Name is required' }, 400);
+  }
+
+  group.name = name;
+  setRegisteredGroup(jid, group);
+  updateChatName(jid, name);
+  logger.info({ jid, name, userId: user.id }, 'QQ chat renamed');
+  return c.json({ success: true });
+});
+
 // Remove (unpair) a QQ chat
 configRoutes.delete('/user-im/qq/paired-chats/:jid', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
@@ -2035,6 +2074,171 @@ configRoutes.post('/user-im/dingtalk/test', authMiddleware, async (c) => {
       err instanceof Error ? err.message : 'Connection test failed';
     logger.warn({ err }, 'DingTalk connection test failed');
     return c.json({ error: message }, 400);
+  }
+});
+
+// ─── Per-user Discord IM config ──────────────────────────────────
+
+configRoutes.get('/user-im/discord', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  try {
+    const config = getUserDiscordConfig(user.id);
+    const connected = deps?.isUserDiscordConnected?.(user.id) ?? false;
+    if (!config) {
+      return c.json({
+        hasBotToken: false,
+        botTokenMasked: null,
+        enabled: false,
+        streamingMode: 'off',
+        updatedAt: null,
+        connected,
+      });
+    }
+    return c.json({
+      hasBotToken: !!config.botToken,
+      botTokenMasked: config.botToken
+        ? config.botToken.slice(0, 4) + '***' + config.botToken.slice(-4)
+        : null,
+      enabled: config.enabled ?? false,
+      streamingMode: config.streamingMode ?? 'off',
+      updatedAt: config.updatedAt,
+      connected,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to load user Discord config');
+    return c.json({ error: 'Failed to load Discord config' }, 500);
+  }
+});
+
+configRoutes.put('/user-im/discord', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const body = await c.req.json().catch(() => ({}));
+  const validation = DiscordConfigSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json(
+      { error: 'Invalid request body', details: validation.error.format() },
+      400,
+    );
+  }
+
+  // Billing: check IM channel limit when enabling
+  if (validation.data.enabled === true && isBillingEnabled()) {
+    const current = getUserDiscordConfig(user.id);
+    if (!current?.enabled) {
+      const limit = checkImChannelLimit(
+        user.id,
+        user.role,
+        countOtherEnabledImChannels(user.id, 'discord'),
+      );
+      if (!limit.allowed) {
+        return c.json({ error: limit.reason }, 403);
+      }
+    }
+  }
+
+  const current = getUserDiscordConfig(user.id);
+  const next = {
+    botToken: current?.botToken || '',
+    enabled: current?.enabled ?? true,
+    streamingMode: current?.streamingMode ?? ('off' as const),
+  };
+
+  if (typeof validation.data.botToken === 'string') {
+    const token = validation.data.botToken.trim();
+    if (token) next.botToken = token;
+  } else if (validation.data.clearBotToken === true) {
+    next.botToken = '';
+  }
+  if (typeof validation.data.enabled === 'boolean') {
+    next.enabled = validation.data.enabled;
+  } else if (!current && next.botToken) {
+    next.enabled = true;
+  }
+  if (typeof validation.data.streamingMode === 'string') {
+    next.streamingMode = validation.data.streamingMode;
+  }
+
+  try {
+    const saved = saveUserDiscordConfig(user.id, next);
+
+    // Hot-reload: reconnect user's Discord channel
+    if (deps?.reloadUserIMConfig) {
+      try {
+        await deps.reloadUserIMConfig(user.id, 'discord');
+      } catch (err) {
+        logger.warn({ err, userId: user.id }, 'Failed to hot-reload Discord');
+      }
+    }
+
+    const connected = deps?.isUserDiscordConnected?.(user.id) ?? false;
+    return c.json({
+      hasBotToken: !!saved.botToken,
+      botTokenMasked: saved.botToken
+        ? saved.botToken.slice(0, 4) + '***' + saved.botToken.slice(-4)
+        : null,
+      enabled: saved.enabled ?? false,
+      streamingMode: saved.streamingMode ?? 'off',
+      updatedAt: saved.updatedAt,
+      connected,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Invalid config';
+    logger.warn({ err }, 'Invalid Discord config');
+    return c.json({ error: message }, 400);
+  }
+});
+
+configRoutes.post('/user-im/discord/test', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const config = getUserDiscordConfig(user.id);
+
+  if (!config?.botToken) {
+    return c.json({ error: 'Discord Bot Token not configured' }, 400);
+  }
+
+  let timeoutId: NodeJS.Timeout | undefined;
+  try {
+    // Test by creating a temporary Client and logging in
+    const { Client, GatewayIntentBits } = await import('discord.js');
+    const testClient = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+    const result = await Promise.race([
+      new Promise<{ success: true; bot_username: string; bot_name: string }>(
+        (resolve, reject) => {
+          testClient.once('ready', () => {
+            const username = testClient.user?.username || 'unknown';
+            const name = testClient.user?.displayName || username;
+            testClient.destroy();
+            resolve({ success: true, bot_username: username, bot_name: name });
+          });
+          testClient.once('error', (err) => {
+            testClient.destroy();
+            reject(err);
+          });
+          testClient.login(config.botToken).catch((err) => {
+            testClient.destroy();
+            reject(err);
+          });
+        },
+      ),
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          testClient.destroy();
+          reject(new Error('Connection test timed out (10s)'));
+        }, 10000);
+      }),
+    ]);
+
+    return c.json(result);
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : 'Connection test failed';
+    logger.warn({ err }, 'Discord connection test failed');
+    return c.json({ error: message }, 400);
+  } finally {
+    // Defense-in-depth: clear the race timer in both success and failure paths
+    // so the process doesn't keep an active handle for up to 10s after the test.
+    if (timeoutId) clearTimeout(timeoutId);
   }
 });
 
@@ -2412,6 +2616,21 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     return c.json({ success: true });
   }
 
+  // Parse activation_mode for activation-only update
+  const rawActivationMode = body.activation_mode;
+  const activationMode =
+    typeof rawActivationMode === 'string' &&
+    VALID_ACTIVATION_MODES.has(rawActivationMode)
+      ? (rawActivationMode as typeof rawActivationMode &
+          'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled')
+      : undefined;
+
+  // Parse owner_im_id for owner_mentioned mode
+  const ownerImId =
+    typeof body.owner_im_id === 'string' && body.owner_im_id.trim()
+      ? body.owner_im_id.trim()
+      : undefined;
+
   // Bind to workspace main conversation
   if (typeof body.target_main_jid === 'string' && body.target_main_jid.trim()) {
     const targetMainJid = body.target_main_jid.trim();
@@ -2447,6 +2666,8 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       target_main_jid: targetMainJid,
       target_agent_id: undefined,
       reply_policy: replyPolicy,
+      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
+      ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
     };
     applyBindingUpdate(imJid, updated);
     logger.info(
@@ -2456,8 +2677,23 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     return c.json({ success: true });
   }
 
+  // Activation-only update (no target, just update activation_mode and/or owner_im_id)
+  if (activationMode !== undefined || ownerImId !== undefined) {
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
+      ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
+    };
+    applyBindingUpdate(imJid, updated);
+    logger.info(
+      { imJid, activationMode, ownerImId, userId: user.id },
+      'IM group activation_mode updated (bindings page)',
+    );
+    return c.json({ success: true });
+  }
+
   return c.json(
-    { error: 'Must provide target_main_jid, target_agent_id, or unbind' },
+    { error: 'Must provide target_main_jid, target_agent_id, activation_mode, or unbind' },
     400,
   );
 });

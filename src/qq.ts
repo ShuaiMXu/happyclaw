@@ -10,6 +10,7 @@
  * Reference: https://github.com/sliverp/qqbot (QQ Bot API v2)
  */
 import crypto from 'crypto';
+import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import WebSocket from 'ws';
@@ -19,6 +20,7 @@ import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeTypeStrict } from './image-detector.js';
+import path from 'node:path';
 import { markdownToPlainText, splitTextChunks } from './im-utils.js';
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -37,6 +39,192 @@ const IMAGE_EXT_MAP: Record<string, string> = {
   'image/gif': '.gif',
   'image/webp': '.webp',
 };
+
+// ─── QQ File Upload Types & Constants ──────────────────────────
+
+class QQApiError extends Error {
+  constructor(
+    message: string,
+    public readonly bizCode?: number,
+  ) {
+    super(message);
+    this.name = 'QQApiError';
+  }
+}
+
+enum QQMediaFileType {
+  IMAGE = 1,
+  VIDEO = 2,
+  VOICE = 3,
+  FILE = 4,
+}
+
+interface UploadPrepareHashes {
+  md5: string;
+  sha1: string;
+  md5_10m: string;
+}
+
+interface QQUploadPart {
+  index: number;
+  presigned_url: string;
+}
+
+interface QQUploadPrepareResponse {
+  upload_id: string;
+  block_size: number;
+  parts: QQUploadPart[];
+  concurrency?: number;
+  retry_timeout?: number;
+}
+
+interface QQMediaUploadResponse {
+  file_uuid: string;
+  file_info: string;
+  ttl: number;
+}
+
+const QQ_FILE_MAX_SIZE = 30 * 1024 * 1024; // 30MB (consistent with other channels)
+const MD5_10M_SIZE = 10_002_432;
+const PART_UPLOAD_TIMEOUT = 300_000; // 5 min
+const PART_UPLOAD_MAX_RETRIES = 2;
+const PART_FINISH_MAX_RETRIES = 2;
+const PART_FINISH_BASE_DELAY_MS = 1000;
+const PART_FINISH_RETRYABLE_CODES = new Set([40093001]);
+const PART_FINISH_RETRYABLE_DEFAULT_TIMEOUT_MS = 2 * 60 * 1000;
+const PART_FINISH_RETRYABLE_INTERVAL_MS = 1000;
+const MAX_PART_FINISH_RETRY_TIMEOUT_MS = 10 * 60 * 1000;
+const COMPLETE_UPLOAD_MAX_RETRIES = 2;
+const COMPLETE_UPLOAD_BASE_DELAY_MS = 1000;
+const DEFAULT_CONCURRENT_PARTS = 1;
+const MAX_CONCURRENT_PARTS = 10;
+
+function getQQMediaFileType(fileName: string): QQMediaFileType {
+  const ext = path.extname(fileName).toLowerCase();
+  if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(ext))
+    return QQMediaFileType.IMAGE;
+  if (['.mp4', '.mov', '.avi', '.mkv', '.webm'].includes(ext))
+    return QQMediaFileType.VIDEO;
+  if (['.mp3', '.wav', '.silk', '.ogg'].includes(ext))
+    return QQMediaFileType.VOICE;
+  return QQMediaFileType.FILE;
+}
+
+// ─── Chunked Upload Utilities ──────────────────────────────────
+
+async function computeFileHashes(
+  filePath: string,
+  fileSize: number,
+): Promise<UploadPrepareHashes> {
+  return new Promise((resolve, reject) => {
+    const md5Hash = crypto.createHash('md5');
+    const sha1Hash = crypto.createHash('sha1');
+    const md5_10mHash = crypto.createHash('md5');
+
+    let bytesRead = 0;
+    const need10m = fileSize > MD5_10M_SIZE;
+
+    const stream = fs.createReadStream(filePath);
+
+    stream.on('data', (chunk: Buffer | string) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      md5Hash.update(buf);
+      sha1Hash.update(buf);
+
+      if (need10m) {
+        const remaining = MD5_10M_SIZE - bytesRead;
+        if (remaining > 0) {
+          md5_10mHash.update(
+            remaining >= buf.length
+              ? buf
+              : buf.subarray(0, remaining),
+          );
+        }
+      }
+      bytesRead += buf.length;
+    });
+
+    stream.on('end', () => {
+      const md5 = md5Hash.digest('hex');
+      const sha1 = sha1Hash.digest('hex');
+      const md5_10m = need10m ? md5_10mHash.digest('hex') : md5;
+      resolve({ md5, sha1, md5_10m });
+    });
+
+    stream.on('error', reject);
+  });
+}
+
+async function readFileChunk(
+  filePath: string,
+  offset: number,
+  length: number,
+): Promise<Buffer> {
+  const fd = await fs.promises.open(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await fd.read(buffer, 0, length, offset);
+    return bytesRead < length ? buffer.subarray(0, bytesRead) : buffer;
+  } finally {
+    await fd.close();
+  }
+}
+
+async function putToPresignedUrl(
+  presignedUrl: string,
+  data: Buffer,
+  partIndex: number,
+  totalParts: number,
+): Promise<void> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= PART_UPLOAD_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), PART_UPLOAD_TIMEOUT);
+
+    try {
+      const response = await fetch(presignedUrl, {
+        method: 'PUT',
+        body: data,
+        headers: { 'Content-Length': String(data.length) },
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw new Error(
+          `COS PUT failed: ${response.status} ${response.statusText} - ${body}`,
+        );
+      }
+      return;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (lastError.name === 'AbortError') {
+        lastError = new Error(
+          `Part ${partIndex}/${totalParts} upload timeout after ${PART_UPLOAD_TIMEOUT}ms`,
+        );
+      }
+      if (attempt < PART_UPLOAD_MAX_RETRIES) {
+        const delay = 1000 * Math.pow(2, attempt);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  throw lastError!;
+}
+
+async function runWithConcurrency(
+  tasks: Array<() => Promise<void>>,
+  maxConcurrent: number,
+): Promise<void> {
+  for (let i = 0; i < tasks.length; i += maxConcurrent) {
+    const batch = tasks.slice(i, i + maxConcurrent);
+    await Promise.all(batch.map((task) => task()));
+  }
+}
 
 // Intents: PUBLIC_MESSAGES (C2C + group @bot)
 const INTENTS = 1 << 25;
@@ -91,6 +279,7 @@ export interface QQConnection {
     caption?: string,
     fileName?: string,
   ): Promise<void>;
+  sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendChatAction(chatId: string, action: 'typing'): Promise<void>;
   isConnected(): boolean;
 }
@@ -153,6 +342,76 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   // Rate-limit rejection messages
   const rejectTimestamps = new Map<string, number>();
   const REJECT_COOLDOWN_MS = 5 * 60 * 1000;
+
+  // Upload cache: avoid re-uploading identical files within TTL
+  const UPLOAD_CACHE_MAX = 500;
+  const UPLOAD_CACHE_TTL_MARGIN_S = 60; // expire 60s early for safety
+  interface UploadCacheEntry {
+    fileInfo: string;
+    expiresAt: number; // ms
+  }
+  const uploadCache = new Map<string, UploadCacheEntry>();
+
+  function getUploadCacheKey(
+    md5: string,
+    chatType: 'c2c' | 'group',
+    openid: string,
+    fileType: number,
+  ): string {
+    return `${md5}:${chatType}:${openid}:${fileType}`;
+  }
+
+  function getCachedFileInfo(
+    md5: string,
+    chatType: 'c2c' | 'group',
+    openid: string,
+    fileType: number,
+  ): string | null {
+    const key = getUploadCacheKey(md5, chatType, openid, fileType);
+    const entry = uploadCache.get(key);
+    if (!entry) return null;
+    if (Date.now() >= entry.expiresAt) {
+      uploadCache.delete(key);
+      return null;
+    }
+    logger.info({ key: key.slice(0, 40) }, 'QQ upload cache HIT');
+    return entry.fileInfo;
+  }
+
+  function setCachedFileInfo(
+    md5: string,
+    chatType: 'c2c' | 'group',
+    openid: string,
+    fileType: number,
+    fileInfo: string,
+    ttlSeconds: number,
+  ): void {
+    // Lazy eviction of expired entries when at capacity
+    if (uploadCache.size >= UPLOAD_CACHE_MAX) {
+      const now = Date.now();
+      for (const [k, v] of uploadCache) {
+        if (now >= v.expiresAt) uploadCache.delete(k);
+      }
+      // Still full → drop oldest half
+      if (uploadCache.size >= UPLOAD_CACHE_MAX) {
+        const keys = Array.from(uploadCache.keys());
+        for (let i = 0; i < keys.length / 2; i++) {
+          uploadCache.delete(keys[i]!);
+        }
+      }
+    }
+
+    const effectiveTtl = Math.max(ttlSeconds - UPLOAD_CACHE_TTL_MARGIN_S, 10);
+    const key = getUploadCacheKey(md5, chatType, openid, fileType);
+    uploadCache.set(key, {
+      fileInfo,
+      expiresAt: Date.now() + effectiveTtl * 1000,
+    });
+    logger.info(
+      { key: key.slice(0, 40), ttl: effectiveTtl },
+      'QQ upload cache SET',
+    );
+  }
 
   function isDuplicate(msgId: string): boolean {
     const now = Date.now();
@@ -294,9 +553,12 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
               const data = JSON.parse(text);
               if (res.statusCode && res.statusCode >= 400) {
                 const errMsg = data.message || data.msg || text;
+                const bizCode =
+                  typeof data.code === 'number' ? data.code : undefined;
                 reject(
-                  new Error(
+                  new QQApiError(
                     `QQ API ${method} ${path} failed (${res.statusCode}): ${errMsg}`,
+                    bizCode,
                   ),
                 );
                 return;
@@ -305,7 +567,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
             } catch {
               if (res.statusCode && res.statusCode >= 400) {
                 reject(
-                  new Error(
+                  new QQApiError(
                     `QQ API ${method} ${path} failed (${res.statusCode}): ${text}`,
                   ),
                 );
@@ -345,8 +607,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         : `/v2/groups/${openid}/messages`;
 
     await apiRequest('POST', endpoint, {
-      content,
-      msg_type: 0, // text
+      markdown: { content },
+      msg_type: 2, // markdown
       msg_seq: msgSeq,
     });
   }
@@ -366,12 +628,17 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       );
     }
 
+    // Check upload cache
+    const md5 = crypto.createHash('md5').update(imageBuffer).digest('hex');
+    const cached = getCachedFileInfo(md5, chatType, openid, QQMediaFileType.IMAGE);
+    if (cached) return cached;
+
     const endpoint =
       chatType === 'c2c'
         ? `/v2/users/${openid}/files`
         : `/v2/groups/${openid}/files`;
 
-    const res = await apiRequest<{ file_info: string }>(
+    const res = await apiRequest<{ file_info: string; file_uuid?: string; ttl?: number }>(
       'POST',
       endpoint,
       {
@@ -383,6 +650,12 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     if (!res.file_info) {
       throw new Error('QQ uploadMedia: no file_info in response');
     }
+
+    // Cache the result
+    if (res.ttl && res.ttl > 0) {
+      setCachedFileInfo(md5, chatType, openid, QQMediaFileType.IMAGE, res.file_info, res.ttl);
+    }
+
     return res.file_info;
   }
 
@@ -405,6 +678,302 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       msg_type: 7, // rich media
       media: { file_info: fileInfo },
       content: caption || '',
+      msg_seq: msgSeq,
+    });
+  }
+
+  // ─── Chunked File Upload ─────────────────────────────────────
+
+  async function qqUploadPrepare(
+    chatType: 'c2c' | 'group',
+    openid: string,
+    fileType: QQMediaFileType,
+    fileName: string,
+    fileSize: number,
+    hashes: UploadPrepareHashes,
+  ): Promise<QQUploadPrepareResponse> {
+    const endpoint =
+      chatType === 'c2c'
+        ? `/v2/users/${openid}/upload_prepare`
+        : `/v2/groups/${openid}/upload_prepare`;
+
+    return apiRequest<QQUploadPrepareResponse>('POST', endpoint, {
+      file_type: fileType,
+      file_name: fileName,
+      file_size: fileSize,
+      md5: hashes.md5,
+      sha1: hashes.sha1,
+      md5_10m: hashes.md5_10m,
+    });
+  }
+
+  async function qqUploadPartFinish(
+    chatType: 'c2c' | 'group',
+    openid: string,
+    uploadId: string,
+    partIndex: number,
+    blockSize: number,
+    md5: string,
+    retryTimeoutMs?: number,
+  ): Promise<void> {
+    const endpoint =
+      chatType === 'c2c'
+        ? `/v2/users/${openid}/upload_part_finish`
+        : `/v2/groups/${openid}/upload_part_finish`;
+
+    const body = {
+      upload_id: uploadId,
+      part_index: partIndex,
+      block_size: blockSize,
+      md5,
+    };
+
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= PART_FINISH_MAX_RETRIES; attempt++) {
+      try {
+        await apiRequest('POST', endpoint, body);
+        return;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+
+        // Retryable biz code → persistent retry
+        if (
+          err instanceof QQApiError &&
+          err.bizCode !== undefined &&
+          PART_FINISH_RETRYABLE_CODES.has(err.bizCode)
+        ) {
+          const timeoutMs =
+            retryTimeoutMs ?? PART_FINISH_RETRYABLE_DEFAULT_TIMEOUT_MS;
+          logger.warn(
+            { bizCode: err.bizCode, timeoutMs },
+            'QQ partFinish hit retryable bizCode, entering persistent retry',
+          );
+          await qqPartFinishPersistentRetry(endpoint, body, timeoutMs);
+          return;
+        }
+
+        if (attempt < PART_FINISH_MAX_RETRIES) {
+          const delay = PART_FINISH_BASE_DELAY_MS * Math.pow(2, attempt);
+          logger.warn(
+            { attempt: attempt + 1, err: lastError.message },
+            'QQ partFinish failed, retrying',
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    throw lastError!;
+  }
+
+  async function qqPartFinishPersistentRetry(
+    endpoint: string,
+    body: Record<string, unknown>,
+    timeoutMs: number,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let attempt = 0;
+
+    while (Date.now() < deadline) {
+      try {
+        await apiRequest('POST', endpoint, body);
+        logger.info({ attempt }, 'QQ partFinish persistent retry succeeded');
+        return;
+      } catch (err) {
+        if (
+          !(err instanceof QQApiError) ||
+          err.bizCode === undefined ||
+          !PART_FINISH_RETRYABLE_CODES.has(err.bizCode)
+        ) {
+          throw err;
+        }
+        attempt++;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await new Promise((resolve) =>
+          setTimeout(
+            resolve,
+            Math.min(PART_FINISH_RETRYABLE_INTERVAL_MS, remaining),
+          ),
+        );
+      }
+    }
+
+    throw new Error(
+      `QQ upload_part_finish persistent retry timed out (${timeoutMs / 1000}s, ${attempt} attempts)`,
+    );
+  }
+
+  async function qqCompleteUpload(
+    chatType: 'c2c' | 'group',
+    openid: string,
+    uploadId: string,
+  ): Promise<QQMediaUploadResponse> {
+    const endpoint =
+      chatType === 'c2c'
+        ? `/v2/users/${openid}/files`
+        : `/v2/groups/${openid}/files`;
+
+    let lastError: Error | null = null;
+
+    for (
+      let attempt = 0;
+      attempt <= COMPLETE_UPLOAD_MAX_RETRIES;
+      attempt++
+    ) {
+      try {
+        return await apiRequest<QQMediaUploadResponse>('POST', endpoint, {
+          upload_id: uploadId,
+        });
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (attempt < COMPLETE_UPLOAD_MAX_RETRIES) {
+          const delay = COMPLETE_UPLOAD_BASE_DELAY_MS * Math.pow(2, attempt);
+          logger.warn(
+            { attempt: attempt + 1, err: lastError.message },
+            'QQ completeUpload failed, retrying',
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    throw lastError!;
+  }
+
+  async function chunkedUpload(
+    chatType: 'c2c' | 'group',
+    openid: string,
+    filePath: string,
+    fileType: QQMediaFileType,
+  ): Promise<string> {
+    const stat = await fs.promises.stat(filePath);
+    const fileSize = stat.size;
+    const fileName = path.basename(filePath);
+
+    logger.info(
+      { fileName, fileSize, fileType },
+      'QQ chunked upload starting',
+    );
+
+    const hashes = await computeFileHashes(filePath, fileSize);
+
+    // Check upload cache
+    const cached = getCachedFileInfo(hashes.md5, chatType, openid, fileType);
+    if (cached) return cached;
+
+    const prepareResp = await qqUploadPrepare(
+      chatType,
+      openid,
+      fileType,
+      fileName,
+      fileSize,
+      hashes,
+    );
+
+    const { upload_id, parts } = prepareResp;
+    const block_size = Number(prepareResp.block_size);
+
+    const maxConcurrent = Math.min(
+      prepareResp.concurrency
+        ? Number(prepareResp.concurrency)
+        : DEFAULT_CONCURRENT_PARTS,
+      MAX_CONCURRENT_PARTS,
+    );
+
+    const retryTimeoutMs = prepareResp.retry_timeout
+      ? Math.min(
+          Number(prepareResp.retry_timeout) * 1000,
+          MAX_PART_FINISH_RETRY_TIMEOUT_MS,
+        )
+      : undefined;
+
+    logger.info(
+      { upload_id, block_size, parts: parts.length, maxConcurrent },
+      'QQ upload prepared',
+    );
+
+    const uploadPart = async (part: QQUploadPart): Promise<void> => {
+      const offset = (part.index - 1) * block_size;
+      const length = Math.min(block_size, fileSize - offset);
+
+      const partBuffer = await readFileChunk(filePath, offset, length);
+      const md5Hex = crypto
+        .createHash('md5')
+        .update(partBuffer)
+        .digest('hex');
+
+      await putToPresignedUrl(
+        part.presigned_url,
+        partBuffer,
+        part.index,
+        parts.length,
+      );
+
+      await qqUploadPartFinish(
+        chatType,
+        openid,
+        upload_id,
+        part.index,
+        length,
+        md5Hex,
+        retryTimeoutMs,
+      );
+    };
+
+    await runWithConcurrency(
+      parts.map((part) => () => uploadPart(part)),
+      maxConcurrent,
+    );
+
+    const result = await qqCompleteUpload(chatType, openid, upload_id);
+    logger.info(
+      { file_uuid: result.file_uuid, ttl: result.ttl },
+      'QQ chunked upload completed',
+    );
+
+    // Cache the result
+    if (result.ttl > 0) {
+      setCachedFileInfo(hashes.md5, chatType, openid, fileType, result.file_info, result.ttl);
+    }
+
+    return result.file_info;
+  }
+
+  async function sendQQFileMessage(
+    chatType: 'c2c' | 'group',
+    openid: string,
+    filePath: string,
+    fileName: string,
+  ): Promise<void> {
+    const stat = await fs.promises.stat(filePath);
+    if (stat.size > QQ_FILE_MAX_SIZE) {
+      throw new Error(
+        `File too large for QQ upload: ${(stat.size / 1024 / 1024).toFixed(1)}MB (max ${QQ_FILE_MAX_SIZE / 1024 / 1024}MB)`,
+      );
+    }
+
+    const fileType = getQQMediaFileType(fileName);
+    const fileInfo = await chunkedUpload(
+      chatType,
+      openid,
+      filePath,
+      fileType,
+    );
+
+    const chatKey = `${chatType}:${openid}`;
+    const msgSeq = getNextMsgSeq(chatKey);
+
+    const endpoint =
+      chatType === 'c2c'
+        ? `/v2/users/${openid}/messages`
+        : `/v2/groups/${openid}/messages`;
+
+    await apiRequest('POST', endpoint, {
+      msg_type: 7,
+      media: { file_info: fileInfo },
+      content: '',
       msg_seq: msgSeq,
     });
   }
@@ -1091,7 +1660,11 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       logger.info('QQ bot disconnected');
     },
 
-    async sendMessage(chatId: string, text: string): Promise<void> {
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+    ): Promise<void> {
       const parsed = parseQQChatId(chatId);
       if (!parsed) {
         logger.error({ chatId }, 'Invalid QQ chat ID format');
@@ -1099,11 +1672,24 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       }
 
       try {
-        const plainText = markdownToPlainText(text);
-        const chunks = splitTextChunks(plainText, MSG_SPLIT_LIMIT);
+        const chunks = splitTextChunks(text, MSG_SPLIT_LIMIT);
 
         for (const chunk of chunks) {
           await sendQQMessage(parsed.type, parsed.openid, chunk);
+        }
+
+        // Send local images after text (same pattern as Feishu)
+        for (const imgPath of localImagePaths || []) {
+          try {
+            const buf = fs.readFileSync(imgPath);
+            await sendQQImageMessage(parsed.type, parsed.openid, buf);
+            logger.info({ chatId, imgPath }, 'QQ local image sent');
+          } catch (imgErr) {
+            logger.warn(
+              { err: imgErr, chatId, imgPath },
+              'Failed to send local image via QQ',
+            );
+          }
         }
 
         logger.info({ chatId }, 'QQ message sent');
@@ -1136,6 +1722,31 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         logger.info({ chatId }, 'QQ image sent');
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send QQ image');
+        throw err;
+      }
+    },
+
+    async sendFile(
+      chatId: string,
+      filePath: string,
+      fileName: string,
+    ): Promise<void> {
+      const parsed = parseQQChatId(chatId);
+      if (!parsed) {
+        logger.error({ chatId }, 'Invalid QQ chat ID format for file');
+        return;
+      }
+
+      try {
+        await sendQQFileMessage(
+          parsed.type,
+          parsed.openid,
+          filePath,
+          fileName,
+        );
+        logger.info({ chatId, fileName }, 'QQ file sent');
+      } catch (err) {
+        logger.error({ err, chatId, fileName }, 'Failed to send QQ file');
         throw err;
       }
     },

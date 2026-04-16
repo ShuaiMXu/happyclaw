@@ -2,15 +2,17 @@ import { Loader2, MessageSquare, Users, ArrowRightLeft, Unlink } from 'lucide-re
 import { Button } from '@/components/ui/button';
 import type { AvailableImGroup } from '../../types';
 import { ChannelBadge } from './channel-meta';
+import { ACTIVATION_MODE_OPTIONS } from '../../constants/im';
 
 interface ImBindingRowProps {
   group: AvailableImGroup;
   isActioning: boolean;
   onRebind: (group: AvailableImGroup) => void;
   onUnbind: (group: AvailableImGroup) => void;
+  onActivationModeChange: (jid: string, mode: string) => void;
 }
 
-export function ImBindingRow({ group, isActioning, onRebind, onUnbind }: ImBindingRowProps) {
+export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onActivationModeChange }: ImBindingRowProps) {
   const hasBound = !!group.bound_agent_id || !!group.bound_main_jid;
 
   const bindingLabel = (): string => {
@@ -65,6 +67,20 @@ export function ImBindingRow({ group, isActioning, onRebind, onUnbind }: ImBindi
 
       {/* Actions */}
       <div className="flex items-center gap-2 flex-shrink-0">
+        {hasBound && (
+          <div className="flex items-center gap-1.5">
+            <select
+              value={group.activation_mode || 'auto'}
+              onChange={(e) => onActivationModeChange(group.jid, e.target.value)}
+              disabled={isActioning}
+              className="text-xs px-1.5 py-1 rounded border border-border bg-background text-foreground disabled:opacity-50"
+            >
+              {ACTIVATION_MODE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
+        )}
         {hasBound && (
           <Button
             size="sm"
