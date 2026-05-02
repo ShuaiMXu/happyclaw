@@ -184,7 +184,7 @@ interface ChatState {
   selectGroup: (jid: string) => void;
   loadMessages: (jid: string, loadMore?: boolean) => Promise<void>;
   refreshMessages: (jid: string) => Promise<void>;
-  sendMessage: (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => Promise<void>;
+  sendMessage: (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => Promise<boolean>;
   stopGroup: (jid: string) => Promise<boolean>;
   interruptQuery: (jid: string) => Promise<boolean>;
   resetSession: (jid: string, agentId?: string) => Promise<boolean>;
@@ -196,7 +196,7 @@ interface ChatState {
   deleteFlow: (jid: string) => Promise<void>;
   handleStreamEvent: (chatJid: string, event: StreamEvent, agentId?: string) => void;
   handleWsNewMessage: (chatJid: string, wsMsg: any, agentId?: string, source?: string) => void;
-  handleAgentStatus: (chatJid: string, agentId: string, status: AgentInfo['status'], name: string, prompt: string, resultSummary?: string, kind?: AgentInfo['kind']) => void;
+  handleAgentStatus: (chatJid: string, agentId: string, status: AgentInfo['status'], name: string, prompt: string, resultSummary?: string, kind?: AgentInfo['kind'], titleGenerating?: boolean) => void;
   clearStreaming: (
     chatJid: string,
     options?: { preserveThinking?: boolean },
@@ -212,7 +212,7 @@ interface ChatState {
   createConversation: (jid: string, name?: string, description?: string) => Promise<AgentInfo | null>;
   renameConversation: (jid: string, agentId: string, name: string) => Promise<boolean>;
   loadAgentMessages: (jid: string, agentId: string, loadMore?: boolean) => Promise<void>;
-  sendAgentMessage: (jid: string, agentId: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => void;
+  sendAgentMessage: (jid: string, agentId: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => boolean;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
   // Runner state sync
   handleRunnerState: (chatJid: string, state: string) => void;
@@ -960,46 +960,57 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
 
       const data = await api.post<{ success: boolean; messageId: string; timestamp: string }>('/api/messages', body);
-      if (data.success) {
-        // Add user message to local state immediately
-        const authState = useAuthStore.getState();
-        const sender = authState.user?.id || 'web-user';
-        const senderName = authState.user?.display_name || authState.user?.username || 'Web';
-        const msg: Message = {
-          id: data.messageId,
-          chat_jid: jid,
-          sender,
-          sender_name: senderName,
-          content,
-          // Use server timestamp so incremental polling cursor stays monotonic with backend data.
-          timestamp: data.timestamp,
-          // is_from_me is from the bot's perspective: true = bot sent it, false = human sent it
-          is_from_me: false,
-          attachments: body.attachments ? JSON.stringify(body.attachments) : undefined,
-        };
-        set((s) => {
-          const existing = s.messages[jid] || [];
-          if (!s.messages[jid]) {
-            console.warn('[sendMessage] messages[jid] is undefined at send time', { jid, storeKeys: Object.keys(s.messages) });
-          }
-          const merged = mergeMessagesChronologically(existing, [msg]);
-          const latest = merged.length > 0 ? merged[merged.length - 1] : null;
-          const shouldWait =
-            !!latest &&
-            latest.is_from_me === false &&
-            !isTerminalSystemMessage(latest);
-          return {
-            messages: {
-              ...s.messages,
-              [jid]: merged,
-            },
-            waiting: { ...s.waiting, [jid]: shouldWait },
-            error: null,
-          };
-        });
+      if (!data.success) {
+        // Server returned non-success payload — surface as a send failure so caller can retain input.
+        const msg = '服务器返回失败，请重试';
+        set({ error: msg });
+        showToast('发送失败', msg);
+        return false;
       }
+      // Add user message to local state immediately
+      const authState = useAuthStore.getState();
+      const sender = authState.user?.id || 'web-user';
+      const senderName = authState.user?.display_name || authState.user?.username || 'Web';
+      const msg: Message = {
+        id: data.messageId,
+        chat_jid: jid,
+        sender,
+        sender_name: senderName,
+        content,
+        // Use server timestamp so incremental polling cursor stays monotonic with backend data.
+        timestamp: data.timestamp,
+        // is_from_me is from the bot's perspective: true = bot sent it, false = human sent it
+        is_from_me: false,
+        attachments: body.attachments ? JSON.stringify(body.attachments) : undefined,
+      };
+      set((s) => {
+        const existing = s.messages[jid] || [];
+        if (!s.messages[jid]) {
+          console.warn('[sendMessage] messages[jid] is undefined at send time', { jid, storeKeys: Object.keys(s.messages) });
+        }
+        const merged = mergeMessagesChronologically(existing, [msg]);
+        const latest = merged.length > 0 ? merged[merged.length - 1] : null;
+        const shouldWait =
+          !!latest &&
+          latest.is_from_me === false &&
+          !isTerminalSystemMessage(latest);
+        return {
+          messages: {
+            ...s.messages,
+            [jid]: merged,
+          },
+          waiting: { ...s.waiting, [jid]: shouldWait },
+          error: null,
+        };
+      });
+      return true;
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      // 弱网/断网/后端 500 等场景：记录错误并给用户可见的 toast，
+      // 返回 false 让调用方（MessageInput）保留输入不清空。
+      const message = err instanceof Error ? err.message : String(err);
+      set({ error: message });
+      showToast('发送失败', '消息未发送，输入已保留，请检查网络后重试');
+      return false;
     }
   },
 
@@ -1062,13 +1073,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   resetSession: async (jid: string, agentId?: string) => {
+    // Hold the clearing lock for main-session reset so late-arriving stream
+    // events from the soon-to-be-killed process can't repopulate UI state
+    // (same lock clearHistory uses at chat.ts ~1105). Agent-specific reset
+    // is scoped narrowly enough that the lock isn't needed.
+    // Release the lock BEFORE calling refreshMessages/loadAgentMessages,
+    // which themselves honor `clearing[jid]` and would otherwise skip.
+    const useLock = !agentId;
+    if (useLock) {
+      set((s) => ({ clearing: { ...s.clearing, [jid]: true } }));
+    }
+    let succeeded = false;
     try {
       await api.post<{ success: boolean; dividerMessageId: string }>(
         `/api/groups/${encodeURIComponent(jid)}/reset-session`,
         agentId ? { agentId } : undefined,
       );
       if (agentId) {
-        // Agent-specific: clear agent streaming and refresh agent messages
         set((s) => {
           const nextStreaming = { ...s.agentStreaming };
           delete nextStreaming[agentId];
@@ -1076,17 +1097,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
           delete nextWaiting[agentId];
           return { agentStreaming: nextStreaming, agentWaiting: nextWaiting };
         });
-        await get().loadAgentMessages(jid, agentId);
       } else {
         get().clearStreaming(jid, { preserveThinking: false });
-        // Refresh messages to pick up the divider message
-        await get().refreshMessages(jid);
       }
-      return true;
+      succeeded = true;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
-      return false;
+    } finally {
+      if (useLock) {
+        set((s) => {
+          const { [jid]: _, ...nextClearing } = s.clearing;
+          return { clearing: nextClearing };
+        });
+      }
     }
+    if (succeeded) {
+      if (agentId) await get().loadAgentMessages(jid, agentId);
+      else await get().refreshMessages(jid);
+    }
+    return succeeded;
   },
 
   clearHistory: async (jid: string) => {
@@ -1108,6 +1137,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const { [jid]: _pending, ...nextPendingThinking } = s.pendingThinking;
         const { [jid]: _clearing, ...nextClearing } = s.clearing;
 
+        // Collect sub-agent IDs that belonged to this workspace so we can
+        // scrub their per-agent state — backend has deleted the agent rows
+        // already, leaving these Maps orphaned otherwise.
+        const staleAgentIds = (s.agents[jid] || []).map((a) => a.id);
+        const nextAgents = { ...s.agents };
+        delete nextAgents[jid];
+        const nextAgentMessages = { ...s.agentMessages };
+        const nextAgentStreaming = { ...s.agentStreaming };
+        const nextAgentWaiting = { ...s.agentWaiting };
+        for (const aid of staleAgentIds) {
+          delete nextAgentMessages[aid];
+          delete nextAgentStreaming[aid];
+          delete nextAgentWaiting[aid];
+        }
+
+        // Reset UI-scoped state tied to this workspace jid.
+        const nextDrafts = { ...s.drafts };
+        delete nextDrafts[jid];
+        const nextActiveAgentTab = { ...s.activeAgentTab };
+        delete nextActiveAgentTab[jid];
+
+        // Purge SDK Task state that originated from this workspace.
+        const nextSdkTasks = { ...s.sdkTasks };
+        const droppedTaskKeys = new Set<string>();
+        for (const [taskKey, info] of Object.entries(s.sdkTasks)) {
+          if (info.chatJid === jid) {
+            delete nextSdkTasks[taskKey];
+            droppedTaskKeys.add(taskKey);
+          }
+        }
+        const nextSdkTaskAliases = { ...s.sdkTaskAliases };
+        for (const [alias, canonical] of Object.entries(s.sdkTaskAliases)) {
+          if (droppedTaskKeys.has(canonical)) delete nextSdkTaskAliases[alias];
+        }
+
         return {
           messages: nextMessages,
           waiting: { ...s.waiting, [jid]: false },
@@ -1119,6 +1183,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
             nextMessages,
             s.thinkingCache,
           ),
+          agents: nextAgents,
+          agentMessages: nextAgentMessages,
+          agentStreaming: nextAgentStreaming,
+          agentWaiting: nextAgentWaiting,
+          drafts: nextDrafts,
+          activeAgentTab: nextActiveAgentTab,
+          sdkTasks: nextSdkTasks,
+          sdkTaskAliases: nextSdkTaskAliases,
           error: null,
         };
       });
@@ -1768,7 +1840,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   // 处理子 Agent 状态变更事件
-  handleAgentStatus: (chatJid, agentId, status, name, prompt, resultSummary?, kind?) => {
+  handleAgentStatus: (chatJid, agentId, status, name, prompt, resultSummary?, kind?, titleGenerating?) => {
     set((s) => {
       const existing = s.agents[chatJid] || [];
 
@@ -1817,6 +1889,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         created_at: previous?.created_at || new Date().toISOString(),
         completed_at: (status === 'completed' || status === 'error') ? new Date().toISOString() : undefined,
         result_summary: resultSummary,
+        title_generating: typeof titleGenerating === 'boolean' ? titleGenerating : previous?.title_generating,
       };
       const updated = idx >= 0
         ? existing.map((a, i) => (i === idx ? agentInfo : a))
@@ -1858,10 +1931,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       // Conversation agent started running: reset agentWaiting so stream events
       // are accepted (mirrors handleRunnerState for the main conversation).
-      // Without this, Feishu-sourced messages (which skip sendAgentMessage) would
-      // leave agentWaiting=false and cause all streaming events to be dropped.
+      // Skip for title-only broadcasts (titleGenerating set) — those carry the
+      // persistent running status but shouldn't re-open the "waiting" window
+      // after the reply has already finalized.
       const nextAgentWaiting =
-        (resolvedKind === 'conversation' || resolvedKind === 'spawn') && status === 'running'
+        (resolvedKind === 'conversation' || resolvedKind === 'spawn') &&
+        status === 'running' &&
+        typeof titleGenerating !== 'boolean'
           ? { ...s.agentWaiting, [agentId]: true }
           : s.agentWaiting;
 
@@ -2089,24 +2165,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   sendAgentMessage: (jid, agentId, content, attachments?) => {
-    // Clear agent streaming state before sending
-    set((s) => {
-      const next = { ...s.agentStreaming };
-      delete next[agentId];
-      return { agentStreaming: next };
-    });
-    // Send via WebSocket with agentId
+    // Send via WebSocket with agentId.
+    // NOTE: 先尝试 ws.send，成功后再清 agentStreaming / 置 agentWaiting，
+    // 避免失败时 UI 进入"等待中但消息没发出"的不一致状态。
     const normalizedAttachments = attachments && attachments.length > 0
       ? attachments.map(att => ({ type: 'image' as const, ...att }))
       : undefined;
     const sent = wsManager.send({ type: 'send_message', chatJid: jid, content, agentId, attachments: normalizedAttachments });
     if (!sent) {
-      showToast('发送失败', 'WebSocket 未连接，请稍后重试');
-      return;
+      showToast('发送失败', 'WebSocket 未连接，输入已保留，请稍后重试');
+      return false;
     }
-    set((s) => ({
-      agentWaiting: { ...s.agentWaiting, [agentId]: true },
-    }));
+    set((s) => {
+      const nextAgentStreaming = { ...s.agentStreaming };
+      delete nextAgentStreaming[agentId];
+      return {
+        agentStreaming: nextAgentStreaming,
+        agentWaiting: { ...s.agentWaiting, [agentId]: true },
+      };
+    });
+    return true;
   },
 
   refreshAgentMessages: async (jid, agentId) => {

@@ -181,7 +181,7 @@ export interface SchedulerDependencies {
   broadcastStreamEvent?: (chatJid: string, event: StreamEvent) => void;
   onWorkspaceCreated?: (jid: string, folder: string, name: string, userId?: string) => void;
   /** Store task prompt as a user-visible message in the workspace chat */
-  storePromptMessage?: (chatJid: string, senderId: string, senderName: string, text: string) => void;
+  storePromptMessage?: (chatJid: string, senderId: string, senderName: string, text: string, taskId?: string) => void;
   /** Store task result in workspace chat and push to owner's IM channels */
   storeResultAndNotify?: (
     chatJid: string,
@@ -191,6 +191,7 @@ export interface SchedulerDependencies {
       notifyChannels?: string[] | null;
       sourceKind?: ContainerOutput['sourceKind'];
       skipStore?: boolean;
+      workspaceFolder?: string;
     },
   ) => Promise<void>;
   assistantName: string;
@@ -349,7 +350,7 @@ async function runTask(
   if (deps.storePromptMessage) {
     const owner = workspaceGroup.created_by ? getUserById(workspaceGroup.created_by) : null;
     const senderName = owner?.display_name || owner?.username || '定时任务';
-    deps.storePromptMessage(workspace.jid, owner?.id || 'system', senderName, task.prompt);
+    deps.storePromptMessage(workspace.jid, owner?.id || 'system', senderName, task.prompt, task.id);
   }
 
   let result: string | null = null;
@@ -521,6 +522,10 @@ async function runTask(
           ownerId: workspaceGroup.created_by || undefined,
           notifyChannels: task.notify_channels,
           sourceKind: 'sdk_final',
+          // Use source workspace folder for IM routing — isolated tasks run in
+          // ephemeral workspaces (task-xxxxxx) that have no IM group bindings.
+          // task.group_folder is the workspace where the task was created.
+          workspaceFolder: task.group_folder || undefined,
         });
       } catch (err) {
         logger.error(
@@ -660,6 +665,7 @@ async function runScriptTask(
               ownerId: group.created_by,
               notifyChannels: task.notify_channels,
               skipStore: true,
+              workspaceFolder: task.group_folder,
             });
           } catch (notifyErr) {
             logger.error(
@@ -736,6 +742,7 @@ async function runGroupModeTask(
       owner?.id || 'system',
       senderName,
       task.prompt,
+      task.id,
     );
 
     // Trigger normal message processing for the source workspace

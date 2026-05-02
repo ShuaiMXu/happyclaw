@@ -89,6 +89,7 @@ export function AppLayout() {
         useChatStore.getState().handleAgentStatus(
           data.chatJid, data.agentId, data.status,
           data.name, data.prompt, data.resultSummary, data.kind,
+          data.titleGenerating,
         );
       }
     });

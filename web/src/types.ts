@@ -35,6 +35,7 @@ export interface AgentInfo {
   thread_id?: string | null;
   root_message_id?: string | null;
   title_source?: 'manual' | 'feishu_root' | 'auto' | 'auto_pending' | null;
+  title_generating?: boolean;
   last_active_at?: string | null;
   latest_message?: { content: string; timestamp: string } | null;
 }

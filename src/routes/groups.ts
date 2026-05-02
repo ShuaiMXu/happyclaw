@@ -275,23 +275,8 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
 }
 
 import { removeFlowArtifacts } from '../file-manager.js';
+import { clearSessionFiles } from '../session-files.js';
 export { removeFlowArtifacts };
-
-function clearSessionJsonlFiles(folder: string, agentId?: string): void {
-  const claudeDir = agentId
-    ? path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude')
-    : path.join(DATA_DIR, 'sessions', folder, '.claude');
-  if (!fs.existsSync(claudeDir)) return;
-
-  // 保留 settings.json，清除所有其他运行时文件和目录
-  const keep = new Set(['settings.json']);
-  const entries = fs.readdirSync(claudeDir);
-  for (const entry of entries) {
-    if (keep.has(entry)) continue;
-    const fullPath = path.join(claudeDir, entry);
-    fs.rmSync(fullPath, { recursive: true, force: true });
-  }
-}
 
 function resetWorkspaceForGroup(folder: string): void {
   // 1. 清除工作目录（Agent 文件、CLAUDE.md、logs/ 等），然后重建空目录
@@ -1035,7 +1020,7 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
 
   // 2. Delete session JSONL files so Claude starts fresh.
   try {
-    clearSessionJsonlFiles(group.folder, agentId);
+    clearSessionFiles(group.folder, agentId);
   } catch (err) {
     logger.error(
       { jid, folder: group.folder, agentId, err },
@@ -1145,13 +1130,23 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   const siblingJids = getJidsByFolder(group.folder);
 
   // 1. Stop ALL active processes for this folder first to avoid writes during cleanup.
+  //    This must include descendant virtual JIDs — sub-agents (`{jid}#agent:{id}`)
+  //    and scheduled tasks (`{jid}#task:{id}`) — otherwise they'd keep running
+  //    with their cwd/session dirs pulled out from under them (ENOENT / undefined
+  //    behavior in container mode).
+  const descendantJids = Array.from(
+    new Set(
+      siblingJids.flatMap((j) => deps.queue.listActiveDescendantJids(j)),
+    ),
+  );
+  const stopJids = [...siblingJids, ...descendantJids];
   try {
     await Promise.all(
-      siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })),
+      stopJids.map((j) => deps.queue.stopGroup(j, { force: true })),
     );
   } catch (err) {
     logger.error(
-      { jid, siblingJids, err },
+      { jid, stopJids, err },
       'Failed to stop containers before clearing history',
     );
     return c.json(

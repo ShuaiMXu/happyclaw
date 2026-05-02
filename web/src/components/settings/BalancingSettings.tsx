@@ -65,6 +65,12 @@ export function BalancingSettings({ balancing, onChange, disabled }: BalancingSe
                   ? '根据提供商的权重值按比例分配请求'
                   : '优先使用第一个健康的提供商，失败时自动切换到下一个'}
             </p>
+            {balancing.strategy === 'weighted-round-robin' && (
+              <div className="mt-2 px-3 py-2 rounded-md border border-teal-200 dark:border-teal-900/40 bg-teal-50 dark:bg-teal-950/30 text-xs text-teal-800 dark:text-teal-300">
+                💡 上方提供商列表已显示每家的「权重」徽标。点击对应提供商的「编辑」按钮可调整。
+                所有提供商默认权重为 1（均匀分配），调整权重后流量按比例分配。
+              </div>
+            )}
           </div>
 
           {/* 高级参数 */}

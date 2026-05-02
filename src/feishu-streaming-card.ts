@@ -19,6 +19,24 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import { createHash } from 'crypto';
 import { logger } from './logger.js';
 import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
+import {
+  buildAgentReplyCard,
+  buildStreamingAgentCard,
+} from './feishu-cards/builder.js';
+import type { CardStatus, ToolCallStat } from './feishu-cards/types.js';
+import {
+  CARD_ELEMENT_IDS,
+  buildStatusBannerText,
+  buildProgressListText,
+  buildToolsTimelineText,
+  buildThinkingBlockquote,
+  buildAskQuestionText,
+  collectAskQuestions,
+  buildTimelineText,
+  type StreamingPhase,
+  type TodoItemView,
+  type ToolCallView,
+} from './feishu-cards/sections.js';
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -103,9 +121,8 @@ function findContainingBlock(
 }
 
 /**
- * Split text respecting fenced code block boundaries.
- * Unlike splitAtParagraphs(), this never truncates inside a code block
- * without properly closing/reopening the fence.
+ * Split text respecting fenced code block boundaries — never truncates inside
+ * a code block without properly closing/reopening the fence.
  */
 function splitCodeBlockSafe(text: string, maxLen: number): string[] {
   if (text.length <= maxLen) return [text];
@@ -153,23 +170,6 @@ function splitCodeBlockSafe(text: string, maxLen: number): string[] {
 
 const CARD_MD_LIMIT = 4000;
 const CARD_SIZE_LIMIT = 25 * 1024; // Feishu limit ~30KB, 5KB safety margin
-
-// ─── Legacy Card Builder (Fallback) ──────────────────────────
-
-function splitAtParagraphs(text: string, maxLen: number): string[] {
-  if (text.length <= maxLen) return [text];
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > maxLen) {
-    let idx = remaining.lastIndexOf('\n\n', maxLen);
-    if (idx < maxLen * 0.3) idx = remaining.lastIndexOf('\n', maxLen);
-    if (idx < maxLen * 0.3) idx = maxLen;
-    chunks.push(remaining.slice(0, idx).trim());
-    remaining = remaining.slice(idx).trim();
-  }
-  if (remaining) chunks.push(remaining);
-  return chunks;
-}
 
 function extractTitleAndBody(text: string): { title: string; body: string } {
   const lines = text.split('\n');
@@ -243,20 +243,7 @@ function buildCardContent(
 
 // ─── Interrupt Button Element ────────────────────────────────
 
-/** Schema 1.0: `action` container wrapping a button (used by legacy message.patch path) */
-const INTERRUPT_BUTTON = {
-  tag: 'action',
-  actions: [
-    {
-      tag: 'button',
-      text: { tag: 'plain_text', content: '⏹ 中断回复' },
-      type: 'danger',
-      value: { action: 'interrupt_stream' },
-    },
-  ],
-} as const;
-
-/** Schema 2.0: standalone button (CardKit rejects `tag: 'action'` in v2 cards) */
+/** Schema 2.0 standalone button — used by every card path (legacy + CardKit). */
 const INTERRUPT_BUTTON_V2 = {
   tag: 'button',
   text: { tag: 'plain_text', content: '⏹ 中断回复' },
@@ -290,6 +277,19 @@ interface ToolCallState {
   status: 'running' | 'complete' | 'error';
   startTime: number;
   toolInputSummary?: string;
+  /** When wrapping a Skill, the concrete skill name for display. */
+  skillName?: string;
+  /** True for tool calls spawned inside a Task sub-agent. */
+  isNested?: boolean;
+  /** Raw tool input, needed for AskUserQuestion structured rendering. */
+  toolInput?: Record<string, unknown>;
+}
+
+/** Extra metadata a caller can attach to a running tool call. */
+export interface ToolCallMeta {
+  skillName?: string;
+  isNested?: boolean;
+  toolInput?: Record<string, unknown>;
 }
 
 function formatElapsed(ms: number): string {
@@ -340,26 +340,31 @@ function buildAuxiliaryElements(aux: AuxiliaryState): {
     });
   }
 
-  // ② Thinking
+  // ② Thinking — v2-styled with text_tag + blockquote so the legacy degraded
+  // path mirrors the structured thinking panel used in streaming mode.
   if (aux.isThinking && aux.thinkingText) {
     const truncated =
       aux.thinkingText.length > MAX_THINKING_CHARS
-        ? '...' + aux.thinkingText.slice(-(MAX_THINKING_CHARS - 3))
+        ? '…' + aux.thinkingText.slice(-(MAX_THINKING_CHARS - 1))
         : aux.thinkingText;
-    // Escape content for blockquote (each line gets "> " prefix)
     const quoted = truncated
       .split('\n')
-      .map((l) => `> ${l}`)
+      .map((l) => (l.trim() ? `> ${l}` : '>'))
       .join('\n');
     before.push({
       tag: 'markdown',
-      content: `💭 **Reasoning...**\n${quoted}`.slice(0, MAX_ELEMENT_CHARS),
+      content:
+        `<text_tag color='blue'>思考中</text_tag> 🧠 <font color='grey'>正在推理…</font>\n${quoted}`.slice(
+          0,
+          MAX_ELEMENT_CHARS,
+        ),
       text_size: 'notation',
     });
   } else if (aux.isThinking) {
     before.push({
       tag: 'markdown',
-      content: '💭 **Thinking...**',
+      content:
+        "<text_tag color='blue'>思考中</text_tag> 🧠 <font color='grey'>正在推理…</font>",
       text_size: 'notation',
     });
   }
@@ -452,54 +457,75 @@ function buildAuxiliaryElements(aux: AuxiliaryState): {
   return { before, after };
 }
 
-// ─── Legacy Card Builder (Fallback) ──────────────────────────
+// ─── Legacy Card Builder (Schema 2.0, im.v1.message.patch path) ──────
+//
+// Used when CardKit streaming_mode / updateCard are unavailable and we fall
+// back to patching the full interactive card JSON via im.v1.message.patch.
+// The shape is v2 throughout — no `action`/`note` containers, no
+// `wide_screen_mode` — so Feishu clients render it with the same look as the
+// CardKit-driven path. Layout stays flat (no collapsible panels) because each
+// patch resends the full card JSON and we want payloads to stay small.
 
 function buildStreamingCard(
   text: string,
   state: 'streaming' | 'completed' | 'aborted',
   footerNote?: string,
 ): object {
-  const { title, contentElements: elements } = buildCardContent(
-    text,
-    splitAtParagraphs,
-  );
-
-  const noteMap = {
-    streaming: '⏳ 生成中...',
-    completed: '',
-    aborted: '⚠️ 已中断',
-  };
-  const headerTemplate = {
-    streaming: 'wathet',
-    completed: 'indigo',
-    aborted: 'orange',
-  };
-
-  if (state === 'streaming') {
-    elements.push(INTERRUPT_BUTTON);
+  // Terminal states delegate to the structured v2 builder so the final card
+  // matches every other reply (themed header + metadata slot + collapsible
+  // continuation sections + grey-notation footer).
+  if (state === 'completed') {
+    return buildAgentReplyCard({
+      status: 'done',
+      text,
+      footer: footerNote,
+    });
   }
-
-  if (noteMap[state]) {
-    elements.push({
-      tag: 'note',
-      elements: [{ tag: 'plain_text', content: noteMap[state] }],
+  if (state === 'aborted') {
+    return buildAgentReplyCard({
+      status: 'warning',
+      text,
+      footer: footerNote,
     });
   }
 
+  // Streaming state — flat v2 layout for cheap full-card patches.
+  const optimized = optimizeMarkdownStyle(text || '...', 2);
+  const { title } = extractTitleAndBody(optimized);
+  const displayTitle = title || '...';
+  const elements: Array<Record<string, unknown>> = [
+    {
+      tag: 'markdown',
+      content: optimized,
+      element_id: CARD_ELEMENT_IDS.MAIN_CONTENT,
+    },
+    { ...INTERRUPT_BUTTON_V2, element_id: CARD_ELEMENT_IDS.INTERRUPT_BTN },
+    {
+      tag: 'markdown',
+      content: '⏳ 生成中...',
+      element_id: CARD_ELEMENT_IDS.STATUS_NOTE,
+      text_size: 'notation',
+    },
+  ];
   if (footerNote) {
     elements.push({
-      tag: 'note',
-      elements: [{ tag: 'plain_text', content: footerNote }],
+      tag: 'markdown',
+      content: footerNote,
+      text_size: 'notation',
+      element_id: CARD_ELEMENT_IDS.FOOTER_NOTE,
     });
   }
-
   return {
-    config: { wide_screen_mode: true },
-    header: {
-      title: { tag: 'plain_text', content: title },
-      template: headerTemplate[state],
+    schema: '2.0',
+    config: {
+      width_mode: 'fill',
+      summary: { content: displayTitle },
     },
-    elements,
+    header: {
+      title: { tag: 'plain_text', content: displayTitle },
+      template: 'blue',
+    },
+    body: { elements },
   };
 }
 
@@ -515,8 +541,8 @@ const SCHEMA2_NOTE_MAP: Record<Schema2State, string> = {
 };
 
 const SCHEMA2_HEADER_MAP: Record<Schema2State, string> = {
-  streaming: 'wathet',
-  completed: 'indigo',
+  streaming: 'blue',
+  completed: 'violet',
   aborted: 'orange',
   frozen: 'grey',
 };
@@ -571,7 +597,7 @@ function buildSchema2Card(
   return {
     schema: '2.0',
     config: {
-      wide_screen_mode: true,
+      width_mode: 'fill',
       summary: { content: displayTitle },
     },
     header: {
@@ -605,55 +631,11 @@ function formatUsageNote(usage: {
 // ─── Streaming Mode Card Builder ──────────────────────────────
 
 function buildStreamingModeCard(initialText: string): object {
-  const { title } = extractTitleAndBody(initialText);
-  const displayTitle = title || '...';
-  return {
-    schema: '2.0',
-    config: {
-      wide_screen_mode: true,
-      summary: { content: displayTitle },
-      streaming_mode: true,
-      streaming_config: STREAMING_CONFIG,
-    },
-    header: {
-      title: { tag: 'plain_text', content: displayTitle },
-      template: 'wathet',
-    },
-    body: {
-      elements: [
-        {
-          tag: 'markdown',
-          content: '',
-          element_id: ELEMENT_IDS.AUX_BEFORE,
-          text_size: 'notation',
-        },
-        {
-          tag: 'markdown',
-          content: initialText || '...',
-          element_id: ELEMENT_IDS.MAIN_CONTENT,
-        },
-        {
-          tag: 'markdown',
-          content: '',
-          element_id: ELEMENT_IDS.AUX_AFTER,
-          text_size: 'notation',
-        },
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: '⏹ 中断回复' },
-          type: 'danger',
-          value: { action: 'interrupt_stream' },
-          element_id: ELEMENT_IDS.INTERRUPT_BTN,
-        },
-        {
-          tag: 'markdown',
-          content: '⏳ 生成中...',
-          element_id: ELEMENT_IDS.STATUS_NOTE,
-          text_size: 'notation',
-        },
-      ],
-    },
-  };
+  // Delegate to the shared rich skeleton: STATUS_BANNER + PROGRESS / TOOLS /
+  // THINKING collapsible_panels + MAIN_CONTENT (typewriter) + INTERRUPT button
+  // + FOOTER_NOTE. Each panel wraps a markdown element with its own element_id
+  // so the controller can patch slots independently.
+  return buildStreamingAgentCard({ initialText, rich: true });
 }
 
 /**
@@ -889,6 +871,7 @@ class StreamingModeBackend {
   private lastMainHash = '';
   private lastAuxBeforeHash = '';
   private lastAuxAfterHash = '';
+  private readonly richSlotHashes = new Map<string, string>();
   private readonly client: lark.Client;
 
   constructor(client: lark.Client) {
@@ -1042,6 +1025,43 @@ class StreamingModeBackend {
       data: { element, sequence: this.nextSequence() },
     });
     this[hashField] = hash;
+  }
+
+  /**
+   * Patch a single markdown element's text content (cardElement.content()).
+   * Works for any markdown element in the card tree, including ones nested
+   * inside collapsible_panel.
+   */
+  async updateMarkdownContent(
+    elementId: string,
+    content: string,
+  ): Promise<void> {
+    if (!this.cardId) return;
+    const hash = quickHash(content);
+    if (this.richSlotHashes.get(elementId) === hash) return;
+    await this.client.cardkit.v1.cardElement.content({
+      path: { card_id: this.cardId, element_id: elementId },
+      data: { content, sequence: this.nextSequence() },
+    });
+    this.richSlotHashes.set(elementId, hash);
+  }
+
+  /**
+   * Replace a whole element (structure + content) via cardElement.update().
+   * Used to toggle collapsible_panel expanded state mid-stream.
+   */
+  async replaceElement(
+    elementId: string,
+    elementJson: object,
+  ): Promise<void> {
+    if (!this.cardId) return;
+    await this.client.cardkit.v1.cardElement.update({
+      path: { card_id: this.cardId, element_id: elementId },
+      data: {
+        element: JSON.stringify(elementJson),
+        sequence: this.nextSequence(),
+      },
+    });
   }
 
   /**
@@ -1284,7 +1304,6 @@ export class StreamingCardController {
   private streamingBackend: StreamingModeBackend | null = null;
   private textFlushCtrl: FlushController | null = null;
   private auxFlushCtrl: FlushController | null = null;
-  private lastAuxSnapshot = '';
 
   // Streaming state
   private thinking = false;
@@ -1362,6 +1381,25 @@ export class StreamingCardController {
       status: 'running',
       startTime: Date.now(),
     });
+    this.stateVersion++;
+    if (this.state === 'streaming') {
+      this.backendMode === 'streaming'
+        ? this.scheduleAuxFlush()
+        : this.schedulePatch();
+    }
+  }
+
+  /**
+   * Attach extra metadata to an already-started tool call. Called separately
+   * from startTool() so the cross-IM StreamingSession union doesn't need to
+   * widen its common signature. A no-op if the toolId is unknown.
+   */
+  setToolMeta(toolId: string, meta: ToolCallMeta): void {
+    const tc = this.toolCalls.get(toolId);
+    if (!tc) return;
+    if (meta.skillName !== undefined) tc.skillName = meta.skillName;
+    if (meta.isNested !== undefined) tc.isNested = meta.isNested;
+    if (meta.toolInput !== undefined) tc.toolInput = meta.toolInput;
     this.stateVersion++;
     if (this.state === 'streaming') {
       this.backendMode === 'streaming'
@@ -1572,19 +1610,10 @@ export class StreamingCardController {
   }): Promise<void> {
     if (this.state !== 'completed') return;
 
-    const note = formatUsageNote(usage);
-    if (!note) return;
-
     try {
       if (this.backendMode === 'streaming' && this.streamingBackend) {
-        const cardJson = buildSchema2Card(
-          this.accumulatedText,
-          'completed',
-          '',
-          undefined,
-          undefined,
-          note,
-        );
+        // Rebuild the structured final card with usage metadata attached.
+        const cardJson = this.buildStructuredFinalCard('completed', usage);
         // Skip if card was split during finalization — rebuilding a single card
         // would overwrite the first card with full text while continuation cards remain.
         const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
@@ -1593,6 +1622,8 @@ export class StreamingCardController {
       } else if (this.messageId || this.multiCard) {
         // For CardKit v1 / legacy: skip if multiCard has split content
         if (this.multiCard && this.multiCard.getCardCount() > 1) return;
+        const note = formatUsageNote(usage);
+        if (!note) return;
         await this.patchCard('completed', note);
       }
     } catch (err) {
@@ -1880,6 +1911,124 @@ export class StreamingCardController {
    * Schedule an auxiliary content flush for streaming mode.
    * Falls back to schedulePatch() if streaming backend is not available.
    */
+  private derivePhase(): StreamingPhase {
+    // Priority: active tool > hook > thinking > streaming text > working > idle
+    for (const tc of this.toolCalls.values()) {
+      if (tc.status === 'running') return 'tooling';
+    }
+    if (this.activeHook) return 'hook';
+    if (this.thinking && !this.accumulatedText) return 'thinking';
+    if (this.accumulatedText) return 'streaming';
+    if (this.systemStatus) return 'working';
+    return 'idle';
+  }
+
+  private deriveBannerDetail(phase: StreamingPhase): string | undefined {
+    if (phase === 'tooling') {
+      const running = Array.from(this.toolCalls.values()).filter(
+        (tc) => tc.status === 'running',
+      );
+      if (running.length === 0) return undefined;
+      const primary = running[0];
+      const name =
+        primary.name === 'Skill' && primary.skillName
+          ? primary.skillName
+          : primary.name;
+      const summary = primary.toolInputSummary
+        ? `: ${primary.toolInputSummary.slice(0, 40)}`
+        : '';
+      const extra =
+        running.length > 1 ? ` <text_tag color='blue'>+${running.length - 1}</text_tag>` : '';
+      return `\`${name}\`${summary}${extra}`;
+    }
+    if (phase === 'hook') {
+      return this.activeHook
+        ? `${this.activeHook.hookName || this.activeHook.hookEvent}`
+        : undefined;
+    }
+    if (phase === 'streaming') {
+      const chars = this.accumulatedText.length;
+      return `已输出 ${chars} 字`;
+    }
+    if (phase === 'working') {
+      return this.systemStatus ?? undefined;
+    }
+    return undefined;
+  }
+
+  private buildRichPanelPatches(): {
+    statusBanner: string;
+    progressContent?: string;
+    toolsContent: string;
+    thinkingContent?: string;
+    askContent?: string;
+    timelineContent?: string;
+    footerNote: string;
+  } {
+    const phase = this.derivePhase();
+    const elapsedMs = this.startTime > 0 ? Date.now() - this.startTime : 0;
+    const statusBanner = buildStatusBannerText({
+      phase,
+      detail: this.deriveBannerDetail(phase),
+      elapsedMs,
+    });
+    // Footer is the short status echo only — recent events have their own panel.
+    const footerNote = `<font color='grey'>${statusBanner.replace(/<[^>]+>/g, '').trim()}</font>`;
+
+    const progressContent =
+      this.todos && this.todos.length > 0
+        ? buildProgressListText(
+            this.todos.map((t) => ({
+              content: t.content,
+              status: t.status as TodoItemView['status'],
+            })),
+          )
+        : undefined;
+
+    const now = Date.now();
+    // Filter out AskUserQuestion from the tools timeline — it gets its own panel.
+    const toolViews: ToolCallView[] = Array.from(this.toolCalls.values())
+      .filter((tc) => tc.name !== 'AskUserQuestion')
+      .map((tc) => ({
+        name: tc.name,
+        status: tc.status,
+        durationMs: now - tc.startTime,
+        summary: tc.toolInputSummary,
+        skillName: tc.skillName,
+        isNested: tc.isNested,
+      }));
+    const toolsContent = buildToolsTimelineText(toolViews);
+
+    const thinkingContent = this.thinkingText
+      ? buildThinkingBlockquote(this.thinkingText)
+      : undefined;
+
+    // AskUserQuestion: gather every running tool of that name and flatten to
+    // a question list (mirrors web AskUserQuestionCard).
+    const askQuestions = Array.from(this.toolCalls.values())
+      .filter((tc) => tc.name === 'AskUserQuestion' && tc.status === 'running')
+      .flatMap((tc) => collectAskQuestions(tc.toolInput));
+    const askContent =
+      askQuestions.length > 0 ? buildAskQuestionText(askQuestions) : undefined;
+
+    const timelineContent =
+      this.recentEvents.length > 0
+        ? buildTimelineText(
+            this.recentEvents.map((e) => ({ text: e.text })),
+          )
+        : undefined;
+
+    return {
+      statusBanner,
+      progressContent,
+      toolsContent,
+      thinkingContent,
+      askContent,
+      timelineContent,
+      footerNote,
+    };
+  }
+
   private scheduleAuxFlush(): void {
     if (!this.streamingBackend || !this.auxFlushCtrl) {
       this.schedulePatch();
@@ -1887,30 +2036,71 @@ export class StreamingCardController {
     }
 
     this.auxFlushCtrl.schedule(this.stateVersion * 1000, async () => {
-      // Recalculate aux state inside callback to avoid stale closures
-      const auxState = this.getAuxiliaryState();
-      const { before, after } = buildAuxiliaryElements(auxState);
-      const auxBefore = serializeAuxContent(before);
-      const auxAfter = serializeAuxContent(after);
-      const snapshot = auxBefore + '||' + auxAfter;
-      if (snapshot === this.lastAuxSnapshot) return;
+      const patches = this.buildRichPanelPatches();
 
+      // Every flush goes through cardElement.content() to update the inner
+      // markdown of each panel. We keep the collapsible_panel structure
+      // constant (initial expanded state set at card creation) to avoid
+      // mid-stream structural rewrites, which Feishu's streaming_mode
+      // sometimes rejects. The user can fold/expand each panel manually.
       try {
-        await this.streamingBackend!.updateAuxiliary(
-          ELEMENT_IDS.AUX_BEFORE,
-          auxBefore,
+        await this.streamingBackend!.updateMarkdownContent(
+          CARD_ELEMENT_IDS.STATUS_BANNER,
+          patches.statusBanner,
         );
-        await this.streamingBackend!.updateAuxiliary(
-          ELEMENT_IDS.AUX_AFTER,
-          auxAfter,
+        if (patches.askContent) {
+          await this.streamingBackend!.updateMarkdownContent(
+            CARD_ELEMENT_IDS.ASK_CONTENT,
+            patches.askContent,
+          );
+        }
+        if (patches.progressContent) {
+          await this.streamingBackend!.updateMarkdownContent(
+            CARD_ELEMENT_IDS.PROGRESS_CONTENT,
+            patches.progressContent,
+          );
+        }
+        await this.streamingBackend!.updateMarkdownContent(
+          CARD_ELEMENT_IDS.TOOLS_CONTENT,
+          patches.toolsContent,
         );
-        this.lastAuxSnapshot = snapshot;
+        if (patches.thinkingContent) {
+          await this.streamingBackend!.updateMarkdownContent(
+            CARD_ELEMENT_IDS.THINKING_CONTENT,
+            patches.thinkingContent,
+          );
+        }
+        if (patches.timelineContent) {
+          await this.streamingBackend!.updateMarkdownContent(
+            CARD_ELEMENT_IDS.TIMELINE_CONTENT,
+            patches.timelineContent,
+          );
+        }
+        await this.streamingBackend!.updateMarkdownContent(
+          CARD_ELEMENT_IDS.FOOTER_NOTE,
+          patches.footerNote,
+        );
       } catch (err) {
-        // Auxiliary update failures do NOT count toward degradation
+        // Rich slot updates may fail if CardKit rejects deep element_id targeting.
+        // Fall back to legacy AUX_BEFORE/AFTER aggregation in that case.
         logger.debug(
           { err, chatId: this.chatId, mode: 'streaming' },
-          'Streaming auxiliary update failed (non-critical)',
+          'Rich panel patch failed, falling back to legacy aux update',
         );
+        try {
+          const auxState = this.getAuxiliaryState();
+          const { before, after } = buildAuxiliaryElements(auxState);
+          await this.streamingBackend!.updateAuxiliary(
+            ELEMENT_IDS.AUX_BEFORE,
+            serializeAuxContent(before),
+          );
+          await this.streamingBackend!.updateAuxiliary(
+            ELEMENT_IDS.AUX_AFTER,
+            serializeAuxContent(after),
+          );
+        } catch {
+          /* legacy aux is best-effort */
+        }
       }
     });
   }
@@ -1960,6 +2150,46 @@ export class StreamingCardController {
   }
 
   /**
+   * Build a structured terminal card from the controller's accumulated state.
+   * Reuses the shared v2 builder so the visual surface matches non-streaming
+   * replies (metadata row, collapsible overflow, themed header).
+   */
+  private buildStructuredFinalCard(
+    finalState: 'completed' | 'aborted',
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      costUSD: number;
+      durationMs: number;
+      numTurns: number;
+    },
+  ): object {
+    const status: CardStatus = finalState === 'aborted' ? 'warning' : 'done';
+    const toolCounts = new Map<string, number>();
+    for (const tc of this.toolCalls.values()) {
+      toolCounts.set(tc.name, (toolCounts.get(tc.name) ?? 0) + 1);
+    }
+    const toolCalls: ToolCallStat[] = Array.from(
+      toolCounts,
+      ([name, count]) => ({ name, count }),
+    );
+    const thinking = this.thinkingText.trim() || undefined;
+    return buildAgentReplyCard({
+      status,
+      text: this.accumulatedText || '...',
+      thinking,
+      meta: {
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        durationMs: usage?.durationMs,
+        inputTokens: usage?.inputTokens,
+        outputTokens: usage?.outputTokens,
+        costUSD: usage?.costUSD,
+        numTurns: usage?.numTurns,
+      },
+    });
+  }
+
+  /**
    * Finalize a streaming card: disable streaming mode, then set final state.
    */
   private async finalizeStreamingCard(
@@ -1971,8 +2201,8 @@ export class StreamingCardController {
       // 1. Disable streaming mode (allows header/button changes)
       await backend.disableStreamingMode();
 
-      // 2. Build final card with optimizeMarkdownStyle
-      const cardJson = buildSchema2Card(this.accumulatedText, finalState);
+      // 2. Build structured final card (usage note comes later via patchUsageNote)
+      const cardJson = this.buildStructuredFinalCard(finalState);
       const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
 
       if (cardSize <= CARD_SIZE_LIMIT) {

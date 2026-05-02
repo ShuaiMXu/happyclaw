@@ -1,4 +1,4 @@
-import { X } from 'lucide-react';
+import { X, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { AgentInfo } from '../../types';
 
@@ -59,13 +59,19 @@ export function TopicSidebar({
                 <button
                   onClick={() => onSelectAgent(agent.id)}
                   className={cn(
-                    'min-w-0 flex-1 px-3 py-2 text-left text-sm truncate cursor-pointer',
+                    'min-w-0 flex-1 px-3 py-2 text-left text-sm cursor-pointer flex items-center gap-1.5',
                     active
                       ? 'font-medium text-primary'
                       : 'text-foreground',
                   )}
                 >
-                  {agent.name}
+                  {agent.title_generating && (
+                    <Loader2
+                      className="h-3 w-3 shrink-0 animate-spin text-teal-500"
+                      aria-label="正在生成标题"
+                    />
+                  )}
+                  <span className="truncate">{agent.name}</span>
                 </button>
                 <button
                   onClick={(e) => { e.stopPropagation(); onDeleteAgent(agent.id); }}

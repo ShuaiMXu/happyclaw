@@ -118,6 +118,12 @@ import {
   resolveLocationInfo,
   type WorkspaceInfo,
 } from './im-command-utils.js';
+import {
+  extractLastTaskId,
+  broadcastToOwnerIMChannels as broadcastToOwnerIMChannelsPure,
+  resolveBroadcastFolder,
+  resolveTaskRoutingDecision,
+} from './task-routing.js';
 import { invalidateSessionCache, getWebDeps } from './web-context.js';
 import {
   getFeishuProviderConfigWithSource,
@@ -131,6 +137,7 @@ import {
   getUserDiscordConfig,
   getSystemSettings,
   saveUserFeishuConfig,
+  saveFeishuOwnerOpenId,
   saveUserTelegramConfig,
   updateAllSessionCredentials,
 } from './runtime-config.js';
@@ -179,6 +186,7 @@ import {
   broadcastTyping,
   broadcastStreamEvent,
   broadcastAgentStatus,
+  broadcastTitleGenerating,
   broadcastGroupCreated,
   broadcastBillingUpdate,
   shutdownTerminals,
@@ -229,6 +237,19 @@ export function feedStreamEventToCard(
     case 'tool_use_start':
       if (se.toolUseId && se.toolName) {
         session.startTool(se.toolUseId, se.toolName);
+        // Feishu streaming card wants richer metadata (skillName / nested /
+        // raw toolInput for AskUserQuestion). Attach separately so the
+        // StreamingSession union's common signature stays tight.
+        if (
+          session instanceof StreamingCardController &&
+          (se.skillName || se.isNested || se.toolInput)
+        ) {
+          session.setToolMeta(se.toolUseId, {
+            skillName: se.skillName,
+            isNested: se.isNested,
+            toolInput: se.toolInput,
+          });
+        }
         const label = se.skillName ? `技能 ${se.skillName}` : se.toolName;
         session.pushRecentEvent(`🔄 ${label}`);
       }
@@ -1056,6 +1077,7 @@ async function handleCommand(
   chatJid: string,
   command: string,
   senderImId?: string,
+  mentions?: Array<{ key?: string; name?: string; id?: { open_id?: string } }>,
 ): Promise<string | null> {
   const parts = command.split(/\s+/);
   const cmd = parts[0].toLowerCase();
@@ -1087,6 +1109,12 @@ async function handleCommand(
     case 'sw':
     case 'spawn':
       return handleSpawnCommand(chatJid, rawArgs, chatJid);
+    case 'allow':
+      return handleAllowCommand(chatJid, senderImId, mentions);
+    case 'disallow':
+      return handleDisallowCommand(chatJid, senderImId, mentions);
+    case 'allowlist':
+      return handleAllowlistCommand(chatJid);
     default:
       return null;
   }
@@ -1517,6 +1545,129 @@ function handleOwnerMentionCommand(chatJid: string, senderImId?: string): string
   return `已开启「仅我响应」模式\n\n你的 IM 标识: ${senderImId}\n只有你 @机器人 时才会响应，其他人的 @mention 将被静默忽略。\n\n发送 /require_mention false 可恢复为全量响应。`;
 }
 
+
+/**
+ * /allow @成员 命令：将 @提及的成员加入发言者白名单（仅 owner 可操作）。
+ */
+function handleAllowCommand(
+  chatJid: string,
+  senderImId?: string,
+  mentions?: Array<{ key?: string; name?: string; id?: { open_id?: string } }>,
+): string {
+  if (!senderImId) return '无法识别发送者身份';
+  let group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前会话';
+
+  // Backfill owner_im_id if the group was registered before the user-level
+  // ownerOpenId was known (e.g., bot added to group first, owner DM'd later).
+  // Only backfill when the sender matches the user-level ownerOpenId.
+  if (!group.owner_im_id && group.created_by) {
+    const userOwnerOpenId = getUserFeishuConfig(group.created_by)?.ownerOpenId;
+    if (userOwnerOpenId && userOwnerOpenId === senderImId) {
+      const updated: RegisteredGroup = { ...group, owner_im_id: senderImId };
+      setRegisteredGroup(chatJid, updated);
+      registeredGroups[chatJid] = updated;
+      group = updated;
+      logger.info(
+        { chatJid, senderImId },
+        'Backfilled owner_im_id via /allow (matched user-level ownerOpenId)',
+      );
+    }
+  }
+
+  if (!group.owner_im_id) {
+    return '尚未识别到 owner，请先向机器人发一条私信以完成身份识别';
+  }
+  if (group.owner_im_id !== senderImId) {
+    return '只有 bot owner 才能修改白名单';
+  }
+
+  const toAdd = (mentions ?? [])
+    .map((m) => m.id?.open_id)
+    .filter((id): id is string => !!id && id !== senderImId);
+
+  if (toAdd.length === 0) {
+    return '请 @提及 要加入白名单的群成员：/allow @成员';
+  }
+
+  const current = group.sender_allowlist ?? [senderImId];
+  const newIds = toAdd.filter((id) => !current.includes(id));
+  if (newIds.length === 0) {
+    return '这些成员已在白名单中';
+  }
+
+  const updated: RegisteredGroup = {
+    ...group,
+    sender_allowlist: [...current, ...newIds],
+  };
+  setRegisteredGroup(chatJid, updated);
+  registeredGroups[chatJid] = updated;
+  logger.info({ chatJid, senderImId, added: newIds }, 'Members added to sender allowlist');
+
+  return `已将 ${newIds.length} 名成员加入白名单（当前共 ${updated.sender_allowlist!.length} 人）`;
+}
+
+/**
+ * /disallow @成员 命令：将 @提及的成员从发言者白名单移除（仅 owner 可操作）。
+ * owner 本人不能被移除。
+ */
+function handleDisallowCommand(
+  chatJid: string,
+  senderImId?: string,
+  mentions?: Array<{ key?: string; name?: string; id?: { open_id?: string } }>,
+): string {
+  if (!senderImId) return '无法识别发送者身份';
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前会话';
+
+  if (!group.owner_im_id || group.owner_im_id !== senderImId) {
+    return '只有 bot owner 才能修改白名单';
+  }
+  if (!group.sender_allowlist || group.sender_allowlist.length === 0) {
+    return '白名单为空';
+  }
+
+  const toRemove = (mentions ?? [])
+    .map((m) => m.id?.open_id)
+    .filter((id): id is string => !!id);
+
+  if (toRemove.length === 0) {
+    return '请 @提及 要从白名单移除的群成员：/disallow @成员';
+  }
+  if (toRemove.includes(senderImId)) {
+    return 'Owner 不能将自己移出白名单';
+  }
+
+  const updated_list = group.sender_allowlist.filter((id) => !toRemove.includes(id));
+  const updated: RegisteredGroup = { ...group, sender_allowlist: updated_list };
+  setRegisteredGroup(chatJid, updated);
+  registeredGroups[chatJid] = updated;
+  logger.info({ chatJid, senderImId, removed: toRemove }, 'Members removed from sender allowlist');
+
+  const removedCount = group.sender_allowlist.length - updated_list.length;
+  return `已将 ${removedCount} 名成员从白名单移除（当前共 ${updated_list.length} 人）`;
+}
+
+/**
+ * /allowlist 命令：查看当前群组的发言者白名单。
+ */
+function handleAllowlistCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前会话';
+
+  const allowlist = group.sender_allowlist;
+  if (allowlist === undefined || allowlist === null) {
+    return '当前群组未启用白名单模式（所有人均可触发）';
+  }
+  if (allowlist.length === 0) {
+    return `白名单模式已启用，当前无人可触发。\nOwner: ${group.owner_im_id ?? '未识别（请先向机器人发一条私信）'}`;
+  }
+
+  const ownerMark = (id: string) => (id === group.owner_im_id ? ' (owner)' : '');
+  const lines = allowlist.map((id, i) => `${i + 1}. ${id}${ownerMark(id)}`);
+  return `白名单（${allowlist.length} 人）：\n${lines.join('\n')}`;
+}
+
 const recallCooldowns = new Map<string, number>();
 
 async function handleRecallCommand(chatJid: string): Promise<string> {
@@ -1626,6 +1777,77 @@ async function summarizeWithClaude(transcript: string): Promise<string | null> {
   const prompt = `请用简洁的中文总结以下对话的要点和进展，重点说明讨论了什么、达成了什么结论、还有什么待办事项。不要逐条翻译，而是提炼核心信息。\n\n${transcript}`;
   const model = process.env.RECALL_MODEL || undefined;
   return sdkQuery(prompt, { model, timeout: 30_000 });
+}
+
+/**
+ * After an agent conversation's first reply finalizes, upgrade the placeholder
+ * title to an LLM-generated one. Fire-and-forget; optimistically flips
+ * title_source to 'auto' up-front so concurrent replies don't double-trigger.
+ */
+async function generateAndApplyLLMTitle(
+  agentId: string,
+  chatJid: string,
+  virtualChatJid: string,
+): Promise<void> {
+  updateAgentContextInfo(agentId, { title_source: 'auto' });
+
+  // Notify clients that title generation has started → show loading indicator.
+  broadcastTitleGenerating(chatJid, agentId, true);
+
+  let finalName: string | undefined;
+  try {
+    const recent = getMessagesPage(virtualChatJid, undefined, 6)
+      .slice()
+      .reverse();
+    const firstUser = recent.find((m) => !m.is_from_me);
+    const firstAI = recent.find((m) => m.is_from_me);
+    if (!firstUser) return;
+
+    const userText = (firstUser.content || '').slice(0, 500);
+    const aiText = (firstAI?.content || '').slice(0, 500);
+    const prompt =
+      `根据以下对话生成一个简洁的中文标题，用于在会话列表中展示。要求：\n` +
+      `- 不超过 16 个字符\n` +
+      `- 概括用户的核心诉求\n` +
+      `- 不要加标点、引号、emoji、括号\n` +
+      `- 直接输出标题，不要解释\n\n` +
+      `用户: ${userText}\n` +
+      (aiText ? `AI: ${aiText}\n` : '');
+
+    const raw = await sdkQuery(prompt, { timeout: 20_000 });
+    if (!raw) return;
+
+    const cleaned = raw
+      .trim()
+      .split('\n')[0]
+      .replace(/^["'「『《【\[(]+|["'」』》】\])]+$/g, '')
+      .trim()
+      .slice(0, 20);
+    if (!cleaned) return;
+
+    // Re-check title_source: user may have manually renamed during the LLM window.
+    const currentAgent = getAgent(agentId);
+    if (currentAgent?.title_source !== 'auto') {
+      logger.info(
+        `[llm-title] skip applying generated title for agent=${agentId} because title_source=${currentAgent?.title_source}`,
+      );
+    } else {
+      updateAgentContextInfo(agentId, { name: cleaned });
+      updateChatName(virtualChatJid, cleaned);
+      finalName = cleaned;
+    }
+  } catch (err) {
+    logger.warn(
+      {
+        err: (err as Error).message?.slice(0, 200),
+        agentId,
+      },
+      'LLM title generation failed',
+    );
+  } finally {
+    // Always clear loading indicator, whether LLM succeeded, returned empty, or threw.
+    broadcastTitleGenerating(chatJid, agentId, false, finalName);
+  }
 }
 
 // ─── /sw & /spawn: parallel task spawning ────────────────────────
@@ -2382,6 +2604,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const images = collectMessageImages(chatJid, missedMessages);
   const imagesForAgent = images.length > 0 ? images : undefined;
 
+  // Extract task_id from the most recent task-prompt message (if any).
+  // See extractLastTaskId() for semantics; see §C of the routing fix plan for
+  // why getMessagesSince (not getNewMessages) surfaces task-prompt rows here.
+  const messageTaskId = extractLastTaskId(missedMessages);
+
   logger.info(
     {
       group: group.name,
@@ -2390,6 +2617,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       imageCount: images.length,
       shared,
       isRecovery,
+      messageTaskId,
     },
     'Processing messages',
   );
@@ -3105,6 +3333,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         }
       },
       imagesForAgent,
+      messageTaskId,
     );
   } finally {
     await setTyping(chatJid, false);
@@ -3535,6 +3764,7 @@ async function runAgent(
   turnId?: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   images?: Array<{ data: string; mimeType?: string }>,
+  messageTaskId?: string,
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
   // For the agent-runner: isMain means this is an admin home container (full privileges)
@@ -3624,6 +3854,7 @@ async function runAgent(
           isHome,
           isAdminHome,
           images,
+          messageTaskId,
         },
         onProcessCb,
         wrappedOnOutput,
@@ -3642,6 +3873,7 @@ async function runAgent(
           isHome,
           isAdminHome,
           images,
+          messageTaskId,
         },
         onProcessCb,
         wrappedOnOutput,
@@ -3999,10 +4231,11 @@ export function canSendCrossGroupMessage(
   return false;
 }
 
-/**
- * Broadcast a message to all connected IM channels of a user that haven't
- * already received it. Used by scheduled tasks to fan out to all IM channels.
- */
+// Thin production wrapper around the pure helper in ./task-routing.ts so the
+// internal call sites keep their short signature (deps inferred from the
+// runtime IM manager + DB). Tests should import `broadcastToOwnerIMChannels`
+// from ./task-routing.js directly and pass their own deps — that file has no
+// side effects, unlike this one (which runs main() at module load).
 function broadcastToOwnerIMChannels(
   userId: string,
   sourceFolder: string,
@@ -4010,24 +4243,31 @@ function broadcastToOwnerIMChannels(
   sendFn: (jid: string) => void,
   notifyChannels?: string[] | null,
 ): void {
-  const sentChannelTypes = new Set<string>();
-  for (const jid of alreadySentJids) {
-    const ct = getChannelType(jid);
-    if (ct) sentChannelTypes.add(ct);
-  }
-  const connectedTypes = imManager.getConnectedChannelTypes(userId);
-  const ownerGroups = getGroupsByOwner(userId);
-  for (const channelType of connectedTypes) {
-    if (sentChannelTypes.has(channelType)) continue;
-    if (notifyChannels && !notifyChannels.includes(channelType)) continue;
-    const target = ownerGroups.find(
-      (g) => getChannelType(g.jid) === channelType && g.folder === sourceFolder,
-    );
-    if (target) {
-      sendFn(target.jid);
-      sentChannelTypes.add(channelType);
-    }
-  }
+  broadcastToOwnerIMChannelsPure(
+    userId,
+    sourceFolder,
+    alreadySentJids,
+    sendFn,
+    notifyChannels,
+    {
+      getConnectedChannelTypes: imManager.getConnectedChannelTypes.bind(imManager),
+      getGroupsByOwner,
+      getChannelType,
+      resolveJidFolder: (jid: string) => {
+        // Follow ImBindingDialog's target_main_jid binding to the bound
+        // workspace's folder. Delegated to resolveWorkspaceJid so we inherit
+        // its legacy-format compatibility: historical DBs may store
+        // target_main_jid as `web:{folder}` instead of `web:{uuid}`,
+        // and resolveWorkspaceJid folds both shapes to the canonical
+        // registered jid.
+        const effectiveJid = resolveWorkspaceJid(jid);
+        if (!effectiveJid) return null;
+        const target =
+          registeredGroups[effectiveJid] ?? getRegisteredGroup(effectiveJid);
+        return target?.folder ?? null;
+      },
+    },
+  );
 }
 
 function startIpcWatcher(): void {
@@ -4096,10 +4336,22 @@ function startIpcWatcher(): void {
       /* tasks-run dir may not exist */
     }
 
-    // Pre-resolve owner's home folder once per group (avoid repeated DB queries in the message loop)
-    const ownerHomeFolderForIm = sourceGroupEntry?.created_by
-      ? getUserHomeGroup(sourceGroupEntry.created_by)?.folder || sourceGroup
-      : sourceGroup;
+    // Broadcast folder: the workspace folder whose IPC message we are
+    // processing. Fix F: use sourceGroup (the emitting workspace's folder),
+    // NOT the owner's home folder — non-home workspaces bind to their own
+    // IM groups and must route replies to those bindings.
+    //
+    // Go through resolveBroadcastFolder so the choice between sourceGroup
+    // and ownerHome is locked by a unit test. Reverting this line to
+    // `ownerHome?.folder || sourceGroup` (the pre-fix F behavior) must
+    // break the helper's test, not silently pass CI.
+    const ownerHomeFolderCandidate = sourceGroupEntry?.created_by
+      ? getUserHomeGroup(sourceGroupEntry.created_by)?.folder
+      : null;
+    const broadcastFolder = resolveBroadcastFolder(
+      sourceGroup,
+      ownerHomeFolderCandidate,
+    );
 
     for (const {
       path: ipcRoot,
@@ -4160,29 +4412,32 @@ function startIpcWatcher(): void {
                     sendImWithFailTracking(ipcImRoute, data.text, localImages);
                   }
 
-                  // Scheduled task: route to the task's configured chat_jid,
-                  // or broadcast to all connected IM channels of the owner
-                  if (data.isScheduledTask && sourceGroupEntry?.created_by) {
+                  // Scheduled-task output routing. Decision logic is in
+                  // resolveTaskRoutingDecision() (src/task-routing.ts) so it
+                  // can be unit-tested without booting this module.
+                  const routingDecision = resolveTaskRoutingDecision(
+                    data,
+                    ipcTaskId,
+                    !!sourceGroupEntry?.created_by,
+                    { getTaskById, getChannelType },
+                  );
+                  if (
+                    routingDecision.mode !== 'none' &&
+                    sourceGroupEntry?.created_by
+                  ) {
                     const taskLocalImages = extractLocalImImagePaths(
                       data.text,
                       sourceGroup,
                     );
-                    let taskNotifyChannels: string[] | null | undefined;
-                    let taskChatJid: string | undefined;
-                    if (ipcTaskId) {
-                      const taskRecord = getTaskById(ipcTaskId);
-                      taskNotifyChannels = taskRecord?.notify_channels;
-                      taskChatJid = taskRecord?.chat_jid;
-                    }
-                    // If the task targets a specific IM group, send directly to it
-                    // (skip if already sent via data.chatJid or ipcImRoute above)
-                    if (taskChatJid && getChannelType(taskChatJid)) {
+                    if (routingDecision.mode === 'direct') {
+                      // Task targets a specific IM group; send there unless
+                      // the prior branches already delivered to the same jid.
                       if (
-                        taskChatJid !== data.chatJid &&
-                        taskChatJid !== ipcImRoute
+                        routingDecision.taskChatJid !== data.chatJid &&
+                        routingDecision.taskChatJid !== ipcImRoute
                       ) {
                         sendImWithFailTracking(
-                          taskChatJid,
+                          routingDecision.taskChatJid,
                           data.text,
                           taskLocalImages,
                         );
@@ -4194,7 +4449,7 @@ function startIpcWatcher(): void {
                       );
                       broadcastToOwnerIMChannels(
                         sourceGroupEntry.created_by,
-                        ownerHomeFolderForIm,
+                        broadcastFolder,
                         alreadySent,
                         (jid) =>
                           sendImWithFailTracking(
@@ -4202,7 +4457,7 @@ function startIpcWatcher(): void {
                             data.text,
                             taskLocalImages,
                           ),
-                        taskNotifyChannels,
+                        routingDecision.notifyChannels,
                       );
                     }
                   }
@@ -4316,24 +4571,28 @@ function startIpcWatcher(): void {
                   });
                   broadcastToWebClients(imgChatJid, displayText);
 
-                  // Scheduled task: broadcast image to all connected IM channels
-                  // (not applicable for agent IPC)
+                  // Scheduled-task image routing. Same decision function as the
+                  // message branch; image IPC has no direct-to-chat_jid mode
+                  // (images only ever fan out), so we ignore 'direct' and
+                  // broadcast on either 'direct' or 'broadcast'.
+                  const imgRoutingDecision = ipcAgentId
+                    ? { mode: 'none' as const }
+                    : resolveTaskRoutingDecision(
+                        data,
+                        ipcTaskId,
+                        !!sourceGroupEntry?.created_by,
+                        { getTaskById, getChannelType },
+                      );
                   if (
-                    !ipcAgentId &&
-                    data.isScheduledTask &&
+                    imgRoutingDecision.mode !== 'none' &&
                     sourceGroupEntry?.created_by
                   ) {
                     const alreadySent = new Set<string>(
                       [data.chatJid, imgImRoute].filter(Boolean) as string[],
                     );
-                    let imgTaskNotifyChannels: string[] | null | undefined;
-                    if (ipcTaskId) {
-                      const imgTaskRecord = getTaskById(ipcTaskId);
-                      imgTaskNotifyChannels = imgTaskRecord?.notify_channels;
-                    }
                     broadcastToOwnerIMChannels(
                       sourceGroupEntry.created_by,
-                      ownerHomeFolderForIm,
+                      broadcastFolder,
                       alreadySent,
                       (jid) =>
                         imManager
@@ -4350,7 +4609,7 @@ function startIpcWatcher(): void {
                               'Failed to broadcast task image to IM',
                             ),
                           ),
-                      imgTaskNotifyChannels,
+                      imgRoutingDecision.notifyChannels,
                     );
                   }
 
@@ -4882,12 +5141,30 @@ async function processTaskIpc(
           data.context_mode === 'group' || data.context_mode === 'isolated'
             ? data.context_mode
             : 'isolated';
-        const executionMode =
-          data.execution_mode === 'host' && isAdminHome
-            ? 'host'
-            : data.execution_mode === 'container'
-              ? 'container'
-              : null;
+        // Inherit execution_mode from the source workspace.
+        // - Source is host: default host, allow explicit container downgrade.
+        // - Source is container: default container, REJECT explicit host
+        //   (prevents container-bound agents from escaping isolation; security).
+        // This matches the user-facing semantics: "a task created from a
+        // docker workspace runs in docker; a task created from a host workspace
+        // runs on host unless explicitly overridden to docker."
+        const sourceIsHost = sourceGroupEntry?.executionMode === 'host';
+        let executionMode: 'host' | 'container';
+        if (data.execution_mode === 'host') {
+          if (!sourceIsHost) {
+            logger.warn(
+              { sourceGroup, targetJid },
+              'schedule_task: host mode requested from container source — forcing container',
+            );
+            executionMode = 'container';
+          } else {
+            executionMode = 'host';
+          }
+        } else if (data.execution_mode === 'container') {
+          executionMode = 'container';
+        } else {
+          executionMode = sourceIsHost ? 'host' : 'container';
+        }
         const taskCreatedBy = resolveTaskOwner(
           {},
           sourceGroupEntry,
@@ -5733,6 +6010,14 @@ async function processAgentConversation(
           },
           agentId,
         );
+
+        // Async LLM title upgrade after the first substantive reply.
+        if (isFirstReply && agent.kind === 'conversation') {
+          const fresh = getAgent(agentId);
+          if (fresh?.title_source === 'auto_pending') {
+            void generateAndApplyLLMTitle(agentId, chatJid, virtualChatJid);
+          }
+        }
 
         const localImagePaths = extractLocalImImagePaths(
           text,
@@ -6654,6 +6939,7 @@ async function ensureDockerRunning(): Promise<void> {
 function buildOnNewChat(
   userId: string,
   homeFolder: string,
+  getOwnerOpenId?: () => string | undefined,
 ): (chatJid: string, chatName: string) => void {
   return (chatJid, chatName) => {
     const existing = registeredGroups[chatJid];
@@ -6743,11 +7029,18 @@ function buildOnNewChat(
       }
       return;
     }
+    const ownerOpenId = getOwnerOpenId?.();
     registerGroup(chatJid, {
       name: chatName,
       folder: homeFolder,
       added_at: new Date().toISOString(),
       created_by: userId,
+      owner_im_id: ownerOpenId,
+      // Only Feishu path (getOwnerOpenId provided) opts into the default
+      // allowlist lock. Other channels leave allowlist unrestricted.
+      sender_allowlist: getOwnerOpenId
+        ? (ownerOpenId ? [ownerOpenId] : [])
+        : undefined,
     });
     logger.info(
       { chatJid, chatName, userId, homeFolder },
@@ -6796,6 +7089,39 @@ function buildTelegramBotAddedHandler(
           'Failed to send Telegram group welcome message',
         ),
       );
+  };
+}
+
+/**
+ * Build the onBotAddedToGroup handler for Feishu connections.
+ * Registers the new group (locked by default) and sends a one-time welcome message.
+ */
+function buildFeishuBotAddedHandler(
+  userId: string,
+  homeFolder: string,
+  getOwnerOpenId?: () => string | undefined,
+): (chatJid: string, chatName: string) => void {
+  const onNewChat = buildOnNewChat(userId, homeFolder, getOwnerOpenId);
+  return (chatJid: string, chatName: string) => {
+    const isNew = !registeredGroups[chatJid] && !getRegisteredGroup(chatJid);
+    onNewChat(chatJid, chatName);
+    if (isNew) {
+      const ownerKnown = !!getOwnerOpenId?.();
+      const welcome =
+        `已加入「${chatName}」。\n\n` +
+        `当前群聊已启用发言者白名单，仅 bot owner 可触发我。\n` +
+        (ownerKnown
+          ? `Owner 已自动从私聊中识别。\n`
+          : `请先向机器人发一条私信，系统将自动识别您的 owner 身份。\n`) +
+        `\n/allow @成员 — 将群成员加入白名单\n` +
+        `/disallow @成员 — 从白名单移除成员\n` +
+        `/allowlist — 查看白名单`;
+      imManager
+        .sendMessage(chatJid, welcome)
+        .catch((err) =>
+          logger.warn({ chatJid, err }, 'Failed to send Feishu group welcome message'),
+        );
+    }
   };
 }
 
@@ -7178,6 +7504,20 @@ function isGroupOwnerMessage(chatJid: string, senderImId?: string): boolean {
 }
 
 /**
+ * 群聊发言者白名单检查。
+ * sender_allowlist 为 null/undefined 时不限制（默认），为空数组时无人可触发，
+ * 为字符串数组时仅列表中的 open_id 可触发。
+ */
+function isSenderAllowedInGroup(chatJid: string, senderImId?: string): boolean {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return false;
+  const allowlist = group.sender_allowlist;
+  if (allowlist === undefined || allowlist === null) return true;
+  if (!senderImId) return false;
+  return allowlist.includes(senderImId);
+}
+
+/**
  * 飞书流式卡片按钮中断回调。
  * 仅由飞书卡片按钮触发，不涉及自动关键词检测。
  */
@@ -7217,13 +7557,24 @@ async function connectUserIMChannels(
   dingtalk: boolean;
   discord: boolean;
 }> {
-  const onNewChat = buildOnNewChat(userId, homeFolder);
+  // Per-user mutable ref for Feishu owner open_id auto-detection via P2P messages
+  const feishuOwnerRef = { value: feishuConfig ? (getUserFeishuConfig(userId)?.ownerOpenId ?? undefined) : undefined };
+  const getFeishuOwnerOpenId = () => feishuOwnerRef.value;
+  const onFeishuP2pSender = (senderOpenId: string) => {
+    if (!feishuOwnerRef.value) {
+      feishuOwnerRef.value = senderOpenId;
+      saveFeishuOwnerOpenId(userId, senderOpenId);
+      logger.info({ userId, senderOpenId }, 'Feishu owner open_id auto-detected from P2P message');
+    }
+  };
+
+  const onNewChat = buildOnNewChat(userId, homeFolder, getFeishuOwnerOpenId);
   const resolveGroupFolder = (chatJid: string): string | undefined => {
     return resolveEffectiveFolder(chatJid);
   };
   const resolveEffectiveChatJid = buildResolveEffectiveChatJid();
   const onAgentMessage = buildOnAgentMessage();
-  const onBotAddedToGroup = buildOnNewChat(userId, homeFolder); // reuse same logic: auto-register
+  const onBotAddedToGroup = buildFeishuBotAddedHandler(userId, homeFolder, getFeishuOwnerOpenId);
   const onBotRemovedFromGroup = buildOnBotRemovedFromGroup();
 
   // 各渠道互相独立，并发连接避免启动时延 N×M 累加
@@ -7242,7 +7593,9 @@ async function connectUserIMChannels(
           onBotRemovedFromGroup,
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
+          isSenderAllowedInGroup,
           onCardInterrupt: handleCardInterrupt,
+          onP2pSender: onFeishuP2pSender,
         })
       : Promise.resolve(false);
 
@@ -7670,7 +8023,16 @@ async function main(): Promise<void> {
     if (config.enabled !== false && config.appId && config.appSecret) {
       const homeGroup = getUserHomeGroup(adminUser.id);
       const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
-      const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
+      const adminOwnerRef = { value: getUserFeishuConfig(adminUser.id)?.ownerOpenId ?? undefined };
+      const getAdminOwnerOpenId = () => adminOwnerRef.value;
+      const onAdminP2pSender = (senderOpenId: string) => {
+        if (!adminOwnerRef.value) {
+          adminOwnerRef.value = senderOpenId;
+          saveFeishuOwnerOpenId(adminUser.id, senderOpenId);
+          logger.info({ userId: adminUser.id, senderOpenId }, 'Feishu owner open_id auto-detected from P2P message');
+        }
+      };
+      const onNewChat = buildOnNewChat(adminUser.id, homeFolder, getAdminOwnerOpenId);
       const connected = await imManager.connectUserFeishu(
         adminUser.id,
         config,
@@ -7678,11 +8040,13 @@ async function main(): Promise<void> {
         {
           ignoreMessagesBefore: Date.now(),
           onCommand: handleCommand,
-          onBotAddedToGroup: buildOnNewChat(adminUser.id, homeFolder),
+          onBotAddedToGroup: buildFeishuBotAddedHandler(adminUser.id, homeFolder, getAdminOwnerOpenId),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
+          isSenderAllowedInGroup,
           onCardInterrupt: handleCardInterrupt,
+          onP2pSender: onAdminP2pSender,
         },
       );
       if (connected) {
@@ -7764,8 +8128,8 @@ async function main(): Promise<void> {
       return false;
     }
     const homeFolder = homeGroup.folder;
-    const onNewChat = buildOnNewChat(userId, homeFolder);
     const ignoreMessagesBefore = Date.now();
+    const onNewChat = buildOnNewChat(userId, homeFolder);
 
     if (channel === 'feishu') {
       await imManager.disconnectUserFeishu(userId);
@@ -7776,6 +8140,16 @@ async function main(): Promise<void> {
         config.appId &&
         config.appSecret
       ) {
+        const reloadOwnerRef = { value: config.ownerOpenId ?? undefined };
+        const getReloadOwnerOpenId = () => reloadOwnerRef.value;
+        const onReloadP2pSender = (senderOpenId: string) => {
+          if (!reloadOwnerRef.value) {
+            reloadOwnerRef.value = senderOpenId;
+            saveFeishuOwnerOpenId(userId, senderOpenId);
+            logger.info({ userId, senderOpenId }, 'Feishu owner open_id auto-detected from P2P message');
+          }
+        };
+        const onNewChat = buildOnNewChat(userId, homeFolder, getReloadOwnerOpenId);
         const connected = await imManager.connectUserFeishu(
           userId,
           config,
@@ -7783,11 +8157,13 @@ async function main(): Promise<void> {
           {
             ignoreMessagesBefore,
             onCommand: handleCommand,
-            onBotAddedToGroup: buildOnNewChat(userId, homeFolder),
+            onBotAddedToGroup: buildFeishuBotAddedHandler(userId, homeFolder, getReloadOwnerOpenId),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
             shouldProcessGroupMessage,
             isGroupOwnerMessage,
+            isSenderAllowedInGroup,
             onCardInterrupt: handleCardInterrupt,
+            onP2pSender: onReloadP2pSender,
           },
         );
         logger.info(
@@ -7967,6 +8343,7 @@ async function main(): Promise<void> {
   startWebServer({
     queue,
     getRegisteredGroups: () => registeredGroups,
+    sessions,
     getSessions: () => sessions,
     processGroupMessages,
     ensureTerminalContainerStarted,
@@ -8205,7 +8582,7 @@ async function main(): Promise<void> {
     sendMessage,
     broadcastStreamEvent,
     onWorkspaceCreated: broadcastGroupCreated,
-    storePromptMessage: (chatJid, senderId, senderName, text) => {
+    storePromptMessage: (chatJid, senderId, senderName, text, taskId) => {
       const msgId = crypto.randomUUID();
       const now = new Date().toISOString();
       ensureChatExists(chatJid);
@@ -8218,7 +8595,7 @@ async function main(): Promise<void> {
         now,
         false,
         {
-          meta: { sourceKind: 'scheduled_task_prompt' },
+          meta: { sourceKind: 'scheduled_task_prompt', taskId },
         },
       );
       broadcastNewMessage(chatJid, {
@@ -8244,11 +8621,12 @@ async function main(): Promise<void> {
 
       if (options.ownerId) {
         const ownerHome = getUserHomeGroup(options.ownerId);
-        if (ownerHome?.folder) {
-          const localImages = extractLocalImImagePaths(text, ownerHome.folder);
+        const broadcastFolder = options.workspaceFolder ?? ownerHome?.folder;
+        if (broadcastFolder) {
+          const localImages = extractLocalImImagePaths(text, broadcastFolder);
           broadcastToOwnerIMChannels(
             options.ownerId,
-            ownerHome.folder,
+            broadcastFolder,
             new Set<string>(),
             (jid) => sendImWithFailTracking(jid, text, localImages),
             options.notifyChannels,

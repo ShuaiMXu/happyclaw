@@ -5,7 +5,7 @@ import { ScheduledTask, TaskRunLog, useTasksStore } from '../../stores/tasks';
 import { showToast } from '../../utils/toast';
 import { INTERVAL_UNITS, formatInterval, decomposeInterval, toggleNotifyChannel } from '../../utils/task-utils';
 import { useConnectedChannels } from '../../hooks/useConnectedChannels';
-import { ChannelBadge, CHANNEL_LABEL } from '../settings/channel-meta';
+import { ChannelBadge, CHANNEL_LABEL, formatGroupLabel } from '../settings/channel-meta';
 
 interface TaskDetailProps {
   task: ScheduledTask;
@@ -439,16 +439,11 @@ export function TaskDetail({ task }: TaskDetailProps) {
               }
               className="w-full text-sm text-foreground bg-card px-2 py-1 rounded border border-border focus:outline-none focus:ring-1 focus:ring-primary"
             >
-              {Object.entries(groupNames).map(([jid, name]) => {
-                const channelType = jid.split(':')[0];
-                const channelLabel = CHANNEL_LABEL[channelType] || (channelType === 'web' ? 'Web' : channelType);
-                const shortId = jid.split(':').slice(1).join(':');
-                return (
-                  <option key={jid} value={jid}>
-                    [{channelLabel}] {name} ({shortId})
-                  </option>
-                );
-              })}
+              {Object.entries(groupNames).map(([jid, name]) => (
+                <option key={jid} value={jid}>
+                  {formatGroupLabel(jid, name)}
+                </option>
+              ))}
             </select>
           ) : (
             <div className="text-sm text-foreground inline-flex items-center gap-1.5">

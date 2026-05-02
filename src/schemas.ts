@@ -244,6 +244,7 @@ export const SystemSettingsSchema = z.object({
       'autoCompactWindow must be 0 (disabled) or between 10000 and 2000000',
     )
     .optional(),
+  disableMemoryLayerForAdminHost: z.boolean().optional(),
 });
 
 export const AppearanceConfigSchema = z.object({

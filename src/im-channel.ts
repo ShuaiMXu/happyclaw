@@ -42,13 +42,15 @@ import {
 } from './feishu-streaming-card.js';
 import type { DingTalkStreamingCardController } from './dingtalk-streaming-card.js';
 import type { DiscordStreamingEditController } from './discord-streaming-edit.js';
+import type { QQStreamingController } from './qq-streaming-card.js';
 import { CHANNEL_PREFIXES } from './channel-prefixes.js';
 
-/** Union type for any streaming card controller (Feishu, DingTalk, or Discord) */
+/** Union type for any streaming card controller (Feishu, DingTalk, Discord, or QQ) */
 export type StreamingSession =
   | StreamingCardController
   | DingTalkStreamingCardController
-  | DiscordStreamingEditController;
+  | DiscordStreamingEditController
+  | QQStreamingController;
 
 // ─── Unified Interface ──────────────────────────────────────────
 
@@ -88,10 +90,14 @@ export interface IMChannelConnectOpts {
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   /** owner_mentioned 模式下检查发送者是否为 owner */
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
+  /** 发言者白名单：返回 false 则丢弃（命令处理后、mention 门控前调用） */
+  isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** Resolve registered group for a jid */
   resolveRegisteredGroup?: (jid: string) => { activation_mode?: string } | undefined;
   /** 飞书流式卡片按钮中断回调 */
   onCardInterrupt?: (chatJid: string) => void;
+  /** P2P（私聊）消息到达时调用，用于自动检测 owner open_id（仅飞书） */
+  onP2pSender?: (senderOpenId: string) => void;
 }
 
 export interface IMChannel {
@@ -186,7 +192,9 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
         shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
         isGroupOwnerMessage: opts.isGroupOwnerMessage,
+        isSenderAllowedInGroup: opts.isSenderAllowedInGroup,
         onCardInterrupt: opts.onCardInterrupt,
+        onP2pSender: opts.onP2pSender,
       });
       if (!connected) {
         inner = null;
@@ -505,6 +513,40 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
 
     isConnected(): boolean {
       return inner?.isConnected() ?? false;
+    },
+
+    async createStreamingSession(
+      chatId: string,
+      _onCardCreated?: (messageId: string) => void,
+    ): Promise<StreamingSession | undefined> {
+      if (!inner) return undefined;
+      // Stream messages only work for C2C (private chat)
+      if (chatId.startsWith('group:')) return undefined;
+
+      const { QQStreamingController } = await import('./qq-streaming-card.js');
+      const openid = chatId.startsWith('c2c:') ? chatId.slice(4) : chatId;
+      const chatKey = `c2c:${openid}`;
+      const msgSeq = inner.getNextMsgSeq(chatKey);
+      const passiveMsgId = inner.getLastIncomingMsgId(openid);
+      const conn = inner;
+
+      if (!passiveMsgId) {
+        // QQ stream_messages endpoint rejects requests without a passive
+        // msg_id reference. Without it there's no point starting a session.
+        logger.debug(
+          { openid },
+          'QQ streaming session skipped: no incoming msg_id yet',
+        );
+        return undefined;
+      }
+
+      return new QQStreamingController({
+        openid,
+        msgSeq,
+        sendStreamChunk: (oid, params) => conn.sendStreamMessage(oid, params),
+        fallbackSend: (text) => conn.sendMessage(chatKey, text),
+        passiveMsgId,
+      });
     },
   };
 

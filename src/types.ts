@@ -63,6 +63,7 @@ export interface RegisteredGroup {
   require_mention?: boolean; // 群聊是否需要 @机器人 才响应（默认 false）
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
   owner_im_id?: string; // activation_mode 为 'owner_mentioned' 时，仅此 IM 标识符的发送者被响应
+  sender_allowlist?: string[] | null; // null/undefined = 不限制，[] = 仅 owner 可触发（未 /claim 时无人可触发），[ids] = 白名单
   mcp_mode?: 'inherit' | 'custom'; // MCP 配置模式（默认 'inherit' 继承用户配置）
   selected_mcps?: string[] | null; // custom 模式下选中的 MCP server IDs
   conversation_source?: ConversationSource; // 工作区会话来源（默认 manual）
@@ -95,6 +96,7 @@ export interface NewMessage {
   sdk_message_uuid?: string | null;
   source_kind?: MessageSourceKind | null;
   finalization_reason?: MessageFinalizationReason | null;
+  task_id?: string | null;
 }
 
 export type MessageSourceKind =
@@ -402,6 +404,7 @@ export type WsMessageOut =
       name: string;
       prompt: string;
       resultSummary?: string;
+      titleGenerating?: boolean;
     }
   | {
       type: 'runner_state';

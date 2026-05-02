@@ -83,6 +83,7 @@ import {
 import { markdownToPlainText } from './im-utils.js';
 import { isSessionExpired } from './auth.js';
 import type {
+  AgentStatus,
   NewMessage,
   WsMessageOut,
   WsMessageIn,
@@ -462,13 +463,15 @@ async function handleAgentConversationMessage(
   );
   updateAgentContextInfo(agentId, { last_active_at: timestamp });
 
-  // Auto-title: generate title from first user message
+  // Auto-title: show a quick placeholder derived from the first user message.
+  // Keep title_source='auto_pending' so processAgentConversation() can upgrade
+  // it to an LLM-generated title after the first reply finalizes.
   if (agent.title_source === 'auto_pending') {
     const autoTitle = generateAutoTitle(content);
     if (autoTitle) {
-      updateAgentContextInfo(agentId, { name: autoTitle, title_source: 'auto' });
+      updateAgentContextInfo(agentId, { name: autoTitle });
       updateChatName(virtualChatJid, autoTitle);
-      broadcastAgentStatus(chatJid, agentId, agent.status as import('./types.js').AgentStatus, autoTitle, agent.prompt);
+      broadcastAgentStatus(chatJid, agentId, agent.status as AgentStatus, autoTitle, agent.prompt);
     }
   }
 
@@ -1613,6 +1616,7 @@ export function broadcastAgentStatus(
   prompt: string,
   resultSummary?: string,
   kind?: import('./types.js').AgentKind,
+  titleGenerating?: boolean,
 ): void {
   const jid = normalizeHomeJid(chatJid);
   const allowedUserIds = getGroupAllowedUserIds(chatJid);
@@ -1627,8 +1631,35 @@ export function broadcastAgentStatus(
     name,
     prompt,
     resultSummary,
+    titleGenerating,
   };
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+}
+
+/**
+ * Broadcast an `agent_status` message that only flips the `titleGenerating`
+ * loading flag — reads `agent.status`/`name`/`prompt` fresh from DB. Used by
+ * the LLM title-generation path so callers don't have to pre-fetch the agent
+ * and pass undefined positional params just to reach the 8th argument.
+ */
+export function broadcastTitleGenerating(
+  chatJid: string,
+  agentId: string,
+  generating: boolean,
+  overrideName?: string,
+): void {
+  const agent = getAgent(agentId);
+  if (!agent) return;
+  broadcastAgentStatus(
+    chatJid,
+    agentId,
+    agent.status as AgentStatus,
+    overrideName ?? agent.name,
+    agent.prompt,
+    undefined,
+    undefined,
+    generating,
+  );
 }
 
 export function broadcastRunnerState(

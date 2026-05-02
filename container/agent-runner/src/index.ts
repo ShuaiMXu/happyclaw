@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import { query, HookCallback, PreCompactHookInput, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
@@ -331,12 +332,22 @@ class MessageStream {
     }
 
     const rejectedReasons: string[] = [];
+    const originalImageCount = images?.length ?? 0;
     let filteredImages = images;
 
     if (filteredImages && filteredImages.length > 0) {
       const { valid, rejected } = filterOversizedImages(filteredImages);
       rejectedReasons.push(...rejected);
       filteredImages = valid.length > 0 ? valid : undefined;
+    }
+
+    // 全部图片被过滤 + text 为空时，替换为说明文本，避免 SDK 收到空 user message
+    // 进而让主模型回复"消息是空的"。典型触发：Web 用户直接粘贴长图（height > 8000px）无文字。
+    let effectiveText = text;
+    const allImagesDropped =
+      originalImageCount > 0 && (!filteredImages || filteredImages.length === 0);
+    if (allImagesDropped && !effectiveText.trim()) {
+      effectiveText = `[用户发送了 ${originalImageCount} 张图片，但因尺寸超出 API 限制（最大 ${IMAGE_MAX_DIMENSION}px）被跳过。请提示用户压缩或截取后重发。]`;
     }
 
     let content:
@@ -346,7 +357,7 @@ class MessageStream {
     if (filteredImages && filteredImages.length > 0) {
       // 多模态消息：text + images
       content = [
-        { type: 'text', text },
+        { type: 'text', text: effectiveText },
         ...filteredImages.map((img) => ({
           type: 'image' as const,
           source: {
@@ -358,7 +369,7 @@ class MessageStream {
       ];
     } else {
       // 纯文本消息
-      content = text;
+      content = effectiveText;
     }
 
     this.queue.push({
@@ -564,6 +575,7 @@ function trimSessionJsonl(jsonlPath: string): void {
 function createPreCompactHook(
   isHome: boolean,
   _isAdminHome: boolean,
+  disableMemoryLayer: boolean,
   deps: { emit: (output: ContainerOutput) => void; getFullText: () => string; resetFullText: () => void },
 ): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -634,7 +646,8 @@ function createPreCompactHook(
     hadCompaction = true;
 
     // Flag memory flush for home containers (full memory write access)
-    if (isHome) {
+    // Skip in native Claude mode — user's ~/.claude/ Playbook handles memory persistence
+    if (isHome && !disableMemoryLayer) {
       needsMemoryFlush = true;
       log('PreCompact: flagged memory flush for home container');
     }
@@ -774,7 +787,7 @@ function shouldDrain(): boolean {
  * Returns messages found (with optional images), or empty array.
  */
 interface IpcDrainResult {
-  messages: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }>;
+  messages: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string }>;
 }
 
 function drainIpcInput(): IpcDrainResult {
@@ -793,6 +806,7 @@ function drainIpcInput(): IpcDrainResult {
           result.messages.push({
             text: data.text,
             images: data.images,
+            taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
           });
         }
       } catch (err) {
@@ -864,7 +878,7 @@ function createIpcWatcher(onFileDetected: () => void): { close: () => void } {
  * Wait for a new IPC message or _close sentinel.
  * Returns the messages (with optional images), or null if _close.
  */
-function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: string; mimeType?: string }> } | null> {
+function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string } | null> {
   return new Promise((resolve) => {
     let resolved = false;
     const tryDrain = () => {
@@ -895,9 +909,19 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
       if (messages.length > 0) {
         const combinedText = messages.map((m) => m.text).join('\n');
         const allImages = messages.flatMap((m) => m.images || []);
+        // If any drained message carries a taskId, attribute the combined turn
+        // to it (take the last one — later messages supersede earlier in a batch).
+        let combinedTaskId: string | undefined;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].taskId) { combinedTaskId = messages[i].taskId; break; }
+        }
         resolved = true;
         ipcWatcher?.close();
-        resolve({ text: combinedText, images: allImages.length > 0 ? allImages : undefined });
+        resolve({
+          text: combinedText,
+          images: allImages.length > 0 ? allImages : undefined,
+          taskId: combinedTaskId,
+        });
         return;
       }
     };
@@ -908,7 +932,11 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
   });
 }
 
-function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean): string {
+function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean, disableMemoryLayer: boolean): string {
+  // 禁用记忆层：完全跳过 HappyClaw 的记忆系统提示，让用户本机 ~/.claude/ Playbook 接管
+  if (disableMemoryLayer) {
+    return '';
+  }
   if (isHome) {
     // Home container (admin or member): full memory system with read/write access to user's global CLAUDE.md
     return [
@@ -975,8 +1003,19 @@ function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean): string 
   ].join('\n');
 }
 
-/** 从 settings.json 读取用户配置的 MCP servers（stdio/http/sse 类型） */
+/** 读取用户配置的 MCP servers（stdio/http/sse 类型） */
 function loadUserMcpServers(): Record<string, unknown> {
+  // 禁用记忆层模式下 CLAUDE_CONFIG_DIR 指向 ~/.claude/，HappyClaw 管理的 per-user MCP
+  // 不在那份 settings.json 里，container-runner 通过 env 透传。优先读 env。
+  const envJson = process.env.HAPPYCLAW_USER_MCP_SERVERS_JSON;
+  if (envJson) {
+    try {
+      const parsed = JSON.parse(envJson);
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Record<string, unknown>;
+      }
+    } catch { /* fall through to settings.json */ }
+  }
   const configDir = process.env.CLAUDE_CONFIG_DIR
     || path.join(process.env.HOME || '/home/node', '.claude');
   const settingsFile = path.join(configDir, 'settings.json');
@@ -1025,8 +1064,13 @@ async function runQuery(
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }> }> {
   const stream = new MessageStream();
+  // Track messages piped into this query.  When the query is interrupted,
+  // these messages would otherwise be lost (consumed by the aborted query).
+  // The main loop uses them as the next prompt so the user's queued intent
+  // continues after the cancelled turn (#421, Claude Code-style queuing).
+  const pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }> = [];
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   let canonicalAssistantText: string | undefined;
@@ -1074,6 +1118,9 @@ async function runQuery(
   let queryRef: { interrupt(): Promise<void> } | null = null;
   let messageCount = 0;
   let resultCount = 0;
+  // SDK transport is not ready until system/init is received. Piping user messages
+  // before init causes "ProcessTransport is not ready for writing" unhandled rejection.
+  let sdkTransportReady = false;
 
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
@@ -1141,9 +1188,17 @@ async function runQuery(
       return;
     }
 
+    // Don't pipe user messages before system/init — the SDK ProcessTransport is not
+    // ready yet and streamInput() will throw "ProcessTransport is not ready for writing".
+    // IPC files remain on disk; we'll drain them once sdkTransportReady is set.
+    if (!sdkTransportReady) {
+      return;
+    }
+
     const { messages } = drainIpcInput();
     for (const msg of messages) {
       log(`Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`);
+      pipedMessagesDuringQuery.push(msg);
       const rejected = stream.push(msg.text, msg.images);
       for (const reason of rejected) {
         emit({ status: 'success', result: `\u26a0\ufe0f ${reason}`, newSessionId: undefined });
@@ -1162,10 +1217,12 @@ async function runQuery(
   const processor = new StreamEventProcessor(emit, log);
 
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
+  const disableMemoryLayer = process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
 
   // Resumed sessions carry prior history — skip re-injecting HEARTBEAT.md to save cache tokens.
+  // HEARTBEAT.md 住在 HappyClaw 记忆层（WORKSPACE_GLOBAL），禁用该层时不读取。
   let heartbeatContent = '';
-  if (isHome && !sessionId) {
+  if (isHome && !sessionId && !disableMemoryLayer) {
     const heartbeatPath = path.join(WORKSPACE_GLOBAL, 'HEARTBEAT.md');
     if (fs.existsSync(heartbeatPath)) {
       try {
@@ -1196,7 +1253,7 @@ async function runQuery(
     `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
     `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>`,
     `<security>\n${SECURITY_RULES}\n</security>`,
-    `<memory-system>\n${memoryRecall}\n</memory-system>`,
+    memoryRecall && `<memory-system>\n${memoryRecall}\n</memory-system>`,
     heartbeatContent && `<recent-work>\n${heartbeatContent}\n</recent-work>`,
     GUIDELINES_BLOCK,
     channelGuidelines && `<channel-format>\n${channelGuidelines}\n</channel-format>`,
@@ -1206,9 +1263,13 @@ async function runQuery(
   // Home containers (admin & member) can access global and memory directories.
   // Non-home containers only access memory directory; global CLAUDE.md is NOT
   // injected into systemPrompt but remains accessible via filesystem (readonly mount).
-  const extraDirs = isHome
-    ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
-    : [WORKSPACE_MEMORY];
+  // 禁用记忆层时 WORKSPACE_GLOBAL/MEMORY 环境变量未设置，fallback 到 /workspace/xxx
+  // 容器路径在宿主机不存在，会让 SDK 报警告；此时直接给空数组。
+  const extraDirs = disableMemoryLayer
+    ? []
+    : isHome
+      ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
+      : [WORKSPACE_MEMORY];
 
   if (shouldInterrupt()) {
     log('Interrupt sentinel detected before query start, skipping query');
@@ -1216,7 +1277,7 @@ async function runQuery(
     suppressOutputAfterInterrupt = true;
     ipcPolling = false;
     stream.end();
-    return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+    return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
   }
 
   // SystemSettings.autoCompactWindow（通过 AUTO_COMPACT_WINDOW 环境变量注入）
@@ -1227,10 +1288,37 @@ async function runQuery(
     flagSettings.autoCompactWindow = autoCompactWindow;
   }
 
+  // Resolve the actual claude CLI path using `which`.
+  // SDK 的 optionalDependencies（@anthropic-ai/claude-agent-sdk-linux-x64 等）在 npm 上是空包，
+  // 无法通过 node_modules/.bin/ 找到 working binary。通过 which 找到实际路径后传给 SDK。
+  let pathToClaudeCodeExecutable: string | undefined;
+  try {
+    const resolvedPath = execFileSync('which', ['claude'], { timeout: 5_000, encoding: 'utf-8' }).trim();
+    if (resolvedPath) {
+      pathToClaudeCodeExecutable = resolvedPath;
+    }
+  } catch {
+    // Fallback: try to find it in common locations
+    const commonPaths = [
+      '/usr/local/bin/claude',
+      '/usr/bin/claude',
+      path.join(process.env.HOME || '/root', '.local/bin/claude'),
+      // 容器内 agent-runner 的本地依赖（package.json 声明了 @anthropic-ai/claude-code）
+      '/app/node_modules/.bin/claude',
+    ];
+    for (const p of commonPaths) {
+      if (fs.existsSync(p)) {
+        pathToClaudeCodeExecutable = p;
+        break;
+      }
+    }
+  }
+
   try {
     const q = query({
     prompt: stream,
     options: {
+      ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
       model: CLAUDE_MODEL,
       cwd: WORKSPACE_GROUP,
       additionalDirectories: extraDirs,
@@ -1239,7 +1327,7 @@ async function runQuery(
       systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
       allowedTools,
       ...(disallowedTools && { disallowedTools }),
-      thinking: { type: 'adaptive' as const },
+      thinking: { type: 'adaptive' as const, display: 'summarized' as const },
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       agentProgressSummaries: true,
@@ -1251,7 +1339,7 @@ async function runQuery(
         happyclaw: mcpServerConfig,  // 内置 SDK MCP 放最后，确保不被同名覆盖
       },
       hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome, {
+        PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome, disableMemoryLayer, {
           emit,
           getFullText: () => processor.getFullText(),
           resetFullText: () => processor.resetFullTextAccumulator(),
@@ -1377,6 +1465,9 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+      // Mark transport ready and drain any IPC messages that arrived before init.
+      sdkTransportReady = true;
+      pollIpcDuringQuery();
 
       // Log skills and context usage for observability.
       // getContextUsage() is a newer SDK API; feature-detect to avoid spamming
@@ -1420,7 +1511,7 @@ async function runQuery(
         // so the caller can retry with a fresh session instead of crashing.
         if (!newSessionId) {
           log(`Session resume failed (no init): ${resultSubtype}`);
-          return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, sessionResumeFailed: true };
+          return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery, sessionResumeFailed: true };
         }
         const detail = textResult?.trim()
           ? textResult.trim()
@@ -1444,12 +1535,12 @@ async function runQuery(
           });
         }
         processor.resetFullTextAccumulator();
-        return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery };
+        return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery, pipedMessagesDuringQuery };
       }
       if (textResult && isUnrecoverableTranscriptError(textResult)) {
         log(`Unrecoverable transcript error in result: ${textResult.slice(0, 200)}`);
         processor.resetFullTextAccumulator();
-        return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery };
+        return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery, pipedMessagesDuringQuery };
       }
 
       const { effectiveResult } = processor.processResult(textResult);
@@ -1526,7 +1617,7 @@ async function runQuery(
   ipcPolling = false;
   ipcQueryWatcher.close();
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, interruptedDuringQuery: ${interruptedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
   } catch (err) {
     ipcPolling = false;
     ipcQueryWatcher.close();
@@ -1547,19 +1638,19 @@ async function runQuery(
           finalizationReason: 'error',
         });
       }
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
     // 检测不可恢复的转录错误
     if (isUnrecoverableTranscriptError(errorMessage)) {
       log(`Unrecoverable transcript error: ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
     // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出
     if (interruptedDuringQuery) {
       log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
     // SDK 在 yield result 后可能再抛异常（如检测到 result text 含错误内容），
@@ -1571,7 +1662,7 @@ async function runQuery(
       if (err instanceof Error && err.stack) {
         log(`runQuery post-result error stack:\n${err.stack}`);
       }
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
     // 其他错误：记录完整堆栈后继续抛出
@@ -1624,17 +1715,25 @@ async function main(): Promise<void> {
   latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
 
+  // 禁用 HappyClaw 记忆层：不注册 memory MCP 工具，让 Agent 按用户本机 Playbook 行事
+  const disableMemoryLayer = process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
+
   // Create in-process SDK MCP server (replaces the stdio subprocess)
+  // NOTE: currentTaskId is mutated in-place by the main loop below so that
+  // createMcpTools() closures observe updates via ctx reference. See the
+  // clear-before-next-turn logic at the bottom of the query loop.
   const mcpToolsConfig = {
     chatJid: containerInput.chatJid,
     groupFolder: containerInput.groupFolder,
     isHome,
     isAdminHome,
     isScheduledTask: containerInput.isScheduledTask || false,
+    currentTaskId: containerInput.messageTaskId ?? null,
     workspaceIpc: WORKSPACE_IPC,
     workspaceGroup: WORKSPACE_GROUP,
     workspaceGlobal: WORKSPACE_GLOBAL,
     workspaceMemory: WORKSPACE_MEMORY,
+    disableMemoryLayer,
   };
   const buildMcpServerConfig = () => createSdkMcpServer({
     name: 'happyclaw',
@@ -1642,7 +1741,7 @@ async function main(): Promise<void> {
     tools: createMcpTools(mcpToolsConfig),
   });
   let mcpServerConfig = buildMcpServerConfig();
-  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome);
+  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome, disableMemoryLayer);
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.
@@ -1806,9 +1905,8 @@ async function main(): Promise<void> {
         break;
       }
 
-      // 中断后：跳过 memory flush 和 session update，等待下一条消息
+      // 中断后：跳过 memory flush 和 session update
       if (queryResult.interruptedDuringQuery) {
-        log('Query interrupted by user, waiting for next message');
         // 中断后清除 resumeAt：被中断的 assistant 消息可能未完整提交到 session 历史。
         // 使用 undefined 让 SDK 自行选择恢复点，避免因指向不完整消息的 UUID 导致 resume 失败。
         resumeAt = undefined;
@@ -1818,9 +1916,33 @@ async function main(): Promise<void> {
           streamEvent: { eventType: 'status', statusText: 'interrupted' },
           newSessionId: sessionId,  // 确保主进程持久化 session ID
         });
-        // 清理可能残留的 _interrupt 文件
+        // 清理可能残留的 _interrupt / _drain 文件
         try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
-        // 不 break，等待下一条消息
+        try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
+        clearInterruptRequested();
+        consecutiveCompactions = 0;
+
+        // Claude Code-style 排队行为：被中断的 query 已经消费了 pipe 进来的消息，
+        // 但这些消息尚未得到回复。将它们写回 IPC 目录作为新文件，通过 waitForIpcMessage
+        // 正常路径走下一个 query，避免 MCP server "Already connected" 问题 (#421)。
+        if (queryResult.pipedMessagesDuringQuery.length > 0) {
+          const piped = queryResult.pipedMessagesDuringQuery;
+          log(`Query interrupted; re-enqueueing ${piped.length} queued message(s) to IPC`);
+          for (const msg of piped) {
+            const filename = `${Date.now()}-requeue-${Math.random().toString(36).slice(2, 8)}.json`;
+            const filepath = path.join(IPC_INPUT_DIR, filename);
+            const tempPath = `${filepath}.tmp`;
+            try {
+              fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: msg.text, images: msg.images }));
+              fs.renameSync(tempPath, filepath);
+            } catch (err) {
+              log(`Failed to re-enqueue piped message: ${err}`);
+            }
+          }
+        }
+
+        // 等待下一条消息（包括刚重新入队的 piped 消息）
+        log('Query interrupted by user, waiting for next message');
         const nextMessage = await waitForIpcMessage();
         if (nextMessage === null) {
           log('Close sentinel received after interrupt, exiting');
@@ -1828,11 +1950,14 @@ async function main(): Promise<void> {
           writeOutput({ status: 'success', result: null, newSessionId: sessionId });
           break;
         }
-        clearInterruptRequested();
-        consecutiveCompactions = 0;
         prompt = nextMessage.text;
         promptImages = nextMessage.images;
         containerInput.turnId = generateTurnId();
+        // See main-loop comment: reset task attribution for this new turn.
+        mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
+        // Rebuild MCP server to avoid "Already connected to a transport" error
+        // when the previous query was aborted mid-stream (#421).
+        mcpServerConfig = buildMcpServerConfig();
         continue;
       }
 
@@ -1985,6 +2110,12 @@ async function main(): Promise<void> {
       prompt = nextMessage.text;
       promptImages = nextMessage.images;
       containerInput.turnId = generateTurnId();
+      // Clear per-turn task attribution: the previous query may have been a
+      // scheduled-task turn, but this new IPC message is a regular follow-up
+      // unless it explicitly carried a taskId (see nextMessage.taskId below).
+      // Forgetting to clear would cause regular user replies to be broadcast
+      // to the task's notify channels, hijacking later conversation.
+      mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -2073,6 +2204,14 @@ process.on('unhandledRejection', (reason: unknown) => {
   }
   if (isWithinInterruptGraceWindow()) {
     console.error('Unhandled rejection during interrupt (non-fatal):', reason);
+    return;
+  }
+  // SDK throws this when streamInput() is called before the ProcessTransport is ready.
+  // The sdkTransportReady guard in pollIpcDuringQuery should prevent this, but catch
+  // it here as a safety net to avoid crashing the agent on any residual race windows.
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  if (msg.includes('ProcessTransport is not ready for writing')) {
+    console.error('Suppressing ProcessTransport race (non-fatal):', reason);
     return;
   }
   console.error('Unhandled rejection:', reason);

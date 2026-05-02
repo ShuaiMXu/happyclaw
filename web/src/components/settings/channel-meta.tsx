@@ -62,6 +62,18 @@ export const CHANNEL_ICON: Record<string, React.FC> = {
   discord: DiscordIcon,
 };
 
+/**
+ * Format a JID + display name as `[ChannelLabel] name (shortId)`. Used by
+ * task pickers (CreateTaskForm, TaskDetail) so the channel origin of each
+ * group is visible at a glance.
+ */
+export function formatGroupLabel(jid: string, name: string): string {
+  const channelType = jid.split(':')[0];
+  const channelLabel = CHANNEL_LABEL[channelType] || (channelType === 'web' ? 'Web' : channelType);
+  const shortId = jid.split(':').slice(1).join(':');
+  return `[${channelLabel}] ${name} (${shortId})`;
+}
+
 /** Render a channel badge with icon + label */
 export function ChannelBadge({ channelType }: { channelType: string }) {
   const Icon = CHANNEL_ICON[channelType];

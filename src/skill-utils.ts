@@ -30,14 +30,13 @@ export function validateSkillPath(
   skillsRoot: string,
   skillDir: string,
 ): boolean {
-  try {
-    const realSkillsRoot = fs.realpathSync(skillsRoot);
-    const realSkillDir = fs.realpathSync(skillDir);
-    const relative = path.relative(realSkillsRoot, realSkillDir);
-    return !relative.startsWith('..') && !path.isAbsolute(relative);
-  } catch {
-    return false;
-  }
+  // Use path.resolve (not fs.realpathSync) so symlinked skills whose targets
+  // live outside skillsRoot still pass validation.  Path traversal is already
+  // prevented by validateSkillId ([\w\-]+ only).
+  const normalizedRoot = path.resolve(skillsRoot);
+  const normalizedDir = path.resolve(skillDir);
+  const relative = path.relative(normalizedRoot, normalizedDir);
+  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
 export function parseFrontmatter(content: string): Record<string, string> {

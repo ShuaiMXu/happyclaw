@@ -22,6 +22,7 @@ import {
   getStreamingSession,
 } from './feishu-streaming-card.js';
 import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
+import { buildAgentReplyCard } from './feishu-cards/builder.js';
 import type { FeishuMessageMeta } from './types.js';
 
 // ─── FeishuConnection Interface ────────────────────────────────
@@ -43,8 +44,8 @@ export interface ConnectOptions {
   onNewChat?: (chatJid: string, chatName: string) => void;
   /** 热重连时设置：丢弃 create_time 早于此时间戳（epoch ms）的消息，避免处理渠道关闭期间的堆积消息 */
   ignoreMessagesBefore?: number;
-  /** 斜杠指令回调（如 /clear），返回回复文本或 null */
-  onCommand?: (chatJid: string, command: string, senderImId?: string) => Promise<string | null>;
+  /** 斜杠指令回调（如 /clear），返回回复文本或 null；mentions 仅飞书渠道传入，用于 /allow 等命令 */
+  onCommand?: (chatJid: string, command: string, senderImId?: string, mentions?: FeishuMentionLike[]) => Promise<string | null>;
   /** 根据 chatJid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (chatJid: string) => string | undefined;
   /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
@@ -62,8 +63,12 @@ export interface ConnectOptions {
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   /** owner_mentioned 模式下检查发送者是否为 owner */
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
+  /** 发言者白名单：命令处理之后、mention 门控之前调用；返回 false 则丢弃 */
+  isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** 飞书流式卡片按钮中断回调 */
   onCardInterrupt?: (chatJid: string) => void;
+  /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
+  onP2pSender?: (senderOpenId: string) => void;
 }
 
 export interface FeishuChatInfo {
@@ -105,8 +110,6 @@ export interface FeishuConnection {
 
 // ─── Shared Helpers (pure functions, no instance state) ────────
 
-// Max characters per markdown element in Feishu cards
-const CARD_MD_LIMIT = 4000;
 // Feishu card allows at most 5 markdown tables; beyond this, skip card and use post+md directly
 const CARD_TABLE_LIMIT = 5;
 const FEISHU_WS_READY_STATE_OPEN = 1;
@@ -438,34 +441,6 @@ function extractMessageContent(
 }
 
 /**
- * Split long text at paragraph boundaries to fit within card element limits.
- */
-function splitAtParagraphs(text: string, maxLen: number): string[] {
-  if (text.length <= maxLen) return [text];
-
-  const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > maxLen) {
-    // Prefer splitting at double newline (paragraph break)
-    let idx = remaining.lastIndexOf('\n\n', maxLen);
-    if (idx < maxLen * 0.3) {
-      // Fallback to single newline
-      idx = remaining.lastIndexOf('\n', maxLen);
-    }
-    if (idx < maxLen * 0.3) {
-      // Hard split as last resort
-      idx = maxLen;
-    }
-    chunks.push(remaining.slice(0, idx).trim());
-    remaining = remaining.slice(idx).trim();
-  }
-  if (remaining) chunks.push(remaining);
-
-  return chunks;
-}
-
-/**
  * Map file extension to Feishu file type.
  */
 function getFileType(
@@ -505,86 +480,7 @@ function buildPostMdFallback(text: string): string {
 }
 
 function buildInteractiveCard(text: string): object {
-  const optimized = optimizeMarkdownStyle(text, 2);
-  const lines = text.split('\n');
-  let title = '';
-  let bodyStartIdx = 0;
-
-  // Extract title from first heading if present (use original text for title)
-  for (let i = 0; i < lines.length; i++) {
-    if (!lines[i].trim()) continue;
-    if (/^#{1,3}\s+/.test(lines[i])) {
-      title = lines[i].replace(/^#+\s*/, '').trim();
-      bodyStartIdx = i + 1;
-    }
-    break;
-  }
-
-  // Apply optimizeMarkdownStyle to body (title was already extracted from original)
-  const optimizedLines = optimized.split('\n');
-  // Skip lines corresponding to the title in optimized text
-  let optimizedBody: string;
-  if (bodyStartIdx > 0) {
-    // Find the first non-empty line in optimized text and skip it (it's the demoted title)
-    let skipIdx = 0;
-    for (let i = 0; i < optimizedLines.length; i++) {
-      if (!optimizedLines[i].trim()) continue;
-      skipIdx = i + 1;
-      break;
-    }
-    optimizedBody = optimizedLines.slice(skipIdx).join('\n').trim();
-  } else {
-    optimizedBody = optimized.trim();
-  }
-
-  // Generate title if no heading found — use first line preview
-  if (!title) {
-    const firstLine = (lines.find((l) => l.trim()) || '')
-      .replace(/[*_`#\[\]]/g, '')
-      .trim();
-    title =
-      firstLine.length > 40
-        ? firstLine.slice(0, 37) + '...'
-        : firstLine || 'Reply';
-  }
-
-  // Build card elements
-  const elements: Array<Record<string, unknown>> = [];
-  const contentToRender = optimizedBody || optimized.trim();
-
-  if (contentToRender.length > CARD_MD_LIMIT) {
-    // Long content: split into multiple markdown elements
-    const chunks = splitAtParagraphs(contentToRender, CARD_MD_LIMIT);
-    for (const chunk of chunks) {
-      elements.push({ tag: 'markdown', content: chunk });
-    }
-  } else if (contentToRender) {
-    // Split by horizontal rules for visual sections
-    const sections = contentToRender.split(/\n-{3,}\n/);
-    for (let i = 0; i < sections.length; i++) {
-      if (i > 0) elements.push({ tag: 'hr' });
-      const s = sections[i].trim();
-      if (s) elements.push({ tag: 'markdown', content: s });
-    }
-  }
-
-  // Ensure at least one element
-  if (elements.length === 0) {
-    elements.push({ tag: 'markdown', content: optimized.trim() });
-  }
-
-  return {
-    schema: '2.0',
-    config: {
-      wide_screen_mode: true,
-      summary: { content: title },
-    },
-    header: {
-      title: { tag: 'plain_text', content: title },
-      template: 'indigo',
-    },
-    body: { elements },
-  };
+  return buildAgentReplyCard({ status: 'done', text });
 }
 
 // ─── Factory Function ──────────────────────────────────────────
@@ -906,6 +802,8 @@ export function createFeishuConnection(
       onAgentMessage,
       shouldProcessGroupMessage,
       isGroupOwnerMessage,
+      isSenderAllowedInGroup,
+      onP2pSender,
     } = connectOptions || {};
     const {
       chatId,
@@ -974,6 +872,11 @@ export function createFeishuConnection(
     // 先注册会话，确保 resolveGroupFolder 能正确解析 folder（含首条文件消息场景）
     onNewChat?.(chatJid, resolvedChatName);
 
+    // P2P 消息：通知调用方用于自动检测 owner open_id
+    if (chatType === 'p2p' && senderOpenId && onP2pSender) {
+      onP2pSender(senderOpenId);
+    }
+
     let attachmentsJson: string | undefined;
 
     if (extracted.imageKeys && extracted.imageKeys.length > 0) {
@@ -1024,12 +927,29 @@ export function createFeishuConnection(
         }
       }
 
+      // 拼接图片标记：成功下载的用路径，失败的用占位符，确保 text 不为空。
+      // 否则长图/超大图片下载失败时会落入 agent 的空消息分支，回复"消息是空的"。
+      const failedCount = extracted.imageKeys.length - attachments.length;
+      const markers: string[] = [];
       if (attachments.length > 0) {
         attachmentsJson = JSON.stringify(attachments);
-        // 在 content 中添加图片标记 + 磁盘路径，与文件消息保持一致
-        // agent 可通过路径直接操作文件，无需从 DB 解码 base64
-        const pathHints = savedPaths.map((p) => `[图片: ${p}]`).join('\n');
-        const imgMarker = pathHints || '[图片]';
+        if (savedPaths.length > 0) {
+          markers.push(...savedPaths.map((p) => `[图片: ${p}]`));
+        } else {
+          markers.push('[图片]');
+        }
+      }
+      if (failedCount > 0) {
+        markers.push(
+          `[图片下载失败: ${failedCount} 张，可能超过飞书接口限制或网络异常]`,
+        );
+        logger.warn(
+          { chatJid, messageId, failedCount, totalKeys: extracted.imageKeys.length },
+          'Feishu image download failed for some or all images',
+        );
+      }
+      const imgMarker = markers.join('\n');
+      if (imgMarker) {
         text = text ? `${imgMarker}\n${text}` : imgMarker;
       }
     } else if (extracted.fileInfos && extracted.fileInfos.length > 0) {
@@ -1093,7 +1013,7 @@ export function createFeishuConnection(
         'Feishu slash command detected',
       );
       try {
-        const reply = await onCommand(chatJid, cmdBody, senderOpenId);
+        const reply = await onCommand(chatJid, cmdBody, senderOpenId, mentions);
         logger.info(
           {
             chatJid,
@@ -1123,6 +1043,26 @@ export function createFeishuConnection(
         }
         return;
       }
+    }
+
+    // ── 群聊发言者白名单过滤（命令已处理后，非白名单发言者丢弃或软拒绝） ──
+    if (chatType === 'group' && isSenderAllowedInGroup && !isSenderAllowedInGroup(chatJid, senderOpenId)) {
+      // 被 @bot 时回 SILENT 表情表达「看到但故意不回复」，让发言者知道 bot 并非无响应而是被白名单挡掉；
+      // 未 @bot 时静默丢弃，避免把群聊闲聊污染成一堆表情。
+      const isBotMentioned = !!botOpenId && (mentions?.some((m) => m.id?.open_id === botOpenId) ?? false);
+      if (isBotMentioned) {
+        addReaction(messageId, 'SILENT').catch(() => {});
+        logger.debug(
+          { chatJid, messageId, senderOpenId },
+          'Soft-rejected group message with SILENT reaction: sender not in allowlist',
+        );
+      } else {
+        logger.debug(
+          { chatJid, messageId, senderOpenId },
+          'Dropped group message: sender not in allowlist',
+        );
+      }
+      return;
     }
 
     // ── 群聊 Mention 过滤：require_mention / owner_mentioned 模式下过滤 ──

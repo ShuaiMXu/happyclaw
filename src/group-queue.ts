@@ -263,6 +263,28 @@ export class GroupQueue {
   }
 
   /**
+   * List all active virtual-JID runners that belong to the same folder family
+   * as `baseJid` (i.e. sub-agents `{...}#agent:{id}` and scheduled tasks
+   * `{...}#task:{id}`), excluding the base JID itself. Used by workspace-level
+   * operations (e.g. clear-history) that need to stop every descendant process
+   * before wiping the folder's filesystem.
+   *
+   * Matching is done via serializationKey (folder-based), so descendants
+   * launched from any sibling JID sharing the same folder are all returned.
+   */
+  listActiveDescendantJids(baseJid: string): string[] {
+    const baseKey = this.getSerializationKey(baseJid);
+    const prefix = baseKey + '#';
+    const result: string[] = [];
+    for (const [jid, state] of this.groups.entries()) {
+      if (!state.active) continue;
+      const key = this.getSerializationKey(jid);
+      if (key.startsWith(prefix)) result.push(jid);
+    }
+    return result;
+  }
+
+  /**
    * Returns true if the active runner for this group (or its serialization
    * sibling) is currently executing a scheduled task rather than user messages.
    * Used by the message loop to avoid prematurely interrupting task containers.

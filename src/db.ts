@@ -80,8 +80,8 @@ function stmts() {
       storeMessageInsert: db.prepare(
         `INSERT OR REPLACE INTO messages (
           id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
-          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageInsert: db.prepare(
         `INSERT INTO usage_records (id, user_id, group_folder, agent_id, message_id, model,
@@ -127,7 +127,7 @@ function stmts() {
          )`,
       ),
       getMessagesSince: db.prepare(
-        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id
          FROM messages
          WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
          ORDER BY timestamp ASC, id ASC`,
@@ -145,7 +145,7 @@ function getNewMessagesStmt(jidCount: number): any {
   if (!s) {
     const placeholders = Array(jidCount).fill('?').join(',');
     s = db.prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id
        FROM messages
        WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
          AND chat_jid IN (${placeholders})
@@ -164,6 +164,7 @@ interface StoredMessageMeta {
   sdkMessageUuid?: string | null;
   sourceKind?: MessageSourceKind | null;
   finalizationReason?: MessageFinalizationReason | null;
+  taskId?: string | null;
 }
 
 function hasColumn(tableName: string, columnName: string): boolean {
@@ -697,12 +698,14 @@ export function initDatabase(): void {
   );
   ensureColumn('registered_groups', 'feishu_chat_mode', 'TEXT');
   ensureColumn('registered_groups', 'feishu_group_message_type', 'TEXT');
+  ensureColumn('registered_groups', 'sender_allowlist', 'TEXT');
   ensureColumn('messages', 'token_usage', 'TEXT');
   ensureColumn('messages', 'turn_id', 'TEXT');
   ensureColumn('messages', 'session_id', 'TEXT');
   ensureColumn('messages', 'sdk_message_uuid', 'TEXT');
   ensureColumn('messages', 'source_kind', 'TEXT');
   ensureColumn('messages', 'finalization_reason', 'TEXT');
+  ensureColumn('messages', 'task_id', 'TEXT');
   ensureColumn('agents', 'source_kind', 'TEXT');
   ensureColumn('agents', 'thread_id', 'TEXT');
   ensureColumn('agents', 'root_message_id', 'TEXT');
@@ -1350,7 +1353,19 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE user_api_tokens DROP COLUMN revoked_at');
   }
 
-  const SCHEMA_VERSION = '38';
+  // v38 → v39: Add provider_id to sessions table for sticky provider binding.
+  // Prevents "Invalid signature in thinking block" errors when a Claude session
+  // resumed across container restarts gets routed to a different OAuth account.
+  if (
+    !db
+      .prepare("PRAGMA table_info('sessions')")
+      .all()
+      .some((c: any) => c.name === 'provider_id')
+  ) {
+    db.exec('ALTER TABLE sessions ADD COLUMN provider_id TEXT');
+  }
+
+  const SCHEMA_VERSION = '39';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1493,6 +1508,7 @@ export function storeMessageDirect(
     meta?.sdkMessageUuid ?? null,
     meta?.sourceKind ?? null,
     meta?.finalizationReason ?? null,
+    meta?.taskId ?? null,
   );
   return effectiveMsgId;
 }
@@ -2340,6 +2356,46 @@ export function deleteSession(
   ).run(groupFolder, effectiveAgentId);
 }
 
+/**
+ * Get the provider_id bound to a session (group_folder + agent_id).
+ * Returns undefined if no row or no binding recorded.
+ *
+ * Used by ProviderPool sticky-selection: when resuming a Claude session that
+ * already produced thinking blocks, route back to the same provider/account so
+ * thinking-block signatures validate.
+ */
+export function getSessionProviderId(
+  groupFolder: string,
+  agentId?: string | null,
+): string | undefined {
+  const effectiveAgentId = agentId || '';
+  const row = db
+    .prepare(
+      'SELECT provider_id FROM sessions WHERE group_folder = ? AND agent_id = ?',
+    )
+    .get(groupFolder, effectiveAgentId) as
+    | { provider_id: string | null }
+    | undefined;
+  return row?.provider_id ?? undefined;
+}
+
+/**
+ * Bind a session to a specific provider_id, or clear the binding (provider_id=null).
+ * Upserts a sessions row if one does not yet exist (with empty session_id).
+ */
+export function setSessionProviderId(
+  groupFolder: string,
+  agentId: string | null | undefined,
+  providerId: string | null,
+): void {
+  const effectiveAgentId = agentId || '';
+  db.prepare(
+    `INSERT INTO sessions (group_folder, session_id, agent_id, provider_id)
+     VALUES (?, '', ?, ?)
+     ON CONFLICT(group_folder, agent_id) DO UPDATE SET provider_id = excluded.provider_id`,
+  ).run(groupFolder, effectiveAgentId, providerId);
+}
+
 export function deleteAllSessionsForFolder(groupFolder: string): void {
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
 }
@@ -2399,6 +2455,7 @@ type RegisteredGroupRow = {
   binding_mode: string | null;
   feishu_chat_mode: string | null;
   feishu_group_message_type: string | null;
+  sender_allowlist: string | null;
 };
 
 /** Convert a raw DB row into a RegisteredGroup domain object. */
@@ -2435,6 +2492,9 @@ function parseGroupRow(
       row.binding_mode === 'thread_map' ? 'thread_map' : 'single_context',
     feishu_chat_mode: row.feishu_chat_mode ?? undefined,
     feishu_group_message_type: row.feishu_group_message_type ?? undefined,
+    sender_allowlist: row.sender_allowlist != null
+      ? (JSON.parse(row.sender_allowlist) as string[])
+      : undefined,
   };
 }
 
@@ -2466,8 +2526,8 @@ export function getRegisteredGroup(
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, feishu_chat_mode, feishu_group_message_type)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, owner_im_id, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -2494,6 +2554,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.binding_mode ?? 'single_context',
     group.feishu_chat_mode ?? null,
     group.feishu_group_message_type ?? null,
+    group.sender_allowlist != null ? JSON.stringify(group.sender_allowlist) : null,
   );
 }
 
@@ -3045,6 +3106,8 @@ export function getGroupsByOwner(
     created_by: string | null;
     is_home: number;
     selected_skills: string | null;
+    target_main_jid: string | null;
+    target_agent_id: string | null;
   }>;
 
   return rows.map((row) => ({
@@ -3061,6 +3124,8 @@ export function getGroupsByOwner(
     initGitUrl: row.init_git_url ?? undefined,
     created_by: row.created_by ?? undefined,
     is_home: row.is_home === 1,
+    target_main_jid: row.target_main_jid ?? undefined,
+    target_agent_id: row.target_agent_id ?? undefined,
   }));
 }
 

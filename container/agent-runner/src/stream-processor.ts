@@ -90,6 +90,11 @@ export class StreamEventProcessor {
   // Sub-agent active tools per parent task ID
   private readonly activeSubAgentToolsByTask = new Map<string, Set<string>>();
 
+  // 主 Agent thinking 是否已通过 content_block_delta 路径流出过。
+  // 某些模型仍按 delta 下发 thinking；若 delta 路径已消费，processAssistantMessage
+  // 必须跳过完整 block 的补发，避免同一段思考被 emit 两次。
+  private mainThinkingStreamed = false;
+
   constructor(emit: EmitFn, log: LogFn) {
     this.emit = emit;
     this.log = log;
@@ -329,6 +334,7 @@ export class StreamEventProcessor {
       this.scheduleFlush();
     } else if (delta?.type === 'thinking_delta' && delta.thinking) {
       const bufKey = parentToolUseId || this.BUF_MAIN;
+      if (!parentToolUseId) this.mainThinkingStreamed = true;
       this.getBuf(bufKey).think += delta.thinking;
       this.scheduleFlush();
     } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
@@ -718,6 +724,24 @@ export class StreamEventProcessor {
   processAssistantMessage(message: any): void {
     const content = message.message?.content;
     if (!Array.isArray(content)) return;
+
+    // 主 Agent thinking 补发:
+    // - 子 Agent 消息 (parent_tool_use_id 非空) 的 thinking 已由 processSubAgentMessage
+    //   emit (带 parentToolUseId), 这里若再 emit 会挂到主 Agent 气泡导致重复展示。
+    // - 主 Agent 若 delta 路径已消费过 thinking (mainThinkingStreamed=true),
+    //   再从完整 block emit 会导致同一段思考被显示两次。
+    const isSubAgent = (message.parent_tool_use_id ?? null) !== null;
+    if (!isSubAgent && !this.mainThinkingStreamed) {
+      for (const block of content) {
+        if (block.type === 'thinking' && block.thinking) {
+          this.emit({
+            status: 'stream', result: null,
+            streamEvent: { eventType: 'thinking_delta', text: block.thinking },
+          });
+        }
+      }
+    }
+    if (!isSubAgent) this.mainThinkingStreamed = false;
 
     // Fallback: extract skill name from complete assistant message
     for (const block of content) {

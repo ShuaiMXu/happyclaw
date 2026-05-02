@@ -104,6 +104,7 @@ export interface SystemSettings {
   billingCurrencyRate: number;
   externalClaudeDir: string;
   autoCompactWindow: number;
+  disableMemoryLayerForAdminHost: boolean;
 }
 
 // ─── OAuth Usage ────────────────────────────────────────────

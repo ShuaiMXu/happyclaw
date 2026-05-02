@@ -59,6 +59,8 @@ interface ProviderEditorProps {
   open: boolean;
   /** null 表示创建模式 */
   provider: ProviderWithHealth | null;
+  /** 当前负载均衡策略，影响权重字段的展示和提示 */
+  balancingStrategy?: 'round-robin' | 'weighted-round-robin' | 'failover';
   onSave: () => void;
   onCancel: () => void;
   setNotice: (msg: string | null) => void;
@@ -68,6 +70,7 @@ interface ProviderEditorProps {
 export function ProviderEditor({
   open,
   provider,
+  balancingStrategy,
   onSave,
   onCancel,
   setNotice,
@@ -81,7 +84,6 @@ export function ProviderEditor({
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
   const [weight, setWeight] = useState(1);
-  const [showAdvanced, setShowAdvanced] = useState(false);
 
   // 官方认证
   const [authTab, setAuthTab] = useState<OfficialAuthTab>('oauth');
@@ -115,7 +117,6 @@ export function ProviderEditor({
       setBaseUrl('');
       setModel('');
       setWeight(1);
-      setShowAdvanced(false);
       setAuthTab('oauth');
       setSetupToken('');
       setApiKey('');
@@ -131,7 +132,6 @@ export function ProviderEditor({
       setBaseUrl(provider.anthropicBaseUrl || '');
       setModel(provider.anthropicModel || '');
       setWeight(provider.weight);
-      setShowAdvanced(provider.weight !== 1);
       setAuthTab('oauth');
       setSetupToken('');
       setApiKey('');
@@ -740,34 +740,30 @@ export function ProviderEditor({
             )}
           </div>
 
-          {/* ─── 高级设置 ─── */}
+          {/* ─── 权重 ─── */}
           <div className="border-t border-border pt-3">
-            <button
-              type="button"
-              className="text-xs text-muted-foreground hover:text-foreground cursor-pointer"
-              onClick={() => setShowAdvanced(!showAdvanced)}
-            >
-              {showAdvanced ? '收起高级设置' : '展开高级设置'}
-            </button>
-            {showAdvanced && (
-              <div className="mt-2">
-                <label className="block text-xs text-muted-foreground mb-1">
-                  权重（用于加权轮询策略）
-                </label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={weight}
-                  onChange={(e) => setWeight(Math.max(1, Math.min(100, parseInt(e.target.value) || 1)))}
-                  disabled={saving}
-                  className="w-24"
-                />
-                <p className="text-xs text-muted-foreground mt-1">
-                  仅当负载均衡策略为「加权轮询」时生效，值越大分配到的请求越多。
-                </p>
-              </div>
-            )}
+            <div className="flex items-center gap-2 mb-1">
+              <label className="block text-sm font-medium">权重</label>
+              {balancingStrategy === 'weighted-round-robin' && (
+                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-teal-100 text-teal-800">
+                  当前策略生效中
+                </span>
+              )}
+            </div>
+            <Input
+              type="number"
+              min={1}
+              max={100}
+              value={weight}
+              onChange={(e) => setWeight(Math.max(1, Math.min(100, parseInt(e.target.value) || 1)))}
+              disabled={saving}
+              className="w-24"
+            />
+            <p className="text-xs text-muted-foreground mt-1">
+              {balancingStrategy === 'weighted-round-robin'
+                ? '值越大分配到的请求越多。例如三家分别设 5/3/2，流量比例就是 5:3:2。'
+                : '仅当负载均衡策略为「加权轮询」时生效（当前策略未生效）。范围 1–100。'}
+            </p>
           </div>
 
           {/* ─── 操作按钮 ─── */}

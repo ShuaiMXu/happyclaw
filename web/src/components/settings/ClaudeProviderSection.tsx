@@ -247,6 +247,7 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
       {/* 提供商列表 */}
       <ProviderList
         providers={providers}
+        balancingStrategy={balancing.strategy}
         onEdit={(p) => {
           setEditingProvider(p);
           setEditorOpen(true);
@@ -322,6 +323,7 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
       <ProviderEditor
         open={editorOpen}
         provider={editingProvider}
+        balancingStrategy={balancing.strategy}
         onSave={handleEditorSave}
         onCancel={handleEditorCancel}
         setNotice={setNotice}

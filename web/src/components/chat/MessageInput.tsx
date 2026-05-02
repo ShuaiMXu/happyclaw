@@ -33,7 +33,15 @@ interface PendingImage {
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;
 
 interface MessageInputProps {
-  onSend: (content: string, attachments?: Array<{ data: string; mimeType: string }>) => void;
+  /**
+   * 发送回调。返回 boolean 表示发送是否成功：
+   * - true：MessageInput 清空输入框和附件
+   * - false：保留输入框内容和附件，用户可重试（弱网/断网场景）
+   */
+  onSend: (
+    content: string,
+    attachments?: Array<{ data: string; mimeType: string }>,
+  ) => Promise<boolean> | boolean;
   groupJid?: string;
   disabled?: boolean;
   onResetSession?: () => void;
@@ -161,21 +169,26 @@ export function MessageInput({
     setSending(true);
     setSendError(null);
 
+    // 先组装 message 但不立刻清空 pendingFiles/pendingImages，
+    // 让 onSend 失败时用户的附件也能保留、可以重试。
+    let message = trimmed;
+    if (hasPending) {
+      const list = pendingFiles.map((f) => `- ${f.label}`).join('\n');
+      const prefix = `[我上传了以下文件到工作区，请查看并使用]\n${list}`;
+      message = message ? `${prefix}\n\n${message}` : prefix;
+    }
+    const attachments = hasImages
+      ? pendingImages.map((img) => ({ data: img.data, mimeType: img.mimeType }))
+      : undefined;
+
+    let ok = false;
     try {
-      let message = trimmed;
+      ok = await onSend(message, attachments);
+    } catch {
+      ok = false;
+    }
 
-      if (hasPending) {
-        const list = pendingFiles.map((f) => `- ${f.label}`).join('\n');
-        const prefix = `[我上传了以下文件到工作区，请查看并使用]\n${list}`;
-        message = message ? `${prefix}\n\n${message}` : prefix;
-        setPendingFiles([]);
-      }
-
-      const attachments = hasImages
-        ? pendingImages.map((img) => ({ data: img.data, mimeType: img.mimeType }))
-        : undefined;
-
-      onSend(message, attachments);
+    if (ok) {
       successTap();
       setContent('');
       if (groupJid) clearDraft(groupJid);
@@ -183,18 +196,18 @@ export function MessageInput({
         clearTimeout(draftTimerRef.current);
         draftTimerRef.current = undefined;
       }
-
-      // Clean up image previews
+      if (hasPending) setPendingFiles([]);
       if (hasImages) {
         pendingImages.forEach((img) => URL.revokeObjectURL(img.preview));
         setPendingImages([]);
       }
-    } catch {
-      setSendError('发送失败，请重试');
-      setTimeout(() => setSendError(null), 3000);
-    } finally {
-      setSending(false);
+    } else {
+      // 失败：保留输入、保留附件；同步保存草稿，刷新/崩溃也能恢复。
+      if (groupJid && trimmed) saveDraft(groupJid, trimmed);
+      setSendError('发送失败，输入已保留，请重试');
+      setTimeout(() => setSendError(null), 4000);
     }
+    setSending(false);
   };
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {

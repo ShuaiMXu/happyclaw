@@ -2,11 +2,13 @@
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
        format format-check install install-host-tools clean reset-init update-sdk ensure-latest-sdk sync-types \
        backup restore help _ensure-docker-image logs status stop \
-       _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale
+       _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale \
+       _start-pm2 _start-direct
 
 # ─── Runtime Detection ──────────────────────────────────────
 # 优先使用 bun（跳过编译、启动更快），fallback 到 npm + tsx + node
 HAS_BUN := $(shell command -v bun >/dev/null 2>&1 && echo 1 || echo 0)
+PORT    ?= $(or $(WEB_PORT),3000)
 
 ifeq ($(HAS_BUN),1)
   PKG     := bun
@@ -20,15 +22,26 @@ endif
 
 # ─── Development ─────────────────────────────────────────────
 
-dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）
+# 单行 shell 片段：运行 dev 命令前暂停 pm2 中的 happyclaw，退出（正常/中断/终止）时恢复。
+# 用法示例：@$(PM2_GUARD); <command>
+PM2_GUARD = PM2_WAS_RUNNING=0; \
+	if command -v pm2 >/dev/null 2>&1 && pm2 show happyclaw 2>/dev/null | grep -q 'online'; then \
+	  PM2_WAS_RUNNING=1; \
+	  echo "⏸  暂停 pm2 happyclaw..."; \
+	  pm2 stop happyclaw; \
+	fi; \
+	trap "if [ \"$$PM2_WAS_RUNNING\" = '1' ]; then echo '▶  恢复 pm2 happyclaw...'; pm2 start happyclaw; fi" EXIT INT TERM
+
+dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）；自动暂停 pm2，退出后恢复
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-docker-image
 	@$(PKG) --prefix container/agent-runner run build --silent 2>/dev/null || $(PKG) --prefix container/agent-runner run build
-	@echo "🚀 使用 $(PKG) 启动..."
+	@$(PM2_GUARD); \
+	echo "🚀 使用 $(PKG) 启动..."; \
 	$(PKG) run dev:all
 
-dev-backend: ## 仅启动后端（bun 直接跑 TS，node 用 tsx）
-	$(RUNNER)
+dev-backend: ## 仅启动后端（bun 直接跑 TS，node 用 tsx）；自动暂停 pm2，退出后恢复
+	@$(PM2_GUARD); $(RUNNER)
 
 dev-web: ## 仅启动前端
 	cd web && $(PKG) run dev
@@ -47,11 +60,27 @@ build-web: ## 仅编译前端
 
 # ─── Production ──────────────────────────────────────────────
 
-start: ensure-latest-sdk ## 一键启动生产环境（前台阻塞运行）
+start: ensure-latest-sdk ## 一键启动生产环境（pm2 托管时自动走 pm2 restart；否则前台阻塞）
+	@# pm2 注册过 happyclaw 就路由到 pm2，避免裸跑和 pm2 抢端口
+	@if command -v pm2 >/dev/null 2>&1 && pm2 describe happyclaw >/dev/null 2>&1; then \
+	  $(MAKE) --no-print-directory _start-pm2; \
+	else \
+	  $(MAKE) --no-print-directory _start-direct; \
+	fi
+
+_start-pm2: ## (内部) pm2 托管模式：build 后 pm2 restart
+	@echo "🔄 检测到 pm2 托管 happyclaw，改走 pm2 restart"
+	@$(MAKE) _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale
+	@pm2 restart happyclaw --update-env
+	@sleep 2
+	@pm2 logs happyclaw --lines 20 --nostream || true
+	@echo "✅ 启动完成，查看实时日志：pm2 logs happyclaw"
+
+_start-direct: ## (内部) 裸跑模式（无 pm2 或未注册）
 	@# 检查端口是否被占用
-	@if lsof -ti:3000 -sTCP:LISTEN >/dev/null 2>&1; then \
-	  echo "❌ 端口 3000 已被占用，请先停掉旧进程：make stop"; \
-	  lsof -ti:3000 -sTCP:LISTEN | xargs ps -fp 2>/dev/null | tail -1; \
+	@if lsof -ti:$(PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+	  echo "❌ 端口 $(PORT) 已被占用，请先停掉旧进程：make stop"; \
+	  lsof -ti:$(PORT) -sTCP:LISTEN | xargs ps -fp 2>/dev/null | tail -1; \
 	  exit 1; \
 	fi
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
@@ -114,16 +143,24 @@ _build-backend-if-stale: ## (内部) 后端变更时重新编译（Node 模式�
 logs: ## 实时查看日志（需配合手动后台运行：make start > /tmp/happyclaw.log 2>&1 &）
 	@tail -f /tmp/happyclaw.log
 
-stop: ## 停止占用 3000 端口的服务（前台运行时请直接 Ctrl+C）
-	@-lsof -ti:3000 -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null && echo "✅ 已停止 HappyClaw (端口 3000)" || echo "⚠️  端口 3000 未被占用，无需停止"
+stop: ## 停止服务（pm2 托管时走 pm2 stop，否则杀端口监听进程）
+	@if command -v pm2 >/dev/null 2>&1 && pm2 describe happyclaw >/dev/null 2>&1; then \
+	  pm2 stop happyclaw >/dev/null && echo "✅ 已 pm2 stop happyclaw（需再起用 pm2 start happyclaw）"; \
+	else \
+	  lsof -ti:$(PORT) -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null && echo "✅ 已停止 HappyClaw (端口 $(PORT))" || echo "⚠️  端口 $(PORT) 未被占用，无需停止"; \
+	fi
 
 status: ## 查看服务运行状态
 	@echo "=== HappyClaw 服务状态 ==="
-	@if lsof -ti:3000 -sTCP:LISTEN >/dev/null 2>&1; then \
-	  echo "✅ 后端进程: 运行中 (端口 3000)"; \
-	  curl -s http://localhost:3000/api/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"   健康状态: {d.get('status','unknown')}\")" 2>/dev/null || echo "   健康状态: 无法获取"; \
+	@if command -v pm2 >/dev/null 2>&1 && pm2 describe happyclaw >/dev/null 2>&1; then \
+	  echo "🔧 pm2 托管模式（重启请用 pm2 restart happyclaw，勿混用 make start/stop）"; \
+	  pm2 describe happyclaw 2>/dev/null | grep -E "status|pid|uptime|restarts" | head -4 | sed 's/^/   /'; \
+	fi
+	@if lsof -ti:$(PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+	  echo "✅ 后端进程: 运行中 (端口 $(PORT))"; \
+	  curl -s http://localhost:$(PORT)/api/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"   健康状态: {d.get('status','unknown')}\")" 2>/dev/null || echo "   健康状态: 无法获取"; \
 	else \
-	  echo "❌ 后端进程: 未运行 (端口 3000 未占用)"; \
+	  echo "❌ 后端进程: 未运行 (端口 $(PORT) 未占用)"; \
 	fi
 	@echo ""
 	@echo "=== 日志文件 ==="
@@ -154,7 +191,7 @@ typecheck-agent-runner:
 
 test: ## 运行单元测试
 ifeq ($(HAS_BUN),1)
-	bun test
+	bun vitest run
 else
 	$(RUN) vitest run
 endif
@@ -210,7 +247,7 @@ ensure-latest-sdk: ## 启动前自动检测并更新 SDK（有新版才更新）
 	LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
 	if [ "$$LOCAL" != "$$LATEST" ]; then \
 		echo "🔄 Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
-		cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build; \
+		(cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build); \
 		sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json; \
 		echo "✅ SDK 更新完成（内置 Claude Code 版本随之更新）"; \
 	else \

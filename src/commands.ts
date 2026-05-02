@@ -3,16 +3,14 @@
  * enter the normal message pipeline.
  */
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
 import {
   deleteSession,
   getJidsByFolder,
   storeMessageDirect,
   ensureChatExists,
 } from './db.js';
-import { DATA_DIR } from './config.js';
 import { logger } from './logger.js';
+import { clearSessionFiles } from './session-files.js';
 import type { NewMessage, MessageCursor } from './types.js';
 
 // ─── Types ──────────────────────────────────────────────────────
@@ -22,29 +20,6 @@ export interface CommandDeps {
   sessions: Record<string, string>;
   broadcast: (jid: string, msg: NewMessage & { is_from_me: boolean }) => void;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
-}
-
-// ─── Session file cleanup (mirrors groups.ts clearSessionJsonlFiles) ────
-
-function clearSessionFiles(folder: string, agentId?: string): void {
-  const claudeDir = agentId
-    ? path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude')
-    : path.join(DATA_DIR, 'sessions', folder, '.claude');
-  if (!fs.existsSync(claudeDir)) return;
-
-  const keep = new Set(['settings.json']);
-  const entries = fs.readdirSync(claudeDir);
-  for (const entry of entries) {
-    if (keep.has(entry)) continue;
-    try {
-      fs.rmSync(path.join(claudeDir, entry), { recursive: true, force: true });
-    } catch (err) {
-      logger.warn(
-        { entry, folder, agentId, err },
-        'Failed to remove session file, skipping',
-      );
-    }
-  }
 }
 
 // ─── Core reset ─────────────────────────────────────────────────

@@ -3,11 +3,10 @@
 
 FROM node:22-slim
 
-# Copy uv from official image (multi-arch, no extra download)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uvx /usr/local/bin/uvx
-
 # Install system packages (organized by category)
+# NOTE: Keep this layer BEFORE `COPY --from=ghcr.io/astral-sh/uv:latest` so that
+# uv:latest digest churn (frequent releases) does not invalidate this ~440MB layer.
+# See issue #403.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # --- Browser & fonts ---
     chromium \
@@ -84,6 +83,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen \
     # Symlink fd-find → fd (Debian names it fdfind)
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+# Copy uv from official image (multi-arch, no extra download).
+# Placed AFTER the apt-get layer: uv:latest releases frequently, so its digest
+# changes invalidate this layer on most rebuilds. Keeping the heavy apt-get
+# layer above ensures it stays cached across uv version bumps. See issue #403.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uvx /usr/local/bin/uvx
 
 # Locale environment
 ENV LANG=en_US.UTF-8

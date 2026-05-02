@@ -230,6 +230,7 @@ interface StoredFeishuProviderConfigV1 {
   appId: string;
   enabled?: boolean;
   updatedAt: string;
+  ownerOpenId?: string;
   secret: EncryptedSecrets;
 }
 
@@ -2325,9 +2326,19 @@ export function buildClaudeEnvLines(
     );
   }
   if (config.anthropicAuthToken) {
-    lines.push(
-      `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
-    );
+    if (config.anthropicBaseUrl) {
+      // Third-party provider: the SDK treats ANTHROPIC_AUTH_TOKEN as an OAuth
+      // legacy token and skips the standard Bearer header, causing 404 on
+      // non-Anthropic endpoints. Use ANTHROPIC_API_KEY instead so the SDK
+      // sends the correct Authorization header.
+      lines.push(
+        `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicAuthToken)}`,
+      );
+    } else {
+      lines.push(
+        `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
+      );
+    }
   }
   if (config.anthropicModel) {
     lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
@@ -2611,7 +2622,7 @@ export function mergeClaudeEnvConfig(
   global: ClaudeProviderConfig,
   override: ContainerEnvConfig,
 ): ClaudeProviderConfig {
-  return {
+  const merged: ClaudeProviderConfig = {
     anthropicBaseUrl: override.anthropicBaseUrl || global.anthropicBaseUrl,
     anthropicAuthToken:
       override.anthropicAuthToken || global.anthropicAuthToken,
@@ -2623,6 +2634,16 @@ export function mergeClaudeEnvConfig(
     anthropicModel: override.anthropicModel || global.anthropicModel,
     updatedAt: global.updatedAt,
   };
+
+  // Third-party provider: strip OAuth credentials so the SDK does not try
+  // the OAuth auth path (which skips the standard Bearer header and causes
+  // 404 on non-Anthropic endpoints like Kimi).
+  if (merged.anthropicBaseUrl) {
+    merged.claudeOAuthCredentials = null;
+    merged.claudeCodeOauthToken = '';
+  }
+
+  return merged;
 }
 
 // ─── Registration config (plain JSON, no encryption) ─────────────
@@ -3011,6 +3032,7 @@ export interface UserFeishuConfig {
   appSecret: string;
   enabled?: boolean;
   updatedAt: string | null;
+  ownerOpenId?: string; // auto-detected from first DM; used as sender_allowlist seed for new groups
 }
 
 export interface UserTelegramConfig {
@@ -3101,6 +3123,7 @@ export function getUserFeishuConfig(userId: string): UserFeishuConfig | null {
       appSecret: secret.appSecret,
       enabled: stored.enabled,
       updatedAt: stored.updatedAt || null,
+      ownerOpenId: stored.ownerOpenId || undefined,
     };
   } catch (err) {
     logger.warn({ err, userId }, 'Failed to read user Feishu config');
@@ -3117,6 +3140,7 @@ export function saveUserFeishuConfig(
     appSecret: normalizeSecret(next.appSecret, 'appSecret'),
     enabled: next.enabled,
     updatedAt: new Date().toISOString(),
+    ownerOpenId: next.ownerOpenId,
   };
 
   const payload: StoredFeishuProviderConfigV1 = {
@@ -3124,6 +3148,7 @@ export function saveUserFeishuConfig(
     appId: normalized.appId,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
+    ownerOpenId: normalized.ownerOpenId,
     secret: encryptChannelSecret<FeishuSecretPayload>({
       appSecret: normalized.appSecret,
     }),
@@ -3136,6 +3161,24 @@ export function saveUserFeishuConfig(
   fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
   fs.renameSync(tmp, filePath);
   return normalized;
+}
+
+/**
+ * Update only the ownerOpenId in an existing Feishu config file, preserving the encrypted secret.
+ */
+export function saveFeishuOwnerOpenId(userId: string, openId: string): void {
+  const filePath = path.join(userImDir(userId), 'feishu.json');
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    parsed.ownerOpenId = openId;
+    const tmp = `${filePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + '\n', 'utf-8');
+    fs.renameSync(tmp, filePath);
+    logger.info({ userId, openId }, 'Feishu owner open_id saved');
+  } catch (err) {
+    logger.warn({ err, userId }, 'Failed to save Feishu owner open_id');
+  }
 }
 
 export function getUserTelegramConfig(
@@ -3484,6 +3527,9 @@ export interface SystemSettings {
   externalClaudeDir: string;
   // Claude Agent SDK 自动对话压缩触发点（tokens）。0 = 保留 SDK 默认（约 1M）
   autoCompactWindow: number;
+  // 关闭 admin host 模式下 HappyClaw 自带的 memory 注入层（MCP 工具、模板 CLAUDE.md、WORKSPACE_GLOBAL/MEMORY env）
+  // 启用后 admin 可以在 host 模式下完全按原生 Claude Code 的 Playbook 使用 ~/.claude/ 下的 memory/skills/rules
+  disableMemoryLayerForAdminHost: boolean;
 }
 
 const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
@@ -3503,6 +3549,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   billingCurrencyRate: 1,
   externalClaudeDir: '',
   autoCompactWindow: 0,
+  disableMemoryLayerForAdminHost: false,
 };
 
 function parseIntEnv(envVar: string | undefined, fallback: number): number {
@@ -3593,6 +3640,10 @@ function readSystemSettingsFromFile(): SystemSettings | null {
       typeof raw.autoCompactWindow === 'number' && raw.autoCompactWindow >= 0
         ? raw.autoCompactWindow
         : DEFAULT_SYSTEM_SETTINGS.autoCompactWindow,
+    disableMemoryLayerForAdminHost:
+      typeof raw.disableMemoryLayerForAdminHost === 'boolean'
+        ? raw.disableMemoryLayerForAdminHost
+        : DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
   };
 }
 
@@ -3654,6 +3705,9 @@ function buildEnvFallbackSettings(): SystemSettings {
       process.env.AUTO_COMPACT_WINDOW,
       DEFAULT_SYSTEM_SETTINGS.autoCompactWindow,
     ),
+    disableMemoryLayerForAdminHost:
+      process.env.DISABLE_MEMORY_LAYER_FOR_ADMIN_HOST === 'true' ||
+      DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
   };
 }
 

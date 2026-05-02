@@ -22,10 +22,17 @@ export interface McpContext {
   isHome: boolean;
   isAdminHome: boolean;
   isScheduledTask?: boolean;
+  /** Mutable: set when the current IPC turn was triggered by a task prompt.
+   * Cleared between turns by the agent-runner main loop so that regular
+   * follow-up messages aren't misattributed to the prior task. */
+  currentTaskId?: string | null;
   workspaceIpc: string;
   workspaceGroup: string;
   workspaceGlobal: string;
   workspaceMemory: string;
+  // 禁用 HappyClaw 的 memory MCP 工具（memory_append/search/get），
+  // 让 Agent 完全按用户本机 ~/.claude/ 下的 Playbook 约定管理记忆
+  disableMemoryLayer?: boolean;
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -150,6 +157,37 @@ function parseMemoryFileReference(fileRef: string): {
 }
 
 /**
+ * Build the IPC payload shared by send_message / send_image MCP tools.
+ *
+ * Always stamps `chatJid`, `groupFolder`, `timestamp`. Conditionally stamps
+ * `isScheduledTask` (when ctx.isScheduledTask is truthy) and `taskId` (when
+ * ctx.currentTaskId is non-empty). The conditional stamping matters for host-
+ * side routing: a missing `taskId` key means "regular user-turn reply", while
+ * a present `taskId` key triggers the task-broadcast branch in the IPC
+ * consumer. `extras` carries per-tool fields (`type`, `text`, `imageBase64`, …).
+ *
+ * Pure function; exported for unit testing.
+ */
+export function buildSendMessageData(
+  ctx: McpContext,
+  extras: Record<string, unknown>,
+): Record<string, unknown> {
+  const data: Record<string, unknown> = {
+    chatJid: ctx.chatJid,
+    groupFolder: ctx.groupFolder,
+    timestamp: new Date().toISOString(),
+    ...extras,
+  };
+  if (ctx.isScheduledTask) {
+    data.isScheduledTask = true;
+  }
+  if (ctx.currentTaskId) {
+    data.taskId = ctx.currentTaskId;
+  }
+  return data;
+}
+
+/**
  * Create all HappyClaw MCP tool definitions for in-process SDK MCP server.
  */
 export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
@@ -165,16 +203,10 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
       "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate with the user or group.",
       { text: z.string().describe('The message text to send') },
       async (args) => {
-        const data: Record<string, unknown> = {
+        const data = buildSendMessageData(ctx, {
           type: 'message',
-          chatJid: ctx.chatJid,
           text: args.text,
-          groupFolder: ctx.groupFolder,
-          timestamp: new Date().toISOString(),
-        };
-        if (ctx.isScheduledTask) {
-          data.isScheduledTask = true;
-        }
+        });
         writeIpcFile(MESSAGES_DIR, data);
         return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
       },
@@ -278,19 +310,13 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
           };
         }
 
-        const data: Record<string, unknown> = {
+        const data = buildSendMessageData(ctx, {
           type: 'image',
-          chatJid: ctx.chatJid,
           imageBase64: base64,
           mimeType,
           caption: args.caption || undefined,
           fileName: path.basename(resolved),
-          groupFolder: ctx.groupFolder,
-          timestamp: new Date().toISOString(),
-        };
-        if (ctx.isScheduledTask) {
-          data.isScheduledTask = true;
-        }
+        });
         writeIpcFile(MESSAGES_DIR, data);
         return {
           content: [
@@ -953,8 +979,8 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_append --- (only available for home containers)
-  if (ctx.isHome) {
+  // --- memory_append --- (only available for home containers, skipped in native Claude mode)
+  if (ctx.isHome && !ctx.disableMemoryLayer) {
     tools.push(
       tool(
         'memory_append',
@@ -1074,8 +1100,9 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_search --- (available for all containers)
-  tools.push(
+  // --- memory_search + memory_get --- (skipped in native Claude mode)
+  if (!ctx.disableMemoryLayer) {
+    tools.push(
     tool(
       'memory_search',
       `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
@@ -1282,6 +1309,7 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
       },
     ),
   );
+  }
 
   // ─── Knowledge Base Tools (home containers only) ─────────────────────────
 

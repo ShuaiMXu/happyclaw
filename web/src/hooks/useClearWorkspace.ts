@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { toast } from 'sonner';
 import { useChatStore } from '../stores/chat';
 
 export function useClearWorkspace() {
@@ -13,10 +14,10 @@ export function useClearWorkspace() {
     setClearLoading(true);
     try {
       const ok = await clearHistory(clearState.jid);
-      if (!ok) alert('重建工作区失败，请稍后重试');
+      if (!ok) toast.error('重建工作区失败，请稍后重试');
       closeClear();
-    } catch {
-      alert('重建工作区失败，请稍后重试');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '重建工作区失败，请稍后重试');
       closeClear();
     } finally {
       setClearLoading(false);

@@ -16,6 +16,7 @@ import {
   setRegisteredGroup,
   updateChatName,
   getAgent,
+  deleteAllSessionsForFolder,
   VALID_ACTIVATION_MODES,
 } from '../db.js';
 import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
@@ -164,6 +165,15 @@ async function applyClaudeConfigToAllGroups(
   );
   const failedCount = results.filter((r) => r.status === 'rejected').length;
   const stoppedCount = groupJids.length - failedCount;
+
+  // 清除所有 session 记录，确保配置变更后下次启动创建全新 session
+  const registeredGroups = deps.getRegisteredGroups();
+  for (const [_, group] of Object.entries(registeredGroups) as [string, RegisteredGroup][]) {
+    if (group.folder) {
+      deleteAllSessionsForFolder(group.folder);
+      delete deps.sessions[group.folder];
+    }
+  }
 
   appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
     stoppedCount,
@@ -1210,6 +1220,22 @@ configRoutes.put(
         { error: 'Invalid request body', details: validation.error.format() },
         400,
       );
+    }
+
+    // 启用「禁用 HappyClaw 记忆层」开关前必须给 admin 主容器配 customCwd，
+    // 否则 CLAUDE_CONFIG_DIR 仍指向 data/sessions/main/.claude，SDK 读不到 ~/.claude/
+    // 又没有 HappyClaw 记忆层注入，agent 会变成空白沙箱。
+    if (validation.data.disableMemoryLayerForAdminHost === true) {
+      const adminMain = getRegisteredGroup('web:main');
+      if (!adminMain || !adminMain.customCwd) {
+        return c.json(
+          {
+            error:
+              '启用前请先给 admin 主容器（web:main）配置 customCwd，否则 SDK 既读不到 HappyClaw 记忆层也读不到 ~/.claude/，会是空白沙箱。',
+          },
+          400,
+        );
+      }
     }
 
     try {
