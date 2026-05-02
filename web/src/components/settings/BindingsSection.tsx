@@ -13,7 +13,7 @@ import type { BindingTarget } from './hooks/useImBindings';
 type ChannelFilter = 'all' | 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord';
 
 export function BindingsSection() {
-  const { bindings, loading, targets, targetsLoading, reload, rebind, deleteImGroup, error: hookError, clearError: clearHookError } = useImBindings();
+  const { bindings, loading, targets, targetsLoading, reload, rebind, deleteImGroup, resetAllowlist, error: hookError, clearError: clearHookError } = useImBindings();
   const [localError, setLocalError] = useState<string | null>(null);
   const errorMsg = localError || hookError;
   const [search, setSearch] = useState('');
@@ -25,6 +25,7 @@ export function BindingsSection() {
   const [rebindGroup, setRebindGroup] = useState<AvailableImGroup | null>(null);
   const [unbindGroup, setUnbindGroup] = useState<AvailableImGroup | null>(null);
   const [deleteGroup, setDeleteGroup] = useState<AvailableImGroup | null>(null);
+  const [resetAllowlistGroup, setResetAllowlistGroup] = useState<AvailableImGroup | null>(null);
 
   const channels: { key: ChannelFilter; label: string }[] = useMemo(() => {
     const types = new Set(bindings.map((b) => b.channel_type));
@@ -77,6 +78,21 @@ export function BindingsSection() {
     setActioningJid(null);
     if (err) setLocalError(err);
   }, [deleteGroup, deleteImGroup]);
+
+  const handleResetAllowlist = useCallback((group: AvailableImGroup) => {
+    setResetAllowlistGroup(group);
+  }, []);
+
+  const confirmResetAllowlist = useCallback(async () => {
+    if (!resetAllowlistGroup) return;
+    const jid = resetAllowlistGroup.jid;
+    setResetAllowlistGroup(null);
+    setActioningJid(jid);
+    setLocalError(null);
+    const err = await resetAllowlist(jid);
+    setActioningJid(null);
+    if (err) setLocalError(err);
+  }, [resetAllowlistGroup, resetAllowlist]);
 
   const handleActivationModeChange = useCallback(async (jid: string, mode: string) => {
     setActioningJid(jid);
@@ -236,6 +252,7 @@ export function BindingsSection() {
                 onRebind={handleRebind}
                 onUnbind={handleUnbind}
                 onDelete={handleDelete}
+                onResetAllowlist={handleResetAllowlist}
                 onActivationModeChange={handleActivationModeChange}
               />
             ))}
@@ -288,6 +305,20 @@ export function BindingsSection() {
         }
         confirmText="删除"
         confirmVariant="danger"
+      />
+
+      {/* Reset sender allowlist confirm dialog */}
+      <ConfirmDialog
+        open={!!resetAllowlistGroup}
+        onClose={() => setResetAllowlistGroup(null)}
+        onConfirm={confirmResetAllowlist}
+        title="重置发言者白名单"
+        message={
+          resetAllowlistGroup
+            ? `「${resetAllowlistGroup.name}」当前白名单为空，没人能触发 bot。重置后白名单将被清空，群内所有成员都能触发 bot。继续？`
+            : ''
+        }
+        confirmText="重置白名单"
       />
     </div>
   );
