@@ -13,7 +13,7 @@ import type { BindingTarget } from './hooks/useImBindings';
 type ChannelFilter = 'all' | 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord';
 
 export function BindingsSection() {
-  const { bindings, loading, targets, targetsLoading, reload, rebind, error: hookError, clearError: clearHookError } = useImBindings();
+  const { bindings, loading, targets, targetsLoading, reload, rebind, deleteImGroup, error: hookError, clearError: clearHookError } = useImBindings();
   const [localError, setLocalError] = useState<string | null>(null);
   const errorMsg = localError || hookError;
   const [search, setSearch] = useState('');
@@ -24,6 +24,7 @@ export function BindingsSection() {
   // Dialog state
   const [rebindGroup, setRebindGroup] = useState<AvailableImGroup | null>(null);
   const [unbindGroup, setUnbindGroup] = useState<AvailableImGroup | null>(null);
+  const [deleteGroup, setDeleteGroup] = useState<AvailableImGroup | null>(null);
 
   const channels: { key: ChannelFilter; label: string }[] = useMemo(() => {
     const types = new Set(bindings.map((b) => b.channel_type));
@@ -61,6 +62,21 @@ export function BindingsSection() {
   const handleUnbind = useCallback((group: AvailableImGroup) => {
     setUnbindGroup(group);
   }, []);
+
+  const handleDelete = useCallback((group: AvailableImGroup) => {
+    setDeleteGroup(group);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!deleteGroup) return;
+    const jid = deleteGroup.jid;
+    setDeleteGroup(null);
+    setActioningJid(jid);
+    setLocalError(null);
+    const err = await deleteImGroup(jid);
+    setActioningJid(null);
+    if (err) setLocalError(err);
+  }, [deleteGroup, deleteImGroup]);
 
   const handleActivationModeChange = useCallback(async (jid: string, mode: string) => {
     setActioningJid(jid);
@@ -219,6 +235,7 @@ export function BindingsSection() {
                 isActioning={actioningJid === group.jid}
                 onRebind={handleRebind}
                 onUnbind={handleUnbind}
+                onDelete={handleDelete}
                 onActivationModeChange={handleActivationModeChange}
               />
             ))}
@@ -256,6 +273,21 @@ export function BindingsSection() {
         title="恢复默认路由"
         message={restoreConfirmGroup ? `确认将「${restoreConfirmGroup.name}」恢复为默认路由（消息发送到主工作区）？` : ''}
         confirmText="恢复默认"
+      />
+
+      {/* Delete IM group confirm dialog */}
+      <ConfirmDialog
+        open={!!deleteGroup}
+        onClose={() => setDeleteGroup(null)}
+        onConfirm={confirmDelete}
+        title="删除 IM 渠道"
+        message={
+          deleteGroup
+            ? `确认删除「${deleteGroup.name}」？将清除该渠道的绑定关系和聊天记录，此操作不可恢复。如果该 Bot 仍在群里，再次收到消息时会重新出现。`
+            : ''
+        }
+        confirmText="删除"
+        confirmVariant="danger"
       />
     </div>
   );

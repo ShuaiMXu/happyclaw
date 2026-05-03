@@ -2724,4 +2724,36 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   );
 });
 
+// Delete an IM group entirely (removes binding record, chat history, and chat metadata)
+configRoutes.delete('/user-im/bindings/:imJid', authMiddleware, (c) => {
+  const imJid = decodeURIComponent(c.req.param('imJid'));
+  const user = c.get('user') as AuthUser;
+
+  const channelType = getChannelType(imJid);
+  if (!channelType) {
+    return c.json({ error: 'Invalid IM JID' }, 400);
+  }
+
+  const imGroup = getRegisteredGroup(imJid);
+  if (!imGroup) {
+    return c.json({ error: 'IM group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  deleteRegisteredGroup(imJid);
+  deleteChatHistory(imJid);
+
+  const webDeps = getWebDeps();
+  if (webDeps) {
+    const groups = webDeps.getRegisteredGroups();
+    delete groups[imJid];
+    webDeps.clearImFailCounts?.(imJid);
+  }
+
+  logger.info({ imJid, userId: user.id }, 'IM group deleted (bindings page)');
+  return c.json({ success: true });
+});
+
 export default configRoutes;

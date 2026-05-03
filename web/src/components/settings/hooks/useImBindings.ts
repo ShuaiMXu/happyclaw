@@ -154,7 +154,25 @@ export function useImBindings() {
     loadTargets();
   }, [loadBindings, loadTargets]);
 
+  const deleteImGroup = useCallback(
+    async (imJid: string): Promise<string | null> => {
+      setError(null);
+      try {
+        await api.delete(
+          `/api/config/user-im/bindings/${encodeURIComponent(imJid)}`,
+        );
+        await loadBindings();
+        return null;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '删除失败，请重试';
+        setError(msg);
+        return msg;
+      }
+    },
+    [loadBindings],
+  );
+
   const clearError = useCallback(() => setError(null), []);
 
-  return { bindings, loading, targets, targetsLoading, reload, rebind, error, clearError };
+  return { bindings, loading, targets, targetsLoading, reload, rebind, deleteImGroup, error, clearError };
 }

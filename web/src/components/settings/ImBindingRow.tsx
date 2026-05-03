@@ -1,4 +1,4 @@
-import { Loader2, MessageSquare, Users, ArrowRightLeft, Unlink } from 'lucide-react';
+import { Loader2, MessageSquare, Users, ArrowRightLeft, Unlink, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { AvailableImGroup } from '../../types';
 import { ChannelBadge } from './channel-meta';
@@ -9,10 +9,11 @@ interface ImBindingRowProps {
   isActioning: boolean;
   onRebind: (group: AvailableImGroup) => void;
   onUnbind: (group: AvailableImGroup) => void;
+  onDelete: (group: AvailableImGroup) => void;
   onActivationModeChange: (jid: string, mode: string) => void;
 }
 
-export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onActivationModeChange }: ImBindingRowProps) {
+export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onDelete, onActivationModeChange }: ImBindingRowProps) {
   const hasBound = !!group.bound_agent_id || !!group.bound_main_jid;
 
   const bindingLabel = (): string => {
@@ -108,6 +109,16 @@ export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onActivat
             <ArrowRightLeft className="w-3 h-3 mr-1" />
           )}
           换绑
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => onDelete(group)}
+          disabled={isActioning}
+          className="text-muted-foreground hover:text-error"
+          title="删除该 IM 渠道"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
         </Button>
       </div>
     </div>
