@@ -179,6 +179,7 @@ status: ## 查看服务运行状态
 
 typecheck: sync-types typecheck-backend typecheck-web typecheck-agent-runner ## 全量类型检查
 	@./scripts/check-stream-event-sync.sh
+	@./scripts/check-agent-runner-prompts.sh
 
 typecheck-backend:
 	$(RUN) tsc --noEmit
