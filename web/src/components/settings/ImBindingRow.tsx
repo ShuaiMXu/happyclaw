@@ -20,7 +20,8 @@ export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onDelete,
   // so nobody (not even the owner) can trigger the bot until allowlist is reset
   // or owner sends a DM (which auto-backfills via learnFeishuOwner).
   const isAllowlistLocked =
-    Array.isArray(group.sender_allowlist) && group.sender_allowlist.length === 0;
+    group.sender_allowlist_locked === true ||
+    (Array.isArray(group.sender_allowlist) && group.sender_allowlist.length === 0);
 
   const bindingLabel = (): string => {
     if (group.bound_agent_id && group.bound_target_name) {

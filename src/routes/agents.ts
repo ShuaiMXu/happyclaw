@@ -377,15 +377,8 @@ router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
   deleteAgent(agentId);
 
   // Broadcast removal
-  const { broadcastAgentStatus } = await import('../web.js');
-  broadcastAgentStatus(
-    jid,
-    agentId,
-    'error',
-    agent.name,
-    agent.prompt,
-    '__removed__',
-  );
+  const { broadcastAgentRemoved } = await import('../web.js');
+  broadcastAgentRemoved(jid, agentId, agent.name);
 
   logger.info({ agentId, jid, userId: user.id }, 'Agent deleted by user');
   return c.json({ success: true });
@@ -450,6 +443,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
     activation_mode?: string;
     owner_im_id?: string | null;
     sender_allowlist?: string[] | null;
+    sender_allowlist_locked?: boolean;
   }
 
   const candidates: ImGroupCandidate[] = [];
@@ -502,6 +496,8 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       activation_mode: g.activation_mode,
       owner_im_id: g.owner_im_id ?? null,
       sender_allowlist: g.sender_allowlist ?? null,
+      sender_allowlist_locked:
+        Array.isArray(g.sender_allowlist) && g.sender_allowlist.length === 0,
     });
   }
 
