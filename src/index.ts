@@ -194,6 +194,7 @@ import {
   broadcastTitleGenerating,
   broadcastGroupCreated,
   broadcastBillingUpdate,
+  broadcastWhatsAppStatus,
   shutdownTerminals,
   shutdownWebServer,
   getActiveStreamingTexts,
@@ -7800,6 +7801,9 @@ async function connectUserIMChannels(
           resolveGroupFolder,
           resolveEffectiveChatJid,
           onAgentMessage,
+          onConnectionUpdate: (uid, state) => {
+            broadcastWhatsAppStatus(uid, state);
+          },
         })
       : Promise.resolve(false);
 
@@ -8470,11 +8474,14 @@ async function main(): Promise<void> {
               resolveEffectiveFolder(chatJid),
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
             onAgentMessage: buildOnAgentMessage(),
+            onConnectionUpdate: (uid, state) => {
+              broadcastWhatsAppStatus(uid, state);
+            },
           },
         );
         logger.info(
           { userId, connected },
-          'User WhatsApp connection hot-reloaded (skeleton)',
+          'User WhatsApp connection hot-reloaded',
         );
         return connected;
       }
@@ -8521,6 +8528,8 @@ async function main(): Promise<void> {
       imManager.isDiscordConnected(userId),
     isUserWhatsAppConnected: (userId: string) =>
       imManager.isWhatsAppConnected(userId),
+    getUserWhatsAppState: (userId: string) =>
+      imManager.getUserWhatsAppState(userId),
     processAgentConversation,
     getFeishuChatInfo: (userId: string, chatId: string) =>
       imManager.getFeishuChatInfo(userId, chatId),
