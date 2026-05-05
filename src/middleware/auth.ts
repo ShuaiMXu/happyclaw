@@ -60,6 +60,15 @@ export const authMiddleware = async (c: any, next: any) => {
     allValues = getAllCookieValues(cookieHeader, SESSION_COOKIE_NAME_PLAIN);
   }
 
+  // Also accept Bearer token from Authorization header (for Chrome Extension / API clients)
+  const authHeader = c.req.header('authorization');
+  const bearerToken = authHeader?.startsWith('Bearer ')
+    ? authHeader.slice(7).trim()
+    : undefined;
+  if (bearerToken) {
+    allValues.push(bearerToken);
+  }
+
   if (allValues.length === 0) {
     return c.json({ error: 'Unauthorized' }, 401);
   }

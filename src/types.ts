@@ -212,6 +212,30 @@ export interface User {
   deleted_at: string | null;
 }
 
+export type ApiTokenScope = 'knowledge';
+
+export interface ApiToken {
+  id: string;
+  user_id: string;
+  token_hash: string;
+  token_prefix: string;
+  scope: ApiTokenScope;
+  name: string;
+  created_at: string;
+  last_used_at: string | null;
+  last_used_ip: string | null;
+}
+
+export interface ApiTokenPublic {
+  id: string;
+  scope: ApiTokenScope;
+  name: string;
+  token_prefix: string;
+  created_at: string;
+  last_used_at: string | null;
+  last_used_ip: string | null;
+}
+
 export interface UserPublic {
   id: string;
   username: string;

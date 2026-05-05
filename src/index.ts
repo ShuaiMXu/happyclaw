@@ -89,6 +89,11 @@ import {
   upsertImContextBinding,
   touchImContextBindingActivity,
   updateAgentContextInfo,
+  getKnowledgeCategories,
+  getKnowledgeClipById,
+  searchKnowledgeClips,
+  createKnowledgeCategory,
+  createKnowledgeClip,
   backfillEmptyAllowlistsForUser,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
@@ -4777,6 +4782,62 @@ function startIpcWatcher(): void {
           );
         }
       }
+
+      // Process knowledge IPC requests from this group
+      const knowledgeDir = path.join(ipcRoot, 'knowledge');
+      try {
+        const knowledgeEntries = await fsp.readdir(knowledgeDir, {
+          withFileTypes: true,
+        });
+
+        // Clean up stale result files (>10min)
+        for (const entry of knowledgeEntries) {
+          if (
+            entry.isFile() &&
+            entry.name.endsWith('.json') &&
+            entry.name.startsWith('knowledge_result_')
+          ) {
+            try {
+              const filePath = path.join(knowledgeDir, entry.name);
+              const stat = await fsp.stat(filePath);
+              if (Date.now() - stat.mtimeMs > 10 * 60 * 1000) {
+                await fsp.unlink(filePath);
+              }
+            } catch { /* ignore */ }
+          }
+        }
+
+        const requestFiles = knowledgeEntries
+          .filter(
+            (entry) =>
+              entry.isFile() &&
+              entry.name.endsWith('.json') &&
+              !entry.name.startsWith('knowledge_result_'),
+          )
+          .map((entry) => entry.name);
+
+        for (const file of requestFiles) {
+          const filePath = path.join(knowledgeDir, file);
+          try {
+            const raw = await fsp.readFile(filePath, 'utf-8');
+            await fsp.unlink(filePath);
+            const data = JSON.parse(raw);
+            await processKnowledgeIpc(data, knowledgeDir, sourceGroup, isHome);
+          } catch (err) {
+            logger.error(
+              { file, sourceGroup, err },
+              'Error processing knowledge IPC',
+            );
+          }
+        }
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT') {
+          logger.error(
+            { err, sourceGroup },
+            'Error reading knowledge IPC directory',
+          );
+        }
+      }
     } // end for (const ipcRoot of ipcRoots)
   };
 
@@ -4812,6 +4873,165 @@ function startIpcWatcher(): void {
   ipcWatcherManager.startFallback();
 
   logger.info('IPC watcher started (event-driven + 5s fallback)');
+}
+
+async function processKnowledgeIpc(
+  data: {
+    type: string;
+    requestId: string;
+    query?: string;
+    category?: string;
+    limit?: number;
+    level?: 'l0' | 'l1' | 'l2';
+    clipId?: string;
+    title?: string;
+    content?: string;
+    url?: string;
+    tags?: string[];
+    summary?: string;
+    sourceType?: string;
+  },
+  knowledgeDir: string,
+  sourceGroup: string,
+  isHome: boolean,
+): Promise<void> {
+  if (!isHome) {
+    logger.warn({ sourceGroup }, 'Non-home group attempted knowledge IPC');
+    return;
+  }
+
+  const resultFile = path.join(
+    knowledgeDir,
+    `knowledge_result_${data.requestId}.json`,
+  );
+
+  const writeResult = async (result: Record<string, unknown>) => {
+    const tmpFile = `${resultFile}.tmp`;
+    await fs.promises.writeFile(tmpFile, JSON.stringify(result));
+    await fs.promises.rename(tmpFile, resultFile);
+  };
+
+  try {
+    // Find the user for this group
+    const groups = getAllRegisteredGroups();
+    const groupEntry = Object.values(groups).find(
+      (g: RegisteredGroup) => g.folder === sourceGroup && g.is_home,
+    );
+    if (!groupEntry?.created_by) {
+      await writeResult({ error: 'Cannot determine user for knowledge operation' });
+      return;
+    }
+    const userId = groupEntry.created_by;
+
+    switch (data.type) {
+      case 'knowledge_search': {
+        // Find category_id from category name if provided
+        let categoryId: string | undefined;
+        if (data.category) {
+          const cats = getKnowledgeCategories(userId);
+          const cat = cats.find(
+            (c) => c.name.toLowerCase() === data.category!.toLowerCase(),
+          );
+          categoryId = cat?.id;
+        }
+        const results = searchKnowledgeClips(userId, data.query || '', {
+          categoryId,
+          limit: data.limit || 10,
+          level: data.level || 'l1',
+        });
+        await writeResult({
+          clips: results.map((clip) => ({
+            id: clip.id,
+            title: clip.title,
+            url: clip.url,
+            summary: clip.summary,
+            content: clip.content,
+            tags: clip.tags,
+            category: clip.category_name,
+            created_at: clip.created_at,
+          })),
+          count: results.length,
+        });
+        break;
+      }
+      case 'knowledge_get': {
+        const clip = getKnowledgeClipById(data.clipId || '', userId);
+        if (!clip) {
+          await writeResult({ error: 'Clip not found' });
+        } else {
+          await writeResult({
+            id: clip.id,
+            title: clip.title,
+            url: clip.url,
+            content: clip.content,
+            summary: clip.summary,
+            tags: clip.tags,
+            category: clip.category_name,
+            source_type: clip.source_type,
+            created_at: clip.created_at,
+          });
+        }
+        break;
+      }
+      case 'knowledge_add': {
+        // Resolve or create category
+        let categoryId: string | undefined;
+        if (data.category) {
+          const cats = getKnowledgeCategories(userId);
+          let cat = cats.find(
+            (c) => c.name.toLowerCase() === data.category!.toLowerCase(),
+          );
+          if (!cat) {
+            cat = createKnowledgeCategory({
+              user_id: userId,
+              name: data.category,
+            });
+          }
+          categoryId = cat.id;
+        }
+        const clip = createKnowledgeClip({
+          user_id: userId,
+          category_id: categoryId,
+          title: data.title || 'Untitled',
+          content: data.content || '',
+          url: data.url,
+          tags: data.tags,
+          summary: data.summary,
+          source_type: data.sourceType || 'manual',
+        });
+        await writeResult({
+          id: clip.id,
+          title: clip.title,
+          category_id: clip.category_id,
+          created_at: clip.created_at,
+          message: '已保存到知识库',
+        });
+        break;
+      }
+      case 'knowledge_list_categories': {
+        const categories = getKnowledgeCategories(userId);
+        await writeResult({
+          categories: categories.map((c) => ({
+            id: c.id,
+            name: c.name,
+            description: c.description,
+            color: c.color,
+            clip_count: c.clip_count,
+          })),
+        });
+        break;
+      }
+      default:
+        await writeResult({ error: `Unknown knowledge IPC type: ${data.type}` });
+    }
+  } catch (err) {
+    logger.error({ err, type: data.type, sourceGroup }, 'Knowledge IPC error');
+    try {
+      await writeResult({
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } catch { /* ignore write error */ }
+  }
 }
 
 async function processTaskIpc(

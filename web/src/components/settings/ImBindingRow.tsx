@@ -1,4 +1,4 @@
-import { Loader2, MessageSquare, Users, ArrowRightLeft, Unlink, AlertTriangle } from 'lucide-react';
+import { Loader2, MessageSquare, Users, ArrowRightLeft, Unlink, Trash2, AlertTriangle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { AvailableImGroup } from '../../types';
 import { ChannelBadge } from './channel-meta';
@@ -9,16 +9,19 @@ interface ImBindingRowProps {
   isActioning: boolean;
   onRebind: (group: AvailableImGroup) => void;
   onUnbind: (group: AvailableImGroup) => void;
+  onDelete: (group: AvailableImGroup) => void;
   onResetAllowlist: (group: AvailableImGroup) => void;
   onActivationModeChange: (jid: string, mode: string) => void;
 }
 
-export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onResetAllowlist, onActivationModeChange }: ImBindingRowProps) {
+export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onDelete, onResetAllowlist, onActivationModeChange }: ImBindingRowProps) {
   const hasBound = !!group.bound_agent_id || !!group.bound_main_jid;
   // Empty array = "owner-locked trap": bot was added before Feishu owner DM'd it,
   // so nobody (not even the owner) can trigger the bot until allowlist is reset
   // or owner sends a DM (which auto-backfills via learnFeishuOwner).
-  const isAllowlistLocked = group.sender_allowlist_locked === true;
+  const isAllowlistLocked =
+    group.sender_allowlist_locked === true ||
+    (Array.isArray(group.sender_allowlist) && group.sender_allowlist.length === 0);
 
   const bindingLabel = (): string => {
     if (group.bound_agent_id && group.bound_target_name) {
@@ -139,6 +142,16 @@ export function ImBindingRow({ group, isActioning, onRebind, onUnbind, onResetAl
             <ArrowRightLeft className="w-3 h-3 mr-1" />
           )}
           换绑
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => onDelete(group)}
+          disabled={isActioning}
+          className="text-muted-foreground hover:text-error"
+          title="删除该 IM 渠道"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
         </Button>
       </div>
     </div>

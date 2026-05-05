@@ -16,6 +16,7 @@ import {
   Link2,
   PieChart,
   Gauge,
+  Chrome,
 } from 'lucide-react';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import type { SettingsTab } from './types';
@@ -37,6 +38,7 @@ const systemItems: NavItem[] = [
 const accountItems: NavItem[] = [
   { key: 'profile', label: '个人偏好', icon: <User className="w-4 h-4" />, group: 'account' },
   { key: 'my-channels', label: '消息通道', icon: <MessageSquare className="w-4 h-4" />, group: 'account' },
+  { key: 'extension', label: '浏览器扩展', icon: <Chrome className="w-4 h-4" />, group: 'account' },
   { key: 'security', label: '安全与设备', icon: <Shield className="w-4 h-4" />, group: 'account' },
 ];
 

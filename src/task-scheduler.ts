@@ -30,6 +30,7 @@ import {
   getUserHomeGroup,
   logTaskRun,
   logTaskRunStart,
+  markTaskScheduled,
   updateTaskRunLog,
   setRegisteredGroup,
   updateChatName,
@@ -873,6 +874,12 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           );
           continue;
         }
+
+        // 立即更新 next_run 时间，防止重复调度。
+        // 注意：这里只清 next_run，不能标 completed——否则 once 任务在
+        // runTask() 真正开跑前就被 isTaskStillActive() 当成已完成丢弃。
+        const nextRun = computeNextRun(currentTask);
+        markTaskScheduled(currentTask.id, nextRun);
 
         if (currentTask.execution_type === 'script') {
           if (!hasScriptCapacity()) {

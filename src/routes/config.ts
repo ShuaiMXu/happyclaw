@@ -2915,6 +2915,38 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   );
 });
 
+// Delete an IM group entirely (removes binding record, chat history, and chat metadata)
+configRoutes.delete('/user-im/bindings/:imJid', authMiddleware, (c) => {
+  const imJid = decodeURIComponent(c.req.param('imJid'));
+  const user = c.get('user') as AuthUser;
+
+  const channelType = getChannelType(imJid);
+  if (!channelType) {
+    return c.json({ error: 'Invalid IM JID' }, 400);
+  }
+
+  const imGroup = getRegisteredGroup(imJid);
+  if (!imGroup) {
+    return c.json({ error: 'IM group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  deleteRegisteredGroup(imJid);
+  deleteChatHistory(imJid);
+
+  const webDeps = getWebDeps();
+  if (webDeps) {
+    const groups = webDeps.getRegisteredGroups();
+    delete groups[imJid];
+    webDeps.clearImFailCounts?.(imJid);
+  }
+
+  logger.info({ imJid, userId: user.id }, 'IM group deleted (bindings page)');
+  return c.json({ success: true });
+});
+
 // Reset sender_allowlist to NULL (unrestricted) — escape hatch for the
 // "owner-locked trap" where buildOnNewChat registered the group with `[]`
 // because the Feishu owner had not DM'd the bot yet. After reset, anyone
@@ -2929,9 +2961,6 @@ configRoutes.post(
     const channelType = getChannelType(imJid);
     if (!channelType) {
       return c.json({ error: 'Invalid IM JID' }, 400);
-    }
-    if (channelType !== 'feishu') {
-      return c.json({ error: 'Only Feishu groups are supported' }, 400);
     }
 
     const imGroup = getRegisteredGroup(imJid);

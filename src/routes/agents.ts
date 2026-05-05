@@ -442,6 +442,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
     is_thread_capable?: boolean;
     activation_mode?: string;
     owner_im_id?: string | null;
+    sender_allowlist?: string[] | null;
     sender_allowlist_locked?: boolean;
   }
 
@@ -494,6 +495,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       }),
       activation_mode: g.activation_mode,
       owner_im_id: g.owner_im_id ?? null,
+      sender_allowlist: g.sender_allowlist ?? null,
       sender_allowlist_locked:
         Array.isArray(g.sender_allowlist) && g.sender_allowlist.length === 0,
     });

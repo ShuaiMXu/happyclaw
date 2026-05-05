@@ -12,6 +12,7 @@ import { AboutSection } from '../components/settings/AboutSection';
 import { AppearanceSection } from '../components/settings/AppearanceSection';
 import { SystemSettingsSection } from '../components/settings/SystemSettingsSection';
 import { UserChannelsSection } from '../components/settings/UserChannelsSection';
+import { ExtensionSection } from '../components/settings/ExtensionSection';
 import { GroupsPage } from './GroupsPage';
 import { MemoryPage } from './MemoryPage';
 import { SkillsPage } from './SkillsPage';
@@ -24,7 +25,7 @@ import { MonitorPage } from './MonitorPage';
 import { Card, CardContent } from '@/components/ui/card';
 import type { SettingsTab } from '../components/settings/types';
 
-const VALID_TABS: SettingsTab[] = ['claude', 'registration', 'appearance', 'system', 'profile', 'my-channels', 'security', 'groups', 'memory', 'skills', 'mcp-servers', 'agent-definitions', 'users', 'about', 'bindings', 'usage', 'monitor'];
+const VALID_TABS: SettingsTab[] = ['claude', 'registration', 'appearance', 'system', 'profile', 'my-channels', 'extension', 'security', 'groups', 'memory', 'skills', 'mcp-servers', 'agent-definitions', 'users', 'about', 'bindings', 'usage', 'monitor'];
 const SYSTEM_TABS: SettingsTab[] = ['claude', 'registration', 'appearance', 'system'];
 const FULLPAGE_TABS: SettingsTab[] = ['groups', 'memory', 'skills', 'mcp-servers', 'agent-definitions', 'users', 'bindings', 'usage', 'monitor'];
 
@@ -67,6 +68,7 @@ export function SettingsPage() {
     const tabs: { key: SettingsTab; label: string }[] = [];
     tabs.push({ key: 'profile', label: '个人偏好' });
     tabs.push({ key: 'my-channels', label: '消息通道' });
+    tabs.push({ key: 'extension', label: '浏览器扩展' });
     tabs.push({ key: 'security', label: '安全' });
     if (canManageSystemConfig) {
       tabs.push({ key: 'claude', label: 'Claude' });
@@ -109,6 +111,7 @@ export function SettingsPage() {
     system: '系统参数',
     profile: '个人偏好',
     'my-channels': '消息通道',
+    extension: '浏览器扩展',
     security: '安全与设备',
     groups: '会话管理',
     memory: '记忆管理',
@@ -211,6 +214,7 @@ export function SettingsPage() {
                   {activeTab === 'system' && <SystemSettingsSection />}
                   {activeTab === 'profile' && <ProfileSection />}
                   {activeTab === 'my-channels' && <UserChannelsSection />}
+                  {activeTab === 'extension' && <ExtensionSection />}
                   {activeTab === 'security' && <SecuritySection />}
                   {activeTab === 'about' && <AboutSection />}
                 </CardContent>

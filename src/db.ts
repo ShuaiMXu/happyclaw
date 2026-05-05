@@ -8,6 +8,9 @@ import { logger } from './logger.js';
 import {
   AgentKind,
   AgentStatus,
+  ApiToken,
+  ApiTokenPublic,
+  ApiTokenScope,
   AuthAuditLog,
   AuthEventType,
   BalanceOperatorType,
@@ -1236,7 +1239,121 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE agents ADD COLUMN spawned_from_jid TEXT');
   }
 
-  // v36 → v37: Add provider_id to sessions table for sticky provider binding.
+  // v34 → v35: Knowledge base tables (categories, clips, FTS5 search)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS knowledge_categories (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      color TEXT DEFAULT '#14b8a6',
+      sort_order INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_kcat_user ON knowledge_categories(user_id);
+
+    CREATE TABLE IF NOT EXISTS knowledge_clips (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      category_id TEXT,
+      title TEXT NOT NULL,
+      url TEXT,
+      content TEXT NOT NULL,
+      summary TEXT,
+      source_type TEXT NOT NULL DEFAULT 'web_clip',
+      tags TEXT DEFAULT '[]',
+      metadata TEXT DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (category_id) REFERENCES knowledge_categories(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_kclip_user ON knowledge_clips(user_id);
+    CREATE INDEX IF NOT EXISTS idx_kclip_cat ON knowledge_clips(category_id);
+    CREATE INDEX IF NOT EXISTS idx_kclip_created ON knowledge_clips(created_at);
+  `);
+
+  // FTS5 virtual table for full-text search on clips
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_clips_fts USING fts5(
+        title, content, summary, tags,
+        content='knowledge_clips',
+        content_rowid='rowid'
+      );
+    `);
+    // Triggers to keep FTS in sync
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS knowledge_clips_ai AFTER INSERT ON knowledge_clips BEGIN
+        INSERT INTO knowledge_clips_fts(rowid, title, content, summary, tags)
+        VALUES (new.rowid, new.title, new.content, COALESCE(new.summary, ''), COALESCE(new.tags, ''));
+      END;
+      CREATE TRIGGER IF NOT EXISTS knowledge_clips_ad AFTER DELETE ON knowledge_clips BEGIN
+        INSERT INTO knowledge_clips_fts(knowledge_clips_fts, rowid, title, content, summary, tags)
+        VALUES ('delete', old.rowid, old.title, old.content, COALESCE(old.summary, ''), COALESCE(old.tags, ''));
+      END;
+      CREATE TRIGGER IF NOT EXISTS knowledge_clips_au AFTER UPDATE ON knowledge_clips BEGIN
+        INSERT INTO knowledge_clips_fts(knowledge_clips_fts, rowid, title, content, summary, tags)
+        VALUES ('delete', old.rowid, old.title, old.content, COALESCE(old.summary, ''), COALESCE(old.tags, ''));
+        INSERT INTO knowledge_clips_fts(rowid, title, content, summary, tags)
+        VALUES (new.rowid, new.title, new.content, COALESCE(new.summary, ''), COALESCE(new.tags, ''));
+      END;
+    `);
+  } catch (err) {
+    // FTS5 may already exist, ignore
+    logger.debug({ err }, 'FTS5 table creation (may already exist)');
+  }
+
+  // v35 → v36: Scoped API tokens (for Chrome Extension and other external clients)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_api_tokens (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      token_prefix TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      last_used_at TEXT,
+      last_used_ip TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_api_tokens_user ON user_api_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_api_tokens_hash ON user_api_tokens(token_hash);
+  `);
+
+  // v36 → v37: Knowledge clip mirror to workspace markdown (llm-wiki ingest pipeline)
+  if (
+    !db
+      .prepare("PRAGMA table_info('knowledge_clips')")
+      .all()
+      .some((c: any) => c.name === 'raw_md_path')
+  ) {
+    db.exec('ALTER TABLE knowledge_clips ADD COLUMN raw_md_path TEXT');
+  }
+  if (
+    !db
+      .prepare("PRAGMA table_info('knowledge_clips')")
+      .all()
+      .some((c: any) => c.name === 'ingested_at')
+  ) {
+    db.exec('ALTER TABLE knowledge_clips ADD COLUMN ingested_at TEXT');
+  }
+
+  // v37 → v38: Hard-delete API tokens on revoke; drop unused revoked_at column.
+  if (
+    db
+      .prepare("PRAGMA table_info('user_api_tokens')")
+      .all()
+      .some((c: any) => c.name === 'revoked_at')
+  ) {
+    db.exec('DELETE FROM user_api_tokens WHERE revoked_at IS NOT NULL');
+    db.exec('ALTER TABLE user_api_tokens DROP COLUMN revoked_at');
+  }
+
+  // v38 → v39: Add provider_id to sessions table for sticky provider binding.
   // Prevents "Invalid signature in thinking block" errors when a Claude session
   // resumed across container restarts gets routed to a different OAuth account.
   if (
@@ -1248,7 +1365,7 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE sessions ADD COLUMN provider_id TEXT');
   }
 
-  const SCHEMA_VERSION = '37';
+  const SCHEMA_VERSION = '39';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -2079,6 +2196,18 @@ export function updateTaskAfterRun(
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
+}
+
+/**
+ * Placeholder update when the scheduler picks up a task: clears `next_run` to
+ * prevent re-pickup during the poll window, but does NOT mark the task as
+ * `completed` — that must wait for `updateTaskAfterRun()` after the agent
+ * actually finishes. See scheduler race fix for once-tasks.
+ */
+export function markTaskScheduled(id: string, nextRun: string | null): void {
+  db.prepare(
+    'UPDATE scheduled_tasks SET next_run = ?, last_result = ? WHERE id = ?',
+  ).run(nextRun, 'Scheduled', id);
 }
 
 export function logTaskRun(log: TaskRunLog): void {
@@ -3623,6 +3752,76 @@ export function getUserSessions(userId: string): UserSession[] {
 
 export function deleteUserSession(sessionId: string): void {
   stmts().deleteSession.run(sessionId);
+}
+
+// ─── Scoped API Tokens ──────────────────────────────────────────────────────
+
+function rowToApiToken(row: any): ApiToken | undefined {
+  if (!row) return undefined;
+  return row as ApiToken;
+}
+
+function rowToApiTokenPublic(row: any): ApiTokenPublic {
+  return {
+    id: row.id,
+    scope: row.scope,
+    name: row.name,
+    token_prefix: row.token_prefix,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+    last_used_ip: row.last_used_ip,
+  };
+}
+
+export function createApiToken(params: {
+  id: string;
+  userId: string;
+  tokenHash: string;
+  tokenPrefix: string;
+  scope: ApiTokenScope;
+  name: string;
+}): void {
+  db.prepare(
+    `INSERT INTO user_api_tokens (id, user_id, token_hash, token_prefix, scope, name, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    params.id,
+    params.userId,
+    params.tokenHash,
+    params.tokenPrefix,
+    params.scope,
+    params.name,
+    new Date().toISOString(),
+  );
+}
+
+export function findApiTokenByHash(tokenHash: string): ApiToken | undefined {
+  const row = db
+    .prepare('SELECT * FROM user_api_tokens WHERE token_hash = ?')
+    .get(tokenHash);
+  return rowToApiToken(row);
+}
+
+export function listApiTokensByUser(userId: string): ApiTokenPublic[] {
+  const rows = db
+    .prepare(
+      'SELECT * FROM user_api_tokens WHERE user_id = ? ORDER BY created_at DESC',
+    )
+    .all(userId) as any[];
+  return rows.map(rowToApiTokenPublic);
+}
+
+export function revokeApiToken(id: string, userId: string): boolean {
+  const result = db
+    .prepare('DELETE FROM user_api_tokens WHERE id = ? AND user_id = ?')
+    .run(id, userId);
+  return result.changes > 0;
+}
+
+export function touchApiToken(id: string, ip: string | null): void {
+  db.prepare(
+    'UPDATE user_api_tokens SET last_used_at = ?, last_used_ip = ? WHERE id = ?',
+  ).run(new Date().toISOString(), ip, id);
 }
 
 export function deleteUserSessionsByUserId(userId: string): void {
@@ -5721,6 +5920,409 @@ export function tryIncrementRedeemCodeUsage(
     ).run(code, userId, now);
     return true;
   })();
+}
+
+// ─── Knowledge Base Functions ────────────────────────────────────────────────
+
+export interface KnowledgeCategory {
+  id: string;
+  user_id: string;
+  name: string;
+  description: string | null;
+  color: string;
+  sort_order: number;
+  clip_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KnowledgeClip {
+  id: string;
+  user_id: string;
+  category_id: string | null;
+  category_name?: string | null;
+  title: string;
+  url: string | null;
+  content: string;
+  summary: string | null;
+  source_type: string;
+  tags: string[];
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+function parseClipRow(row: any): KnowledgeClip {
+  return {
+    ...row,
+    tags: row.tags ? JSON.parse(row.tags) : [],
+    metadata: row.metadata ? JSON.parse(row.metadata) : {},
+  };
+}
+
+export function createKnowledgeCategory(data: {
+  user_id: string;
+  name: string;
+  description?: string | null;
+  color?: string | null;
+}): KnowledgeCategory {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO knowledge_categories (id, user_id, name, description, color, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, data.user_id, data.name, data.description || null, data.color || '#14b8a6', now, now);
+  return {
+    id,
+    user_id: data.user_id,
+    name: data.name,
+    description: data.description || null,
+    color: data.color || '#14b8a6',
+    sort_order: 0,
+    clip_count: 0,
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+export function getKnowledgeCategories(userId: string): KnowledgeCategory[] {
+  return db
+    .prepare(
+      `SELECT c.*, COALESCE(cnt.clip_count, 0) as clip_count
+       FROM knowledge_categories c
+       LEFT JOIN (
+         SELECT category_id, COUNT(*) as clip_count
+         FROM knowledge_clips WHERE user_id = ?
+         GROUP BY category_id
+       ) cnt ON cnt.category_id = c.id
+       WHERE c.user_id = ?
+       ORDER BY c.sort_order ASC, c.name ASC`,
+    )
+    .all(userId, userId) as KnowledgeCategory[];
+}
+
+export function updateKnowledgeCategory(
+  id: string,
+  userId: string,
+  data: {
+    name?: string;
+    description?: string | null;
+    color?: string | null;
+    sort_order?: number;
+  },
+): KnowledgeCategory | null {
+  const existing = db
+    .prepare('SELECT * FROM knowledge_categories WHERE id = ? AND user_id = ?')
+    .get(id, userId) as any;
+  if (!existing) return null;
+
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE knowledge_categories
+     SET name = ?, description = ?, color = ?, sort_order = ?, updated_at = ?
+     WHERE id = ? AND user_id = ?`,
+  ).run(
+    data.name ?? existing.name,
+    data.description ?? existing.description,
+    data.color ?? existing.color,
+    data.sort_order ?? existing.sort_order,
+    now,
+    id,
+    userId,
+  );
+
+  return {
+    ...existing,
+    ...data,
+    updated_at: now,
+    clip_count: 0,
+  };
+}
+
+export function deleteKnowledgeCategory(id: string, userId: string): boolean {
+  const result = db
+    .prepare('DELETE FROM knowledge_categories WHERE id = ? AND user_id = ?')
+    .run(id, userId);
+  return result.changes > 0;
+}
+
+export function createKnowledgeClip(data: {
+  user_id: string;
+  category_id?: string | null;
+  title: string;
+  url?: string | null;
+  content: string;
+  summary?: string | null;
+  source_type?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+}): KnowledgeClip {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const tags = JSON.stringify(data.tags || []);
+  const metadata = JSON.stringify(data.metadata || {});
+
+  db.prepare(
+    `INSERT INTO knowledge_clips (id, user_id, category_id, title, url, content, summary, source_type, tags, metadata, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    data.user_id,
+    data.category_id || null,
+    data.title,
+    data.url || null,
+    data.content,
+    data.summary || null,
+    data.source_type || 'web_clip',
+    tags,
+    metadata,
+    now,
+    now,
+  );
+
+  return {
+    id,
+    user_id: data.user_id,
+    category_id: data.category_id || null,
+    title: data.title,
+    url: data.url || null,
+    content: data.content,
+    summary: data.summary || null,
+    source_type: data.source_type || 'web_clip',
+    tags: data.tags || [],
+    metadata: data.metadata || {},
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+export function setKnowledgeClipMirrorPath(
+  clipId: string,
+  relativePath: string | null,
+): void {
+  db.prepare('UPDATE knowledge_clips SET raw_md_path = ? WHERE id = ?').run(
+    relativePath,
+    clipId,
+  );
+}
+
+export function getKnowledgeClipMirrorPath(clipId: string): string | null {
+  const row = db
+    .prepare('SELECT raw_md_path FROM knowledge_clips WHERE id = ?')
+    .get(clipId) as { raw_md_path: string | null } | undefined;
+  return row?.raw_md_path || null;
+}
+
+export function getKnowledgeClips(
+  userId: string,
+  limit = 50,
+  offset = 0,
+): KnowledgeClip[] {
+  const rows = db
+    .prepare(
+      `SELECT kc.*, cat.name as category_name
+       FROM knowledge_clips kc
+       LEFT JOIN knowledge_categories cat ON cat.id = kc.category_id
+       WHERE kc.user_id = ?
+       ORDER BY kc.created_at DESC
+       LIMIT ? OFFSET ?`,
+    )
+    .all(userId, limit, offset) as any[];
+  return rows.map(parseClipRow);
+}
+
+export function getKnowledgeClipsByCategory(
+  userId: string,
+  categoryId: string,
+  limit = 50,
+  offset = 0,
+): KnowledgeClip[] {
+  const rows = db
+    .prepare(
+      `SELECT kc.*, cat.name as category_name
+       FROM knowledge_clips kc
+       LEFT JOIN knowledge_categories cat ON cat.id = kc.category_id
+       WHERE kc.user_id = ? AND kc.category_id = ?
+       ORDER BY kc.created_at DESC
+       LIMIT ? OFFSET ?`,
+    )
+    .all(userId, categoryId, limit, offset) as any[];
+  return rows.map(parseClipRow);
+}
+
+export function getKnowledgeClipById(
+  id: string,
+  userId: string,
+): KnowledgeClip | null {
+  const row = db
+    .prepare(
+      `SELECT kc.*, cat.name as category_name
+       FROM knowledge_clips kc
+       LEFT JOIN knowledge_categories cat ON cat.id = kc.category_id
+       WHERE kc.id = ? AND kc.user_id = ?`,
+    )
+    .get(id, userId) as any;
+  if (!row) return null;
+  return parseClipRow(row);
+}
+
+export function updateKnowledgeClip(
+  id: string,
+  userId: string,
+  data: {
+    title?: string;
+    content?: string;
+    summary?: string;
+    category_id?: string | null;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+  },
+): KnowledgeClip | null {
+  const existing = db
+    .prepare('SELECT * FROM knowledge_clips WHERE id = ? AND user_id = ?')
+    .get(id, userId) as any;
+  if (!existing) return null;
+
+  const now = new Date().toISOString();
+  const tags = data.tags !== undefined ? JSON.stringify(data.tags) : existing.tags;
+  const metadata = data.metadata !== undefined ? JSON.stringify(data.metadata) : existing.metadata;
+
+  db.prepare(
+    `UPDATE knowledge_clips
+     SET title = ?, content = ?, summary = ?, category_id = ?, tags = ?, metadata = ?, updated_at = ?
+     WHERE id = ? AND user_id = ?`,
+  ).run(
+    data.title ?? existing.title,
+    data.content ?? existing.content,
+    data.summary ?? existing.summary,
+    data.category_id !== undefined ? data.category_id : existing.category_id,
+    tags,
+    metadata,
+    now,
+    id,
+    userId,
+  );
+
+  return getKnowledgeClipById(id, userId);
+}
+
+export function deleteKnowledgeClip(id: string, userId: string): boolean {
+  const result = db
+    .prepare('DELETE FROM knowledge_clips WHERE id = ? AND user_id = ?')
+    .run(id, userId);
+  return result.changes > 0;
+}
+
+export function batchDeleteKnowledgeClips(ids: string[], userId: string): number {
+  if (ids.length === 0) return 0;
+  const placeholders = ids.map(() => '?').join(',');
+  const result = db
+    .prepare(
+      `DELETE FROM knowledge_clips WHERE id IN (${placeholders}) AND user_id = ?`,
+    )
+    .run(...ids, userId);
+  return result.changes;
+}
+
+export function searchKnowledgeClips(
+  userId: string,
+  query: string,
+  options: { categoryId?: string; limit?: number; level?: 'l0' | 'l1' | 'l2' } = {},
+): KnowledgeClip[] {
+  const { categoryId, limit = 20, level = 'l1' } = options;
+
+  // Build the select fields based on detail level
+  let selectFields: string;
+  switch (level) {
+    case 'l0':
+      // Index only: title + tags + one-line summary
+      selectFields = `kc.id, kc.user_id, kc.category_id, kc.title, kc.url, '' as content,
+                      COALESCE(SUBSTR(kc.summary, 1, 100), SUBSTR(kc.content, 1, 100)) as summary,
+                      kc.source_type, kc.tags, '{}' as metadata, kc.created_at, kc.updated_at,
+                      cat.name as category_name`;
+      break;
+    case 'l2':
+      // Full content
+      selectFields = `kc.*, cat.name as category_name`;
+      break;
+    default:
+      // L1: summary (up to 1000 chars) + truncated content
+      selectFields = `kc.id, kc.user_id, kc.category_id, kc.title, kc.url,
+                      SUBSTR(kc.content, 1, 1000) as content,
+                      kc.summary, kc.source_type, kc.tags, kc.metadata, kc.created_at, kc.updated_at,
+                      cat.name as category_name`;
+  }
+
+  // Escape FTS5 special characters and build match query
+  const ftsQuery = query
+    .replace(/['"]/g, '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => `"${w}"`)
+    .join(' OR ');
+
+  if (!ftsQuery) return [];
+
+  const categoryFilter = categoryId ? 'AND kc.category_id = ?' : '';
+  const params: any[] = [ftsQuery, userId];
+  if (categoryId) params.push(categoryId);
+  params.push(limit);
+
+  try {
+    const rows = db
+      .prepare(
+        `SELECT ${selectFields}
+         FROM knowledge_clips kc
+         JOIN knowledge_clips_fts fts ON fts.rowid = kc.rowid
+         LEFT JOIN knowledge_categories cat ON cat.id = kc.category_id
+         WHERE knowledge_clips_fts MATCH ?
+           AND kc.user_id = ?
+           ${categoryFilter}
+         ORDER BY rank
+         LIMIT ?`,
+      )
+      .all(...params) as any[];
+    return rows.map(parseClipRow);
+  } catch (err) {
+    // FTS query error — fallback to LIKE search
+    logger.warn({ err, query }, 'FTS5 search failed, falling back to LIKE');
+    const likePattern = `%${query}%`;
+    const rows = db
+      .prepare(
+        `SELECT ${selectFields}
+         FROM knowledge_clips kc
+         LEFT JOIN knowledge_categories cat ON cat.id = kc.category_id
+         WHERE kc.user_id = ?
+           AND (kc.title LIKE ? OR kc.content LIKE ? OR kc.tags LIKE ?)
+           ${categoryFilter}
+         ORDER BY kc.created_at DESC
+         LIMIT ?`,
+      )
+      .all(userId, likePattern, likePattern, likePattern, ...(categoryId ? [categoryId] : []), limit) as any[];
+    return rows.map(parseClipRow);
+  }
+}
+
+export function getKnowledgeStats(userId: string): {
+  total_clips: number;
+  total_categories: number;
+  clips_today: number;
+  clips_this_week: number;
+} {
+  const today = new Date().toISOString().slice(0, 10);
+  const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+
+  const stats = db
+    .prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM knowledge_clips WHERE user_id = ?) as total_clips,
+        (SELECT COUNT(*) FROM knowledge_categories WHERE user_id = ?) as total_categories,
+        (SELECT COUNT(*) FROM knowledge_clips WHERE user_id = ? AND created_at >= ?) as clips_today,
+        (SELECT COUNT(*) FROM knowledge_clips WHERE user_id = ? AND created_at >= ?) as clips_this_week`,
+    )
+    .get(userId, userId, userId, today, userId, weekAgo) as any;
+
+  return stats;
 }
 
 /**
