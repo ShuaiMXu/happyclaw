@@ -944,6 +944,11 @@ app.use(
 
 // --- WebSocket ---
 
+// Origin 被 403 拒绝时,每个 origin 只 warn 一次,避免反复连接刷屏。
+// 反向代理 + 公网域名场景下,管理员只能通过日志才能定位"为什么 WS 连不上"
+// (前端只看到 onclose、后端默认静默 destroy socket),没有这行日志运维成本极高。
+const warnedRejectedOrigins = new Set<string>();
+
 function setupWebSocket(server: any): WebSocketServer {
   // 8 MiB 上限：覆盖单条消息含 10 张 5MB base64 image 的合法上限（~70MB 是
   // attachments 上限里的极端情形——通过 schema 上的 attachments.max(10) 控制
@@ -968,6 +973,16 @@ function setupWebSocket(server: any): WebSocketServer {
     if (origin) {
       const allowed = isAllowedOrigin(origin);
       if (!allowed) {
+        if (!warnedRejectedOrigins.has(origin)) {
+          warnedRejectedOrigins.add(origin);
+          logger.warn(
+            {
+              origin,
+              hint: 'add this origin to CORS_ALLOWED_ORIGINS env var (comma-separated) or set it to "*" to allow all',
+            },
+            'WebSocket upgrade rejected: Origin not in allowlist (CSWSH defense)',
+          );
+        }
         socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
         socket.destroy();
         return;
