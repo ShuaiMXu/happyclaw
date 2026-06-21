@@ -436,9 +436,27 @@ export const ClaudeSecretsSchema = z
     { message: 'At least one secret field must be provided' },
   );
 
+// 飞书/Lark 官方 appId 形如 `cli_xxxxxxxxxxxxxxxx`(cli_ 前缀 + 小写字母数字)。
+// 历史上有用户把用户名 / 手机号 / 邮箱前缀填进去,后端不校验直接存,飞书 SDK 拿这串
+// 错误的 appId 反复重试拿 token,导致日志被 axios error dump 灌爆(实测 ~2.5G/天)。
+// 这里挡掉格式不对的;真实的"凭据错配"留给保存前的 testFeishuCredentials 兜底。
+const FEISHU_APP_ID_REGEX = /^cli_[a-z0-9]+$/;
+
 export const FeishuConfigSchema = z
   .object({
-    appId: z.string().max(2000).optional(),
+    appId: z
+      .string()
+      .max(2000)
+      // refine 内先 trim 再匹配,与下游 routes/config.ts 的 trim() 行为对齐
+      // (per PR #572 review minor):粘贴带首尾空白的合法 appId 不被误拒
+      .refine((v) => {
+        const trimmed = v.trim();
+        return trimmed === '' || FEISHU_APP_ID_REGEX.test(trimmed);
+      }, {
+        message:
+          'appId must be in Feishu/Lark official format (cli_ prefix + lowercase alphanumeric)',
+      })
+      .optional(),
     appSecret: z.string().max(2000).optional(),
     clearAppSecret: z.boolean().optional(),
     enabled: z.boolean().optional(),

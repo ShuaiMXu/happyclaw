@@ -95,6 +95,7 @@ import { parseOAuthUsageBucket } from '../runtime-config.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
+import { testFeishuCredentials } from '../feishu-connectivity.js';
 import {
   checkImChannelLimit,
   isBillingEnabled,
@@ -1471,6 +1472,54 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
   }
   if (typeof validation.data.autoIsolateContext === 'boolean') {
     next.autoIsolateContext = validation.data.autoIsolateContext;
+  }
+
+  // Pre-save connectivity test: 启用且有完整凭据,且 (appId 或 appSecret 跟当前
+  // 持久化值不一致) 时,先调一次 tenant_access_token 接口验证凭据真能换出 token。
+  //
+  // 凭据变更守卫(per PR #572 review):仅 autoIsolateContext / enabled 这类与
+  // 凭据无关的设置变更不应触发 8s 飞书 API 测试;否则飞书抖动期间用户改个无关
+  // 开关都会被 400 阻塞。current 在上方已 decrypt 持有明文 appSecret,可直接比较。
+  //
+  // 不可达 / timeout 不强行阻塞:既然连飞书都连不上,自动重连阶段也会失败,
+  // 此时把错误暴露给用户比"成功保存但实际拿不到 token"更体面。
+  const credentialsChanged =
+    next.appId !== (current?.appId ?? '') ||
+    next.appSecret !== (current?.appSecret ?? '');
+  if (
+    next.enabled === true &&
+    typeof next.appId === 'string' &&
+    typeof next.appSecret === 'string' &&
+    next.appId &&
+    next.appSecret &&
+    credentialsChanged
+  ) {
+    const test = await testFeishuCredentials(
+      next.appId as string,
+      next.appSecret as string,
+    );
+    if (!test.ok) {
+      logger.warn(
+        {
+          userId: user.id,
+          appId: next.appId,
+          errorCode: test.errorCode,
+          errorMessage: test.errorMessage,
+        },
+        'Feishu credentials verification failed before save',
+      );
+      return c.json(
+        {
+          error: 'Feishu credentials verification failed',
+          details: {
+            code: test.errorCode,
+            message: test.errorMessage,
+            hint: 'Check appId/appSecret on the Lark/Feishu developer console',
+          },
+        },
+        400,
+      );
+    }
   }
 
   try {
