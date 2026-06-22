@@ -115,6 +115,19 @@ ARG CACHEBUST=1
 RUN npm install -g agent-browser
 RUN npm install
 
+# Headroom (https://github.com/chopratejas/headroom) - 工具输出/RAG/日志压缩.
+# 装上 binary 但默认不启用——用户在 /mcp-servers 自行添加才生效, 配置:
+#   { "command": "headroom", "args": ["mcp", "serve"] }
+# 只选 [code,mcp] 两个 extras: [memory] 通过 sentence-transformers 强依赖
+# torch + CUDA (cudnn-cu12, cublas, cusparse, cusolver, nccl, triton...),
+# 压缩包就 ~2.45GB, 解包 3-6GB 量级. HappyClaw 容器无 GPU, 也不需要语义
+# embedding 类 retrieve. 用户如真需要 headroom 的 memory 能力, 可在容器内
+# 单独 `pip install --index-url https://download.pytorch.org/whl/cpu torch`
+# 再 `pip install "headroom-ai[memory]"` 走 CPU 路径. PIP_BREAK_SYSTEM_PACKAGES
+# 已在 line 103 设置, 这里无需再传 --break-system-packages.
+RUN pip install "headroom-ai[code,mcp]" \
+    && headroom --version
+
 # Install feishu-cli (binary + builtin skills), 始终跟踪 latest release。
 # 通过 302 redirect 从 github.com/releases/latest 的 Location header 提取 tag
 # （和 install.sh 作者自己用的技巧一致），不经 api.github.com 规避 rate limit。
