@@ -19,6 +19,7 @@ import {
   deleteSession,
   getGroupsByTargetAgent,
   setRegisteredGroup,
+  deleteRegisteredGroup,
   getJidsByFolder,
   updateAgentLastImJid,
   updateAgentInfo,
@@ -215,6 +216,31 @@ router.post('/:jid/agents', authMiddleware, async (c) => {
   const virtualChatJid = `${jid}#agent:${agentId}`;
   ensureChatExists(virtualChatJid);
 
+  // Register virtual chat as a sibling group so router and queue can look up
+  // folder / executionMode / ownerId by virtualChatJid. Without this, web-side
+  // agent fork chats (web:...#agent:...) are absent from registered_groups,
+  // causing processAgentConversation() and the message router to drop their
+  // messages silently. Mirrors what feishu.ts/telegram.ts do at IM ingestion.
+  // The skip-on-target_agent_id branch in the router intentionally lets the
+  // web-side handleAgentConversationMessage() own this path; without a registered
+  // sibling here, that handler's cold-start branch can't find the parent group
+  // and the message vanishes.
+  const { jid: _parentJid, ...parentFields } = group;
+  setRegisteredGroup(virtualChatJid, {
+    ...parentFields,
+    name,
+    added_at: now,
+    created_by: user.id,
+    is_home: false,
+    target_agent_id: agentId,
+    target_main_jid: jid,
+    // Reset IM-specific fields — agent fork is web-only
+    owner_im_id: undefined,
+    feishu_chat_mode: undefined,
+    feishu_group_message_type: undefined,
+    sender_allowlist: undefined,
+  });
+
   // Broadcast agent_status (idle) via WebSocket
   // Import dynamically to avoid circular deps
   const { broadcastAgentStatus } = await import('../web.js');
@@ -389,6 +415,9 @@ router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
   if (agent.kind === 'conversation') {
     const virtualChatJid = `${jid}#agent:${agentId}`;
     deleteMessagesForChatJid(virtualChatJid);
+    // Also unregister the sibling group created at agent creation time
+    // (paired with the setRegisteredGroup call in POST /:jid/agents).
+    deleteRegisteredGroup(virtualChatJid);
 
     // Note: IM bindings are checked above and block deletion if present.
     // No auto-clear here — user must unbind explicitly before deleting.
