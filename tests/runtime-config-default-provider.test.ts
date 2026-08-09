@@ -139,4 +139,36 @@ describe('default model configuration', () => {
       defaultProviderId: firstEnabledId,
     });
   });
+
+  test('promoting a disabled provider to default auto-enables it', () => {
+    const primary = runtimeConfig.createProvider({
+      name: 'Auto-enable primary',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://ae-primary.example.test',
+      anthropicAuthToken: 'ae-primary-token',
+      anthropicModel: 'ae-primary-model',
+      enabled: true,
+    });
+    runtimeConfig.setDefaultProvider(primary.id);
+    expect(runtimeConfig.getDefaultProviderId()).toBe(primary.id);
+
+    const alt = runtimeConfig.createProvider({
+      name: 'Auto-enable alt',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://ae-alt.example.test',
+      anthropicAuthToken: 'ae-alt-token',
+      anthropicModel: 'ae-alt-model',
+      enabled: false,
+    });
+    expect(alt.enabled).toBe(false);
+
+    // 旧行为是抛错「默认模型配置必须处于启用状态」；现在应自动启用并设为默认，
+    // 从而把原默认释放出来去禁用或删除，避免死结。
+    const promoted = runtimeConfig.setDefaultProvider(alt.id);
+    expect(promoted.enabled).toBe(true);
+    expect(runtimeConfig.getDefaultProviderId()).toBe(alt.id);
+    expect(() =>
+      runtimeConfig.setProviderEnabled(primary.id, false),
+    ).not.toThrow();
+  });
 });
