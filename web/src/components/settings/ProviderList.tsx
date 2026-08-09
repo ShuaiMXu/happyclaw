@@ -221,12 +221,17 @@ export function ProviderList({
                           provider.enabled ? '禁用模型配置' : '启用模型配置'
                         }
                       />
-                      {provider.enabled && !isDefault && (
+                      {!isDefault && (
                         <Button
                           size="sm"
                           variant="ghost"
                           onClick={() => onSetDefault(provider)}
                           disabled={disabled || toggling || deleting}
+                          title={
+                            provider.enabled
+                              ? undefined
+                              : '设为默认（将同时启用该模型）'
+                          }
                           className="h-7 px-2 text-xs"
                         >
                           <Star className="size-3.5" />

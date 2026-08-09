@@ -1412,11 +1412,18 @@ export function getDefaultProviderId(): string | null {
 export function setDefaultProvider(id: string): UnifiedProvider {
   const state = readStoredStateV4();
   if (!state) throw new Error('模型配置不存在');
-  const provider = state.providers.find((item) => item.id === id);
-  if (!provider) throw new Error('未找到指定模型配置');
-  if (!provider.enabled) throw new Error('默认模型配置必须处于启用状态');
-  writeStoredStateV4(state.providers, state.balancing, provider.id);
-  return provider;
+  const idx = state.providers.findIndex((item) => item.id === id);
+  if (idx < 0) throw new Error('未找到指定模型配置');
+  const provider = state.providers[idx];
+  // 默认模型是所有「跟随系统默认」Agent 的运行时兜底，必须处于启用状态。
+  // 这里在提升为默认时自动启用，而不是直接报错：用户可以把一个处于关闭状态
+  // 的备选模型一步设为默认，从而把原默认释放出来去禁用或删除，避免死结。
+  const next = provider.enabled
+    ? provider
+    : { ...provider, enabled: true, updatedAt: new Date().toISOString() };
+  if (!provider.enabled) state.providers[idx] = next;
+  writeStoredStateV4(state.providers, state.balancing, id);
+  return next;
 }
 
 export function getBalancingConfig(): BalancingConfig {
