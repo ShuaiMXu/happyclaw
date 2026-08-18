@@ -66,6 +66,10 @@ Public：
 - `PATCH /api/groups/:jid/agent-profile`
 - `POST /api/groups/:jid/stop`
 - `POST /api/groups/:jid/interrupt`
+- `POST /api/groups/:jid/generate-image`，服务端确定性生图：校验工作区
+  `image_generation_enabled` 与选定模型后，直接调用平台级 OpenAI 兼容 Images
+  API，不经过对话模型或 Agent 容器；成功后将用户请求与生成图片各写为一条消息
+  并经 WebSocket 推送。仅 `web:` 前缀工作区可用，未开启开关时返回 409
 - `POST /api/groups/:jid/reset-session`
 - `POST /api/groups/:jid/clear-history`，重建工作区内容：永久清除聊天、
   Runtime Session、子对话、工作目录及 Workspace Memory（含版本历史和

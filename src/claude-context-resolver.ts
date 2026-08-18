@@ -31,40 +31,6 @@ export const HOST_CLAUDE_SETTINGS_FILES = [
   'settings.local.json',
 ] as const;
 
-/**
- * The one builtin Skill id gated behind the Workspace "platform image
- * generation" capability switch (see `getWorkspaceImageGenerationConfig` in
- * db.ts). Unlike every other builtin Skill — always available, no opt-in
- * required — this id is excluded by default and only force-included when the
- * switch is on, so turning generic image generation on for a Workspace is a
- * single, explicit action instead of a side effect of shipping the Skill.
- */
-export const IMAGE_GENERATION_BUILTIN_SKILL_ID = 'baoyu-image-gen';
-
-/**
- * Thrown when a Workspace has a capability switch on (currently only image
- * generation) but the builtin Skill it depends on is missing from
- * data/builtin-skills/ — e.g. this host never ran
- * `scripts/install-host-tools.sh`, or the cache was wiped mid-refresh.
- * Per CLAUDE.md §5, a missing precisely-selected capability must fail the
- * configuration, not silently run without it.
- */
-export class WorkspaceCapabilitySkillMissingError extends Error {
-  constructor(
-    public readonly groupFolder: string,
-    public readonly missingSkillIds: string[],
-  ) {
-    super(
-      `Workspace "${groupFolder}" has a capability enabled that requires the ` +
-        `builtin Skill(s) [${missingSkillIds.join(', ')}], but they are not ` +
-        `installed in data/builtin-skills/. Run ` +
-        `scripts/install-host-tools.sh (or "skills" mode) to install them, or ` +
-        `turn the capability off for this Workspace.`,
-    );
-    this.name = 'WorkspaceCapabilitySkillMissingError';
-  }
-}
-
 export interface ClaudeNativeConfigEntry {
   name: string;
   kind: 'file' | 'directory';
@@ -92,14 +58,6 @@ export interface ClaudeContextPlanArgs {
   managedSkillPolicy?: ManagedSkillPolicy;
   workspaceSkillsDirOverride?: string;
   pluginSkillLayers?: EffectiveSkillLayer[];
-  /**
-   * The Workspace's platform image generation capability switch. When true,
-   * `IMAGE_GENERATION_BUILTIN_SKILL_ID` is force-included regardless of the
-   * Workspace/Agent's manual Skill selection. Callers must also inject the
-   * matching env credentials (`PlatformImageInjection` in runtime-config.ts)
-   * so the Skill and its credentials always turn on together.
-   */
-  imageGenerationEnabled?: boolean;
 }
 
 export interface ClaudeContextPlan {
@@ -339,17 +297,7 @@ export function buildClaudeContextPlan(
     ],
     managedPolicy: args.managedSkillPolicy,
     hostPolicy: hostSkillPolicy,
-    gatedBuiltinIds: [IMAGE_GENERATION_BUILTIN_SKILL_ID],
-    forcedBuiltinIds: args.imageGenerationEnabled
-      ? [IMAGE_GENERATION_BUILTIN_SKILL_ID]
-      : [],
   });
-  if (effectiveSkills.missingForcedSkillIds.length > 0) {
-    throw new WorkspaceCapabilitySkillMissingError(
-      args.group.folder,
-      effectiveSkills.missingForcedSkillIds,
-    );
-  }
   const skillAuditNames = {
     builtin: 'builtin',
     host: 'external',

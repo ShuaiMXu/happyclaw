@@ -8,8 +8,6 @@ import {
   buildClaudeContextPlan,
   loadHostClaudeSettings,
   syncHostClaudeContext,
-  IMAGE_GENERATION_BUILTIN_SKILL_ID,
-  WorkspaceCapabilitySkillMissingError,
 } from '../src/claude-context-resolver.js';
 
 function writeFile(file: string, text = 'x'): void {
@@ -396,65 +394,5 @@ describe('ClaudeContextResolver', () => {
     expect(fs.readFileSync(path.join(sessionDir, 'CLAUDE.md'), 'utf8')).toBe(
       '# session-authored',
     );
-  });
-
-  describe('image generation capability gating', () => {
-    function basePlanArgs(dataDir: string, sessionDir: string) {
-      return {
-        executionMode: 'host' as const,
-        group: fakeGroup('imaging', 'owner') as any,
-        externalClaudeDir: path.join(dataDir, 'unused-external'),
-        projectRoot: path.join(dataDir, 'project'),
-        dataDir,
-        groupSessionsDir: sessionDir,
-      };
-    }
-
-    test('the gated builtin Skill stays out of every ordinary plan', () => {
-      const dataDir = path.join(tmp, 'data');
-      const sessionDir = path.join(tmp, 'sessions', 'imaging', '.claude');
-      makeSkill(
-        path.join(dataDir, 'builtin-skills'),
-        IMAGE_GENERATION_BUILTIN_SKILL_ID,
-      );
-      makeSkill(path.join(dataDir, 'builtin-skills'), 'ordinary-builtin');
-
-      const plan = buildClaudeContextPlan(basePlanArgs(dataDir, sessionDir));
-
-      expect(plan.effectiveSkills.selected.map((s) => s.id)).toEqual([
-        'ordinary-builtin',
-      ]);
-    });
-
-    test('imageGenerationEnabled force-mounts the Skill when it is installed', () => {
-      const dataDir = path.join(tmp, 'data');
-      const sessionDir = path.join(tmp, 'sessions', 'imaging', '.claude');
-      makeSkill(
-        path.join(dataDir, 'builtin-skills'),
-        IMAGE_GENERATION_BUILTIN_SKILL_ID,
-      );
-
-      const plan = buildClaudeContextPlan({
-        ...basePlanArgs(dataDir, sessionDir),
-        imageGenerationEnabled: true,
-      });
-
-      expect(plan.effectiveSkills.selected.map((s) => s.id)).toEqual([
-        IMAGE_GENERATION_BUILTIN_SKILL_ID,
-      ]);
-    });
-
-    test('imageGenerationEnabled without the Skill installed fails loudly instead of silently running without it', () => {
-      const dataDir = path.join(tmp, 'data');
-      const sessionDir = path.join(tmp, 'sessions', 'imaging', '.claude');
-      fs.mkdirSync(path.join(dataDir, 'builtin-skills'), { recursive: true });
-
-      expect(() =>
-        buildClaudeContextPlan({
-          ...basePlanArgs(dataDir, sessionDir),
-          imageGenerationEnabled: true,
-        }),
-      ).toThrow(WorkspaceCapabilitySkillMissingError);
-    });
   });
 });

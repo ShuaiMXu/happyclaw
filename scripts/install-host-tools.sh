@@ -17,14 +17,9 @@ DATA_DIR="$PROJECT_ROOT/data"
 BUILTIN_SKILLS_DIR="$DATA_DIR/builtin-skills"
 FEISHU_CLI_VERSION="v1.35.0"
 FEISHU_CLI_SOURCE_SHA256="91b5575833f003527c7b60a26f08703ebfdb348098deecfa9ceed1dcf230f253"
-# JimLiu/baoyu-skills is a multi-Skill monorepo; only skills/baoyu-image-gen/
-# is extracted below — the repo also ships several "danger-*" Skills that must
-# not become available to every Workspace by mounting the whole tree.
 # Keep this pair in sync with scripts/builtin-skill-catalog.mjs's
 # BUILTIN_SKILL_SOURCES; a mismatch fails
 # tests/builtin-skill-bootstrap-contract.test.ts.
-BAOYU_SKILLS_VERSION="v2.5.2"
-BAOYU_SKILLS_SOURCE_SHA256="b7e88f4183289cc1e5e4635e3746fac3ccd5db4e0beb25e38bb84c01aad885cb"
 
 # ── Helpers ──────────────────────────────────────────────────
 
@@ -92,20 +87,6 @@ refresh_builtin_skills() {
   tar -xzf "$TMP/feishu-cli-source.tar.gz" -C "$TMP"
 
   cp -r "$TMP"/*/skills/. "$STAGING"/
-
-  # baoyu-skills is a multi-Skill monorepo (article illustration, WeChat/X
-  # posting, a couple of Skills literally named "danger-*", ...). Only
-  # skills/baoyu-image-gen/ is pulled in — everything else in that repo stays
-  # out of every Workspace's reach.
-  info "Fetching baoyu-image-gen $BAOYU_SKILLS_VERSION..."
-  curl -fsSL \
-    -o "$TMP/baoyu-skills-source.tar.gz" \
-    "https://github.com/JimLiu/baoyu-skills/archive/refs/tags/${BAOYU_SKILLS_VERSION}.tar.gz"
-  verify_sha256 "$BAOYU_SKILLS_SOURCE_SHA256" "$TMP/baoyu-skills-source.tar.gz"
-  BAOYU_EXTRACT="$TMP/baoyu-skills"
-  mkdir -p "$BAOYU_EXTRACT"
-  tar -xzf "$TMP/baoyu-skills-source.tar.gz" -C "$BAOYU_EXTRACT"
-  cp -r "$BAOYU_EXTRACT"/*/skills/baoyu-image-gen "$STAGING"/baoyu-image-gen
 
   node "$PROJECT_ROOT/scripts/builtin-skill-catalog.mjs" write "$STAGING"
 

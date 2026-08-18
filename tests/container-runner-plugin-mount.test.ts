@@ -53,7 +53,6 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 const containerRunner = await import('../src/container-runner.js');
-const runtimeConfig = await import('../src/runtime-config.js');
 const catalog = await import('../src/plugin-catalog.js');
 const utils = await import('../src/plugin-utils.js');
 const materializer = await import('../src/plugin-materializer.js');
@@ -67,7 +66,6 @@ const {
 } = containerRunner;
 const { writeCatalogIndex, getCatalogSnapshotDir } = catalog;
 const { CONTAINER_PLUGINS_PATH } = utils;
-const { saveImageGenerationBackendConfig } = runtimeConfig;
 const { getUserRuntimeRoot, getUserPluginRuntimeDir } = materializer;
 
 const USER = 'alice';
@@ -127,15 +125,6 @@ function fakeGroup(folder: string, ownerId: string) {
     created_by: ownerId,
     is_home: false,
   };
-}
-
-function seedBuiltinImageSkill(): void {
-  const skillDir = path.join(tmpDataDir, 'builtin-skills', 'baoyu-image-gen');
-  fs.mkdirSync(skillDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(skillDir, 'SKILL.md'),
-    '---\nname: baoyu-image-gen\ndescription: Image generation\n---\n',
-  );
 }
 
 function writeSystemSettings(partial: Record<string, unknown>): void {
@@ -212,87 +201,6 @@ describe('buildVolumeMounts — container proxy secret boundary', () => {
     });
     expect(args.join(' ')).not.toContain(secret);
     expect(args.join(' ')).not.toContain('HTTPS_PROXY=');
-  });
-});
-
-describe('buildVolumeMounts — platform image generation preferences', () => {
-  test('provisions the upstream Skill preferences for an image-enabled workspace', () => {
-    seedBuiltinImageSkill();
-    saveImageGenerationBackendConfig(
-      'http://image.example.test/v1',
-      'test-image-key',
-    );
-    buildVolumeMounts(
-      fakeGroup('image-enabled', USER) as any,
-      false,
-      true,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      false,
-      undefined,
-      { enabled: true, model: 'gpt-image-2' },
-    );
-
-    const preferences = path.join(
-      tmpDataDir,
-      'groups',
-      'image-enabled',
-      '.baoyu-skills',
-      'baoyu-image-gen',
-      'EXTEND.md',
-    );
-    expect(fs.readFileSync(preferences, 'utf8')).toContain(
-      'default_provider: openai',
-    );
-    expect(fs.readFileSync(preferences, 'utf8')).toContain(
-      'openai: gpt-image-2',
-    );
-    expect(fs.statSync(preferences).mode & 0o777).toBe(0o600);
-  });
-
-  test('does not overwrite a workspace preference file owned by the user', () => {
-    seedBuiltinImageSkill();
-    saveImageGenerationBackendConfig(
-      'http://image.example.test/v1',
-      'test-image-key',
-    );
-    const preferences = path.join(
-      tmpDataDir,
-      'groups',
-      'image-customized',
-      '.baoyu-skills',
-      'baoyu-image-gen',
-      'EXTEND.md',
-    );
-    fs.mkdirSync(path.dirname(preferences), { recursive: true });
-    fs.writeFileSync(preferences, 'default_provider: google\n');
-
-    buildVolumeMounts(
-      fakeGroup('image-customized', USER) as any,
-      false,
-      true,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      false,
-      undefined,
-      { enabled: true, model: 'gpt-image-1.5' },
-    );
-
-    expect(fs.readFileSync(preferences, 'utf8')).toBe(
-      'default_provider: google\n',
-    );
   });
 });
 

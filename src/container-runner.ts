@@ -67,7 +67,6 @@ import {
   getSessionProviderId,
   setSessionProviderId,
   getWorkspaceLockedModelConfigId,
-  getWorkspaceImageGenerationConfig,
 } from './db.js';
 import { isApiError } from './agent-output-parser.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
@@ -1401,48 +1400,6 @@ export function cleanupContainerTaskRuntimeEnvDirs(
   }
 }
 
-const PLATFORM_IMAGE_PREFERENCES_MARKER =
-  '# Managed by HappyClaw platform image generation';
-
-/**
- * The upstream Skill blocks its first invocation until a provider preference
- * file exists. Provision only a HappyClaw-owned default so enabling the
- * Workspace switch really means images can be generated immediately, while a
- * user's own preferences are never overwritten.
- */
-function ensurePlatformImageGenerationPreferences(
-  workspaceDir: string,
-  imageGenerationConfig: {
-    enabled: boolean;
-    model: 'gpt-image-1.5' | 'gpt-image-2' | null;
-  },
-): void {
-  if (!imageGenerationConfig.enabled || !imageGenerationConfig.model) return;
-
-  const preferencesPath = path.join(
-    workspaceDir,
-    '.baoyu-skills',
-    'baoyu-image-gen',
-    'EXTEND.md',
-  );
-  try {
-    if (fs.existsSync(preferencesPath)) {
-      const existing = fs.readFileSync(preferencesPath, 'utf-8');
-      if (!existing.startsWith(PLATFORM_IMAGE_PREFERENCES_MARKER)) return;
-    }
-    fs.mkdirSync(path.dirname(preferencesPath), { recursive: true });
-    fs.writeFileSync(
-      preferencesPath,
-      `${PLATFORM_IMAGE_PREFERENCES_MARKER}\n---\nversion: 1\ndefault_provider: openai\ndefault_quality: null\ndefault_aspect_ratio: null\ndefault_image_size: null\ndefault_image_api_dialect: null\ndefault_model:\n  openai: ${imageGenerationConfig.model}\n---\n`,
-      { mode: 0o600 },
-    );
-  } catch (err) {
-    throw new Error(
-      `Failed to provision image generation preferences for workspace ${workspaceDir}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
 export function buildVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
@@ -1462,17 +1419,6 @@ export function buildVolumeMounts(
     envLines: [],
     addHostGateway: false,
   },
-  /**
-   * The Workspace's platform image generation capability state. Accepted as a
-   * parameter (default: off) rather than looked up here so this function
-   * stays DB-free and safely unit-testable without an initialized database;
-   * the real caller (runContainerAgent) resolves it once via
-   * getWorkspaceImageGenerationConfig(group.folder).
-   */
-  imageGenerationConfig: {
-    enabled: boolean;
-    model: 'gpt-image-1.5' | 'gpt-image-2' | null;
-  } = { enabled: false, model: null },
 ): VolumeMount[] {
   if (group.containerConfigError) {
     throw new AdditionalMountValidationError([
@@ -1504,9 +1450,7 @@ export function buildVolumeMounts(
   const mounts: VolumeMount[] = [];
   let feishuCliBinding: FeishuCliRuntimeBinding | null = null;
   const projectRoot = process.cwd();
-  const groupDir = path.join(GROUPS_DIR, group.folder);
   const ownerId = group.created_by;
-  ensurePlatformImageGenerationPreferences(groupDir, imageGenerationConfig);
 
   if (isAdminHome) {
     // Admin home gets the entire project root mounted
@@ -1563,7 +1507,6 @@ export function buildVolumeMounts(
     userSkillsDirOverride: userSkillsPolicy.userSkillsDirOverride,
     managedSkillPolicy: agentProfile?.runtimePolicy?.skills,
     pluginSkillLayers: pluginSkillLayers(pluginSkills),
-    imageGenerationEnabled: imageGenerationConfig.enabled,
   });
   syncHostClaudeContext(claudeContextPlan, groupSessionsDir, {
     materializeLinks: false,
@@ -1751,10 +1694,6 @@ export function buildVolumeMounts(
     globalConfig,
     effectiveContainerOverride,
     resolvedProvider?.customEnv,
-    {
-      enabled: imageGenerationConfig.enabled,
-      model: imageGenerationConfig.model,
-    },
   );
   const agentEffort = resolveAgentSdkEffort(agentProfile?.runtimePolicy);
   removeProviderEffortEnv(envLines, agentEffort);
@@ -2257,7 +2196,6 @@ export async function runContainerAgent(
       poolResult?.modelOverride,
       modelSelectionPinned,
       containerProxy,
-      getWorkspaceImageGenerationConfig(group.folder),
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId
@@ -2362,9 +2300,6 @@ export async function runContainerAgent(
                 ? loadUserPlugins(group.created_by, { runtime: 'host' })
                 : [],
             ),
-            imageGenerationEnabled: getWorkspaceImageGenerationConfig(
-              group.folder,
-            ).enabled,
           }).audit;
           const mcpManifest = buildRuntimeMcpManifest(
             group,
@@ -2416,9 +2351,6 @@ export async function runContainerAgent(
                 ? loadUserPlugins(group.created_by, { runtime: 'host' })
                 : [],
             ),
-            imageGenerationEnabled: getWorkspaceImageGenerationConfig(
-              group.folder,
-            ).enabled,
           }).effectiveSkills;
           return {
             hash: manifest.hash,
@@ -2972,10 +2904,6 @@ export async function runHostAgent(
     input.agentProfile,
   );
   const preparedHostPlugins = prepareHostPlugins(group.created_by);
-  const hostImageGenerationConfig = getWorkspaceImageGenerationConfig(
-    group.folder,
-  );
-  ensurePlatformImageGenerationPreferences(groupDir, hostImageGenerationConfig);
   const hostClaudeContextPlan = buildClaudeContextPlan({
     executionMode: 'host',
     group,
@@ -2992,7 +2920,6 @@ export async function runHostAgent(
     userSkillsDirOverride: hostUserSkillsPolicy.userSkillsDirOverride,
     managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,
     pluginSkillLayers: pluginSkillLayers(preparedHostPlugins),
-    imageGenerationEnabled: hostImageGenerationConfig.enabled,
   });
   const hostClaudeContextSync = syncHostClaudeContext(
     hostClaudeContextPlan,
@@ -3103,10 +3030,6 @@ export async function runHostAgent(
         ? { customEnv: containerOverride.customEnv }
         : containerOverride,
       hostPoolResult?.resolved.customEnv,
-      {
-        enabled: hostImageGenerationConfig.enabled,
-        model: hostImageGenerationConfig.model,
-      },
     );
     const agentEffort = resolveAgentSdkEffort(
       input.agentProfile?.runtimePolicy,

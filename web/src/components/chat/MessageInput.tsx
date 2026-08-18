@@ -76,6 +76,11 @@ interface MessageInputProps {
   onToggleTerminal?: () => void;
   /** Stop the active run when the composer has no follow-up to send. */
   onStop?: () => Promise<boolean> | boolean;
+  /** The workspace has enabled the service-side image generation capability. */
+  imageGenerationEnabled?: boolean;
+  onGenerateImage?: (
+    prompt: string,
+  ) => Promise<{ success: boolean; error?: string }>;
   isRunning?: boolean;
   queuedFollowUps?: QueuedFollowUp[];
   onFollowUpAction?: (
@@ -93,6 +98,8 @@ export function MessageInput({
   onResetSession,
   onToggleTerminal,
   onStop,
+  imageGenerationEnabled = false,
+  onGenerateImage,
   isRunning = false,
   queuedFollowUps = [],
   onFollowUpAction,
@@ -103,6 +110,10 @@ export function MessageInput({
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [generatingImage, setGeneratingImage] = useState(false);
+  const [imageGenerationStatus, setImageGenerationStatus] = useState<
+    string | null
+  >(null);
   const [stopping, setStopping] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [followUpMode, setFollowUpMode] = useState<FollowUpMode>(() =>
@@ -324,6 +335,28 @@ export function MessageInput({
       setTimeout(() => setSendError(null), 4000);
     }
     setSending(false);
+  };
+
+  const handleGenerateImage = async () => {
+    const prompt = content.trim();
+    if (!prompt) {
+      setImageGenerationStatus('请先输入图片描述，再点击生成图片。');
+      return;
+    }
+    if (!onGenerateImage || disabled || generatingImage) return;
+
+    setGeneratingImage(true);
+    setImageGenerationStatus('正在生成图片…');
+    const result = await onGenerateImage(prompt);
+    if (result.success) {
+      successTap();
+      setContent('');
+      if (groupJid) clearDraft(groupJid);
+      setImageGenerationStatus('图片已生成，已发送到聊天窗口。');
+    } else {
+      setImageGenerationStatus(result.error || '图片生成失败，请重试。');
+    }
+    setGeneratingImage(false);
   };
 
   const handleFollowUpAction = async (
@@ -1103,6 +1136,36 @@ export function MessageInput({
                 <FolderUp className="w-3.5 h-3.5" />
                 上传文件夹
               </button>
+              {imageGenerationEnabled && onGenerateImage && (
+                <button
+                  type="button"
+                  onClick={() => void handleGenerateImage()}
+                  disabled={disabled || generatingImage}
+                  aria-busy={generatingImage}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 rounded-lg transition-colors cursor-pointer disabled:opacity-40"
+                >
+                  {generatingImage ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <ImageIcon className="w-3.5 h-3.5" />
+                  )}
+                  {generatingImage ? '正在生成…' : '生成图片'}
+                </button>
+              )}
+            </div>
+          )}
+
+          {imageGenerationStatus && (
+            <div
+              className={`px-4 py-1.5 text-xs ${
+                imageGenerationStatus.startsWith('图片已') ||
+                imageGenerationStatus.startsWith('正在')
+                  ? 'text-emerald-700 dark:text-emerald-300'
+                  : 'text-destructive'
+              }`}
+              role="status"
+            >
+              {imageGenerationStatus}
             </div>
           )}
 

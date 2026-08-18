@@ -119,6 +119,10 @@ import path from 'node:path';
 import { z } from 'zod';
 import { broadcastNewMessage } from '../web.js';
 import { getStreamingSession } from '../feishu-streaming-card.js';
+import {
+  generateWorkspaceImage,
+  ImageGenerationError,
+} from '../image-generation-service.js';
 import { attachSessionWorkflowRuns } from '../session-workflows.js';
 import {
   buildPinnedGitEnvironment,
@@ -2105,6 +2109,107 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
     }
   }
   return c.json({ success: true, interrupted });
+});
+
+// POST /api/groups/:jid/generate-image - service-side deterministic generation
+groupRoutes.post('/:jid/generate-image', authMiddleware, async (c) => {
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (
+    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })
+  ) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (!jid.startsWith('web:')) {
+    return c.json(
+      { error: 'Image generation is available from web workspaces only' },
+      409,
+    );
+  }
+
+  const parsed = z
+    .object({ prompt: z.string().trim().min(1).max(8_000) })
+    .safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json(
+      { error: 'prompt must be between 1 and 8000 characters' },
+      400,
+    );
+  }
+
+  const imageConfig = getWorkspaceImageGenerationConfig(group.folder);
+  if (!imageConfig.enabled || !imageConfig.model) {
+    return c.json(
+      { error: 'Image generation is not enabled for this workspace' },
+      409,
+    );
+  }
+
+  try {
+    const image = await generateWorkspaceImage(
+      parsed.data.prompt,
+      imageConfig.model,
+    );
+    const timestamp = new Date().toISOString();
+    const requestMessageId = crypto.randomUUID();
+    const imageMessageId = crypto.randomUUID();
+    const requestContent = `生成图片：${parsed.data.prompt}`;
+    const attachments = JSON.stringify([
+      { type: 'image', data: image.data, mimeType: image.mimeType },
+    ]);
+
+    ensureChatExists(jid);
+    storeMessageDirect(
+      requestMessageId,
+      jid,
+      `web:${authUser.id}`,
+      authUser.display_name || authUser.username || 'Web',
+      requestContent,
+      timestamp,
+      false,
+    );
+    storeMessageDirect(
+      imageMessageId,
+      jid,
+      '__image_generation__',
+      '图像生成',
+      '图片已生成。',
+      timestamp,
+      true,
+      { attachments },
+    );
+
+    broadcastNewMessage(jid, {
+      id: requestMessageId,
+      chat_jid: jid,
+      sender: `web:${authUser.id}`,
+      sender_name: authUser.display_name || authUser.username || 'Web',
+      content: requestContent,
+      timestamp,
+      is_from_me: false,
+    });
+    broadcastNewMessage(jid, {
+      id: imageMessageId,
+      chat_jid: jid,
+      sender: '__image_generation__',
+      sender_name: '图像生成',
+      content: '图片已生成。',
+      timestamp,
+      is_from_me: true,
+      attachments,
+    });
+
+    return c.json({ success: true, messageId: imageMessageId });
+  } catch (err) {
+    if (err instanceof ImageGenerationError) {
+      return c.json({ error: err.message }, err.status);
+    }
+    logger.error({ jid, err }, 'Direct image generation failed');
+    return c.json({ error: '图片生成失败，请稍后重试。' }, 502);
+  }
 });
 
 // POST /api/groups/:jid/reset-session - 重置会话上下文

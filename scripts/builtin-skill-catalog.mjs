@@ -22,12 +22,6 @@ export const BUILTIN_SKILL_SOURCES = [
     sourceSha256:
       '91b5575833f003527c7b60a26f08703ebfdb348098deecfa9ceed1dcf230f253',
   },
-  {
-    name: 'baoyu-skills',
-    version: 'v2.5.2',
-    sourceSha256:
-      'b7e88f4183289cc1e5e4635e3746fac3ccd5db4e0beb25e38bb84c01aad885cb',
-  },
 ];
 
 // Back-compat named exports for callers that only ever cared about the

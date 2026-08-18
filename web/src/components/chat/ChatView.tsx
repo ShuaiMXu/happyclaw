@@ -582,6 +582,24 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     return ok;
   };
 
+  const handleGenerateImage = async (prompt: string) => {
+    try {
+      await api.post(
+        `/api/groups/${encodeURIComponent(groupJid)}/generate-image`,
+        { prompt },
+        130_000,
+      );
+      setScrollTrigger((value) => value + 1);
+      return { success: true };
+    } catch (error) {
+      const message =
+        typeof error === 'object' && error && 'message' in error
+          ? String(error.message)
+          : '图片生成失败，请稍后重试。';
+      return { success: false, error: message };
+    }
+  };
+
   const handleActiveAgentSend = async (
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
@@ -1220,6 +1238,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 <MessageInput
                   onSend={handleSend}
                   groupJid={groupJid}
+                  imageGenerationEnabled={
+                    group?.image_generation_enabled === true
+                  }
+                  onGenerateImage={handleGenerateImage}
                   isRunning={currentContextWaiting}
                   onStop={
                     mainInterrupted ? undefined : () => interruptQuery(groupJid)

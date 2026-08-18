@@ -32,11 +32,7 @@ export interface EffectiveSkillCandidate {
   selected: boolean;
   precedence: number;
   definitionHash: string;
-  excludedReason?:
-    | 'disabled'
-    | 'profile_filtered'
-    | 'shadowed'
-    | 'capability_gated';
+  excludedReason?: 'disabled' | 'profile_filtered' | 'shadowed';
 }
 
 export interface EffectiveSkillEntry {
@@ -57,18 +53,6 @@ export interface EffectiveSkillManifest {
   conflicts: string[];
   missingManagedSkillIds: string[];
   missingHostSkillIds: string[];
-  /**
-   * Capability-gated builtin Skill ids (see `gatedBuiltinIds`) that a caller
-   * asked to force on (`forcedBuiltinIds`) but that have no enabled builtin
-   * candidate on disk. Unlike `missingManagedSkillIds`/`missingHostSkillIds`
-   * — which are user-typed selections validated at profile-save time — a
-   * forced builtin id is set once via a Workspace capability switch,
-   * independent of whether the Skill happens to be installed; a stale switch
-   * must not silently run without the capability it promises. Callers that
-   * actually mount/sync Skills MUST treat a non-empty list here as fatal
-   * (see CLAUDE.md §5: "缺失的精确选择能力必须让配置失败，不得静默替换").
-   */
-  missingForcedSkillIds: string[];
 }
 
 export function pluginSkillLayers(
@@ -146,16 +130,6 @@ export function resolveEffectiveSkills(options: {
   layers: EffectiveSkillLayer[];
   managedPolicy?: ManagedSkillPolicy;
   hostPolicy?: ManagedSkillPolicy;
-  /**
-   * Builtin-layer Skill ids that are off by default for every caller and only
-   * turn on when the same id also appears in `forcedBuiltinIds`. Use for a
-   * builtin Skill that must stay opt-in per platform capability switch
-   * instead of being available to every Workspace like ordinary builtin
-   * Skills.
-   */
-  gatedBuiltinIds?: string[];
-  /** Gated builtin ids this caller's Workspace capability switches turn on. */
-  forcedBuiltinIds?: string[];
 }): EffectiveSkillManifest {
   const policy = options.managedPolicy ?? { mode: 'inherit' as const, ids: [] };
   const policyIds = [...new Set(policy.ids ?? [])].sort();
@@ -166,9 +140,6 @@ export function resolveEffectiveSkills(options: {
   };
   const hostPolicyIds = [...new Set(hostPolicy.ids ?? [])].sort();
   const requestedHostIds = new Set(hostPolicyIds);
-  const gatedBuiltinIds = new Set(options.gatedBuiltinIds ?? []);
-  const forcedBuiltinIds = [...new Set(options.forcedBuiltinIds ?? [])].sort();
-  const requestedForcedIds = new Set(forcedBuiltinIds);
   const candidates: EffectiveSkillCandidate[] = [];
 
   options.layers.forEach((layer, precedence) => {
@@ -177,8 +148,6 @@ export function resolveEffectiveSkills(options: {
       const candidateId = layer.idPrefix
         ? `${layer.idPrefix}:${skill.id}`
         : skill.id;
-      const isGatedBuiltin =
-        layer.source === 'builtin' && gatedBuiltinIds.has(candidateId);
       const filteredByProfile =
         (layer.source === 'managed' &&
           (policy.mode === 'disabled' ||
@@ -199,11 +168,9 @@ export function resolveEffectiveSkills(options: {
         definitionHash: hashSkillDirectory(skillPath),
         ...(!skill.enabled
           ? { excludedReason: 'disabled' as const }
-          : isGatedBuiltin && !requestedForcedIds.has(candidateId)
-            ? { excludedReason: 'capability_gated' as const }
-            : filteredByProfile
-              ? { excludedReason: 'profile_filtered' as const }
-              : {}),
+          : filteredByProfile
+            ? { excludedReason: 'profile_filtered' as const }
+            : {}),
       });
     }
   });
@@ -266,26 +233,12 @@ export function resolveEffectiveSkills(options: {
     hostPolicy.mode === 'custom'
       ? hostPolicyIds.filter((id) => !availableHostIds.has(id))
       : [];
-  const availableGatedBuiltinIds = new Set(
-    candidates
-      .filter(
-        (candidate) =>
-          candidate.source === 'builtin' &&
-          candidate.enabled === true &&
-          gatedBuiltinIds.has(candidate.id),
-      )
-      .map((candidate) => candidate.id),
-  );
-  const missingForcedSkillIds = forcedBuiltinIds.filter(
-    (id) => !availableGatedBuiltinIds.has(id),
-  );
   const hash = createHash('sha256')
     .update(
       JSON.stringify({
         schemaVersion: 1,
         policy: { mode: policy.mode, ids: policyIds },
         hostPolicy: { mode: hostPolicy.mode, ids: hostPolicyIds },
-        forcedBuiltinIds,
         selected: selected.map(({ id, source, definitionHash, overrides }) => ({
           id,
           source,
@@ -314,7 +267,6 @@ export function resolveEffectiveSkills(options: {
     conflicts,
     missingManagedSkillIds,
     missingHostSkillIds,
-    missingForcedSkillIds,
   };
 }
 

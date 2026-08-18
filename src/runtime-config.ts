@@ -3118,44 +3118,14 @@ export function saveRegistrationConfig(
 }
 
 /**
- * Env keys owned by the platform image generation capability. When a Workspace
- * has the capability enabled, these are injected from the platform backend
- * config and cannot be shadowed by workspace customEnv, so the capability
- * behaves identically in every Workspace that turns it on.
- */
-const PLATFORM_IMAGE_ENV_KEYS = [
-  'OPENAI_BASE_URL',
-  'OPENAI_API_KEY',
-  'OPENAI_IMAGE_MODEL',
-] as const;
-
-export interface PlatformImageInjection {
-  /** Resolved from the Workspace's image_generation switch. */
-  enabled: boolean;
-  /** Workspace's chosen model; null/undefined falls back to gpt-image-2. */
-  model?: PlatformImageModel | null;
-}
-
-/**
  * Build full env lines: merged Claude config + custom env vars.
  */
 export function buildContainerEnvLines(
   global: ClaudeProviderConfig,
   override: ContainerEnvConfig,
   profileCustomEnv?: Record<string, string>,
-  imageInjection?: PlatformImageInjection,
 ): string[] {
   const merged = mergeClaudeEnvConfig(global, override);
-  const imageBackend =
-    imageInjection?.enabled === true ? getImageGenerationBackendConfig() : null;
-  if (imageInjection?.enabled === true && !imageBackend) {
-    throw new Error(
-      'Image generation is enabled for this workspace, but the platform image backend is not configured',
-    );
-  }
-  const managedImageKeys = new Set<string>(
-    imageBackend ? PLATFORM_IMAGE_ENV_KEYS : [],
-  );
   const lines = [
     `${CLAUDE_ENDPOINT_KIND_ENV}=${merged.anthropicBaseUrl ? 'custom' : 'official'}`,
     ...buildClaudeEnvLines(merged, profileCustomEnv),
@@ -3190,28 +3160,10 @@ export function buildContainerEnvLines(
         );
         continue;
       }
-      if (managedImageKeys.has(key)) {
-        logger.warn(
-          { key },
-          'Skipping platform image generation env variable in workspace override',
-        );
-        continue;
-      }
       // Strip control characters to prevent env injection
       const sanitized = sanitizeCustomEnvValue(key, value);
       lines.push(`${key}=${sanitized}`);
     }
-  }
-
-  // Platform image generation: injected last so the platform values win over
-  // any provider defaults above; workspace customEnv copies were already
-  // skipped via managedImageKeys. An enabled capability without a backend was
-  // rejected above so it cannot silently target api.openai.com.
-  if (imageBackend) {
-    const model = imageInjection?.model ?? DEFAULT_PLATFORM_IMAGE_MODEL;
-    lines.push(`OPENAI_BASE_URL=${imageBackend.baseUrl}`);
-    lines.push(`OPENAI_API_KEY=${imageBackend.apiKey}`);
-    lines.push(`OPENAI_IMAGE_MODEL=${model}`);
   }
 
   return lines;
