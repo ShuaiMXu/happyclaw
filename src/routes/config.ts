@@ -2259,9 +2259,17 @@ configRoutes.put(
       );
     }
     try {
+      // A masked public projection is display-only and must never be written
+      // back as an API credential. An omitted key means retain the existing
+      // secret; a first-time configuration must still provide one.
+      const existing = getImageGenerationBackendConfig();
+      const apiKey = validation.data.apiKey ?? existing?.apiKey;
+      if (!apiKey) {
+        return c.json({ error: 'API Key is required' }, 400);
+      }
       const saved = saveImageGenerationBackendConfig(
         validation.data.baseUrl,
-        validation.data.apiKey,
+        apiKey,
       );
       return c.json(toPublicImageGenerationConfig(saved));
     } catch (err) {

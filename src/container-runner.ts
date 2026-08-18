@@ -1401,6 +1401,48 @@ export function cleanupContainerTaskRuntimeEnvDirs(
   }
 }
 
+const PLATFORM_IMAGE_PREFERENCES_MARKER =
+  '# Managed by HappyClaw platform image generation';
+
+/**
+ * The upstream Skill blocks its first invocation until a provider preference
+ * file exists. Provision only a HappyClaw-owned default so enabling the
+ * Workspace switch really means images can be generated immediately, while a
+ * user's own preferences are never overwritten.
+ */
+function ensurePlatformImageGenerationPreferences(
+  workspaceDir: string,
+  imageGenerationConfig: {
+    enabled: boolean;
+    model: 'gpt-image-1.5' | 'gpt-image-2' | null;
+  },
+): void {
+  if (!imageGenerationConfig.enabled || !imageGenerationConfig.model) return;
+
+  const preferencesPath = path.join(
+    workspaceDir,
+    '.baoyu-skills',
+    'baoyu-image-gen',
+    'EXTEND.md',
+  );
+  try {
+    if (fs.existsSync(preferencesPath)) {
+      const existing = fs.readFileSync(preferencesPath, 'utf-8');
+      if (!existing.startsWith(PLATFORM_IMAGE_PREFERENCES_MARKER)) return;
+    }
+    fs.mkdirSync(path.dirname(preferencesPath), { recursive: true });
+    fs.writeFileSync(
+      preferencesPath,
+      `${PLATFORM_IMAGE_PREFERENCES_MARKER}\n---\nversion: 1\ndefault_provider: openai\ndefault_quality: null\ndefault_aspect_ratio: null\ndefault_image_size: null\ndefault_image_api_dialect: null\ndefault_model:\n  openai: ${imageGenerationConfig.model}\n---\n`,
+      { mode: 0o600 },
+    );
+  } catch (err) {
+    throw new Error(
+      `Failed to provision image generation preferences for workspace ${workspaceDir}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 export function buildVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
@@ -1464,6 +1506,7 @@ export function buildVolumeMounts(
   const projectRoot = process.cwd();
   const groupDir = path.join(GROUPS_DIR, group.folder);
   const ownerId = group.created_by;
+  ensurePlatformImageGenerationPreferences(groupDir, imageGenerationConfig);
 
   if (isAdminHome) {
     // Admin home gets the entire project root mounted
@@ -2932,6 +2975,7 @@ export async function runHostAgent(
   const hostImageGenerationConfig = getWorkspaceImageGenerationConfig(
     group.folder,
   );
+  ensurePlatformImageGenerationPreferences(groupDir, hostImageGenerationConfig);
   const hostClaudeContextPlan = buildClaudeContextPlan({
     executionMode: 'host',
     group,

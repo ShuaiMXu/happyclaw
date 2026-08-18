@@ -3148,6 +3148,11 @@ export function buildContainerEnvLines(
   const merged = mergeClaudeEnvConfig(global, override);
   const imageBackend =
     imageInjection?.enabled === true ? getImageGenerationBackendConfig() : null;
+  if (imageInjection?.enabled === true && !imageBackend) {
+    throw new Error(
+      'Image generation is enabled for this workspace, but the platform image backend is not configured',
+    );
+  }
   const managedImageKeys = new Set<string>(
     imageBackend ? PLATFORM_IMAGE_ENV_KEYS : [],
   );
@@ -3200,9 +3205,8 @@ export function buildContainerEnvLines(
 
   // Platform image generation: injected last so the platform values win over
   // any provider defaults above; workspace customEnv copies were already
-  // skipped via managedImageKeys. When the capability is on but the platform
-  // backend is not configured, no keys are injected and the skill surfaces a
-  // setup hint instead of silently targeting api.openai.com.
+  // skipped via managedImageKeys. An enabled capability without a backend was
+  // rejected above so it cannot silently target api.openai.com.
   if (imageBackend) {
     const model = imageInjection?.model ?? DEFAULT_PLATFORM_IMAGE_MODEL;
     lines.push(`OPENAI_BASE_URL=${imageBackend.baseUrl}`);

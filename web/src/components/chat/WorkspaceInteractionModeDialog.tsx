@@ -279,16 +279,21 @@ export function WorkspaceInteractionModeDialog({
                 onCheckedChange={setDraftImageGenEnabled}
                 disabled={
                   saving ||
-                  (imageGenOptions !== null && !imageGenOptions.configured)
+                  imageGenOptions === null ||
+                  !imageGenOptions.configured
                 }
                 aria-label="生图能力"
               />
             </div>
-            {imageGenOptions && !imageGenOptions.configured && (
+            {imageGenOptions === null ? (
+              <p className="text-xs text-amber-600 dark:text-amber-500">
+                生图后端状态加载失败，暂时无法修改；请稍后重试。
+              </p>
+            ) : !imageGenOptions.configured ? (
               <p className="text-xs text-amber-600 dark:text-amber-500">
                 管理员尚未配置生图后端，暂时无法开启；请联系管理员在系统设置中配置。
               </p>
-            )}
+            ) : null}
             {draftImageGenEnabled && (
               <Select
                 value={draftImageGenModel}

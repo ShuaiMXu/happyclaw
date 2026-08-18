@@ -89,6 +89,7 @@ import {
 } from '../agent-profile-runtime.js';
 import {
   getContainerEnvConfig,
+  getImageGenerationBackendConfig,
   getProviders,
   getSystemSettings,
   saveContainerEnvConfig,
@@ -1321,6 +1322,20 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
       ? image_generation_model
       : existingImageGeneration.model;
 
+  // The switch is a promise that the Workspace can actually generate images,
+  // not merely that it can see an otherwise credential-less Skill. Enforce the
+  // backend precondition server-side because stale clients and direct API calls
+  // bypass the settings dialog's availability hint.
+  if (nextImageGenerationEnabled && !getImageGenerationBackendConfig()) {
+    return c.json(
+      {
+        error: '管理员尚未配置生图后端，暂时无法开启生图能力。',
+        code: 'IMAGE_GENERATION_BACKEND_NOT_CONFIGURED',
+      },
+      409,
+    );
+  }
+
   // Interaction mode is stored on the Workspace↔AgentProfile binding rather
   // than registered_groups. It still shares the execution-mode quiesce
   // boundary so a warm runner can observe only the old or the new contract.
@@ -1450,6 +1465,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
       executionModeChanged ||
       interactionModeChanged ||
       lockedModelChanged ||
+      imageGenerationChanged ||
       (runtimeContractFieldProvided && runtimeWasSafetyBlocked)
     ) {
       const runtimeJids = getWorkspaceRuntimeJids(deps, existing.folder, jid);

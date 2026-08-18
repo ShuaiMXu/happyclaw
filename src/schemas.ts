@@ -809,7 +809,9 @@ export const AppearanceConfigSchema = z.object({
 // (see GroupPatchSchema.image_generation_enabled below).
 export const ImageGenerationBackendConfigSchema = z.object({
   baseUrl: z.string().trim().url().max(2048),
-  apiKey: z.string().trim().min(1).max(2048),
+  // Omission retains the stored secret, allowing an administrator to update
+  // only the endpoint without ever sending a masked key back as a credential.
+  apiKey: z.string().trim().min(1).max(2048).optional(),
 });
 
 export const ChangePasswordSchema = z.object({

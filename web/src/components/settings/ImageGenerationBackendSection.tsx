@@ -64,10 +64,9 @@ export function ImageGenerationBackendSection() {
         '/api/config/image-generation',
         {
           baseUrl: trimmedBaseUrl,
-          // A blank field keeps the previously saved key — only send a new
-          // value when the admin actually typed one, so re-saving baseUrl
-          // alone never blanks out the key.
-          apiKey: trimmedApiKey || config?.apiKeyMasked || '',
+          // Omit a blank field. The server preserves the secret internally;
+          // the masked value is presentation-only and is never a credential.
+          ...(trimmedApiKey ? { apiKey: trimmedApiKey } : {}),
         },
       );
       setConfig(saved);
