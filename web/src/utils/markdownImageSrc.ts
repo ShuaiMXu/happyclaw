@@ -51,7 +51,7 @@ export function decodeMarkdownImagePath(value: string): string {
   );
 }
 
-/** Resolve a markdown image source to the local file download API. */
+/** Resolve a markdown image source to the local file preview API. */
 export function resolveMarkdownImageSrc(
   src: string,
   groupJid?: string,
@@ -62,6 +62,6 @@ export function resolveMarkdownImageSrc(
   const baseJid = groupJid.replace(/#agent:.*$/, '');
   const encoded = toBase64Url(decodeMarkdownImagePath(src));
   return withBasePath(
-    `/api/groups/${encodeURIComponent(baseJid)}/files/download/${encoded}`,
+    `/api/groups/${encodeURIComponent(baseJid)}/files/preview/${encoded}`,
   );
 }

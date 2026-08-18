@@ -173,6 +173,10 @@ describe('schema version head', () => {
     // actually landed. Update the literal in the same commit as the migration.
     // v69: adds Agent-level reasoning effort; see
     // tests/schema-v69-agent-effort.test.ts for migration coverage.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(69);
+    // v70: adds Workspace-level locked_model_config_id; see
+    // tests/schema-v70-workspace-locked-model.test.ts for migration coverage.
+    // v71: adds Workspace-level image generation switch + model; see
+    // tests/schema-v71-workspace-image-generation.test.ts for migration coverage.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(71);
   });
 });

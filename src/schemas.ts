@@ -677,6 +677,23 @@ export const GroupPatchSchema = z.object({
     .optional(),
   execution_mode: z.enum(['container', 'host']).optional(),
   interaction_mode: InteractionModeSchema.optional(),
+  /**
+   * Lock the Workspace to one Provider model configuration (its id), or null to
+   * follow the default (Agent Profile pin, else the automatic provider pool).
+   */
+  locked_model_config_id: z.string().nullable().optional(),
+  /**
+   * Turn the platform image generation capability on/off for this Workspace.
+   * When on, mounts the builtin image generation Skill and injects the
+   * platform's shared OpenAI-compatible backend credentials for every
+   * session in the Workspace.
+   */
+  image_generation_enabled: z.boolean().optional(),
+  /** Image model used while the capability is on; null falls back to gpt-image-2. */
+  image_generation_model: z
+    .enum(['gpt-image-1.5', 'gpt-image-2'])
+    .nullable()
+    .optional(),
 });
 
 export const LoginSchema = z.object({
@@ -785,6 +802,14 @@ export const AppearanceConfigSchema = z.object({
     )
     .nullable()
     .optional(),
+});
+
+// The platform-wide image generation backend: one OpenAI-compatible
+// baseUrl+apiKey shared by every Workspace that turns its own switch on
+// (see GroupPatchSchema.image_generation_enabled below).
+export const ImageGenerationBackendConfigSchema = z.object({
+  baseUrl: z.string().trim().url().max(2048),
+  apiKey: z.string().trim().min(1).max(2048),
 });
 
 export const ChangePasswordSchema = z.object({

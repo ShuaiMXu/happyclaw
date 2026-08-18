@@ -342,6 +342,12 @@ export interface WorkspaceAgentProfileBinding {
   group_folder: string;
   agent_profile_id: string;
   interaction_mode: InteractionMode;
+  /** Provider config id this Workspace is locked to, or null to follow the default. */
+  locked_model_config_id: string | null;
+  /** Platform image generation capability switch; off by default. */
+  image_generation_enabled: boolean;
+  /** Image model used when the switch is on; null falls back to gpt-image-2. */
+  image_generation_model: 'gpt-image-1.5' | 'gpt-image-2' | null;
   created_at: string;
   updated_at: string;
 }

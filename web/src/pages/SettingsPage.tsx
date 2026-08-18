@@ -12,6 +12,7 @@ import { PreferencesSection } from '../components/settings/PreferencesSection';
 import { SecuritySection } from '../components/settings/SecuritySection';
 import { AboutSection } from '../components/settings/AboutSection';
 import { AppearanceSection } from '../components/settings/AppearanceSection';
+import { ImageGenerationBackendSection } from '../components/settings/ImageGenerationBackendSection';
 import { MainAgentIdentitySection } from '../components/settings/MainAgentIdentitySection';
 import { MainAgentCapabilitiesSection } from '../components/settings/MainAgentCapabilitiesSection';
 import {
@@ -234,7 +235,12 @@ export function SettingsPage() {
               )}
 
               {activeTab === 'system' ? (
-                <SystemSettingsSection scope="runtime" />
+                <div className="space-y-8">
+                  <SystemSettingsSection scope="runtime" />
+                  <div className="border-t border-border pt-6">
+                    <ImageGenerationBackendSection />
+                  </div>
+                </div>
               ) : activeTab === 'main-agent' ||
                 activeTab === 'host-integration' ? (
                 <div>

@@ -399,6 +399,11 @@ interface ChatState {
   updateInteractionMode: (
     jid: string,
     interactionMode: InteractionMode,
+    lockedModelConfigId?: string | null,
+    imageGeneration?: {
+      enabled: boolean;
+      model: 'gpt-image-1.5' | 'gpt-image-2' | null;
+    },
   ) => Promise<boolean>;
   togglePin: (jid: string) => Promise<void>;
   inspectDeleteFlow: (jid: string) => Promise<WorkspaceDeleteImpact>;
@@ -2353,18 +2358,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  updateInteractionMode: async (jid, interactionMode) => {
+  updateInteractionMode: async (
+    jid,
+    interactionMode,
+    lockedModelConfigId,
+    imageGeneration,
+  ) => {
     try {
+      const body: Record<string, unknown> = {
+        interaction_mode: interactionMode,
+      };
+      if (lockedModelConfigId !== undefined) {
+        body.locked_model_config_id = lockedModelConfigId;
+      }
+      if (imageGeneration !== undefined) {
+        body.image_generation_enabled = imageGeneration.enabled;
+        body.image_generation_model = imageGeneration.model;
+      }
       await api.patch<{ success: boolean }>(
         `/api/groups/${encodeURIComponent(jid)}`,
-        { interaction_mode: interactionMode },
+        body,
       );
       const patchGroups = (groups: Record<string, GroupInfo>) => {
         const group = groups[jid];
         if (!group) return groups;
+        const next: GroupInfo = { ...group, interaction_mode: interactionMode };
+        if (lockedModelConfigId !== undefined) {
+          next.locked_model_config_id = lockedModelConfigId;
+        }
+        if (imageGeneration !== undefined) {
+          next.image_generation_enabled = imageGeneration.enabled;
+          next.image_generation_model = imageGeneration.model;
+        }
         return {
           ...groups,
-          [jid]: { ...group, interaction_mode: interactionMode },
+          [jid]: next,
         };
       };
       set((state) => ({

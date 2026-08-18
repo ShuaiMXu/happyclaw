@@ -156,12 +156,12 @@
   --popover-foreground: #0f172a;
   --primary: #0d9488;
   --primary-foreground: #ffffff;
-  --secondary: #f1f5f9;
+  --secondary: #f4f4f5;
   --secondary-foreground: #0f172a;
-  --muted: #f1f5f9;
+  --muted: #f4f4f5;
   --muted-foreground: #64748b;
-  --accent: #f0fdfa;
-  --accent-foreground: #134e4a;
+  --accent: #fff7ed;
+  --accent-foreground: #7c2d12;
   --destructive: #dc2626;
   --destructive-foreground: #ffffff;
   --border: #e2e8f0;
@@ -169,15 +169,16 @@
   --ring: #0d9488;
   --radius: 0.625rem;
 
-  /* Brand color scale (Teal) */
-  --brand-50: #f0fdfa;
-  --brand-100: #ccfbf1;
-  --brand-200: #99f6e4;
-  --brand-300: #5eead4;
-  --brand-400: #2dd4bf;
-  --brand-500: #0d9488;
-  --brand-600: #0f766e;
-  --brand-700: #115e59;
+  /* Brand color scale (Orange accent — used for hover/active touches
+     across module chrome; --primary stays Teal for core CTAs) */
+  --brand-50: #fff7ed;
+  --brand-100: #ffedd5;
+  --brand-200: #fed7aa;
+  --brand-300: #fdba74;
+  --brand-400: #fb923c;
+  --brand-500: #f97316;
+  --brand-600: #ea580c;
+  --brand-700: #c2410c;
 
   /* Chart colors */
   --chart-1: #0d9488;
@@ -186,12 +187,13 @@
   --chart-4: #9333ea;
   --chart-5: #dc2626;
 
-  /* Sidebar */
-  --sidebar-background: #f8fafc;
+  /* Sidebar — pure white module background, light gray border lines,
+     orange accent tint for hover/active states */
+  --sidebar-background: #ffffff;
   --sidebar-foreground: #0f172a;
   --sidebar-primary: #0d9488;
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #f1f5f9;
+  --sidebar-accent: #fff7ed;
   --sidebar-accent-foreground: #0f172a;
   --sidebar-border: #e2e8f0;
   --sidebar-ring: #0d9488;
@@ -231,7 +233,7 @@
     rgba(255, 255, 255, 0) 60%
   );
   --glass-inner-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.6);
-  --sidebar: #f8fafc;
+  --sidebar: #ffffff;
 }
 
 /* =====================================================

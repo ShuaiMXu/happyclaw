@@ -1332,8 +1332,13 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         open={showInteractionModeDialog}
         workspaceName={workspaceDisplayName}
         currentMode={interactionMode}
+        currentLockedModelId={group?.locked_model_config_id}
+        currentImageGenerationEnabled={group?.image_generation_enabled}
+        currentImageGenerationModel={group?.image_generation_model}
         onClose={() => setShowInteractionModeDialog(false)}
-        onSave={(mode) => updateInteractionMode(groupJid, mode)}
+        onSave={(mode, lockedModelId, imageGeneration) =>
+          updateInteractionMode(groupJid, mode, lockedModelId, imageGeneration)
+        }
       />
 
       {/* Mobile: Terminal sheet */}

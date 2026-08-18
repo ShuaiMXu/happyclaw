@@ -73,6 +73,10 @@ import {
   getWorkspaceAgentProfileId,
   getWorkspaceInteractionMode,
   setWorkspaceInteractionMode,
+  getWorkspaceLockedModelConfigId,
+  setWorkspaceLockedModelConfigId,
+  getWorkspaceImageGenerationConfig,
+  setWorkspaceImageGenerationConfig,
   getUserById,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
@@ -85,6 +89,7 @@ import {
 } from '../agent-profile-runtime.js';
 import {
   getContainerEnvConfig,
+  getProviders,
   getSystemSettings,
   saveContainerEnvConfig,
   toPublicContainerEnvConfig,
@@ -293,6 +298,9 @@ interface GroupPayloadItem {
   lastMessageTime?: string;
   execution_mode: 'container' | 'host';
   interaction_mode?: InteractionMode;
+  locked_model_config_id?: string | null;
+  image_generation_enabled?: boolean;
+  image_generation_model?: 'gpt-image-1.5' | 'gpt-image-2' | null;
   custom_cwd?: string;
   is_home?: boolean;
   is_my_home?: boolean;
@@ -386,6 +394,15 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       execution_mode: group.executionMode || 'container',
       interaction_mode: isWeb
         ? getWorkspaceInteractionMode(group.folder)
+        : undefined,
+      locked_model_config_id: isWeb
+        ? getWorkspaceLockedModelConfigId(group.folder)
+        : undefined,
+      image_generation_enabled: isWeb
+        ? getWorkspaceImageGenerationConfig(group.folder).enabled
+        : undefined,
+      image_generation_model: isWeb
+        ? getWorkspaceImageGenerationConfig(group.folder).model
         : undefined,
       custom_cwd: isAdmin ? group.customCwd : undefined,
       is_home: isHome || undefined,
@@ -1130,6 +1147,9 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     activation_mode,
     execution_mode,
     interaction_mode,
+    locked_model_config_id,
+    image_generation_enabled,
+    image_generation_model,
   } = validation.data;
   const name = rawName ? normalizeGroupName(rawName) : undefined;
 
@@ -1139,7 +1159,10 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     is_pinned === undefined &&
     activation_mode === undefined &&
     execution_mode === undefined &&
-    interaction_mode === undefined
+    interaction_mode === undefined &&
+    locked_model_config_id === undefined &&
+    image_generation_enabled === undefined &&
+    image_generation_model === undefined
   ) {
     return c.json({ error: 'No fields to update' }, 400);
   }
@@ -1180,7 +1203,10 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     !name &&
     activation_mode === undefined &&
     execution_mode === undefined &&
-    interaction_mode === undefined;
+    interaction_mode === undefined &&
+    locked_model_config_id === undefined &&
+    image_generation_enabled === undefined &&
+    image_generation_model === undefined;
   if (isPinOnly) {
     if (
       !canAccessGroup(
@@ -1218,6 +1244,24 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         403,
       );
     }
+    if (locked_model_config_id !== undefined && !jid.startsWith('web:')) {
+      return c.json(
+        { error: 'Only web workspaces can change the locked model' },
+        403,
+      );
+    }
+    if (
+      (image_generation_enabled !== undefined ||
+        image_generation_model !== undefined) &&
+      !jid.startsWith('web:')
+    ) {
+      return c.json(
+        {
+          error: 'Only web workspaces can change image generation settings',
+        },
+        403,
+      );
+    }
   }
 
   // Handle pin/unpin (per-user, separate table)
@@ -1234,7 +1278,10 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   // unbound. Refuse up front: throwing inside commitUpdate would surface as a
   // 500 and, on the quiesce path, only after the runtime was already stopped.
   if (
-    interaction_mode !== undefined &&
+    (interaction_mode !== undefined ||
+      locked_model_config_id !== undefined ||
+      image_generation_enabled !== undefined ||
+      image_generation_model !== undefined) &&
     !getWorkspaceAgentProfileId(existing.folder)
   ) {
     return c.json(
@@ -1246,6 +1293,34 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     );
   }
 
+  // A locked model must reference a real Provider configuration. Reject unknown
+  // ids up front so a typo can't silently store a no-op lock; null unlocks.
+  if (
+    locked_model_config_id !== undefined &&
+    locked_model_config_id !== null &&
+    !getProviders().some((p) => p.id === locked_model_config_id)
+  ) {
+    return c.json(
+      { error: '指定的模型配置不存在', code: 'MODEL_CONFIG_NOT_FOUND' },
+      400,
+    );
+  }
+
+  // Precompute the effective image generation state up front: the DB setter
+  // takes both fields together, but a PATCH may only send one of them (e.g.
+  // toggling the switch without also re-sending the last chosen model).
+  const existingImageGeneration = getWorkspaceImageGenerationConfig(
+    existing.folder,
+  );
+  const nextImageGenerationEnabled =
+    image_generation_enabled !== undefined
+      ? image_generation_enabled
+      : existingImageGeneration.enabled;
+  const nextImageGenerationModel =
+    image_generation_model !== undefined
+      ? image_generation_model
+      : existingImageGeneration.model;
+
   // Interaction mode is stored on the Workspace↔AgentProfile binding rather
   // than registered_groups. It still shares the execution-mode quiesce
   // boundary so a warm runner can observe only the old or the new contract.
@@ -1253,7 +1328,10 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     name ||
     activation_mode !== undefined ||
     execution_mode !== undefined ||
-    interaction_mode !== undefined
+    interaction_mode !== undefined ||
+    locked_model_config_id !== undefined ||
+    image_generation_enabled !== undefined ||
+    image_generation_model !== undefined
   ) {
     // Spread `...existing` instead of rebuilding from an explicit field list.
     // setRegisteredGroup is INSERT OR REPLACE (full-row overwrite), so every
@@ -1305,10 +1383,40 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
           `Workspace ${jid} has no AgentProfile binding for interaction mode update`,
         );
       }
-      if (executionModeChanged || interactionModeChanged) {
+      if (
+        locked_model_config_id !== undefined &&
+        !setWorkspaceLockedModelConfigId(
+          existing.folder,
+          locked_model_config_id,
+        )
+      ) {
+        throw new WorkspaceAgentProfileMissingError(
+          `Workspace ${jid} has no AgentProfile binding for locked model update`,
+        );
+      }
+      if (
+        (image_generation_enabled !== undefined ||
+          image_generation_model !== undefined) &&
+        !setWorkspaceImageGenerationConfig(
+          existing.folder,
+          nextImageGenerationEnabled,
+          nextImageGenerationModel,
+        )
+      ) {
+        throw new WorkspaceAgentProfileMissingError(
+          `Workspace ${jid} has no AgentProfile binding for image generation update`,
+        );
+      }
+      if (
+        executionModeChanged ||
+        interactionModeChanged ||
+        lockedModelChanged ||
+        imageGenerationChanged
+      ) {
         // SDK resume state is environment-bound. Never carry a host session
-        // into a container, or an assistant/proactive transcript across output
-        // authorities, after the old runner is stopped.
+        // into a container, an assistant/proactive transcript across output
+        // authorities, or a transcript produced by one model into a runner
+        // pinned to another, after the old runner is stopped.
         deleteWorkspaceSessions(existing.folder);
         delete deps.sessions[existing.folder];
       }
@@ -1320,14 +1428,28 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     const interactionModeChanged =
       interaction_mode !== undefined &&
       interaction_mode !== getWorkspaceInteractionMode(existing.folder);
+    const lockedModelChanged =
+      locked_model_config_id !== undefined &&
+      locked_model_config_id !==
+        getWorkspaceLockedModelConfigId(existing.folder);
+    const imageGenerationChanged =
+      (image_generation_enabled !== undefined ||
+        image_generation_model !== undefined) &&
+      (nextImageGenerationEnabled !== existingImageGeneration.enabled ||
+        nextImageGenerationModel !== existingImageGeneration.model);
     const runtimeContractFieldProvided =
-      execution_mode !== undefined || interaction_mode !== undefined;
+      execution_mode !== undefined ||
+      interaction_mode !== undefined ||
+      locked_model_config_id !== undefined ||
+      image_generation_enabled !== undefined ||
+      image_generation_model !== undefined;
     const runtimeWasSafetyBlocked =
       runtimeContractFieldProvided &&
       (deps.queue?.isGroupRuntimeSafetyBlocked?.(jid) ?? false);
     if (
       executionModeChanged ||
       interactionModeChanged ||
+      lockedModelChanged ||
       (runtimeContractFieldProvided && runtimeWasSafetyBlocked)
     ) {
       const runtimeJids = getWorkspaceRuntimeJids(deps, existing.folder, jid);
@@ -1409,10 +1531,16 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     }
   }
 
+  const finalImageGeneration = getWorkspaceImageGenerationConfig(
+    existing.folder,
+  );
   return c.json({
     success: true,
     pinned_at,
     interaction_mode: getWorkspaceInteractionMode(existing.folder),
+    locked_model_config_id: getWorkspaceLockedModelConfigId(existing.folder),
+    image_generation_enabled: finalImageGeneration.enabled,
+    image_generation_model: finalImageGeneration.model,
   });
 });
 

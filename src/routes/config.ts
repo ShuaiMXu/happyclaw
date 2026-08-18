@@ -74,6 +74,7 @@ import {
   WhatsAppConfigSchema,
   RegistrationConfigSchema,
   AppearanceConfigSchema,
+  ImageGenerationBackendConfigSchema,
   HostIntegrationSettingsSchema,
   SystemSettingsSchema,
   UnifiedProviderCreateSchema,
@@ -110,6 +111,10 @@ import {
   saveRegistrationConfig,
   getAppearanceConfig,
   saveAppearanceConfig,
+  getImageGenerationBackendConfig,
+  saveImageGenerationBackendConfig,
+  toPublicImageGenerationConfig,
+  PLATFORM_IMAGE_MODELS,
   getSystemSettings,
   getEffectiveExternalDir,
   getContainerEnvConfig,
@@ -884,6 +889,28 @@ configRoutes.get(
     }
   },
 );
+
+// ─── GET /claude/providers/options — 工作区模型锁定选择器使用的精简列表 ──
+// 仅返回 id/name/model/enabled，不含任何密钥或健康信息，因此对任意登录用户
+// 开放（工作区所有者不一定是管理员，但需要看到可锁定的模型清单）。
+configRoutes.get('/claude/providers/options', authMiddleware, (c) => {
+  try {
+    const defaultProviderId = getDefaultProviderId();
+    return c.json({
+      providers: getProviders().map((p) => ({
+        id: p.id,
+        name: p.name,
+        model: p.anthropicModel,
+        enabled: p.enabled,
+        isDefault: p.id === defaultProviderId,
+      })),
+      defaultProviderId,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to list provider options');
+    return c.json({ error: 'Failed to list provider options' }, 500);
+  }
+});
 
 // ─── PUT /claude/default — 设置所有继承型 Agent 使用的默认模型配置 ─────
 configRoutes.put(
@@ -2192,17 +2219,92 @@ configRoutes.delete(
   },
 );
 
-// ─── Brand assets (sidebar mark + wordmark) ────────────────────────
+// ─── Platform image generation backend ─────────────────────────────
 //
-// Two independently configurable images:
+// One admin-configured OpenAI-compatible baseUrl+apiKey shared by every
+// Workspace that turns its own `image_generation_enabled` switch on
+// (PATCH /api/groups/:jid, see routes/groups.ts). The apiKey never leaves
+// this route unmasked; GET only returns `apiKeyMasked`/`hasApiKey`.
+
+configRoutes.get(
+  '/image-generation',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    try {
+      return c.json(
+        toPublicImageGenerationConfig(getImageGenerationBackendConfig()),
+      );
+    } catch (err) {
+      logger.error({ err }, 'Failed to load image generation backend config');
+      return c.json(
+        { error: 'Failed to load image generation backend config' },
+        500,
+      );
+    }
+  },
+);
+
+configRoutes.put(
+  '/image-generation',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ImageGenerationBackendConfigSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    try {
+      const saved = saveImageGenerationBackendConfig(
+        validation.data.baseUrl,
+        validation.data.apiKey,
+      );
+      return c.json(toPublicImageGenerationConfig(saved));
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Invalid image generation backend config';
+      logger.warn({ err }, 'Invalid image generation backend config payload');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+// Read-only, non-admin: the Workspace settings dialog needs the list of
+// selectable models and whether an admin has configured a backend at all
+// (to explain a disabled toggle), without exposing the baseUrl or key.
+configRoutes.get('/image-generation/options', authMiddleware, (c) => {
+  try {
+    const config = getImageGenerationBackendConfig();
+    return c.json({
+      configured: !!config,
+      models: PLATFORM_IMAGE_MODELS,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to load image generation options');
+    return c.json({ error: 'Failed to load image generation options' }, 500);
+  }
+});
+
+// ─── Brand assets (sidebar mark + wordmark + favicon) ──────────────
+//
+// Three independently configurable images:
 // - brand-icon:   400x400 square mark shown in the collapsed sidebar rail.
 // - brand-banner: 600x200 left-aligned wordmark shown above the workspace
-//                 list. Only PNG/JPG are accepted for either asset.
+//                 list.
+// - favicon:      browser tab icon shown when the site loads.
+//                 Only PNG/JPG are accepted for any of the three assets.
 
 const BRAND_ASSETS_DIR = path.join(DATA_DIR, 'brand-assets');
 const BRAND_ASSET_KINDS = {
   icon: { field: 'brandIconUrl', prefix: 'brand-icon-' },
   banner: { field: 'brandBannerUrl', prefix: 'brand-banner-' },
+  favicon: { field: 'faviconUrl', prefix: 'brand-favicon-' },
 } as const;
 type BrandAssetKind = keyof typeof BRAND_ASSET_KINDS;
 const BRAND_ASSET_EXTENSIONS: Record<string, string> = {
@@ -2210,7 +2312,7 @@ const BRAND_ASSET_EXTENSIONS: Record<string, string> = {
   'image/png': '.png',
 };
 const BRAND_ASSET_FILENAME_RE =
-  /^brand-(?:icon|banner)-[a-f0-9]{8}\.(?:jpg|png)$/;
+  /^brand-(?:icon|banner|favicon)-[a-f0-9]{8}\.(?:jpg|png)$/;
 
 // Appearance settings are stored in one JSON file and each asset kind owns a
 // shared directory. Serialize mutations so a stale cleanup from one request
@@ -2315,6 +2417,7 @@ function registerBrandAssetUploadRoute(kind: BrandAssetKind) {
 
 registerBrandAssetUploadRoute('icon');
 registerBrandAssetUploadRoute('banner');
+registerBrandAssetUploadRoute('favicon');
 
 // Public — serves the uploaded brand assets. No auth: the sidebar and the
 // pre-login screens render these images before a session exists.
@@ -2361,6 +2464,7 @@ configRoutes.get('/appearance/public', (c) => {
       aiAvatarMode: config.aiAvatarMode,
       brandIconUrl: config.brandIconUrl,
       brandBannerUrl: config.brandBannerUrl,
+      faviconUrl: config.faviconUrl,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load public appearance config');

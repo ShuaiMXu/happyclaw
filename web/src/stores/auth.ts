@@ -46,6 +46,8 @@ export interface AppearanceConfig {
   brandIconUrl: string | null;
   // 600x200 left-aligned wordmark shown above the workspace list.
   brandBannerUrl: string | null;
+  // Browser tab favicon shown when the site loads.
+  faviconUrl: string | null;
 }
 
 export interface SetupStatus {

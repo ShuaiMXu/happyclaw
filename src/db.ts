@@ -103,7 +103,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 69;
+export const CURRENT_SCHEMA_VERSION = 71;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -988,6 +988,10 @@ export function initDatabase(): void {
       agent_profile_id TEXT NOT NULL,
       interaction_mode TEXT NOT NULL DEFAULT 'assistant'
         CHECK (interaction_mode IN ('assistant', 'proactive')),
+      locked_model_config_id TEXT,
+      image_generation_enabled INTEGER NOT NULL DEFAULT 0,
+      image_generation_model TEXT
+        CHECK (image_generation_model IS NULL OR image_generation_model IN ('gpt-image-1.5', 'gpt-image-2')),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -2251,6 +2255,11 @@ export function initDatabase(): void {
     'interaction_mode',
     "TEXT NOT NULL DEFAULT 'assistant'",
   );
+  // v69 -> v70: a Workspace can lock its model to one Provider configuration,
+  // overriding the bound Agent Profile's own model pin. Null means "follow the
+  // default per-Agent / pool resolution" (several models allocated on demand).
+  // The ensureColumn runs AFTER the v62 table recreation below so the column
+  // survives the CREATE…DROP…RENAME on fresh and pre-v62 databases.
 
   // v61 -> v62: "persona" conflated identity with reply delivery. The mode is
   // now named "proactive": the Agent explicitly decides when to call
@@ -2266,6 +2275,7 @@ export function initDatabase(): void {
           agent_profile_id TEXT NOT NULL,
           interaction_mode TEXT NOT NULL DEFAULT 'assistant'
             CHECK (interaction_mode IN ('assistant', 'proactive')),
+          locked_model_config_id TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -2296,6 +2306,24 @@ export function initDatabase(): void {
      WHERE interaction_mode IS NULL
         OR interaction_mode NOT IN ('assistant', 'proactive')`,
   ).run();
+  // v69 -> v70: ensure the Workspace model-lock column exists on every path
+  // (fresh CREATE TABLE above, the v62 recreation above, and direct upgrades
+  // from v62+ that skip the recreation). Idempotent, so order-safe.
+  ensureColumn('workspace_agent_profiles', 'locked_model_config_id', 'TEXT');
+  // v70 -> v71: Workspace-level image generation contract. Off by default;
+  // when enabled, the model picks between the platform image models. The
+  // ensureColumn pair runs after the v62 recreation, same ordering rationale
+  // as locked_model_config_id above.
+  ensureColumn(
+    'workspace_agent_profiles',
+    'image_generation_enabled',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  ensureColumn(
+    'workspace_agent_profiles',
+    'image_generation_model',
+    "TEXT CHECK (image_generation_model IS NULL OR image_generation_model IN ('gpt-image-1.5', 'gpt-image-2'))",
+  );
 
   db.exec('DROP TABLE IF EXISTS group_members');
   backfillAgentProfileDefaultsAndWorkspaceMappings();
@@ -9108,7 +9136,7 @@ export function getWorkspaceAgentProfileBinding(
 ): WorkspaceAgentProfileBinding | undefined {
   const row = db
     .prepare(
-      `SELECT group_folder, agent_profile_id, interaction_mode, created_at, updated_at
+      `SELECT group_folder, agent_profile_id, interaction_mode, locked_model_config_id, image_generation_enabled, image_generation_model, created_at, updated_at
        FROM workspace_agent_profiles
        WHERE group_folder = ?`,
     )
@@ -9117,6 +9145,9 @@ export function getWorkspaceAgentProfileBinding(
         group_folder: string;
         agent_profile_id: string;
         interaction_mode: unknown;
+        locked_model_config_id: string | null;
+        image_generation_enabled: unknown;
+        image_generation_model: unknown;
         created_at: string;
         updated_at: string;
       }
@@ -9129,6 +9160,20 @@ export function getWorkspaceAgentProfileBinding(
       row.interaction_mode,
       row.group_folder,
     ),
+    locked_model_config_id:
+      typeof row.locked_model_config_id === 'string' &&
+      row.locked_model_config_id
+        ? row.locked_model_config_id
+        : null,
+    image_generation_enabled:
+      typeof row.image_generation_enabled === 'number'
+        ? row.image_generation_enabled === 1
+        : false,
+    image_generation_model:
+      row.image_generation_model === 'gpt-image-1.5' ||
+      row.image_generation_model === 'gpt-image-2'
+        ? row.image_generation_model
+        : null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -9160,6 +9205,67 @@ export function setWorkspaceInteractionMode(
        WHERE group_folder = ?`,
     )
     .run(interactionMode, new Date().toISOString(), groupFolder);
+  return result.changes > 0;
+}
+
+/**
+ * The model configuration a Workspace is locked to, or null when the Workspace
+ * follows the default resolution (its bound Agent Profile's pin, else the
+ * automatic provider pool). A workspace-level lock takes precedence over the
+ * Agent Profile's own model_config_id so every conversation in the Workspace
+ * runs on one model.
+ */
+export function getWorkspaceLockedModelConfigId(
+  groupFolder: string,
+): string | null {
+  return (
+    getWorkspaceAgentProfileBinding(groupFolder)?.locked_model_config_id ?? null
+  );
+}
+
+export function setWorkspaceLockedModelConfigId(
+  groupFolder: string,
+  modelConfigId: string | null,
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE workspace_agent_profiles
+       SET locked_model_config_id = ?, updated_at = ?
+       WHERE group_folder = ?`,
+    )
+    .run(modelConfigId, new Date().toISOString(), groupFolder);
+  return result.changes > 0;
+}
+
+/**
+ * Whether this Workspace has the platform image generation capability turned
+ * on. Off by default; enabling injects the platform image backend credentials
+ * and mounts the image generation skill for every session in the Workspace.
+ */
+export function getWorkspaceImageGenerationConfig(groupFolder: string): {
+  enabled: boolean;
+  model: 'gpt-image-1.5' | 'gpt-image-2' | null;
+} {
+  const binding = getWorkspaceAgentProfileBinding(groupFolder);
+  if (!binding) return { enabled: false, model: null };
+  return {
+    enabled: binding.image_generation_enabled,
+    model: binding.image_generation_model,
+  };
+}
+
+export function setWorkspaceImageGenerationConfig(
+  groupFolder: string,
+  enabled: boolean,
+  model: 'gpt-image-1.5' | 'gpt-image-2' | null,
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE workspace_agent_profiles
+       SET image_generation_enabled = ?, image_generation_model = ?, updated_at = ?
+       WHERE group_folder = ?`,
+    )
+    .run(enabled ? 1 : 0, model, new Date().toISOString(), groupFolder);
   return result.changes > 0;
 }
 

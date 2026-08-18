@@ -36,6 +36,7 @@ describe('system brand migration', () => {
       aiAvatarMode: 'brand',
       brandIconUrl: null,
       brandBannerUrl: null,
+      faviconUrl: null,
     });
   });
 
@@ -69,6 +70,22 @@ describe('system brand migration', () => {
 
     expect(runtime.saveAppearanceConfig({ brandIconUrl: null })).toMatchObject({
       brandIconUrl: null,
+      brandBannerUrl: '/api/config/brand-assets/brand-banner-abcd1234.png',
+    });
+  });
+
+  test('persists the favicon URL independently of the brand icon and banner', () => {
+    expect(
+      runtime.saveAppearanceConfig({
+        faviconUrl: '/api/config/brand-assets/brand-favicon-abcd1234.png',
+      }),
+    ).toMatchObject({
+      faviconUrl: '/api/config/brand-assets/brand-favicon-abcd1234.png',
+      brandBannerUrl: '/api/config/brand-assets/brand-banner-abcd1234.png',
+    });
+
+    expect(runtime.saveAppearanceConfig({ faviconUrl: null })).toMatchObject({
+      faviconUrl: null,
       brandBannerUrl: '/api/config/brand-assets/brand-banner-abcd1234.png',
     });
   });

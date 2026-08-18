@@ -2934,6 +2934,95 @@ export function toPublicContainerEnvConfig(
   };
 }
 
+// ─── Platform image generation backend (per-instance, shared by all
+// workspaces that turn the capability on) ───────────────────────────
+
+const IMAGE_GENERATION_CONFIG_FILE = path.join(
+  CLAUDE_CONFIG_DIR,
+  'image-generation.json',
+);
+
+/** Image models the platform image capability can be pinned to. */
+export const PLATFORM_IMAGE_MODELS = ['gpt-image-1.5', 'gpt-image-2'] as const;
+export type PlatformImageModel = (typeof PLATFORM_IMAGE_MODELS)[number];
+
+export const DEFAULT_PLATFORM_IMAGE_MODEL: PlatformImageModel = 'gpt-image-2';
+
+export interface ImageGenerationBackendConfig {
+  /** OpenAI-compatible base URL, e.g. http://172.17.0.1:8317/v1 */
+  baseUrl: string;
+  apiKey: string;
+  updatedAt: string;
+}
+
+export interface ImageGenerationBackendPublicConfig {
+  baseUrl: string;
+  hasApiKey: boolean;
+  apiKeyMasked: string;
+  defaultModel: PlatformImageModel;
+  updatedAt: string;
+}
+
+/**
+ * Read the platform image backend. The file is stored with 0600 permissions
+ * because it carries an API key; callers must hand out only the masked
+ * projection (toPublicImageGenerationConfig) to clients.
+ */
+export function getImageGenerationBackendConfig(): ImageGenerationBackendConfig | null {
+  try {
+    if (!fs.existsSync(IMAGE_GENERATION_CONFIG_FILE)) return null;
+    const stored = JSON.parse(
+      fs.readFileSync(IMAGE_GENERATION_CONFIG_FILE, 'utf-8'),
+    ) as Partial<ImageGenerationBackendConfig>;
+    if (!stored.baseUrl || !stored.apiKey) return null;
+    return {
+      baseUrl: stored.baseUrl,
+      apiKey: stored.apiKey,
+      updatedAt: stored.updatedAt || '',
+    };
+  } catch (err) {
+    logger.warn(
+      { err },
+      'Failed to read image generation backend config, treating as unset',
+    );
+    return null;
+  }
+}
+
+export function saveImageGenerationBackendConfig(
+  baseUrl: string,
+  apiKey: string,
+): ImageGenerationBackendConfig {
+  const sanitizedBaseUrl = sanitizeEnvValue(baseUrl.trim());
+  const sanitizedApiKey = sanitizeEnvValue(apiKey.trim());
+  if (!sanitizedBaseUrl || !sanitizedApiKey) {
+    throw new Error('Image generation baseUrl and apiKey are both required');
+  }
+  const config: ImageGenerationBackendConfig = {
+    baseUrl: sanitizedBaseUrl,
+    apiKey: sanitizedApiKey,
+    updatedAt: new Date().toISOString(),
+  };
+  fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
+  writeSecretFile(
+    IMAGE_GENERATION_CONFIG_FILE,
+    JSON.stringify(config, null, 2) + '\n',
+  );
+  return config;
+}
+
+export function toPublicImageGenerationConfig(
+  config: ImageGenerationBackendConfig | null,
+): ImageGenerationBackendPublicConfig {
+  return {
+    baseUrl: config?.baseUrl || '',
+    hasApiKey: !!config?.apiKey,
+    apiKeyMasked: config ? (maskSecret(config.apiKey) ?? '') : '',
+    defaultModel: DEFAULT_PLATFORM_IMAGE_MODEL,
+    updatedAt: config?.updatedAt || '',
+  };
+}
+
 /**
  * Merge global config with per-container overrides.
  * Non-empty per-container fields override the global value.
@@ -3029,14 +3118,39 @@ export function saveRegistrationConfig(
 }
 
 /**
+ * Env keys owned by the platform image generation capability. When a Workspace
+ * has the capability enabled, these are injected from the platform backend
+ * config and cannot be shadowed by workspace customEnv, so the capability
+ * behaves identically in every Workspace that turns it on.
+ */
+const PLATFORM_IMAGE_ENV_KEYS = [
+  'OPENAI_BASE_URL',
+  'OPENAI_API_KEY',
+  'OPENAI_IMAGE_MODEL',
+] as const;
+
+export interface PlatformImageInjection {
+  /** Resolved from the Workspace's image_generation switch. */
+  enabled: boolean;
+  /** Workspace's chosen model; null/undefined falls back to gpt-image-2. */
+  model?: PlatformImageModel | null;
+}
+
+/**
  * Build full env lines: merged Claude config + custom env vars.
  */
 export function buildContainerEnvLines(
   global: ClaudeProviderConfig,
   override: ContainerEnvConfig,
   profileCustomEnv?: Record<string, string>,
+  imageInjection?: PlatformImageInjection,
 ): string[] {
   const merged = mergeClaudeEnvConfig(global, override);
+  const imageBackend =
+    imageInjection?.enabled === true ? getImageGenerationBackendConfig() : null;
+  const managedImageKeys = new Set<string>(
+    imageBackend ? PLATFORM_IMAGE_ENV_KEYS : [],
+  );
   const lines = [
     `${CLAUDE_ENDPOINT_KIND_ENV}=${merged.anthropicBaseUrl ? 'custom' : 'official'}`,
     ...buildClaudeEnvLines(merged, profileCustomEnv),
@@ -3071,10 +3185,29 @@ export function buildContainerEnvLines(
         );
         continue;
       }
+      if (managedImageKeys.has(key)) {
+        logger.warn(
+          { key },
+          'Skipping platform image generation env variable in workspace override',
+        );
+        continue;
+      }
       // Strip control characters to prevent env injection
       const sanitized = sanitizeCustomEnvValue(key, value);
       lines.push(`${key}=${sanitized}`);
     }
+  }
+
+  // Platform image generation: injected last so the platform values win over
+  // any provider defaults above; workspace customEnv copies were already
+  // skipped via managedImageKeys. When the capability is on but the platform
+  // backend is not configured, no keys are injected and the skill surfaces a
+  // setup hint instead of silently targeting api.openai.com.
+  if (imageBackend) {
+    const model = imageInjection?.model ?? DEFAULT_PLATFORM_IMAGE_MODEL;
+    lines.push(`OPENAI_BASE_URL=${imageBackend.baseUrl}`);
+    lines.push(`OPENAI_API_KEY=${imageBackend.apiKey}`);
+    lines.push(`OPENAI_IMAGE_MODEL=${model}`);
   }
 
   return lines;
@@ -3303,6 +3436,9 @@ export interface AppearanceConfig {
   brandIconUrl: string | null;
   // 600x200 left-aligned wordmark shown above the workspace list.
   brandBannerUrl: string | null;
+  // Browser tab favicon shown when the site loads. Falls back to the
+  // built-in icon when unset.
+  faviconUrl: string | null;
 }
 
 const DEFAULT_APPEARANCE_CONFIG: AppearanceConfig = {
@@ -3314,6 +3450,7 @@ const DEFAULT_APPEARANCE_CONFIG: AppearanceConfig = {
   aiAvatarMode: 'brand',
   brandIconUrl: null,
   brandBannerUrl: null,
+  faviconUrl: null,
 };
 
 export function getAppearanceConfig(): AppearanceConfig {
@@ -3354,6 +3491,10 @@ export function getAppearanceConfig(): AppearanceConfig {
         typeof raw.brandBannerUrl === 'string' && raw.brandBannerUrl
           ? raw.brandBannerUrl
           : null,
+      faviconUrl:
+        typeof raw.faviconUrl === 'string' && raw.faviconUrl
+          ? raw.faviconUrl
+          : null,
     };
   } catch (err) {
     logger.warn(
@@ -3384,6 +3525,8 @@ export function saveAppearanceConfig(
       next.brandBannerUrl === undefined
         ? existing.brandBannerUrl
         : next.brandBannerUrl,
+    faviconUrl:
+      next.faviconUrl === undefined ? existing.faviconUrl : next.faviconUrl,
     updatedAt: new Date().toISOString(),
   };
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
@@ -3399,6 +3542,7 @@ export function saveAppearanceConfig(
     aiAvatarMode: config.aiAvatarMode,
     brandIconUrl: config.brandIconUrl,
     brandBannerUrl: config.brandBannerUrl,
+    faviconUrl: config.faviconUrl,
   };
 }
 

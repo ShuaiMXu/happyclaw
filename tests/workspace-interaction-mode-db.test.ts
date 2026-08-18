@@ -77,4 +77,39 @@ describe('Workspace AgentProfile interaction-mode binding', () => {
       'assistant',
     );
   });
+
+  test('stores and clears a workspace model lock independently of mode', () => {
+    db.assignWorkspaceAgentProfile('locked-workspace', 'profile-a');
+
+    expect(db.getWorkspaceLockedModelConfigId('locked-workspace')).toBeNull();
+
+    expect(
+      db.setWorkspaceLockedModelConfigId('locked-workspace', 'provider-glm'),
+    ).toBe(true);
+    expect(db.getWorkspaceLockedModelConfigId('locked-workspace')).toBe(
+      'provider-glm',
+    );
+
+    // Locking does not disturb the bound Agent Profile or interaction mode.
+    expect(db.getWorkspaceAgentProfileBinding('locked-workspace')).toEqual(
+      expect.objectContaining({
+        agent_profile_id: 'profile-a',
+        interaction_mode: 'assistant',
+        locked_model_config_id: 'provider-glm',
+      }),
+    );
+
+    expect(db.setWorkspaceLockedModelConfigId('locked-workspace', null)).toBe(
+      true,
+    );
+    expect(db.getWorkspaceLockedModelConfigId('locked-workspace')).toBeNull();
+
+    // A missing binding cannot store a lock.
+    expect(
+      db.setWorkspaceLockedModelConfigId('missing-lock-workspace', 'x'),
+    ).toBe(false);
+    expect(
+      db.getWorkspaceLockedModelConfigId('missing-lock-workspace'),
+    ).toBeNull();
+  });
 });

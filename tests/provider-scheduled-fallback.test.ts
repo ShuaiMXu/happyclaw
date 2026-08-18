@@ -42,6 +42,18 @@ vi.mock('../src/runtime-config.js', async () => {
   };
 });
 
+// runAgentWithModelFallback resolves a Workspace model lock before picking a
+// provider. These scheduled-fallback cases are not locked, and the real DB is
+// not initialized here, so stub the lookup to "no lock".
+vi.mock('../src/db.js', async () => {
+  const actual =
+    await vi.importActual<typeof import('../src/db.js')>('../src/db.js');
+  return {
+    ...actual,
+    getWorkspaceLockedModelConfigId: () => null,
+  };
+});
+
 const { runAgentWithModelFallback } =
   await import('../src/container-runner.js');
 const { providerPool } = await import('../src/provider-pool.js');

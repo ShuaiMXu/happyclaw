@@ -16,6 +16,7 @@ import { AuthGuard } from './components/auth/AuthGuard';
 import { AppLayout } from './components/layout/AppLayout';
 import { APP_BASE, shouldUseHashRouter } from './utils/url';
 import { shouldPreloadChatRoute } from './utils/chat-route-preload';
+import { useDynamicFavicon } from './hooks/useDynamicFavicon';
 import { Toaster } from '@/components/ui/sonner';
 
 let chatPagePromise:
@@ -271,6 +272,7 @@ function getAppRouter() {
 }
 
 export function App() {
+  useDynamicFavicon();
   return (
     <>
       <Toaster position="top-right" richColors />

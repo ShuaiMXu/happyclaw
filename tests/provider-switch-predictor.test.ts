@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   },
   boundId: undefined as string | undefined,
   defaultProviderId: null as string | null,
+  workspaceLock: null as string | null,
   strategy: 'failover' as 'round-robin' | 'weighted-round-robin' | 'failover',
 }));
 
@@ -33,6 +34,7 @@ vi.mock('../src/runtime-config.js', async () => {
   return {
     ...actual,
     getEnabledProviders: () => mocks.enabledProviders,
+    getProviders: () => mocks.enabledProviders,
     getDefaultProviderId: () => mocks.defaultProviderId,
     getContainerEnvConfig: () => mocks.envOverride,
     getBalancingConfig: () => ({
@@ -49,6 +51,7 @@ vi.mock('../src/db.js', async () => {
   return {
     ...actual,
     getSessionProviderId: () => mocks.boundId,
+    getWorkspaceLockedModelConfigId: () => mocks.workspaceLock,
   };
 });
 
@@ -71,6 +74,7 @@ beforeEach(() => {
   mocks.envOverride = {};
   mocks.boundId = undefined;
   mocks.defaultProviderId = null;
+  mocks.workspaceLock = null;
   // Stickiness is a property of the failover strategy. The round-robin
   // strategies rotate on every request, so they are asserted separately.
   mocks.strategy = 'failover';
@@ -152,6 +156,27 @@ describe('willClearSessionOnProviderSwitch', () => {
 
     expect(willClearSessionOnProviderSwitch('grp', null, 'A')).toBe(false);
     expect(willClearSessionOnProviderSwitch('grp', null, 'B')).toBe(true);
+  });
+
+  test('a Workspace model lock overrides the Agent pin and pool rotation', () => {
+    setProviders('A', 'B');
+    mocks.boundId = 'A';
+    mocks.workspaceLock = 'A';
+
+    // The lock wins over an Agent pin to a different model: effective pin is A,
+    // which matches the binding, so no switch is predicted even though the
+    // Agent pin arg says 'B'.
+    expect(willClearSessionOnProviderSwitch('grp', null, 'B')).toBe(false);
+
+    // Under a rotating strategy the pool would normally clear the session every
+    // turn; a Workspace lock pins the run and suppresses that rotation.
+    mocks.strategy = 'round-robin';
+    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
+
+    // A lock whose provider no longer exists falls through to the pool: the
+    // deleted lock is ignored and rotation resumes.
+    mocks.workspaceLock = 'deleted-model';
+    expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
   });
 
   test('an auto-resolved default does not force a switch off a healthy binding', () => {

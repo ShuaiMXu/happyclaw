@@ -5,6 +5,12 @@ export interface GroupInfo {
   folder: string;
   added_at: string;
   interaction_mode: InteractionMode;
+  /** Provider id this workspace is locked to; null/undefined = follow default. */
+  locked_model_config_id?: string | null;
+  /** Platform image generation capability switch; off by default. */
+  image_generation_enabled?: boolean;
+  /** Image model used while the switch is on; null falls back to gpt-image-2. */
+  image_generation_model?: 'gpt-image-1.5' | 'gpt-image-2' | null;
   kind?: 'home' | 'main' | 'feishu' | 'web';
   is_home?: boolean;
   is_my_home?: boolean;

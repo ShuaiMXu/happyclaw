@@ -70,7 +70,7 @@ describe('builtin Skill catalog bootstrap contract', () => {
 
       const markerPath = path.join(root, '.catalog.json');
       const stale = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
-      stale.version = 'v0.0.0';
+      stale.sources[0].version = 'v0.0.0';
       fs.writeFileSync(markerPath, JSON.stringify(stale));
       expect(validate()).toBe(false);
 

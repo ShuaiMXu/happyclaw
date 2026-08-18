@@ -66,6 +66,8 @@ import {
   getUserById,
   getSessionProviderId,
   setSessionProviderId,
+  getWorkspaceLockedModelConfigId,
+  getWorkspaceImageGenerationConfig,
 } from './db.js';
 import { isApiError } from './agent-output-parser.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
@@ -908,9 +910,29 @@ function stickyBindingCanServeTier(
   return !providerPool.isModelQuarantined(boundId, model);
 }
 
+/**
+ * Resolve a Workspace-level model lock into a pinned Provider id. A Workspace
+ * lock takes the highest precedence ("this Workspace's every conversation runs
+ * on one model"), overriding the bound Agent Profile's own pin. The lock is
+ * only honored while the Provider still exists; a deleted/disabled lock falls
+ * through to the normal Agent-pin / pool resolution instead of throwing, so a
+ * Workspace is never bricked by a stale lock.
+ */
+function resolveWorkspaceLockedModelConfigId(
+  groupFolder: string,
+): string | null {
+  const lock = getWorkspaceLockedModelConfigId(groupFolder);
+  if (!lock) return null;
+  if (getProviders().some((provider) => provider.id === lock)) return lock;
+  return null;
+}
+
 function resolvePinnedModelConfigId(
+  groupFolder: string,
   modelConfigId?: string | null,
 ): string | null {
+  const workspaceLock = resolveWorkspaceLockedModelConfigId(groupFolder);
+  if (workspaceLock) return workspaceLock;
   if (modelConfigId) return modelConfigId;
   if (getEnabledProviders().length > 1) return null;
   return getDefaultProviderId();
@@ -921,7 +943,7 @@ export function shouldRotatePoolProviderAfterTurn(
   groupFolder: string,
   modelConfigId?: string | null,
 ): boolean {
-  if (resolvePinnedModelConfigId(modelConfigId)) return false;
+  if (resolvePinnedModelConfigId(groupFolder, modelConfigId)) return false;
   const override = getContainerEnvConfig(groupFolder);
   if (
     override.anthropicApiKey ||
@@ -975,7 +997,10 @@ export function willClearSessionOnProviderSwitch(
   agentId?: string | null,
   modelConfigId?: string | null,
 ): boolean {
-  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
+  const selectedModelConfigId = resolvePinnedModelConfigId(
+    groupFolder,
+    modelConfigId,
+  );
   const boundId = getSessionProviderId(groupFolder, agentId);
   if (selectedModelConfigId) {
     return !!boundId && boundId !== selectedModelConfigId;
@@ -1058,7 +1083,10 @@ export function trySelectPoolProvider(
    */
   modelOverride?: string;
 } | null {
-  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
+  const selectedModelConfigId = resolvePinnedModelConfigId(
+    groupFolder,
+    modelConfigId,
+  );
   const existingBoundId = getSessionProviderId(groupFolder, agentId);
   if (selectedModelConfigId) {
     // Agent/default selection is authoritative. Workspace credentials must
@@ -1392,6 +1420,17 @@ export function buildVolumeMounts(
     envLines: [],
     addHostGateway: false,
   },
+  /**
+   * The Workspace's platform image generation capability state. Accepted as a
+   * parameter (default: off) rather than looked up here so this function
+   * stays DB-free and safely unit-testable without an initialized database;
+   * the real caller (runContainerAgent) resolves it once via
+   * getWorkspaceImageGenerationConfig(group.folder).
+   */
+  imageGenerationConfig: {
+    enabled: boolean;
+    model: 'gpt-image-1.5' | 'gpt-image-2' | null;
+  } = { enabled: false, model: null },
 ): VolumeMount[] {
   if (group.containerConfigError) {
     throw new AdditionalMountValidationError([
@@ -1481,6 +1520,7 @@ export function buildVolumeMounts(
     userSkillsDirOverride: userSkillsPolicy.userSkillsDirOverride,
     managedSkillPolicy: agentProfile?.runtimePolicy?.skills,
     pluginSkillLayers: pluginSkillLayers(pluginSkills),
+    imageGenerationEnabled: imageGenerationConfig.enabled,
   });
   syncHostClaudeContext(claudeContextPlan, groupSessionsDir, {
     materializeLinks: false,
@@ -1668,6 +1708,10 @@ export function buildVolumeMounts(
     globalConfig,
     effectiveContainerOverride,
     resolvedProvider?.customEnv,
+    {
+      enabled: imageGenerationConfig.enabled,
+      model: imageGenerationConfig.model,
+    },
   );
   const agentEffort = resolveAgentSdkEffort(agentProfile?.runtimePolicy);
   removeProviderEffortEnv(envLines, agentEffort);
@@ -2109,6 +2153,7 @@ export async function runContainerAgent(
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
   const modelSelectionPinned = !!resolvePinnedModelConfigId(
+    group.folder,
     input.agentProfile?.modelConfigId,
   );
   let providerFailureReported = false;
@@ -2169,6 +2214,7 @@ export async function runContainerAgent(
       poolResult?.modelOverride,
       modelSelectionPinned,
       containerProxy,
+      getWorkspaceImageGenerationConfig(group.folder),
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId
@@ -2273,6 +2319,9 @@ export async function runContainerAgent(
                 ? loadUserPlugins(group.created_by, { runtime: 'host' })
                 : [],
             ),
+            imageGenerationEnabled: getWorkspaceImageGenerationConfig(
+              group.folder,
+            ).enabled,
           }).audit;
           const mcpManifest = buildRuntimeMcpManifest(
             group,
@@ -2324,6 +2373,9 @@ export async function runContainerAgent(
                 ? loadUserPlugins(group.created_by, { runtime: 'host' })
                 : [],
             ),
+            imageGenerationEnabled: getWorkspaceImageGenerationConfig(
+              group.folder,
+            ).enabled,
           }).effectiveSkills;
           return {
             hash: manifest.hash,
@@ -2877,6 +2929,9 @@ export async function runHostAgent(
     input.agentProfile,
   );
   const preparedHostPlugins = prepareHostPlugins(group.created_by);
+  const hostImageGenerationConfig = getWorkspaceImageGenerationConfig(
+    group.folder,
+  );
   const hostClaudeContextPlan = buildClaudeContextPlan({
     executionMode: 'host',
     group,
@@ -2893,6 +2948,7 @@ export async function runHostAgent(
     userSkillsDirOverride: hostUserSkillsPolicy.userSkillsDirOverride,
     managedSkillPolicy: input.agentProfile?.runtimePolicy?.skills,
     pluginSkillLayers: pluginSkillLayers(preparedHostPlugins),
+    imageGenerationEnabled: hostImageGenerationConfig.enabled,
   });
   const hostClaudeContextSync = syncHostClaudeContext(
     hostClaudeContextPlan,
@@ -2954,6 +3010,7 @@ export async function runHostAgent(
   );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const hostModelSelectionPinned = !!resolvePinnedModelConfigId(
+    group.folder,
     input.agentProfile?.modelConfigId,
   );
   const globalConfig =
@@ -3002,6 +3059,10 @@ export async function runHostAgent(
         ? { customEnv: containerOverride.customEnv }
         : containerOverride,
       hostPoolResult?.resolved.customEnv,
+      {
+        enabled: hostImageGenerationConfig.enabled,
+        model: hostImageGenerationConfig.model,
+      },
     );
     const agentEffort = resolveAgentSdkEffort(
       input.agentProfile?.runtimePolicy,
@@ -3589,6 +3650,7 @@ export async function runAgentWithModelFallback(
   // auto-resolved default is not such a contract, so a multi-provider pool
   // still retries across its members (see resolvePinnedModelConfigId).
   const selectedModelConfigId = resolvePinnedModelConfigId(
+    group.folder,
     input.agentProfile?.modelConfigId,
   );
   const enabledProviders = getEnabledProviders();

@@ -109,6 +109,64 @@ describe('EffectiveSkillResolver', () => {
     expect(selected.missingHostSkillIds).toEqual(['missing']);
   });
 
+  test('gated builtin Skill is excluded by default and only selected when forced', () => {
+    const builtin = path.join(root, 'builtin');
+    skill('builtin', 'baoyu-image-gen');
+    skill('builtin', 'ordinary-builtin-skill');
+
+    const off = resolveEffectiveSkills({
+      layers: [{ source: 'builtin', root: builtin }],
+      gatedBuiltinIds: ['baoyu-image-gen'],
+      forcedBuiltinIds: [],
+    });
+    expect(off.selected.map((entry) => entry.id)).toEqual([
+      'ordinary-builtin-skill',
+    ]);
+    expect(
+      off.candidates.find((c) => c.id === 'baoyu-image-gen'),
+    ).toMatchObject({ excludedReason: 'capability_gated' });
+    expect(off.missingForcedSkillIds).toEqual([]);
+
+    const on = resolveEffectiveSkills({
+      layers: [{ source: 'builtin', root: builtin }],
+      gatedBuiltinIds: ['baoyu-image-gen'],
+      forcedBuiltinIds: ['baoyu-image-gen'],
+    });
+    expect(on.selected.map((entry) => entry.id).sort()).toEqual([
+      'baoyu-image-gen',
+      'ordinary-builtin-skill',
+    ]);
+    expect(on.hash).not.toBe(off.hash);
+  });
+
+  test('forcing a gated builtin Skill that is not installed is reported as missing, not silently dropped', () => {
+    const builtin = path.join(root, 'builtin');
+    fs.mkdirSync(builtin, { recursive: true });
+
+    const manifest = resolveEffectiveSkills({
+      layers: [{ source: 'builtin', root: builtin }],
+      gatedBuiltinIds: ['baoyu-image-gen'],
+      forcedBuiltinIds: ['baoyu-image-gen'],
+    });
+
+    expect(manifest.selected).toEqual([]);
+    expect(manifest.missingForcedSkillIds).toEqual(['baoyu-image-gen']);
+  });
+
+  test('a disabled gated builtin Skill still counts as missing when forced', () => {
+    const builtin = path.join(root, 'builtin');
+    skill('builtin', 'baoyu-image-gen', { disabled: true });
+
+    const manifest = resolveEffectiveSkills({
+      layers: [{ source: 'builtin', root: builtin }],
+      gatedBuiltinIds: ['baoyu-image-gen'],
+      forcedBuiltinIds: ['baoyu-image-gen'],
+    });
+
+    expect(manifest.selected).toEqual([]);
+    expect(manifest.missingForcedSkillIds).toEqual(['baoyu-image-gen']);
+  });
+
   test('real session ghost is quarantined and cannot survive reconciliation', () => {
     const managed = path.join(root, 'managed');
     const selected = skill('managed', 'selected');

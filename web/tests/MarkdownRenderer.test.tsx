@@ -15,7 +15,7 @@ function renderedImageSrc(markdown: string): string {
   return src;
 }
 
-function renderedDownloadPath(markdown: string): string {
+function renderedLocalFilePath(markdown: string): string {
   const src = renderedImageSrc(markdown);
   const encoded = src.split('/').at(-1);
   if (!encoded) throw new Error(`Encoded path not found in: ${src}`);
@@ -84,39 +84,39 @@ describe('resolveMarkdownImageSrc', () => {
       'images/photo.png',
       'group@example#agent:researcher',
     );
-    expect(src).toContain('/api/groups/group%40example/files/download/');
+    expect(src).toContain('/api/groups/group%40example/files/preview/');
     expect(src).not.toContain('agent');
   });
 });
 
 describe('MarkdownRenderer local image paths through react-markdown/micromark', () => {
   it('resolves a plain Chinese filename to its real UTF-8 path', () => {
-    expect(renderedDownloadPath('![截图](images/图片.png)')).toBe(
+    expect(renderedLocalFilePath('![截图](images/图片.png)')).toBe(
       'images/图片.png',
     );
   });
 
   it('resolves spaces and literal percent signs after micromark encoding', () => {
-    expect(renderedDownloadPath('![截图](images/100%-完成%20截图.png)')).toBe(
+    expect(renderedLocalFilePath('![截图](images/100%-完成%20截图.png)')).toBe(
       'images/100%-完成 截图.png',
     );
   });
 
   it('keeps a literal invalid percent escape while decoding Chinese text', () => {
-    expect(renderedDownloadPath('![截图](images/%ZZ-图片.png)')).toBe(
+    expect(renderedLocalFilePath('![截图](images/%ZZ-图片.png)')).toBe(
       'images/%ZZ-图片.png',
     );
   });
 
   it('does not turn a percent-encoded reserved slash into a path separator', () => {
-    expect(renderedDownloadPath('![截图](dir%2F图片.png)')).toBe(
+    expect(renderedLocalFilePath('![截图](dir%2F图片.png)')).toBe(
       'dir%2F图片.png',
     );
   });
 
-  it('strips the agent suffix from the download route', () => {
+  it('strips the agent suffix from the preview route', () => {
     expect(renderedImageSrc('![截图](images/photo.png)')).toContain(
-      '/api/groups/test-group/files/download/',
+      '/api/groups/test-group/files/preview/',
     );
   });
 });
