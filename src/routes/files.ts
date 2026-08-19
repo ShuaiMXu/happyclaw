@@ -653,13 +653,21 @@ fileRoutes.get('/:jid/files/preview/:path', authMiddleware, (c) => {
         ? stats.mtimeMs <= new Date(ifModifiedSince).getTime() + 999
         : false;
 
+    // 生成图片文件名含时间戳 + 随机后缀、内容写入后不变，可以安全地让
+    // 浏览器长缓存（零请求返回）；其他文件仍走每次条件请求的 304 协商。
+    const isImmutableImage =
+      relativePath.startsWith('generated-images/') &&
+      mimeType.startsWith('image/');
+
     const commonHeaders = {
       ...securityHeaders,
       'Content-Type': contentType,
       'Content-Disposition': disposition,
       ETag: etag,
       'Last-Modified': lastModified,
-      'Cache-Control': 'private, no-cache, must-revalidate',
+      'Cache-Control': isImmutableImage
+        ? 'private, max-age=86400, immutable'
+        : 'private, no-cache, must-revalidate',
     };
 
     if (notModified) {

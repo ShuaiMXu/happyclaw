@@ -100,6 +100,7 @@ Host Workspace 在 Access 之外还要求 admin。
 - 重命名、切换 Agent、修改执行方式
 - stop、interrupt、reset-session、clear-history
 - generate-image（服务端生图，另要求 `web:` 前缀工作区）
+- generated-images 列表为只读，仅要求 `canAccessGroup`
 - 创建、修改、删除 Runtime Session
 - 写入工作区 Skills/MCP
 - 修改群聊绑定、激活方式、响应对象和 owner
@@ -198,20 +199,22 @@ read-only 投影按 host-issued turn ID 精确匹配当前或已接纳的 queued
 
 ## 6. 系统和管理权限
 
-| 路由族/操作                                       | 权限                                               |
-| ------------------------------------------------- | -------------------------------------------------- |
-| Provider、系统容量、Host 集成、注册策略、系统外观 | `manage_system_config`                             |
-| Plugin Catalog 手动扫描                           | admin / `manage_system_config` 路径中的 admin 检查 |
-| 系统 MCP 写入                                     | admin                                              |
-| 用户创建、禁用、恢复、角色与权限                  | `manage_users`                                     |
-| 邀请码                                            | `manage_invites`                                   |
-| 审计日志和导出                                    | `view_audit_log`                                   |
-| `/api/billing/admin/*`                            | `manage_billing`                                   |
-| `/api/docker/pull`、运行监控管理                  | `manage_system_config`                             |
-| `/api/status/channel-outbox/*` 人工裁决           | `manage_system_config`                             |
-| 系统外观读写（`GET/PUT /api/config/appearance`）  | `manage_system_config`                             |
-| 品牌资源上传/删除（图标、横幅头像文件写入）       | admin（`adminRoleMiddleware`）                     |
-| `POST /api/groups/:jid/reset-owner`               | admin break-glass，同时仍验证目标资源              |
+| 路由族/操作                                                     | 权限                                               |
+| --------------------------------------------------------------- | -------------------------------------------------- |
+| Provider、系统容量、Host 集成、注册策略、系统外观               | `manage_system_config`                             |
+| Plugin Catalog 手动扫描                                         | admin / `manage_system_config` 路径中的 admin 检查 |
+| 系统 MCP 写入                                                   | admin                                              |
+| 用户创建、禁用、恢复、角色与权限                                | `manage_users`                                     |
+| 邀请码                                                          | `manage_invites`                                   |
+| 审计日志和导出                                                  | `view_audit_log`                                   |
+| `/api/billing/admin/*`                                          | `manage_billing`                                   |
+| `/api/docker/pull`、运行监控管理                                | `manage_system_config`                             |
+| `/api/status/channel-outbox/*` 人工裁决                         | `manage_system_config`                             |
+| 系统外观读写（`GET/PUT /api/config/appearance`）                | `manage_system_config`                             |
+| 生图常用提示词管理（`/api/config/admin/image-prompt-presets*`） | `manage_system_config`                             |
+| 生图常用提示词读取（`GET /api/config/image-prompt-presets`）    | 仅要求已登录，全用户全工作区共享只读               |
+| 品牌资源上传/删除（图标、横幅头像文件写入）                     | admin（`adminRoleMiddleware`）                     |
+| `POST /api/groups/:jid/reset-owner`                             | admin break-glass，同时仍验证目标资源              |
 
 系统 MCP 默认仅 admin 可用；只有显式设置为 shared 后，普通成员的 Agent 才能进入
 有效能力清单。API 不回传 Secret 明文。

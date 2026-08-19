@@ -24,6 +24,7 @@ import { mediumTap } from '../../hooks/useHaptic';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { formatThinkingDuration } from '../../utils/thinking-duration';
 import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
+import { resolveMarkdownImageSrc } from '../../utils/markdownImageSrc';
 import { getPresentedMessageContent } from '../../lib/message-presentation';
 import { getMessageDisplayTimestamp } from '../../lib/message-timeline';
 import {
@@ -52,7 +53,8 @@ interface MessageBubbleProps {
 
 interface MessageAttachment {
   type: 'image';
-  data: string; // base64
+  data?: string; // base64（旧格式，直接内嵌）
+  path?: string; // 工作区相对路径（新格式，经文件预览接口加载）
   mimeType?: string;
   name?: string;
 }
@@ -278,9 +280,13 @@ export const MessageBubble = memo(
           }
         })()
       : [];
-    const images = attachments.filter((att) => att.type === 'image');
-    const allImageSrcs = images.map(
-      (img) => `data:${img.mimeType || 'image/png'};base64,${img.data}`,
+    const images = attachments.filter(
+      (att) => att.type === 'image' && (att.data || att.path),
+    );
+    const allImageSrcs = images.map((img) =>
+      img.path
+        ? resolveMarkdownImageSrc(img.path, message.chat_jid)
+        : `data:${img.mimeType || 'image/png'};base64,${img.data}`,
     );
 
     // Check if content is empty (only whitespace) and we have images
@@ -480,7 +486,7 @@ export const MessageBubble = memo(
               {images.map((img, i) => (
                 <img
                   key={i}
-                  src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
+                  src={allImageSrcs[i]}
                   alt={img.name || `图片 ${i + 1}`}
                   className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-border hover:border-primary transition-colors"
                   onClick={() =>
@@ -562,7 +568,7 @@ export const MessageBubble = memo(
                   {images.map((img, i) => (
                     <img
                       key={i}
-                      src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
+                      src={allImageSrcs[i]}
                       alt={img.name || `图片 ${i + 1}`}
                       className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border-2 border-primary hover:border-primary transition-colors"
                       onClick={() =>
@@ -680,7 +686,7 @@ export const MessageBubble = memo(
                   {images.map((img, i) => (
                     <img
                       key={i}
-                      src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
+                      src={allImageSrcs[i]}
                       alt={img.name || `图片 ${i + 1}`}
                       className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-border hover:border-primary transition-colors"
                       onClick={() =>

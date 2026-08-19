@@ -69,7 +69,20 @@ Public：
 - `POST /api/groups/:jid/generate-image`，服务端确定性生图：校验工作区
   `image_generation_enabled` 与选定模型后，直接调用平台级 OpenAI 兼容 Images
   API，不经过对话模型或 Agent 容器；成功后将用户请求与生成图片各写为一条消息
-  并经 WebSocket 推送。仅 `web:` 前缀工作区可用，未开启开关时返回 409
+  并经 WebSocket 推送。仅 `web:` 前缀工作区可用，未开启开关时返回 409。
+  Body 可选 `references[]`（最多 6 张，PNG/JPEG/WebP，单张 ≤8MB，每张可附
+  `note` 说明该图要参考的内容）：带参考图时走 `images/edits` 图生图，参考图
+  说明会编号追加进 prompt。生成结果落盘到工作区 `generated-images/` 目录，
+  消息附件以相对路径引用（不再内嵌 base64）
+- `GET /api/groups/:jid/generated-images`，生图画廊轻量列表：只返回
+  `__image_generation__` 消息的附件引用（路径或旧版内嵌 base64），按时间倒序，
+  `limit` 默认 100、上限 200；要求 `canAccessGroup`
+- `GET /api/config/image-prompt-presets`，生图常用提示词：只返回启用中的预设
+  （`label` 简短标签 + `prompt` 完整提示词），供生图页面「常用提示词」下拉
+  选用；平台级、全用户全工作区共享，仅要求已登录（`authMiddleware`）
+- `GET/POST /api/config/admin/image-prompt-presets`、
+  `PATCH|DELETE /api/config/admin/image-prompt-presets/:id`，常用提示词的
+  管理端 CRUD；要求 `manage_system_config`
 - `POST /api/groups/:jid/reset-session`
 - `POST /api/groups/:jid/clear-history`，重建工作区内容：永久清除聊天、
   Runtime Session、子对话、工作目录及 Workspace Memory（含版本历史和

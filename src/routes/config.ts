@@ -1,6 +1,6 @@
 // Configuration management routes
 
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes, createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Agent as HttpsAgent } from 'node:https';
@@ -46,6 +46,12 @@ import {
   getGroupsByTargetAgent,
   updateAgentLastImJid,
   countAgentProfilesByModelConfigId,
+  getActiveImagePromptPresets,
+  getAllImagePromptPresets,
+  getImagePromptPreset,
+  createImagePromptPreset,
+  updateImagePromptPreset,
+  deleteImagePromptPreset,
 } from '../db.js';
 import {
   channelConversationJid,
@@ -75,6 +81,8 @@ import {
   RegistrationConfigSchema,
   AppearanceConfigSchema,
   ImageGenerationBackendConfigSchema,
+  ImagePromptPresetCreateSchema,
+  ImagePromptPresetUpdateSchema,
   HostIntegrationSettingsSchema,
   SystemSettingsSchema,
   UnifiedProviderCreateSchema,
@@ -2298,6 +2306,101 @@ configRoutes.get('/image-generation/options', authMiddleware, (c) => {
     return c.json({ error: 'Failed to load image generation options' }, 500);
   }
 });
+
+// ─── Image Studio common prompt presets ────────────────────────────
+//
+// Platform-wide, admin-managed short-label prompts shown next to the "生成
+// 图片" button in the Image Studio ("/image-studio") UI. Shared by every
+// user/workspace — not a per-workspace or per-user setting.
+
+// Read-only, non-admin: any logged-in user can load the active preset list
+// on demand (lazily, when the picker is opened) to insert into their prompt.
+configRoutes.get('/image-prompt-presets', authMiddleware, (c) => {
+  try {
+    return c.json({ presets: getActiveImagePromptPresets() });
+  } catch (err) {
+    logger.error({ err }, 'Failed to load image prompt presets');
+    return c.json({ error: 'Failed to load image prompt presets' }, 500);
+  }
+});
+
+// Admin: full list including inactive presets, for the management UI.
+configRoutes.get(
+  '/admin/image-prompt-presets',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    try {
+      return c.json({ presets: getAllImagePromptPresets() });
+    } catch (err) {
+      logger.error({ err }, 'Failed to load image prompt presets (admin)');
+      return c.json({ error: 'Failed to load image prompt presets' }, 500);
+    }
+  },
+);
+
+configRoutes.post(
+  '/admin/image-prompt-presets',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ImagePromptPresetCreateSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    const now = new Date().toISOString();
+    const preset = createImagePromptPreset({
+      id: randomUUID(),
+      label: validation.data.label,
+      prompt: validation.data.prompt,
+      sort_order: validation.data.sort_order ?? 0,
+      is_active: validation.data.is_active ?? true,
+      created_at: now,
+      updated_at: now,
+    });
+    return c.json(preset, 201);
+  },
+);
+
+configRoutes.patch(
+  '/admin/image-prompt-presets/:id',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const id = c.req.param('id');
+    if (!getImagePromptPreset(id)) {
+      return c.json({ error: 'Preset not found' }, 404);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ImagePromptPresetUpdateSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    const updated = updateImagePromptPreset(id, validation.data);
+    return c.json(updated);
+  },
+);
+
+configRoutes.delete(
+  '/admin/image-prompt-presets/:id',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    const id = c.req.param('id');
+    const deleted = deleteImagePromptPreset(id);
+    if (!deleted) {
+      return c.json({ error: 'Preset not found' }, 404);
+    }
+    return c.json({ success: true });
+  },
+);
 
 // ─── Brand assets (sidebar mark + wordmark + favicon) ──────────────
 //

@@ -74,6 +74,11 @@ const CapabilitiesPage = lazy(() =>
     default: m.CapabilitiesPage,
   })),
 );
+const ImageStudioPage = lazy(() =>
+  import('./pages/ImageStudioPage').then((m) => ({
+    default: m.ImageStudioPage,
+  })),
+);
 
 function UsageRouteFallback() {
   return (
@@ -158,6 +163,14 @@ const appRoutes = createRoutesFromElements(
         element={
           <Suspense fallback={<AgentProfilesRouteFallback />}>
             <AgentProfilesPage />
+          </Suspense>
+        }
+      />
+      <Route
+        path="/image-studio"
+        element={
+          <Suspense fallback={null}>
+            <ImageStudioPage />
           </Suspense>
         }
       />

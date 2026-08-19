@@ -13,6 +13,7 @@ import { SecuritySection } from '../components/settings/SecuritySection';
 import { AboutSection } from '../components/settings/AboutSection';
 import { AppearanceSection } from '../components/settings/AppearanceSection';
 import { ImageGenerationBackendSection } from '../components/settings/ImageGenerationBackendSection';
+import { ImagePromptPresetsSection } from '../components/settings/ImagePromptPresetsSection';
 import { MainAgentIdentitySection } from '../components/settings/MainAgentIdentitySection';
 import { MainAgentCapabilitiesSection } from '../components/settings/MainAgentCapabilitiesSection';
 import {
@@ -239,6 +240,9 @@ export function SettingsPage() {
                   <SystemSettingsSection scope="runtime" />
                   <div className="border-t border-border pt-6">
                     <ImageGenerationBackendSection />
+                  </div>
+                  <div className="border-t border-border pt-6">
+                    <ImagePromptPresetsSection />
                   </div>
                 </div>
               ) : activeTab === 'main-agent' ||

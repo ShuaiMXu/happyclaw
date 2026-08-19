@@ -1271,3 +1271,17 @@ export interface BillingAccessResult {
   exceededWindow?: QuotaCheckResult['exceededWindow'];
   resetAt?: string;
 }
+
+// --- Image Studio prompt presets ---
+// Platform-wide, admin-managed short-label prompt presets shared by every
+// user/workspace in the Image Studio ("生图") UI. Not scoped to a group or
+// user, unlike per-workspace image generation settings.
+export interface ImagePromptPreset {
+  id: string;
+  label: string; // short text shown in the picker
+  prompt: string; // full prompt text inserted when selected
+  sort_order: number;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}

@@ -77,21 +77,22 @@ HTTP 路由位于 `src/routes/`，完整模块索引见 `docs/API.md`。
 Web 位于 `web/`，使用 React 19、Vite、Tailwind CSS 4、React Router、Zustand 和
 Radix UI。路由以 `web/src/App.tsx` 为准：
 
-| 路径                      | 用途                                  |
-| ------------------------- | ------------------------------------- |
-| `/setup`                  | 首个管理员初始化                      |
-| `/setup/providers`        | Provider 引导                         |
-| `/setup/channels`         | 用户渠道引导                          |
-| `/login`、`/register`     | 登录和注册                            |
-| `/chat/:groupFolder?`     | 工作台与会话                          |
-| `/agent-profiles`         | Agent 管理                            |
-| `/capabilities/:section?` | Skills、MCP、Plugins                  |
-| `/tasks`                  | 定时任务                              |
-| `/usage`、`/billing`      | 用量与计费                            |
-| `/memory`                 | 记忆管理                              |
-| `/settings`               | 账户和系统设置                        |
-| `/monitor`                | 运行状态，需要 `manage_system_config` |
-| `/users`                  | 用户、邀请和审计管理                  |
+| 路径                      | 用途                                       |
+| ------------------------- | ------------------------------------------ |
+| `/setup`                  | 首个管理员初始化                           |
+| `/setup/providers`        | Provider 引导                              |
+| `/setup/channels`         | 用户渠道引导                               |
+| `/login`、`/register`     | 登录和注册                                 |
+| `/chat/:groupFolder?`     | 工作台与会话                               |
+| `/agent-profiles`         | Agent 管理                                 |
+| `/image-studio`           | 生图板块，直接对已开启生图的工作区生成图片 |
+| `/capabilities/:section?` | Skills、MCP、Plugins                       |
+| `/tasks`                  | 定时任务                                   |
+| `/usage`、`/billing`      | 用量与计费                                 |
+| `/memory`                 | 记忆管理                                   |
+| `/settings`               | 账户和系统设置                             |
+| `/monitor`                | 运行状态，需要 `manage_system_config`      |
+| `/users`                  | 用户、邀请和审计管理                       |
 
 `/groups`、`/skills`、`/mcp-servers` 和 `/plugins` 是兼容重定向，不应新增独立页面。
 

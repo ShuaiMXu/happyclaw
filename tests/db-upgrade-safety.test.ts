@@ -177,6 +177,8 @@ describe('schema version head', () => {
     // tests/schema-v70-workspace-locked-model.test.ts for migration coverage.
     // v71: adds Workspace-level image generation switch + model; see
     // tests/schema-v71-workspace-image-generation.test.ts for migration coverage.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(71);
+    // v72: adds the platform-wide image_prompt_presets table; see
+    // tests/schema-v72-image-prompt-presets.test.ts for migration coverage.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(72);
   });
 });

@@ -38,6 +38,7 @@ import {
   MessageFinalizationReason,
   FollowUpMode,
   FollowUpStatus,
+  ImagePromptPreset,
   QueuedFollowUp,
   MonthlyUsage,
   NewMessage,
@@ -103,7 +104,7 @@ let db: InstanceType<typeof Database>;
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 71;
+export const CURRENT_SCHEMA_VERSION = 72;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -997,6 +998,21 @@ export function initDatabase(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_workspace_agent_profiles_profile
       ON workspace_agent_profiles(agent_profile_id);
+  `);
+
+  // Platform-wide, admin-managed common prompt presets for the Image Studio
+  // ("生图" 页面). Shared by every user/workspace — not scoped to a user or
+  // group, unlike per-workspace settings.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS image_prompt_presets (
+      id TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 
   // Billing tables
@@ -9269,6 +9285,29 @@ export function setWorkspaceImageGenerationConfig(
   return result.changes > 0;
 }
 
+/**
+ * Lightweight gallery listing for the image studio page: only the persisted
+ * generation rows, never the full message page. Attachments are returned raw
+ * (JSON string) so the route can project path references without loading
+ * unrelated message content.
+ */
+export function getGeneratedImageMessages(
+  chatJid: string,
+  limit = 100,
+): Array<{ id: string; timestamp: string; attachments: string | null }> {
+  return db
+    .prepare(
+      `SELECT id, timestamp, attachments FROM messages
+       WHERE chat_jid = ? AND sender = '__image_generation__' AND attachments IS NOT NULL
+       ORDER BY timestamp DESC LIMIT ?`,
+    )
+    .all(chatJid, limit) as Array<{
+    id: string;
+    timestamp: string;
+    attachments: string | null;
+  }>;
+}
+
 export function deleteWorkspaceAgentProfile(groupFolder: string): void {
   db.transaction(() => {
     db.prepare(
@@ -13456,6 +13495,114 @@ function safeParseJsonArray(val: unknown): string[] {
   } catch {
     return [];
   }
+}
+
+// --- Image Studio prompt presets CRUD ---
+
+export function getImagePromptPreset(
+  id: string,
+): ImagePromptPreset | undefined {
+  const row = db
+    .prepare('SELECT * FROM image_prompt_presets WHERE id = ?')
+    .get(id) as Record<string, unknown> | undefined;
+  return row ? mapImagePromptPresetRow(row) : undefined;
+}
+
+/** Ordered, active-only list — what regular users get in the Image Studio picker. */
+export function getActiveImagePromptPresets(): ImagePromptPreset[] {
+  return (
+    db
+      .prepare(
+        'SELECT * FROM image_prompt_presets WHERE is_active = 1 ORDER BY sort_order ASC, created_at ASC',
+      )
+      .all() as Record<string, unknown>[]
+  ).map(mapImagePromptPresetRow);
+}
+
+/** Full list including inactive rows — for the admin management UI. */
+export function getAllImagePromptPresets(): ImagePromptPreset[] {
+  return (
+    db
+      .prepare(
+        'SELECT * FROM image_prompt_presets ORDER BY sort_order ASC, created_at ASC',
+      )
+      .all() as Record<string, unknown>[]
+  ).map(mapImagePromptPresetRow);
+}
+
+export function createImagePromptPreset(
+  preset: ImagePromptPreset,
+): ImagePromptPreset {
+  db.prepare(
+    `INSERT INTO image_prompt_presets (id, label, prompt, sort_order, is_active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    preset.id,
+    preset.label,
+    preset.prompt,
+    preset.sort_order,
+    preset.is_active ? 1 : 0,
+    preset.created_at,
+    preset.updated_at,
+  );
+  return preset;
+}
+
+export function updateImagePromptPreset(
+  id: string,
+  updates: Partial<Omit<ImagePromptPreset, 'id' | 'created_at'>>,
+): ImagePromptPreset | undefined {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (updates.label !== undefined) {
+    fields.push('label = ?');
+    values.push(updates.label);
+  }
+  if (updates.prompt !== undefined) {
+    fields.push('prompt = ?');
+    values.push(updates.prompt);
+  }
+  if (updates.sort_order !== undefined) {
+    fields.push('sort_order = ?');
+    values.push(updates.sort_order);
+  }
+  if (updates.is_active !== undefined) {
+    fields.push('is_active = ?');
+    values.push(updates.is_active ? 1 : 0);
+  }
+
+  if (fields.length === 0) return getImagePromptPreset(id);
+
+  fields.push('updated_at = ?');
+  values.push(new Date().toISOString());
+  values.push(id);
+
+  db.prepare(
+    `UPDATE image_prompt_presets SET ${fields.join(', ')} WHERE id = ?`,
+  ).run(...values);
+  return getImagePromptPreset(id);
+}
+
+export function deleteImagePromptPreset(id: string): boolean {
+  const result = db
+    .prepare('DELETE FROM image_prompt_presets WHERE id = ?')
+    .run(id);
+  return result.changes > 0;
+}
+
+function mapImagePromptPresetRow(
+  row: Record<string, unknown>,
+): ImagePromptPreset {
+  return {
+    id: String(row.id),
+    label: String(row.label),
+    prompt: String(row.prompt),
+    sort_order: Number(row.sort_order) || 0,
+    is_active: !!(row.is_active as number),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
 }
 
 // --- User Subscriptions ---

@@ -814,6 +814,26 @@ export const ImageGenerationBackendConfigSchema = z.object({
   apiKey: z.string().trim().min(1).max(2048).optional(),
 });
 
+// Platform-wide, admin-managed common prompt presets shown as short-label
+// options in the Image Studio ("生图") UI, shared by every user/workspace.
+export const ImagePromptPresetCreateSchema = z
+  .object({
+    label: z.string().trim().min(1).max(60),
+    prompt: z.string().trim().min(1).max(4_000),
+    sort_order: z.number().int().min(0).max(100_000).optional(),
+    is_active: z.boolean().optional(),
+  })
+  .strict();
+
+export const ImagePromptPresetUpdateSchema = z
+  .object({
+    label: z.string().trim().min(1).max(60).optional(),
+    prompt: z.string().trim().min(1).max(4_000).optional(),
+    sort_order: z.number().int().min(0).max(100_000).optional(),
+    is_active: z.boolean().optional(),
+  })
+  .strict();
+
 export const ChangePasswordSchema = z.object({
   current_password: z.string().min(1),
   new_password: z.string().min(8).max(128),
