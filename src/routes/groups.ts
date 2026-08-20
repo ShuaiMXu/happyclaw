@@ -84,6 +84,7 @@ import {
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
 import { getFileRoot, deleteFile } from '../file-manager.js';
+import { removeCachedThumbnail } from './files.js';
 import {
   getWorkspaceRuntimeJids,
   quiesceWorkspaceRunnersAroundCommit,
@@ -2501,6 +2502,9 @@ groupRoutes.delete(
             'Failed to remove generated image file during deletion',
           );
         }
+        // Best-effort: drop the cached low-res preview too, so deleting an
+        // image doesn't leave an orphaned thumbnail file behind.
+        removeCachedThumbnail(group.folder, relPath);
       }
     }
 

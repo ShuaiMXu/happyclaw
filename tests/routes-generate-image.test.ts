@@ -12,6 +12,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import sharp from 'sharp';
 
 import {
   afterEach,
@@ -81,10 +82,12 @@ vi.mock('../src/image-generation-service.js', () => ({
 }));
 
 const groupRoutesModule = await import('../src/routes/groups.js');
+const fileRoutesModule = await import('../src/routes/files.js');
 const db = await import('../src/db.js');
 const webContext = await import('../src/web-context.js');
 
 const groupRoutes = groupRoutesModule.default;
+const fileRoutes = fileRoutesModule.default;
 
 const OWNER_ID = 'alice';
 const JID = 'web:image-group';
@@ -431,6 +434,36 @@ describe('DELETE /:jid/generated-images/:messageId', () => {
       .getMessagesPage(JID, undefined, 10)
       .find((m) => m.id === messageId);
     expect(stillThere).toBeUndefined();
+  });
+
+  test('also removes the cached low-res thumbnail, if one was generated', async () => {
+    // TINY_PNG is just a truncated signature (not a decodable image), so use
+    // a real one here — the thumbnail route only caches successfully decoded
+    // images.
+    const realPng = await sharp({
+      create: { width: 400, height: 300, channels: 3, background: 'red' },
+    })
+      .png()
+      .toBuffer();
+    generateWorkspaceImage.mockResolvedValueOnce({
+      data: realPng.toString('base64'),
+      mimeType: 'image/png',
+    });
+    const { messageId, path: imagePath } = await generateOne();
+
+    const thumbRes = await fileRoutes.request(
+      `/${JID}/files/preview/${Buffer.from(imagePath, 'utf-8').toString('base64url')}?thumb=1`,
+    );
+    expect(thumbRes.status).toBe(200);
+    const thumbCacheDir = path.join(SHARED_TMP, 'image-thumbnails', FOLDER);
+    expect(fs.readdirSync(thumbCacheDir).length).toBeGreaterThan(0);
+
+    const res = await groupRoutes.request(
+      `/${JID}/generated-images/${messageId}`,
+      { method: 'DELETE' },
+    );
+    expect(res.status).toBe(200);
+    expect(fs.readdirSync(thumbCacheDir)).toHaveLength(0);
   });
 
   test('404s for an unknown message id', async () => {

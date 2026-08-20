@@ -129,11 +129,33 @@ export function imageEntrySrc(jid: string, entry: GeneratedImageEntry): string {
   return filePreviewUrl(jid, entry.path ?? '');
 }
 
+/**
+ * Resolve an entry to a low-resolution preview <img src> for bandwidth-
+ * conscious display (gallery grid, lightbox default view). Falls back to the
+ * full-resolution src for legacy inline-base64 rows, which have no path to
+ * request a server-generated thumbnail for.
+ */
+export function imageEntryThumbSrc(
+  jid: string,
+  entry: GeneratedImageEntry,
+): string {
+  if (entry.data) return `data:${entry.mimeType};base64,${entry.data}`;
+  return `${filePreviewUrl(jid, entry.path ?? '')}?thumb=1`;
+}
+
 /** Resolve a workspace-relative file path to a `/files/preview/...` URL. */
 export function filePreviewUrl(jid: string, relativePath: string): string {
   const encoded = toBase64Url(relativePath);
   return withBasePath(
     `/api/groups/${encodeURIComponent(jid)}/files/preview/${encoded}`,
+  );
+}
+
+/** Resolve a workspace-relative file path to a `/files/download/...` URL. */
+export function fileDownloadUrl(jid: string, relativePath: string): string {
+  const encoded = toBase64Url(relativePath);
+  return withBasePath(
+    `/api/groups/${encodeURIComponent(jid)}/files/download/${encoded}`,
   );
 }
 

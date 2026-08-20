@@ -22,14 +22,103 @@ import {
   getFileRoot,
 } from '../file-manager.js';
 import { checkStorageLimit, isBillingEnabled } from '../billing.js';
-import { MAX_FILE_SIZE_MB } from '../config.js';
+import { MAX_FILE_SIZE_MB, DATA_DIR } from '../config.js';
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { promisify } from 'node:util';
+import sharp from 'sharp';
 
 const execFileAsync = promisify(execFile);
+
+// 缩略图缓存：与工作区文件目录分开存放（避免污染文件面板列表），按
+// 工作区文件夹分子目录，文件名为相对路径的 hash，内容与体积随请求方
+// ?thumb=1 生成的 webp 缩略图一一对应。只用于生图画廊等场景的省流量预览，
+// 原图下载 / 复用配方仍然读取未缩放的原始文件。
+const THUMBNAIL_CACHE_DIR = path.join(DATA_DIR, 'image-thumbnails');
+const THUMBNAIL_MAX_DIMENSION = 1024;
+const THUMBNAIL_WEBP_QUALITY = 78;
+// 仅对确定是静态光栅图片的类型生成缩略图：GIF 可能是动图（resize 只取首帧
+// 会丢失动画），SVG 本身已是矢量小文件，两者都跳过、直接回退到原图。
+const THUMBNAIL_SOURCE_MIME_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+]);
+
+function thumbnailCachePath(groupFolder: string, relativePath: string): string {
+  const hash = crypto.createHash('sha1').update(relativePath).digest('hex');
+  return path.join(THUMBNAIL_CACHE_DIR, groupFolder, `${hash}.webp`);
+}
+
+/**
+ * 删除某个文件对应的缩略图缓存（如果存在）。在原文件被显式删除时调用，
+ * 避免缓存目录里堆积再也不会被访问的孤儿缩略图。静默忽略不存在的情况。
+ */
+export function removeCachedThumbnail(
+  groupFolder: string,
+  relativePath: string,
+): void {
+  try {
+    fs.unlinkSync(thumbnailCachePath(groupFolder, relativePath));
+  } catch {
+    // 缓存本来就不存在（从未预览过缩略图），无需处理
+  }
+}
+
+/**
+ * 生成（或复用缓存的）指定图片文件的缩略图，返回缩略图的绝对路径。
+ * 缓存以「原文件 mtime」失效：原文件被覆盖写入后会重新生成。生成失败
+ * （例如文件不是合法图片）时返回 null，调用方应回退到原图。
+ */
+async function getOrCreateThumbnail(
+  absolutePath: string,
+  groupFolder: string,
+  relativePath: string,
+  mimeType: string,
+  originalStats: fs.Stats,
+): Promise<(fs.Stats & { path: string }) | null> {
+  if (!THUMBNAIL_SOURCE_MIME_TYPES.has(mimeType)) return null;
+
+  const cacheDir = path.join(THUMBNAIL_CACHE_DIR, groupFolder);
+  const cachePath = thumbnailCachePath(groupFolder, relativePath);
+
+  try {
+    const cacheStat = fs.statSync(cachePath);
+    if (cacheStat.mtimeMs >= originalStats.mtimeMs) {
+      return Object.assign(cacheStat, { path: cachePath });
+    }
+  } catch {
+    // 缓存不存在，走下方生成分支
+  }
+
+  try {
+    fs.mkdirSync(cacheDir, { recursive: true });
+    // 先写临时文件再重命名，避免并发请求下读到未写完的半成品文件。
+    const tmpPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+    await sharp(absolutePath)
+      .rotate() // 按 EXIF 方向校正，避免竖拍照片缩略图被拉伸/旋转
+      .resize({
+        width: THUMBNAIL_MAX_DIMENSION,
+        height: THUMBNAIL_MAX_DIMENSION,
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .webp({ quality: THUMBNAIL_WEBP_QUALITY })
+      .toFile(tmpPath);
+    fs.renameSync(tmpPath, cachePath);
+    const cacheStat = fs.statSync(cachePath);
+    return Object.assign(cacheStat, { path: cachePath });
+  } catch (error) {
+    logger.warn(
+      { err: error, relativePath },
+      'Failed to generate image thumbnail, falling back to original',
+    );
+    return null;
+  }
+}
 
 // MIME 类型映射（预览和编辑端点共用）
 const MIME_MAP: Record<string, string> = {
@@ -572,7 +661,9 @@ fileRoutes.get('/:jid/files/download/:path', authMiddleware, (c) => {
 });
 
 // GET /api/groups/:jid/files/preview/:path - 预览文件
-fileRoutes.get('/:jid/files/preview/:path', authMiddleware, (c) => {
+// 可选查询参数 ?thumb=1：返回缩小重编码的 webp 缩略图而非原图，用于生图
+// 画廊等省流量场景；仅对静态光栅图片生效，其余类型或生成失败时回退原图。
+fileRoutes.get('/:jid/files/preview/:path', authMiddleware, async (c) => {
   const jid = c.req.param('jid');
   const encodedPath = c.req.param('path');
 
@@ -622,6 +713,28 @@ fileRoutes.get('/:jid/files/preview/:path', authMiddleware, (c) => {
     const isStreamable =
       mimeType.startsWith('video/') || mimeType.startsWith('audio/');
 
+    // 缩略图请求：只对静态光栅图片生效，用远小于原图的 webp 版本节省带宽
+    // （生图画廊等场景）；类型不支持或生成失败时静默回退到原图，不报错。
+    let servePath = absolutePath;
+    let serveStats = stats;
+    let serveMimeType = mimeType;
+    let serveFileSize = fileSize;
+    if (c.req.query('thumb') === '1' && !isStreamable) {
+      const thumb = await getOrCreateThumbnail(
+        absolutePath,
+        group.folder,
+        relativePath,
+        mimeType,
+        stats,
+      );
+      if (thumb) {
+        servePath = thumb.path;
+        serveStats = thumb;
+        serveMimeType = 'image/webp';
+        serveFileSize = thumb.size;
+      }
+    }
+
     // 安全头
     const securityHeaders: Record<string, string> = {
       'Content-Security-Policy': "default-src 'none'; sandbox",
@@ -631,8 +744,8 @@ fileRoutes.get('/:jid/files/preview/:path', authMiddleware, (c) => {
     // Content-Type 和 Content-Disposition
     let contentType: string;
     let disposition: string;
-    if (SAFE_PREVIEW_MIME_TYPES.has(mimeType)) {
-      contentType = mimeType;
+    if (SAFE_PREVIEW_MIME_TYPES.has(serveMimeType)) {
+      contentType = serveMimeType;
       disposition = 'inline';
     } else {
       contentType = 'application/octet-stream';
@@ -643,21 +756,21 @@ fileRoutes.get('/:jid/files/preview/:path', authMiddleware, (c) => {
     // 每次刷新都会重新拉取整个文件。这里按 size+mtime 生成弱 ETag，命中
     // 条件请求即返回 304 空体；内容一旦被覆盖写入（mtime/size 变化）会
     // 立即失效，不会返回过期内容。
-    const etag = `W/"${fileSize.toString(16)}-${Math.floor(stats.mtimeMs).toString(16)}"`;
-    const lastModified = stats.mtime.toUTCString();
+    const etag = `W/"${serveFileSize.toString(16)}-${Math.floor(serveStats.mtimeMs).toString(16)}"`;
+    const lastModified = serveStats.mtime.toUTCString();
     const ifNoneMatch = c.req.header('if-none-match');
     const ifModifiedSince = c.req.header('if-modified-since');
     const notModified = ifNoneMatch
       ? ifNoneMatch === etag
       : ifModifiedSince
-        ? stats.mtimeMs <= new Date(ifModifiedSince).getTime() + 999
+        ? serveStats.mtimeMs <= new Date(ifModifiedSince).getTime() + 999
         : false;
 
     // 生成图片文件名含时间戳 + 随机后缀、内容写入后不变，可以安全地让
     // 浏览器长缓存（零请求返回）；其他文件仍走每次条件请求的 304 协商。
     const isImmutableImage =
       relativePath.startsWith('generated-images/') &&
-      mimeType.startsWith('image/');
+      serveMimeType.startsWith('image/');
 
     const commonHeaders = {
       ...securityHeaders,
@@ -726,13 +839,13 @@ fileRoutes.get('/:jid/files/preview/:path', authMiddleware, (c) => {
 
     // 非流媒体类型：也使用流式响应避免大文件占满内存
     const stream = Readable.toWeb(
-      fs.createReadStream(absolutePath),
+      fs.createReadStream(servePath),
     ) as ReadableStream<Uint8Array>;
     return new Response(stream, {
       status: 200,
       headers: {
         ...commonHeaders,
-        'Content-Length': String(fileSize),
+        'Content-Length': String(serveFileSize),
       },
     });
   } catch (error) {

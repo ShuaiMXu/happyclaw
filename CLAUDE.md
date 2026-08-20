@@ -235,6 +235,7 @@ data/
 ├── mcp-servers/{userId}/
 ├── plugins/
 ├── agent-profile-runtime/
+├── image-thumbnails/{folder}/
 ├── env/
 └── extra/
 ```

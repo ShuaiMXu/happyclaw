@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
+  Download,
   ImagePlus,
   Loader2,
   RefreshCw,
@@ -9,14 +10,19 @@ import {
   Trash2,
   Wand2,
   X,
+  ZoomIn,
 } from 'lucide-react';
 import { api, computeUploadTimeoutMs, type ApiError } from '../api/client';
 import { wsManager } from '../api/ws';
+import { downloadFromDataUrl, downloadFromUrl } from '../utils/download';
+import { showToast } from '../utils/toast';
 import { useGroupsStore } from '../stores/groups';
 import {
   entriesFromMessageRow,
+  fileDownloadUrl,
   filePreviewUrl,
   imageEntrySrc,
+  imageEntryThumbSrc,
   useGalleryWithCache,
   useImageStudioStore,
   type GeneratedImageEntry,
@@ -244,7 +250,37 @@ export function ImageStudioPage() {
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<GeneratedImageEntry | null>(null);
+  // Whether the lightbox shows the full-resolution image instead of the
+  // low-res preview; reset every time a different image is opened.
+  const [lightboxOriginal, setLightboxOriginal] = useState(false);
+  const openLightbox = useCallback((entry: GeneratedImageEntry) => {
+    setLightboxOriginal(false);
+    setLightbox(entry);
+  }, []);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // "下载原图": always fetches the full-resolution bytes regardless of
+  // whether the grid/lightbox is currently showing the low-res preview.
+  const downloadImageEntry = useCallback(
+    async (jid: string, entry: GeneratedImageEntry) => {
+      try {
+        if (entry.path) {
+          const filename =
+            entry.path.split('/').pop() || `${entry.messageId}.png`;
+          await downloadFromUrl(fileDownloadUrl(jid, entry.path), filename);
+        } else if (entry.data) {
+          const ext = entry.mimeType.split('/')[1] || 'png';
+          await downloadFromDataUrl(
+            `data:${entry.mimeType};base64,${entry.data}`,
+            `${entry.messageId}.${ext}`,
+          );
+        }
+      } catch (err) {
+        showToast('下载失败', errorMessage(err, '图片下载失败，请稍后重试。'));
+      }
+    },
+    [],
+  );
 
   // Common prompt presets: platform-wide, admin-managed short-label options.
   // Loaded lazily the first time the picker is opened, not on page load.
@@ -566,7 +602,11 @@ export function ImageStudioPage() {
                     isDraggingOverRefZone && 'bg-accent ring-2 ring-primary',
                   )}
                   onDragOver={(e) => {
-                    if (!draggedImageRef.current) return;
+                    // Accept both the in-page gallery drag (tracked via ref)
+                    // and files dragged in from outside the browser window.
+                    const isExternalFiles =
+                      e.dataTransfer.types.includes('Files');
+                    if (!draggedImageRef.current && !isExternalFiles) return;
                     e.preventDefault();
                     e.dataTransfer.dropEffect = 'copy';
                     setIsDraggingOverRefZone(true);
@@ -575,6 +615,12 @@ export function ImageStudioPage() {
                   onDrop={(e) => {
                     e.preventDefault();
                     setIsDraggingOverRefZone(false);
+                    if (e.dataTransfer.files?.length) {
+                      // Dropped from outside the browser (Finder/Explorer/desktop).
+                      draggedImageRef.current = null;
+                      void addReferenceFiles(e.dataTransfer.files);
+                      return;
+                    }
                     const entry = draggedImageRef.current;
                     draggedImageRef.current = null;
                     if (entry && selectedJid) {
@@ -587,7 +633,7 @@ export function ImageStudioPage() {
                       参考图（可选，最多 {MAX_REFERENCES} 张）
                     </span>
                     <span className="text-xs text-muted-foreground">
-                      图生图模式：可为每张参考图单独填写要参考的内容；也可把下方已生成的图片拖到这里
+                      图生图模式：可为每张参考图单独填写要参考的内容；也可把下方已生成的图片或电脑里的图片文件拖到这里
                     </span>
                   </div>
                   <div className="flex flex-wrap gap-3">
@@ -783,6 +829,23 @@ export function ImageStudioPage() {
                       e.dataTransfer.effectAllowed = 'copy';
                       // Firefox requires setData() for a drag to actually start.
                       e.dataTransfer.setData('text/plain', img.messageId);
+                      // Chromium: a "DownloadURL" record lets the image be
+                      // dragged out of the browser window (e.g. onto the
+                      // desktop) to save it as a file, even though the <img>
+                      // itself is non-draggable below (native image drag
+                      // would otherwise fight the drag-to-reference gesture).
+                      if (selectedJid && img.path) {
+                        const absoluteUrl = new URL(
+                          fileDownloadUrl(selectedJid, img.path),
+                          window.location.origin,
+                        ).toString();
+                        const filename =
+                          img.path.split('/').pop() || `${img.messageId}.png`;
+                        e.dataTransfer.setData(
+                          'DownloadURL',
+                          `${img.mimeType}:${filename}:${absoluteUrl}`,
+                        );
+                      }
                     }}
                     onDragEnd={() => {
                       draggedImageRef.current = null;
@@ -791,12 +854,16 @@ export function ImageStudioPage() {
                   >
                     <button
                       type="button"
-                      onClick={() => setLightbox(img)}
-                      title="可拖拽到上方参考图区域，作为下一次生成的参考"
+                      onClick={() => openLightbox(img)}
+                      title="可拖拽到上方参考图区域、或拖出浏览器窗口保存"
                       className="absolute inset-0"
                     >
                       <img
-                        src={selectedJid ? imageEntrySrc(selectedJid, img) : ''}
+                        src={
+                          selectedJid
+                            ? imageEntryThumbSrc(selectedJid, img)
+                            : ''
+                        }
                         alt="生成的图片"
                         loading="lazy"
                         draggable={false}
@@ -804,6 +871,33 @@ export function ImageStudioPage() {
                       />
                     </button>
                     <div className="pointer-events-none absolute right-1 top-1 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                      <button
+                        type="button"
+                        aria-label="设为参考图"
+                        title="把这张图加入上方参考图区域，作为下一次生成的参考"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (selectedJid) {
+                            void addReferenceFromGalleryImage(selectedJid, img);
+                          }
+                        }}
+                        className="pointer-events-auto rounded-full bg-black/60 p-1.5 text-white transition-colors hover:bg-black/80"
+                      >
+                        <ImagePlus className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="下载原图"
+                        title="下载原始分辨率图片"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (selectedJid)
+                            void downloadImageEntry(selectedJid, img);
+                        }}
+                        className="pointer-events-auto rounded-full bg-black/60 p-1.5 text-white transition-colors hover:bg-black/80"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                      </button>
                       <button
                         type="button"
                         aria-label="复用配方"
@@ -850,15 +944,44 @@ export function ImageStudioPage() {
             onClick={() => setLightbox(null)}
           >
             <img
-              src={imageEntrySrc(selectedJid, lightbox)}
+              src={
+                lightboxOriginal
+                  ? imageEntrySrc(selectedJid, lightbox)
+                  : imageEntryThumbSrc(selectedJid, lightbox)
+              }
               alt="生成的图片"
               className="max-h-full max-w-full rounded-lg object-contain"
               onClick={(e) => e.stopPropagation()}
             />
             <div
-              className="absolute bottom-6 left-1/2 flex -translate-x-1/2 gap-2"
+              className="absolute bottom-6 left-1/2 flex max-w-full -translate-x-1/2 flex-wrap justify-center gap-2 px-2"
               onClick={(e) => e.stopPropagation()}
             >
+              {!lightboxOriginal && lightbox.path && (
+                <Button
+                  variant="secondary"
+                  onClick={() => setLightboxOriginal(true)}
+                >
+                  <ZoomIn />
+                  查看原图
+                </Button>
+              )}
+              <Button
+                variant="secondary"
+                onClick={() => void downloadImageEntry(selectedJid, lightbox)}
+              >
+                <Download />
+                下载原图
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  void addReferenceFromGalleryImage(selectedJid, lightbox)
+                }
+              >
+                <ImagePlus />
+                设为参考图
+              </Button>
               <Button
                 variant="secondary"
                 disabled={applyingRecipeId === lightbox.messageId}

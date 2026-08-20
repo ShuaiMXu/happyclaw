@@ -157,6 +157,12 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 
 路径必须位于目标工作区允许范围内；系统目录、路径穿越和不安全符号链接会被拒绝。
 
+`files/preview` 支持可选查询参数 `?thumb=1`：仅对静态光栅图片（PNG/JPEG/WebP）
+返回按最长边 1024px 重编码的 webp 缩略图，缓存在 `data/image-thumbnails/{folder}/`
+下（原文件被覆盖写入后自动失效重新生成）；GIF/SVG 等不支持类型或生成失败时静默
+回退到原图，不返回错误。用于生图画廊等省流量的小图预览场景，下载原图仍应使用
+`files/download` 或不带 `thumb` 参数的 `files/preview`。
+
 ## Runtime Session 与渠道绑定
 
 推荐使用 `/sessions` 语义：
