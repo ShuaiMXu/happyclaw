@@ -242,7 +242,7 @@ export function UnifiedSidebar({
             />
           </div>
 
-          <div className="mt-[10px] flex flex-col items-center gap-1">
+          <div className="mt-[5px] flex flex-col items-center gap-1">
             {navItems.map(({ path, icon: Icon, label }) => {
               const isChatItem = path === '/chat';
               const isActive = location.pathname.startsWith(path);

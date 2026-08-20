@@ -369,9 +369,12 @@ export function ChatPage() {
             {/* Logo */}
             <div className="w-16 h-16 rounded-2xl overflow-hidden mx-auto mb-6">
               <img
-                src={`${import.meta.env.BASE_URL}icons/icon-192.png`}
-                alt="SoftopiaAI"
-                className="w-full h-full object-cover"
+                src={
+                  appearance?.brandLoadingIconUrl ||
+                  `${import.meta.env.BASE_URL}icons/loading-mark.png`
+                }
+                alt={appearance?.appName || 'SoftopiaAI'}
+                className="w-full h-full object-contain"
               />
             </div>
             <h2 className="text-xl font-semibold text-foreground mb-2">
