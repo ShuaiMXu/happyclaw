@@ -16,7 +16,7 @@ const BRAND_ASSET_MAX_BYTES = 3 * 1024 * 1024;
 const BRAND_ASSET_TYPES = ['image/png', 'image/jpeg'];
 
 interface BrandAssetUploadProps {
-  kind: 'icon' | 'banner' | 'favicon';
+  kind: 'icon' | 'banner' | 'favicon' | 'loadingIcon';
   title: string;
   desc: string;
   url: string | null;
@@ -154,6 +154,9 @@ export function AppearanceSection() {
   const [brandIconUrl, setBrandIconUrl] = useState<string | null>(null);
   const [brandBannerUrl, setBrandBannerUrl] = useState<string | null>(null);
   const [faviconUrl, setFaviconUrl] = useState<string | null>(null);
+  const [brandLoadingIconUrl, setBrandLoadingIconUrl] = useState<string | null>(
+    null,
+  );
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -175,6 +178,7 @@ export function AppearanceSection() {
         setBrandIconUrl(data.brandIconUrl);
         setBrandBannerUrl(data.brandBannerUrl);
         setFaviconUrl(data.faviconUrl);
+        setBrandLoadingIconUrl(data.brandLoadingIconUrl);
       } catch (err) {
         toast.error(getErrorMessage(err, '加载外观配置失败'));
       } finally {
@@ -294,6 +298,20 @@ export function AppearanceSection() {
         canManageAssets={canManageAssets}
         onChange={syncBrandAsset(setFaviconUrl, (a) => a.faviconUrl)}
         previewClassName="h-10 w-10 justify-center"
+        imageClassName="h-full w-full"
+      />
+
+      <BrandAssetUpload
+        kind="loadingIcon"
+        title="加载动画图标"
+        desc="建议尺寸 400x400 的正方形图片（透明底效果最佳），登录前和鉴权校验期间的全屏加载动画使用，支持 PNG/JPG"
+        url={brandLoadingIconUrl}
+        canManageAssets={canManageAssets}
+        onChange={syncBrandAsset(
+          setBrandLoadingIconUrl,
+          (a) => a.brandLoadingIconUrl,
+        )}
+        previewClassName="h-16 w-16 justify-center"
         imageClassName="h-full w-full"
       />
     </div>

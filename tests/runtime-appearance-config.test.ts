@@ -37,6 +37,7 @@ describe('system brand migration', () => {
       brandIconUrl: null,
       brandBannerUrl: null,
       faviconUrl: null,
+      brandLoadingIconUrl: null,
     });
   });
 
@@ -86,6 +87,26 @@ describe('system brand migration', () => {
 
     expect(runtime.saveAppearanceConfig({ faviconUrl: null })).toMatchObject({
       faviconUrl: null,
+      brandBannerUrl: '/api/config/brand-assets/brand-banner-abcd1234.png',
+    });
+  });
+
+  test('persists the boot-loading icon URL independently of the other brand assets', () => {
+    expect(
+      runtime.saveAppearanceConfig({
+        brandLoadingIconUrl:
+          '/api/config/brand-assets/brand-loading-icon-abcd1234.png',
+      }),
+    ).toMatchObject({
+      brandLoadingIconUrl:
+        '/api/config/brand-assets/brand-loading-icon-abcd1234.png',
+      brandBannerUrl: '/api/config/brand-assets/brand-banner-abcd1234.png',
+    });
+
+    expect(
+      runtime.saveAppearanceConfig({ brandLoadingIconUrl: null }),
+    ).toMatchObject({
+      brandLoadingIconUrl: null,
       brandBannerUrl: '/api/config/brand-assets/brand-banner-abcd1234.png',
     });
   });

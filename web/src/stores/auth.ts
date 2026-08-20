@@ -48,6 +48,8 @@ export interface AppearanceConfig {
   brandBannerUrl: string | null;
   // Browser tab favicon shown when the site loads.
   faviconUrl: string | null;
+  // Icon shown in the full-screen boot/auth-check loading animation.
+  brandLoadingIconUrl: string | null;
 }
 
 export interface SetupStatus {

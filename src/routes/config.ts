@@ -2402,20 +2402,27 @@ configRoutes.delete(
   },
 );
 
-// ─── Brand assets (sidebar mark + wordmark + favicon) ──────────────
+// ─── Brand assets (sidebar mark + wordmark + favicon + boot icon) ──
 //
-// Three independently configurable images:
-// - brand-icon:   400x400 square mark shown in the collapsed sidebar rail.
-// - brand-banner: 600x200 left-aligned wordmark shown above the workspace
-//                 list.
-// - favicon:      browser tab icon shown when the site loads.
-//                 Only PNG/JPG are accepted for any of the three assets.
+// Four independently configurable images:
+// - brand-icon:        400x400 square mark shown in the collapsed sidebar
+//                       rail.
+// - brand-banner:      600x200 left-aligned wordmark shown above the
+//                       workspace list.
+// - favicon:           browser tab icon shown when the site loads.
+// - brand-loadingIcon: icon shown in the full-screen boot/auth-check loading
+//                       animation (login, setup, post-auth-check screens).
+//                       Only PNG/JPG are accepted for any of the four assets.
 
 const BRAND_ASSETS_DIR = path.join(DATA_DIR, 'brand-assets');
 const BRAND_ASSET_KINDS = {
   icon: { field: 'brandIconUrl', prefix: 'brand-icon-' },
   banner: { field: 'brandBannerUrl', prefix: 'brand-banner-' },
   favicon: { field: 'faviconUrl', prefix: 'brand-favicon-' },
+  loadingIcon: {
+    field: 'brandLoadingIconUrl',
+    prefix: 'brand-loading-icon-',
+  },
 } as const;
 type BrandAssetKind = keyof typeof BRAND_ASSET_KINDS;
 const BRAND_ASSET_EXTENSIONS: Record<string, string> = {
@@ -2423,7 +2430,7 @@ const BRAND_ASSET_EXTENSIONS: Record<string, string> = {
   'image/png': '.png',
 };
 const BRAND_ASSET_FILENAME_RE =
-  /^brand-(?:icon|banner|favicon)-[a-f0-9]{8}\.(?:jpg|png)$/;
+  /^brand-(?:icon|banner|favicon|loading-icon)-[a-f0-9]{8}\.(?:jpg|png)$/;
 
 // Appearance settings are stored in one JSON file and each asset kind owns a
 // shared directory. Serialize mutations so a stale cleanup from one request
@@ -2529,6 +2536,7 @@ function registerBrandAssetUploadRoute(kind: BrandAssetKind) {
 registerBrandAssetUploadRoute('icon');
 registerBrandAssetUploadRoute('banner');
 registerBrandAssetUploadRoute('favicon');
+registerBrandAssetUploadRoute('loadingIcon');
 
 // Public — serves the uploaded brand assets. No auth: the sidebar and the
 // pre-login screens render these images before a session exists.
@@ -2576,6 +2584,7 @@ configRoutes.get('/appearance/public', (c) => {
       brandIconUrl: config.brandIconUrl,
       brandBannerUrl: config.brandBannerUrl,
       faviconUrl: config.faviconUrl,
+      brandLoadingIconUrl: config.brandLoadingIconUrl,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load public appearance config');

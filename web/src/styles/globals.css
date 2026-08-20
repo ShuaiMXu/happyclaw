@@ -597,7 +597,30 @@ html.font-anthropic .font-mono {
     transform: rotate(360deg);
   }
 }
+/* Boot screen exit flourish: pop to 105% (first ~150ms), then collapse to
+   near-nothing over the remaining ~300ms, right before the homepage takes
+   over. `forwards` holds the collapsed state until the element unmounts. */
+@keyframes hc-boot-exit {
+  0% {
+    transform: scale(1);
+  }
+  33% {
+    transform: scale(1.05);
+  }
+  100% {
+    transform: scale(0.01);
+  }
+}
+.hc-boot-exit {
+  animation: hc-boot-exit 450ms cubic-bezier(0.6, 0, 0.9, 0.4) forwards;
+  transform-origin: center;
+}
 @media (prefers-reduced-motion: reduce) {
+  .hc-boot-exit {
+    /* Keep the animation (so onAnimationEnd still fires and the caller can
+       proceed) but skip the motion itself. */
+    animation-duration: 1ms;
+  }
   .animate-\[breathe_3s_ease-in-out_infinite\],
   .animate-\[float_4s_ease-in-out_infinite\],
   .animate-\[orbit_6s_linear_infinite\] {

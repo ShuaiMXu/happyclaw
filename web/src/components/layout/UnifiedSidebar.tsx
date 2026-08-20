@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import { NavLink, useNavigate, useLocation } from 'react-router-dom';
-import { PanelLeftClose, Bug, LogOut, Plus, UserCog } from 'lucide-react';
+import { PanelLeftClose, SquarePen, LogOut, Plus, UserCog } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { useBillingStore } from '../../stores/billing';
@@ -231,7 +231,7 @@ export function UnifiedSidebar({
     <TooltipProvider delayDuration={200}>
       <div className="h-full flex flex-shrink-0">
         <nav className="w-[4.5rem] h-full bg-sidebar border-r border-border flex flex-col items-center py-3 gap-1 flex-shrink-0">
-          <div className="w-[50px] h-[50px] mb-3 flex-shrink-0 flex items-center justify-center">
+          <div className="mt-[5px] w-[50px] h-[50px] mb-3 flex-shrink-0 flex items-center justify-center">
             <img
               src={
                 appearance?.brandIconUrl ||
@@ -242,49 +242,55 @@ export function UnifiedSidebar({
             />
           </div>
 
-          {navItems.map(({ path, icon: Icon, label }) => {
-            const isChatItem = path === '/chat';
-            const isActive = location.pathname.startsWith(path);
-            const baseClass =
-              'w-12 h-12 rounded-xl flex flex-col items-center justify-center gap-0.5 transition-colors';
-            const activeClass = isActive
-              ? 'bg-accent text-primary'
-              : 'text-muted-foreground hover:bg-accent hover:text-primary';
+          <div className="mt-[10px] flex flex-col items-center gap-1">
+            {navItems.map(({ path, icon: Icon, label }) => {
+              const isChatItem = path === '/chat';
+              const isActive = location.pathname.startsWith(path);
+              const baseClass =
+                'w-12 h-12 rounded-xl flex flex-col items-center justify-center gap-0.5 transition-colors';
+              const activeClass = isActive
+                ? 'bg-accent text-primary'
+                : 'text-muted-foreground hover:bg-accent hover:text-primary';
 
-            return (
-              <Tooltip key={path}>
-                <TooltipTrigger asChild>
-                  {isChatItem && isChatRoute ? (
-                    <button
-                      onClick={onToggleCollapse}
-                      className={cn(baseClass, activeClass)}
-                    >
-                      <Icon
-                        className="w-[20px] h-[20px]"
-                        strokeWidth={isActive ? 2 : 1.75}
-                      />
-                      <span className="text-[10px] leading-tight">{label}</span>
-                    </button>
-                  ) : (
-                    <NavLink to={path} className={cn(baseClass, activeClass)}>
-                      <Icon
-                        className="w-[20px] h-[20px]"
-                        strokeWidth={isActive ? 2 : 1.75}
-                      />
-                      <span className="text-[10px] leading-tight">{label}</span>
-                    </NavLink>
-                  )}
-                </TooltipTrigger>
-                <TooltipContent side="right">
-                  {isChatItem && isChatRoute
-                    ? collapsed
-                      ? '展开智能体工作台'
-                      : '收起智能体工作台'
-                    : label}
-                </TooltipContent>
-              </Tooltip>
-            );
-          })}
+              return (
+                <Tooltip key={path}>
+                  <TooltipTrigger asChild>
+                    {isChatItem && isChatRoute ? (
+                      <button
+                        onClick={onToggleCollapse}
+                        className={cn(baseClass, activeClass)}
+                      >
+                        <Icon
+                          className="w-[20px] h-[20px]"
+                          strokeWidth={isActive ? 2 : 1.75}
+                        />
+                        <span className="text-[10px] leading-tight">
+                          {label}
+                        </span>
+                      </button>
+                    ) : (
+                      <NavLink to={path} className={cn(baseClass, activeClass)}>
+                        <Icon
+                          className="w-[20px] h-[20px]"
+                          strokeWidth={isActive ? 2 : 1.75}
+                        />
+                        <span className="text-[10px] leading-tight">
+                          {label}
+                        </span>
+                      </NavLink>
+                    )}
+                  </TooltipTrigger>
+                  <TooltipContent side="right">
+                    {isChatItem && isChatRoute
+                      ? collapsed
+                        ? '展开智能体工作台'
+                        : '收起智能体工作台'
+                      : label}
+                  </TooltipContent>
+                </Tooltip>
+              );
+            })}
+          </div>
 
           {/* Spacer */}
           <div className="flex-1" />
@@ -296,7 +302,7 @@ export function UnifiedSidebar({
                 onClick={() => setShowBugReport(true)}
                 className="w-10 h-10 rounded-lg flex items-center justify-center text-muted-foreground hover:text-primary hover:bg-accent transition-colors"
               >
-                <Bug className="w-4 h-4" />
+                <SquarePen className="w-4 h-4" strokeWidth={1.75} />
               </button>
             </TooltipTrigger>
             <TooltipContent side="right">报告问题</TooltipContent>

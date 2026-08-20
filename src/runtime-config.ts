@@ -3395,6 +3395,9 @@ export interface AppearanceConfig {
   // Browser tab favicon shown when the site loads. Falls back to the
   // built-in icon when unset.
   faviconUrl: string | null;
+  // Icon shown in the full-screen boot/auth-check loading animation (login,
+  // setup and post-auth-check screens). Falls back to the built-in mark.
+  brandLoadingIconUrl: string | null;
 }
 
 const DEFAULT_APPEARANCE_CONFIG: AppearanceConfig = {
@@ -3407,6 +3410,7 @@ const DEFAULT_APPEARANCE_CONFIG: AppearanceConfig = {
   brandIconUrl: null,
   brandBannerUrl: null,
   faviconUrl: null,
+  brandLoadingIconUrl: null,
 };
 
 export function getAppearanceConfig(): AppearanceConfig {
@@ -3451,6 +3455,10 @@ export function getAppearanceConfig(): AppearanceConfig {
         typeof raw.faviconUrl === 'string' && raw.faviconUrl
           ? raw.faviconUrl
           : null,
+      brandLoadingIconUrl:
+        typeof raw.brandLoadingIconUrl === 'string' && raw.brandLoadingIconUrl
+          ? raw.brandLoadingIconUrl
+          : null,
     };
   } catch (err) {
     logger.warn(
@@ -3483,6 +3491,10 @@ export function saveAppearanceConfig(
         : next.brandBannerUrl,
     faviconUrl:
       next.faviconUrl === undefined ? existing.faviconUrl : next.faviconUrl,
+    brandLoadingIconUrl:
+      next.brandLoadingIconUrl === undefined
+        ? existing.brandLoadingIconUrl
+        : next.brandLoadingIconUrl,
     updatedAt: new Date().toISOString(),
   };
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
@@ -3499,6 +3511,7 @@ export function saveAppearanceConfig(
     brandIconUrl: config.brandIconUrl,
     brandBannerUrl: config.brandBannerUrl,
     faviconUrl: config.faviconUrl,
+    brandLoadingIconUrl: config.brandLoadingIconUrl,
   };
 }
 
