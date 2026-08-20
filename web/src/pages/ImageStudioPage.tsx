@@ -596,114 +596,124 @@ export function ImageStudioPage() {
             <Card className="mb-6">
               <CardContent className="p-4 sm:p-5">
                 {/* Reference images */}
-                <div
-                  className={cn(
-                    'mb-3 rounded-lg p-1 -m-1 transition-colors',
-                    isDraggingOverRefZone && 'bg-accent ring-2 ring-primary',
-                  )}
-                  onDragOver={(e) => {
-                    // Accept both the in-page gallery drag (tracked via ref)
-                    // and files dragged in from outside the browser window.
-                    const isExternalFiles =
-                      e.dataTransfer.types.includes('Files');
-                    if (!draggedImageRef.current && !isExternalFiles) return;
-                    e.preventDefault();
-                    e.dataTransfer.dropEffect = 'copy';
-                    setIsDraggingOverRefZone(true);
-                  }}
-                  onDragLeave={() => setIsDraggingOverRefZone(false)}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    setIsDraggingOverRefZone(false);
-                    if (e.dataTransfer.files?.length) {
-                      // Dropped from outside the browser (Finder/Explorer/desktop).
+                {/*
+                  The inner element uses an equal p-1/-m-1 pair so the drag-hover
+                  highlight can extend slightly beyond the content without
+                  shifting layout. Because -m-1 is a shorthand (all sides), it
+                  would otherwise cancel out a bottom margin placed on the same
+                  element — so the gap before the prompt textarea below lives on
+                  this outer wrapper instead.
+                */}
+                <div className="mb-3">
+                  <div
+                    className={cn(
+                      'rounded-lg p-1 -m-1 transition-colors',
+                      isDraggingOverRefZone && 'bg-accent ring-2 ring-primary',
+                    )}
+                    onDragOver={(e) => {
+                      // Accept both the in-page gallery drag (tracked via ref)
+                      // and files dragged in from outside the browser window.
+                      const isExternalFiles =
+                        e.dataTransfer.types.includes('Files');
+                      if (!draggedImageRef.current && !isExternalFiles) return;
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = 'copy';
+                      setIsDraggingOverRefZone(true);
+                    }}
+                    onDragLeave={() => setIsDraggingOverRefZone(false)}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      setIsDraggingOverRefZone(false);
+                      if (e.dataTransfer.files?.length) {
+                        // Dropped from outside the browser (Finder/Explorer/desktop).
+                        draggedImageRef.current = null;
+                        void addReferenceFiles(e.dataTransfer.files);
+                        return;
+                      }
+                      const entry = draggedImageRef.current;
                       draggedImageRef.current = null;
-                      void addReferenceFiles(e.dataTransfer.files);
-                      return;
-                    }
-                    const entry = draggedImageRef.current;
-                    draggedImageRef.current = null;
-                    if (entry && selectedJid) {
-                      void addReferenceFromGalleryImage(selectedJid, entry);
-                    }
-                  }}
-                >
-                  <div className="mb-2 flex items-center justify-between gap-2">
-                    <span className="text-sm font-medium">
-                      参考图（可选，最多 {MAX_REFERENCES} 张）
-                    </span>
-                    <span className="text-xs text-muted-foreground">
-                      图生图模式：可为每张参考图单独填写要参考的内容；也可把下方已生成的图片或电脑里的图片文件拖到这里
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap gap-3">
-                    {references.map((ref, index) => (
-                      <div
-                        key={ref.id}
-                        className="w-36 overflow-hidden rounded-lg border border-border"
-                      >
-                        <div className="group relative">
-                          <img
-                            src={ref.previewUrl}
-                            alt={ref.name}
-                            className="aspect-square w-full object-cover"
-                          />
-                          <button
-                            type="button"
-                            aria-label="移除参考图"
-                            onClick={() => removeReference(ref.id)}
-                            className="absolute right-1 top-1 rounded-full bg-black/60 p-1 text-white opacity-0 transition-opacity group-hover:opacity-100"
-                          >
-                            <X className="h-3.5 w-3.5" />
-                          </button>
-                          <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-xs text-white">
-                            {index + 1}
-                          </span>
+                      if (entry && selectedJid) {
+                        void addReferenceFromGalleryImage(selectedJid, entry);
+                      }
+                    }}
+                  >
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <span className="text-sm font-medium">
+                        参考图（可选，最多 {MAX_REFERENCES} 张）
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        图生图模式：可为每张参考图单独填写要参考的内容；也可把下方已生成的图片或电脑里的图片文件拖到这里
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap gap-3">
+                      {references.map((ref, index) => (
+                        <div
+                          key={ref.id}
+                          className="w-36 overflow-hidden rounded-lg border border-border"
+                        >
+                          <div className="group relative">
+                            <img
+                              src={ref.previewUrl}
+                              alt={ref.name}
+                              className="aspect-square w-full object-cover"
+                            />
+                            <button
+                              type="button"
+                              aria-label="移除参考图"
+                              onClick={() => removeReference(ref.id)}
+                              className="absolute right-1 top-1 rounded-full bg-black/60 p-1 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                            <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-xs text-white">
+                              {index + 1}
+                            </span>
+                          </div>
+                          <div className="p-1.5">
+                            <Input
+                              value={ref.note}
+                              onChange={(e) =>
+                                updateReferenceNote(ref.id, e.target.value)
+                              }
+                              placeholder={`第 ${index + 1} 张参考什么`}
+                              maxLength={NOTE_MAX_LENGTH}
+                              className="h-7 border-none px-1 text-xs shadow-none focus-visible:ring-0"
+                              disabled={generating}
+                            />
+                          </div>
                         </div>
-                        <div className="p-1.5">
-                          <Input
-                            value={ref.note}
-                            onChange={(e) =>
-                              updateReferenceNote(ref.id, e.target.value)
-                            }
-                            placeholder={`第 ${index + 1} 张参考什么`}
-                            maxLength={NOTE_MAX_LENGTH}
-                            className="h-7 border-none px-1 text-xs shadow-none focus-visible:ring-0"
-                            disabled={generating}
-                          />
-                        </div>
-                      </div>
-                    ))}
-                    {references.length < MAX_REFERENCES && (
-                      <button
-                        type="button"
-                        onClick={() => fileInputRef.current?.click()}
-                        disabled={generating}
-                        className="flex aspect-square w-36 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-border text-muted-foreground transition-colors hover:border-primary hover:text-foreground"
-                      >
-                        <ImagePlus className="h-5 w-5" />
-                        <span className="text-xs">添加参考图</span>
-                      </button>
+                      ))}
+                      {references.length < MAX_REFERENCES && (
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                          disabled={generating}
+                          className="flex aspect-square w-36 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-border text-muted-foreground transition-colors hover:border-primary hover:text-foreground"
+                        >
+                          <ImagePlus className="h-5 w-5" />
+                          <span className="text-xs">添加参考图</span>
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp"
+                      multiple
+                      className="hidden"
+                      onChange={(e) => {
+                        if (e.target.files?.length) {
+                          void addReferenceFiles(e.target.files);
+                        }
+                        e.target.value = '';
+                      }}
+                    />
+                    {referenceError && (
+                      <p className="mt-2 text-sm text-destructive">
+                        {referenceError}
+                      </p>
                     )}
                   </div>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/png,image/jpeg,image/webp"
-                    multiple
-                    className="hidden"
-                    onChange={(e) => {
-                      if (e.target.files?.length) {
-                        void addReferenceFiles(e.target.files);
-                      }
-                      e.target.value = '';
-                    }}
-                  />
-                  {referenceError && (
-                    <p className="mt-2 text-sm text-destructive">
-                      {referenceError}
-                    </p>
-                  )}
                 </div>
 
                 <Textarea
