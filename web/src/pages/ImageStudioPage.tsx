@@ -26,6 +26,8 @@ import {
   useGalleryWithCache,
   useImageStudioStore,
   type GeneratedImageEntry,
+  type ImageAspectRatio,
+  type ImageQuality,
 } from '../stores/imageStudio';
 import { cn } from '@/lib/utils';
 import { EmptyState } from '@/components/common/EmptyState';
@@ -80,6 +82,45 @@ interface PromptPreset {
   id: string;
   label: string;
   prompt: string;
+}
+
+const QUALITY_OPTIONS: Array<{ value: ImageQuality; label: string }> = [
+  { value: '4k', label: '4K' },
+  { value: '2k', label: '2K' },
+];
+
+// Aspect ratio picker: a segmented control matching the quality control's
+// look. Each option shows a bold rectangle glyph (w/h drive the glyph's
+// shape) when idle; the selected option shows its ratio text instead (see
+// the render below). The ratio value is also revealed on hover (desktop) or
+// tap (touch) via a small floating label — see `ratioHint` below.
+const ASPECT_RATIO_OPTIONS: Array<{
+  value: ImageAspectRatio;
+  w: number;
+  h: number;
+}> = [
+  { value: '21:9', w: 21, h: 9 },
+  { value: '16:9', w: 16, h: 9 },
+  { value: '3:2', w: 3, h: 2 },
+  { value: '4:3', w: 4, h: 3 },
+  { value: '1:1', w: 1, h: 1 },
+  { value: '3:4', w: 3, h: 4 },
+  { value: '2:3', w: 2, h: 3 },
+  { value: '9:16', w: 9, h: 16 },
+];
+
+/** Small rectangle glyph whose proportions mirror the aspect ratio itself. */
+function AspectRatioGlyph({ w, h }: { w: number; h: number }) {
+  const max = 18;
+  const scale = max / Math.max(w, h);
+  const width = Math.max(6, Math.round(w * scale));
+  const height = Math.max(6, Math.round(h * scale));
+  return (
+    <span
+      className="block rounded-[2px] border-2 border-current"
+      style={{ width, height }}
+    />
+  );
 }
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -245,6 +286,25 @@ export function ImageStudioPage() {
   }, [upsertEntries]);
 
   const [prompt, setPrompt] = useState('');
+  const [quality, setQuality] = useState<ImageQuality>('4k');
+  const [aspectRatio, setAspectRatio] = useState<ImageAspectRatio>('4:3');
+  // Floating label shown above an aspect-ratio glyph: on hover for desktop,
+  // briefly on tap for touch devices (which have no hover state).
+  const [ratioHint, setRatioHint] = useState<ImageAspectRatio | null>(null);
+  const ratioHintTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const flashRatioHint = useCallback((value: ImageAspectRatio) => {
+    if (ratioHintTimeoutRef.current) clearTimeout(ratioHintTimeoutRef.current);
+    setRatioHint(value);
+    ratioHintTimeoutRef.current = setTimeout(() => setRatioHint(null), 1200);
+  }, []);
+  useEffect(() => {
+    return () => {
+      if (ratioHintTimeoutRef.current)
+        clearTimeout(ratioHintTimeoutRef.current);
+    };
+  }, []);
   const [references, setReferences] = useState<ReferenceDraft[]>([]);
   const [referenceError, setReferenceError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
@@ -428,6 +488,16 @@ export function ImageStudioPage() {
       setApplyingRecipeId(entry.messageId);
       try {
         setPrompt(recipe.prompt.slice(0, PROMPT_MAX_LENGTH));
+        setQuality(
+          QUALITY_OPTIONS.some((o) => o.value === recipe.quality)
+            ? (recipe.quality as ImageQuality)
+            : '4k',
+        );
+        setAspectRatio(
+          ASPECT_RATIO_OPTIONS.some((o) => o.value === recipe.aspectRatio)
+            ? (recipe.aspectRatio as ImageAspectRatio)
+            : '4:3',
+        );
         const nextRefs: ReferenceDraft[] = [];
         let missing = 0;
         for (const ref of recipe.references ?? []) {
@@ -506,8 +576,10 @@ export function ImageStudioPage() {
     try {
       const body: {
         prompt: string;
+        quality: ImageQuality;
+        aspectRatio: ImageAspectRatio;
         references?: Array<{ data: string; mimeType: string; note?: string }>;
-      } = { prompt: trimmed };
+      } = { prompt: trimmed, quality, aspectRatio };
       if (references.length > 0) {
         body.references = references.map((ref) => ({
           data: ref.data,
@@ -716,83 +788,175 @@ export function ImageStudioPage() {
                   </div>
                 </div>
 
-                <Textarea
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  placeholder={
-                    references.length > 0
-                      ? '描述要生成的图片，例如：以第 1 张的角色造型放进第 2 张的海边场景'
-                      : '描述你想生成的图片，例如：夕阳下沙漠中的一只橙色刺猬'
-                  }
-                  maxLength={PROMPT_MAX_LENGTH}
-                  rows={3}
-                  disabled={generating}
-                  onKeyDown={(e) => {
-                    if (
-                      (e.metaKey || e.ctrlKey) &&
-                      e.key === 'Enter' &&
-                      !generating
-                    ) {
-                      e.preventDefault();
-                      void handleGenerate();
+                <div className="relative">
+                  <Textarea
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                    placeholder={
+                      references.length > 0
+                        ? '描述要生成的图片，例如：以第 1 张的角色造型放进第 2 张的海边场景'
+                        : '描述你想生成的图片，例如：夕阳下沙漠中的一只橙色刺猬'
                     }
-                  }}
-                />
+                    maxLength={PROMPT_MAX_LENGTH}
+                    rows={3}
+                    disabled={generating}
+                    className="pb-6"
+                    onKeyDown={(e) => {
+                      if (
+                        (e.metaKey || e.ctrlKey) &&
+                        e.key === 'Enter' &&
+                        !generating
+                      ) {
+                        e.preventDefault();
+                        void handleGenerate();
+                      }
+                    }}
+                  />
+                  {/* Character count, tucked into the textarea's own corner
+                      instead of a separate row, to save vertical space. */}
+                  <span className="pointer-events-none absolute bottom-1.5 right-2 rounded bg-background/80 px-1 text-[11px] text-muted-foreground">
+                    {prompt.length}/{PROMPT_MAX_LENGTH}
+                  </span>
+                </div>
                 {generateError && (
                   <p className="mt-2 text-sm text-destructive">
                     {generateError}
                   </p>
                 )}
-                <div className="mt-3 flex items-center justify-between gap-2">
-                  <span className="text-xs text-muted-foreground">
-                    {prompt.length}/{PROMPT_MAX_LENGTH}
-                  </span>
+
+                {/* Basic image options + actions share one row with the
+                    generate button, instead of a dedicated row, to save
+                    space. Aspect ratio is shown as small shape glyphs (not
+                    text) with the exact ratio revealed on hover/tap. */}
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                  <Popover
+                    open={presetOpen}
+                    onOpenChange={handlePresetOpenChange}
+                  >
+                    <PopoverTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={generating}
+                      >
+                        <Wand2 />
+                        常用提示词
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" className="w-80">
+                      {presetsLoading ? (
+                        <div className="flex items-center gap-2 px-1 py-1 text-sm text-muted-foreground">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          加载中…
+                        </div>
+                      ) : presetsError ? (
+                        <p className="px-1 py-1 text-sm text-destructive">
+                          {presetsError}
+                        </p>
+                      ) : presets && presets.length > 0 ? (
+                        <div className="flex max-h-64 flex-col gap-0.5 overflow-y-auto">
+                          {presets.map((p) => (
+                            <button
+                              key={p.id}
+                              type="button"
+                              onClick={() => applyPreset(p.prompt)}
+                              title={p.prompt}
+                              className="rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent"
+                            >
+                              {p.label}
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="px-1 py-1 text-sm text-muted-foreground">
+                          还没有配置常用提示词，可在系统设置「执行与容量」中添加。
+                        </p>
+                      )}
+                    </PopoverContent>
+                  </Popover>
+
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs text-muted-foreground">
+                        画质
+                      </span>
+                      <div className="flex overflow-hidden rounded-md border border-border">
+                        {QUALITY_OPTIONS.map((opt, index) => (
+                          <button
+                            key={opt.value}
+                            type="button"
+                            disabled={generating}
+                            onClick={() => setQuality(opt.value)}
+                            className={cn(
+                              'px-2.5 py-1 text-xs font-medium transition-colors',
+                              index > 0 && 'border-l border-border',
+                              quality === opt.value
+                                ? 'bg-primary text-primary-foreground'
+                                : 'bg-background text-muted-foreground hover:bg-accent hover:text-foreground',
+                            )}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs text-muted-foreground">
+                        画幅
+                      </span>
+                      {/* Same segmented-control look as the quality group.
+                          Idle options show a bold shape glyph; the selected
+                          option shows its ratio text instead of the glyph. */}
+                      <div className="flex overflow-hidden rounded-md border border-border">
+                        {ASPECT_RATIO_OPTIONS.map((opt, index) => (
+                          <div key={opt.value} className="relative">
+                            <button
+                              type="button"
+                              disabled={generating}
+                              aria-label={`画幅 ${opt.value}`}
+                              onMouseEnter={() => setRatioHint(opt.value)}
+                              onMouseLeave={() =>
+                                setRatioHint((cur) =>
+                                  cur === opt.value ? null : cur,
+                                )
+                              }
+                              onFocus={() => setRatioHint(opt.value)}
+                              onBlur={() =>
+                                setRatioHint((cur) =>
+                                  cur === opt.value ? null : cur,
+                                )
+                              }
+                              onClick={() => {
+                                setAspectRatio(opt.value);
+                                flashRatioHint(opt.value);
+                              }}
+                              className={cn(
+                                'flex h-7 min-w-7 items-center justify-center px-2 text-xs font-medium transition-colors',
+                                index > 0 && 'border-l border-border',
+                                aspectRatio === opt.value
+                                  ? 'bg-primary text-primary-foreground'
+                                  : 'bg-background text-muted-foreground hover:bg-accent hover:text-foreground',
+                              )}
+                            >
+                              {aspectRatio === opt.value ? (
+                                opt.value
+                              ) : (
+                                <AspectRatioGlyph w={opt.w} h={opt.h} />
+                              )}
+                            </button>
+                            {ratioHint === opt.value &&
+                              aspectRatio !== opt.value && (
+                                <span className="pointer-events-none absolute -top-6 left-1/2 z-10 -translate-x-1/2 whitespace-nowrap rounded bg-foreground px-1.5 py-0.5 text-[10px] font-medium text-background">
+                                  {opt.value}
+                                </span>
+                              )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="flex items-center gap-2">
-                    <Popover
-                      open={presetOpen}
-                      onOpenChange={handlePresetOpenChange}
-                    >
-                      <PopoverTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          disabled={generating}
-                        >
-                          <Wand2 />
-                          常用提示词
-                        </Button>
-                      </PopoverTrigger>
-                      <PopoverContent align="end" className="w-80">
-                        {presetsLoading ? (
-                          <div className="flex items-center gap-2 px-1 py-1 text-sm text-muted-foreground">
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                            加载中…
-                          </div>
-                        ) : presetsError ? (
-                          <p className="px-1 py-1 text-sm text-destructive">
-                            {presetsError}
-                          </p>
-                        ) : presets && presets.length > 0 ? (
-                          <div className="flex max-h-64 flex-col gap-0.5 overflow-y-auto">
-                            {presets.map((p) => (
-                              <button
-                                key={p.id}
-                                type="button"
-                                onClick={() => applyPreset(p.prompt)}
-                                title={p.prompt}
-                                className="rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent"
-                              >
-                                {p.label}
-                              </button>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="px-1 py-1 text-sm text-muted-foreground">
-                            还没有配置常用提示词，可在系统设置「执行与容量」中添加。
-                          </p>
-                        )}
-                      </PopoverContent>
-                    </Popover>
                     <Button
                       onClick={() => void handleGenerate()}
                       disabled={generating || !prompt.trim()}

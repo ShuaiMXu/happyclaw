@@ -70,10 +70,18 @@ Public：
   `image_generation_enabled` 与选定模型后，直接调用平台级 OpenAI 兼容 Images
   API，不经过对话模型或 Agent 容器；成功后将用户请求与生成图片各写为一条消息
   并经 WebSocket 推送。仅 `web:` 前缀工作区可用，未开启开关时返回 409。
-  Body 可选 `references[]`（最多 6 张，PNG/JPEG/WebP，单张 ≤8MB，每张可附
-  `note` 说明该图要参考的内容）：带参考图时走 `images/edits` 图生图，参考图
-  说明会编号追加进 prompt。生成结果落盘到工作区 `generated-images/` 目录，
-  消息附件以相对路径引用（不再内嵌 base64）
+  Body 可选 `quality`（`4k` 默认 / `2k`）与 `aspectRatio`（`21:9` /
+  `16:9` / `3:2` / `4:3` 默认 / `1:1` / `3:4` / `2:3` / `9:16`），两者共同
+  决定传给上游 `size`（WxH）的像素预算——`2k` 固定为 `4k` 每边减半（约四
+  分之一像素量），换画幅不改变总像素量。`size` 参数之外，`quality`/
+  `aspectRatio` 还会被转成一句自然语言指令追加进实际发给上游模型的 prompt
+  （`size` 对部分上游模型只是弱提示甚至被忽略，因此显式写进文本）。Body 可选
+  `references[]`（最多 6 张，PNG/JPEG/WebP，单张 ≤8MB，每张可附 `note` 说明
+  该图要参考的内容）：带参考图时走 `images/edits` 图生图，参考图说明会编号
+  追加进 prompt，`size` 同样透传。生成结果落盘到工作区 `generated-images/`
+  目录，消息附件以相对路径引用（不再内嵌 base64），附件 `recipe` 一并记录
+  `quality`/`aspectRatio`（原始 prompt，不含拼接的画质/画幅指令），供
+  「复用配方」还原
 - `GET /api/groups/:jid/generated-images`，生图画廊轻量列表：只返回
   `__image_generation__` 消息的附件引用（路径或旧版内嵌 base64），按时间倒序，
   `limit` 默认 100、上限 200；要求 `canAccessGroup`

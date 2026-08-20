@@ -68,18 +68,27 @@ vi.mock('../src/web.js', () => ({
 }));
 
 const generateWorkspaceImage = vi.fn();
-vi.mock('../src/image-generation-service.js', () => ({
-  generateWorkspaceImage: (...args: unknown[]) =>
-    generateWorkspaceImage(...args),
-  ImageGenerationError: class ImageGenerationError extends Error {
-    constructor(
-      message: string,
-      readonly status: 400 | 409 | 502 | 504,
-    ) {
-      super(message);
-    }
-  },
-}));
+vi.mock('../src/image-generation-service.js', async (importOriginal) => {
+  // Only `generateWorkspaceImage` needs mocking (no real network calls in
+  // route tests); the size-resolution constants/helper are pure and kept
+  // real so the route's zod schema and size lookups behave identically to
+  // production.
+  const actual =
+    await importOriginal<typeof import('../src/image-generation-service.js')>();
+  return {
+    ...actual,
+    generateWorkspaceImage: (...args: unknown[]) =>
+      generateWorkspaceImage(...args),
+    ImageGenerationError: class ImageGenerationError extends Error {
+      constructor(
+        message: string,
+        readonly status: 400 | 409 | 502 | 504,
+      ) {
+        super(message);
+      }
+    },
+  };
+});
 
 const groupRoutesModule = await import('../src/routes/groups.js');
 const fileRoutesModule = await import('../src/routes/files.js');
@@ -169,8 +178,13 @@ describe('POST /:jid/generate-image', () => {
     expect(attachments[0].type).toBe('image');
     expect(attachments[0].path).toBe(body.image.path);
     expect(attachments[0].data).toBeUndefined();
-    // No references were sent, so the recipe carries only the prompt.
-    expect(attachments[0].recipe).toEqual({ prompt: 'a hedgehog' });
+    // No references were sent, so the recipe carries only the prompt plus
+    // the (default) quality/aspectRatio used for this generation.
+    expect(attachments[0].recipe).toEqual({
+      prompt: 'a hedgehog',
+      quality: '4k',
+      aspectRatio: '4:3',
+    });
   });
 
   test('persists reference images and attaches a reusable recipe', async () => {
@@ -231,12 +245,66 @@ describe('POST /:jid/generate-image', () => {
     expect(res.status).toBe(200);
     expect(generateWorkspaceImage).toHaveBeenCalledTimes(1);
     const [prompt, model, refs] = generateWorkspaceImage.mock.calls[0];
-    expect(prompt).toBe('merge the scenes\n\n参考图 1：角色造型');
+    // The service prompt also carries an explicit quality/aspect-ratio
+    // directive (default 4K / 4:3 here) — `size` alone doesn't reliably
+    // steer every upstream model.
+    expect(prompt).toBe(
+      'merge the scenes\n\n参考图 1：角色造型\n\n请生成画质为 4K 高清、画面比例为 4:3（横版）的图片。',
+    );
     expect(model).toBe('gpt-image-2');
     expect(refs).toHaveLength(2);
     expect(Buffer.from(refs[0].data)).toEqual(TINY_PNG);
     expect(refs[0].mimeType).toBe('image/png');
     expect(refs[1].note).toBeUndefined();
+  });
+
+  test('defaults to 4K / 4:3 when quality and aspectRatio are omitted', async () => {
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'a hedgehog' }),
+    });
+    expect(res.status).toBe(200);
+    const [, , , size] = generateWorkspaceImage.mock.calls[0];
+    expect(size).toBe('3328x2496');
+
+    const imageRow = db
+      .getMessagesPage(JID, undefined, 10)
+      .find((m) => m.sender === '__image_generation__');
+    const attachments = JSON.parse(imageRow!.attachments as string);
+    expect(attachments[0].recipe.quality).toBe('4k');
+    expect(attachments[0].recipe.aspectRatio).toBe('4:3');
+  });
+
+  test('threads a custom quality/aspectRatio through to the size and the recipe', async () => {
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: 'a hedgehog',
+        quality: '2k',
+        aspectRatio: '16:9',
+      }),
+    });
+    expect(res.status).toBe(200);
+    const [, , , size] = generateWorkspaceImage.mock.calls[0];
+    expect(size).toBe('1920x1080');
+
+    const imageRow = db
+      .getMessagesPage(JID, undefined, 10)
+      .find((m) => m.sender === '__image_generation__');
+    const attachments = JSON.parse(imageRow!.attachments as string);
+    expect(attachments[0].recipe.quality).toBe('2k');
+    expect(attachments[0].recipe.aspectRatio).toBe('16:9');
+  });
+
+  test('rejects an invalid aspectRatio', async () => {
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'a hedgehog', aspectRatio: '5:4' }),
+    });
+    expect(res.status).toBe(400);
   });
 
   test('rejects a non-web workspace', async () => {
@@ -384,6 +452,71 @@ describe('GET /:jid/generated-images', () => {
     );
     const legacy = body.images.find((i) => i.path === 'generated-images/c.png');
     expect(legacy?.recipe).toBeUndefined();
+  });
+
+  test('passes through recipe quality/aspectRatio and drops an invalid value', async () => {
+    db.storeMessageDirect(
+      'gen-recipe-quality',
+      JID,
+      '__image_generation__',
+      '图像生成',
+      '图片已生成。',
+      new Date().toISOString(),
+      true,
+      {
+        attachments: JSON.stringify([
+          {
+            type: 'image',
+            path: 'generated-images/d.png',
+            mimeType: 'image/png',
+            recipe: {
+              prompt: 'a hedgehog',
+              quality: '2k',
+              aspectRatio: '16:9',
+            },
+          },
+        ]),
+      },
+    );
+    db.storeMessageDirect(
+      'gen-recipe-invalid-quality',
+      JID,
+      '__image_generation__',
+      '图像生成',
+      '图片已生成。',
+      new Date(Date.now() - 1000).toISOString(),
+      true,
+      {
+        attachments: JSON.stringify([
+          {
+            type: 'image',
+            path: 'generated-images/e.png',
+            mimeType: 'image/png',
+            recipe: {
+              prompt: 'a hedgehog',
+              quality: 'ultra',
+              aspectRatio: '5:4',
+            },
+          },
+        ]),
+      },
+    );
+
+    const res = await groupRoutes.request(`/${JID}/generated-images`);
+    const body = (await res.json()) as {
+      images: Array<{
+        path?: string;
+        recipe?: { quality?: string; aspectRatio?: string };
+      }>;
+    };
+    const valid = body.images.find((i) => i.path === 'generated-images/d.png');
+    expect(valid?.recipe?.quality).toBe('2k');
+    expect(valid?.recipe?.aspectRatio).toBe('16:9');
+    const invalid = body.images.find(
+      (i) => i.path === 'generated-images/e.png',
+    );
+    expect(invalid?.recipe?.quality).toBeUndefined();
+    expect(invalid?.recipe?.aspectRatio).toBeUndefined();
   });
 });
 

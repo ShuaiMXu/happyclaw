@@ -5,8 +5,12 @@ vi.mock('../src/runtime-config.js', () => ({
   getImageGenerationBackendConfig,
 }));
 
-const { generateWorkspaceImage, ImageGenerationError } =
-  await import('../src/image-generation-service.js');
+const {
+  generateWorkspaceImage,
+  ImageGenerationError,
+  resolveImageSize,
+  describeImageRequirements,
+} = await import('../src/image-generation-service.js');
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -84,10 +88,57 @@ describe('generateWorkspaceImage', () => {
     expect(form).toBeInstanceOf(FormData);
     expect(form.get('model')).toBe('gpt-image-2');
     expect(form.get('prompt')).toBe('blend the scenes');
+    expect(form.get('size')).toBe('1024x1024');
     const images = form.getAll('image[]');
     expect(images).toHaveLength(2);
     expect((images[0] as File).name).toBe('reference-1.png');
     expect((images[1] as File).name).toBe('reference-2.jpg');
+  });
+
+  test('threads a custom size through to the text-to-image request body', async () => {
+    mockBackend();
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(mockSuccessResponse());
+
+    await generateWorkspaceImage(
+      'a hedgehog in the desert',
+      'gpt-image-2',
+      [],
+      '3840x2160',
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://images.example.test/v1/images/generations',
+      expect.objectContaining({
+        body: JSON.stringify({
+          model: 'gpt-image-2',
+          prompt: 'a hedgehog in the desert',
+          size: '3840x2160',
+        }),
+      }),
+    );
+  });
+
+  test('threads a custom size through to the edits request form', async () => {
+    mockBackend();
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(mockSuccessResponse());
+
+    await generateWorkspaceImage(
+      'blend the scenes',
+      'gpt-image-2',
+      [{ data: TINY_PNG, mimeType: 'image/png' }],
+      '1080x1920',
+    );
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    const form = init.body as FormData;
+    expect(form.get('size')).toBe('1080x1920');
   });
 
   test('rejects more than six reference images before any network call', async () => {
@@ -176,5 +227,56 @@ describe('generateWorkspaceImage', () => {
     await expect(
       generateWorkspaceImage('a hedgehog in the desert', 'gpt-image-2'),
     ).rejects.toMatchObject<ImageGenerationError>({ status: 502 });
+  });
+});
+
+describe('resolveImageSize', () => {
+  test('keeps the 2k pixel budget at exactly a quarter of 4k for every aspect ratio', () => {
+    const parsePx = (size: string) => {
+      const [w, h] = size.split('x').map(Number);
+      return w * h;
+    };
+    for (const aspect of [
+      '1:1',
+      '4:3',
+      '3:2',
+      '16:9',
+      '21:9',
+      '3:4',
+      '2:3',
+      '9:16',
+    ] as const) {
+      const px4k = parsePx(resolveImageSize('4k', aspect));
+      const px2k = parsePx(resolveImageSize('2k', aspect));
+      expect(px2k).toBeCloseTo(px4k / 4, -3);
+    }
+  });
+
+  test('produces the conventional 3840x2160 / 1920x1080 sizes for 16:9', () => {
+    expect(resolveImageSize('4k', '16:9')).toBe('3840x2160');
+    expect(resolveImageSize('2k', '16:9')).toBe('1920x1080');
+  });
+
+  test('matches width/height to the requested aspect ratio', () => {
+    expect(resolveImageSize('4k', '3:2')).toBe('3528x2352');
+    expect(resolveImageSize('4k', '2:3')).toBe('2352x3528');
+    expect(resolveImageSize('4k', '1:1')).toBe('2880x2880');
+    expect(resolveImageSize('4k', '4:3')).toBe('3328x2496');
+    expect(resolveImageSize('4k', '3:4')).toBe('2496x3328');
+    expect(resolveImageSize('4k', '21:9')).toBe('4396x1884');
+  });
+});
+
+describe('describeImageRequirements', () => {
+  test('spells out quality and aspect ratio (with orientation) in natural language', () => {
+    expect(describeImageRequirements('4k', '16:9')).toBe(
+      '请生成画质为 4K 高清、画面比例为 16:9（横版）的图片。',
+    );
+    expect(describeImageRequirements('2k', '9:16')).toBe(
+      '请生成画质为 2K、画面比例为 9:16（竖版）的图片。',
+    );
+    expect(describeImageRequirements('4k', '1:1')).toBe(
+      '请生成画质为 4K 高清、画面比例为 1:1（正方形）的图片。',
+    );
   });
 });

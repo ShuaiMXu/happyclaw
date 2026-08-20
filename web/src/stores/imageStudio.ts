@@ -10,9 +10,22 @@ export interface ImageRecipeReference {
   note?: string;
 }
 
+export type ImageQuality = '2k' | '4k';
+export type ImageAspectRatio =
+  | '21:9'
+  | '16:9'
+  | '3:2'
+  | '4:3'
+  | '1:1'
+  | '3:4'
+  | '2:3'
+  | '9:16';
+
 /** The inputs that produced a generated image: prompt plus any references. */
 export interface ImageRecipe {
   prompt: string;
+  quality?: ImageQuality;
+  aspectRatio?: ImageAspectRatio;
   references?: ImageRecipeReference[];
 }
 
@@ -60,6 +73,8 @@ function entriesFromAttachments(
         mimeType?: string;
         recipe?: {
           prompt?: string;
+          quality?: ImageQuality;
+          aspectRatio?: ImageAspectRatio;
           references?: ImageRecipeReference[];
         };
       }>,
@@ -71,6 +86,8 @@ function entriesFromAttachments(
     mimeType?: string;
     recipe?: {
       prompt?: string;
+      quality?: ImageQuality;
+      aspectRatio?: ImageAspectRatio;
       references?: ImageRecipeReference[];
     };
   }>;
@@ -95,6 +112,8 @@ function entriesFromAttachments(
         ? {
             recipe: {
               prompt: att.recipe.prompt,
+              quality: att.recipe.quality,
+              aspectRatio: att.recipe.aspectRatio,
               references: att.recipe.references,
             },
           }
@@ -116,7 +135,12 @@ export function entriesFromMessageRow(row: {
         path?: string;
         data?: string;
         mimeType?: string;
-        recipe?: { prompt?: string; references?: ImageRecipeReference[] };
+        recipe?: {
+          prompt?: string;
+          quality?: ImageQuality;
+          aspectRatio?: ImageAspectRatio;
+          references?: ImageRecipeReference[];
+        };
       }>;
 }): GeneratedImageEntry[] {
   if (row.sender !== '__image_generation__' || !row.attachments) return [];

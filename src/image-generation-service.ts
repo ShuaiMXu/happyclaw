@@ -17,6 +17,82 @@ export type ImageReference = {
   mimeType: 'image/png' | 'image/jpeg' | 'image/webp';
 };
 
+/** Resolution tier: "4k" targets ~8.3MP (4K UHD budget), "2k" is exactly a
+ * quarter of that (half the linear resolution in each dimension), matching
+ * the conventional 3840x2160 / 1920x1080 relationship. */
+export const IMAGE_QUALITIES = ['2k', '4k'] as const;
+export type ImageQuality = (typeof IMAGE_QUALITIES)[number];
+export const DEFAULT_IMAGE_QUALITY: ImageQuality = '4k';
+
+export const IMAGE_ASPECT_RATIOS = [
+  '21:9',
+  '16:9',
+  '3:2',
+  '4:3',
+  '1:1',
+  '3:4',
+  '2:3',
+  '9:16',
+] as const;
+export type ImageAspectRatio = (typeof IMAGE_ASPECT_RATIOS)[number];
+export const DEFAULT_IMAGE_ASPECT_RATIO: ImageAspectRatio = '4:3';
+
+// Precomputed WxH pairs per quality tier / aspect ratio. Each tier targets a
+// fixed pixel budget (4K ≈ 3840x2160's 8,294,400px; 2K is a quarter of that,
+// i.e. both dimensions halved) so switching aspect ratio doesn't change the
+// overall image size the way a fixed long-edge would.
+const IMAGE_SIZE_BY_QUALITY: Record<
+  ImageQuality,
+  Record<ImageAspectRatio, string>
+> = {
+  '4k': {
+    '21:9': '4396x1884',
+    '16:9': '3840x2160',
+    '3:2': '3528x2352',
+    '4:3': '3328x2496',
+    '1:1': '2880x2880',
+    '3:4': '2496x3328',
+    '2:3': '2352x3528',
+    '9:16': '2160x3840',
+  },
+  '2k': {
+    '21:9': '2198x942',
+    '16:9': '1920x1080',
+    '3:2': '1764x1176',
+    '4:3': '1664x1248',
+    '1:1': '1440x1440',
+    '3:4': '1248x1664',
+    '2:3': '1176x1764',
+    '9:16': '1080x1920',
+  },
+};
+
+/** Resolve a quality tier + aspect ratio into the "WxH" string the upstream
+ * Images API expects for `size`. */
+export function resolveImageSize(
+  quality: ImageQuality,
+  aspectRatio: ImageAspectRatio,
+): string {
+  return IMAGE_SIZE_BY_QUALITY[quality][aspectRatio];
+}
+
+/**
+ * Human-readable directive describing the requested quality/aspect ratio.
+ * The `size` parameter alone isn't enough — many upstream image models treat
+ * it as a loose hint (or ignore it outright) and mostly follow the natural-
+ * language prompt instead, so the caller appends this sentence to the prompt
+ * text to make the requirement explicit to the model itself.
+ */
+export function describeImageRequirements(
+  quality: ImageQuality,
+  aspectRatio: ImageAspectRatio,
+): string {
+  const qualityLabel = quality === '4k' ? '4K 高清' : '2K';
+  const [w, h] = aspectRatio.split(':').map(Number);
+  const orientation = w === h ? '正方形' : w > h ? '横版' : '竖版';
+  return `请生成画质为 ${qualityLabel}、画面比例为 ${aspectRatio}（${orientation}）的图片。`;
+}
+
 function imageMimeType(bytes: Uint8Array): GeneratedImage['mimeType'] | null {
   if (
     bytes.length >= 8 &&
@@ -95,6 +171,7 @@ export async function generateWorkspaceImage(
   prompt: string,
   model: 'gpt-image-1.5' | 'gpt-image-2',
   references: ImageReference[] = [],
+  size: string = '1024x1024',
 ): Promise<GeneratedImage> {
   const backend = getImageGenerationBackendConfig();
   if (!backend) {
@@ -111,7 +188,7 @@ export async function generateWorkspaceImage(
       response = await fetch(imageEditEndpoint(backend.baseUrl), {
         method: 'POST',
         headers: { Authorization: `Bearer ${backend.apiKey}` },
-        body: buildEditsFormData(model, prompt, references),
+        body: buildEditsFormData(model, prompt, references, size),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } else {
@@ -121,7 +198,7 @@ export async function generateWorkspaceImage(
           Authorization: `Bearer ${backend.apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ model, prompt, size: '1024x1024' }),
+        body: JSON.stringify({ model, prompt, size }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     }
@@ -219,10 +296,12 @@ function buildEditsFormData(
   model: 'gpt-image-1.5' | 'gpt-image-2',
   prompt: string,
   references: ImageReference[],
+  size: string,
 ): FormData {
   const form = new FormData();
   form.set('model', model);
   form.set('prompt', prompt);
+  form.set('size', size);
   references.forEach((ref, index) => {
     form.append(
       'image[]',
