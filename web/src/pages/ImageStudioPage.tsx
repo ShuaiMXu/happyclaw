@@ -4,7 +4,9 @@ import {
   ImagePlus,
   Loader2,
   RefreshCw,
+  RotateCcw,
   Sparkles,
+  Trash2,
   Wand2,
   X,
 } from 'lucide-react';
@@ -13,6 +15,7 @@ import { wsManager } from '../api/ws';
 import { useGroupsStore } from '../stores/groups';
 import {
   entriesFromMessageRow,
+  filePreviewUrl,
   imageEntrySrc,
   useGalleryWithCache,
   useImageStudioStore,
@@ -21,6 +24,7 @@ import {
 import { cn } from '@/lib/utils';
 import { EmptyState } from '@/components/common/EmptyState';
 import { PageHeader } from '@/components/common/PageHeader';
+import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
@@ -372,6 +376,87 @@ export function ImageStudioPage() {
     );
   }, []);
 
+  // "Reuse recipe": load a previously generated image's prompt and reference
+  // images back into the composer so the user can tweak and regenerate.
+  const [applyingRecipeId, setApplyingRecipeId] = useState<string | null>(null);
+
+  const applyRecipe = useCallback(
+    async (jid: string, entry: GeneratedImageEntry) => {
+      const recipe = entry.recipe;
+      if (!recipe) {
+        setGenerateError('这张图片是旧版本生成的，没有保存可复用的生成参数。');
+        return;
+      }
+      setGenerateError(null);
+      setReferenceError(null);
+      setApplyingRecipeId(entry.messageId);
+      try {
+        setPrompt(recipe.prompt.slice(0, PROMPT_MAX_LENGTH));
+        const nextRefs: ReferenceDraft[] = [];
+        let missing = 0;
+        for (const ref of recipe.references ?? []) {
+          try {
+            const res = await fetch(filePreviewUrl(jid, ref.path), {
+              credentials: 'include',
+            });
+            if (!res.ok) throw new Error('图片加载失败');
+            const blob = await res.blob();
+            const name = ref.path.split('/').pop() || 'reference';
+            const draft = await blobToGalleryReference(blob, name);
+            if (!draft) {
+              missing += 1;
+              continue;
+            }
+            nextRefs.push({ ...draft, note: ref.note ?? '' });
+          } catch {
+            missing += 1;
+          }
+        }
+        setReferences((prev) => {
+          for (const r of prev) URL.revokeObjectURL(r.previewUrl);
+          return nextRefs.slice(0, MAX_REFERENCES);
+        });
+        if (missing > 0) {
+          setReferenceError(
+            `已应用配方，但有 ${missing} 张参考图无法加载（可能已被删除）。`,
+          );
+        }
+      } finally {
+        setApplyingRecipeId(null);
+      }
+    },
+    [],
+  );
+
+  // Delete a generated image: destructive, so it always goes through a
+  // second confirmation before the file and message row are removed.
+  const [deleteTarget, setDeleteTarget] = useState<GeneratedImageEntry | null>(
+    null,
+  );
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const removeEntry = useImageStudioStore((s) => s.removeEntry);
+
+  const confirmDelete = useCallback(async () => {
+    const jid = selectedJid;
+    const target = deleteTarget;
+    if (!jid || !target) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await api.delete(
+        `/api/groups/${encodeURIComponent(jid)}/generated-images/${encodeURIComponent(target.messageId)}`,
+      );
+      removeEntry(jid, target.messageId);
+      setLightbox((cur) => (cur?.messageId === target.messageId ? null : cur));
+      setDeleteTarget(null);
+    } catch (err) {
+      setDeleteError(errorMessage(err, '删除失败，请稍后重试。'));
+    } finally {
+      setDeleting(false);
+    }
+  }, [selectedJid, deleteTarget, removeEntry]);
+
   const handleGenerate = async () => {
     const trimmed = prompt.trim();
     if (!trimmed) {
@@ -690,9 +775,8 @@ export function ImageStudioPage() {
             ) : (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
                 {images.map((img) => (
-                  <button
+                  <div
                     key={img.path || img.messageId}
-                    type="button"
                     draggable
                     onDragStart={(e) => {
                       draggedImageRef.current = img;
@@ -703,18 +787,55 @@ export function ImageStudioPage() {
                     onDragEnd={() => {
                       draggedImageRef.current = null;
                     }}
-                    onClick={() => setLightbox(img)}
-                    title="可拖拽到上方参考图区域，作为下一次生成的参考"
                     className="group relative aspect-square cursor-grab overflow-hidden rounded-lg border border-border bg-muted active:cursor-grabbing"
                   >
-                    <img
-                      src={selectedJid ? imageEntrySrc(selectedJid, img) : ''}
-                      alt="生成的图片"
-                      loading="lazy"
-                      draggable={false}
-                      className="h-full w-full object-cover transition-transform group-hover:scale-105"
-                    />
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => setLightbox(img)}
+                      title="可拖拽到上方参考图区域，作为下一次生成的参考"
+                      className="absolute inset-0"
+                    >
+                      <img
+                        src={selectedJid ? imageEntrySrc(selectedJid, img) : ''}
+                        alt="生成的图片"
+                        loading="lazy"
+                        draggable={false}
+                        className="h-full w-full object-cover transition-transform group-hover:scale-105"
+                      />
+                    </button>
+                    <div className="pointer-events-none absolute right-1 top-1 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                      <button
+                        type="button"
+                        aria-label="复用配方"
+                        title="把这张图的提示词和参考图重新载入上方，方便微调"
+                        disabled={applyingRecipeId === img.messageId}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (selectedJid) void applyRecipe(selectedJid, img);
+                        }}
+                        className="pointer-events-auto rounded-full bg-black/60 p-1.5 text-white transition-colors hover:bg-black/80 disabled:opacity-60"
+                      >
+                        {applyingRecipeId === img.messageId ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <RotateCcw className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="删除图片"
+                        title="删除这张图片"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDeleteError(null);
+                          setDeleteTarget(img);
+                        }}
+                        className="pointer-events-auto rounded-full bg-black/60 p-1.5 text-white transition-colors hover:bg-destructive"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
                 ))}
               </div>
             )}
@@ -734,6 +855,33 @@ export function ImageStudioPage() {
               className="max-h-full max-w-full rounded-lg object-contain"
               onClick={(e) => e.stopPropagation()}
             />
+            <div
+              className="absolute bottom-6 left-1/2 flex -translate-x-1/2 gap-2"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Button
+                variant="secondary"
+                disabled={applyingRecipeId === lightbox.messageId}
+                onClick={() => void applyRecipe(selectedJid, lightbox)}
+              >
+                {applyingRecipeId === lightbox.messageId ? (
+                  <Loader2 className="animate-spin" />
+                ) : (
+                  <RotateCcw />
+                )}
+                复用配方
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  setDeleteError(null);
+                  setDeleteTarget(lightbox);
+                }}
+              >
+                <Trash2 />
+                删除
+              </Button>
+            </div>
             <button
               type="button"
               onClick={() => setLightbox(null)}
@@ -744,6 +892,26 @@ export function ImageStudioPage() {
             </button>
           </div>
         )}
+
+        <ConfirmDialog
+          open={deleteTarget !== null}
+          onClose={() => {
+            if (!deleting) {
+              setDeleteTarget(null);
+              setDeleteError(null);
+            }
+          }}
+          onConfirm={() => void confirmDelete()}
+          title="删除这张图片？"
+          message={
+            deleteError ??
+            '删除后无法恢复，该图片会从生成记录中永久移除。确定要删除吗？'
+          }
+          messageClassName={deleteError ? 'text-destructive' : undefined}
+          confirmText="删除"
+          confirmVariant="danger"
+          loading={deleting}
+        />
       </div>
     </div>
   );

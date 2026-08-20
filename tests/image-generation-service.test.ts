@@ -128,6 +128,40 @@ describe('generateWorkspaceImage', () => {
     ).rejects.toMatchObject<ImageGenerationError>({ status: 409 });
   });
 
+  test('surfaces a moderation block as a 400 with an actionable message', async () => {
+    mockBackend();
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: {
+            message: 'Your request was rejected by the safety system.',
+            type: 'image_generation_user_error',
+            code: 'moderation_blocked',
+          },
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    await expect(
+      generateWorkspaceImage('a hedgehog in the desert', 'gpt-image-2'),
+    ).rejects.toMatchObject<ImageGenerationError>({
+      status: 400,
+      message: expect.stringContaining('内容安全审核'),
+    });
+  });
+
+  test('falls back to a generic 502 for an unrecognized upstream failure', async () => {
+    mockBackend();
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('upstream exploded', { status: 500 }),
+    );
+
+    await expect(
+      generateWorkspaceImage('a hedgehog in the desert', 'gpt-image-2'),
+    ).rejects.toMatchObject<ImageGenerationError>({ status: 502 });
+  });
+
   test('rejects an invalid image payload instead of persisting it', async () => {
     mockBackend();
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(

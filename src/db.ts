@@ -9313,6 +9313,25 @@ export function getGeneratedImageMessages(
   }>;
 }
 
+/**
+ * Fetch a single generated-image row for deletion. Scoped to
+ * `sender = '__image_generation__'` so the delete route can never be used to
+ * remove an arbitrary chat message via this endpoint.
+ */
+export function getGeneratedImageMessageById(
+  chatJid: string,
+  messageId: string,
+): { id: string; attachments: string | null } | undefined {
+  return db
+    .prepare(
+      `SELECT id, attachments FROM messages
+       WHERE id = ? AND chat_jid = ? AND sender = '__image_generation__'`,
+    )
+    .get(messageId, chatJid) as
+    | { id: string; attachments: string | null }
+    | undefined;
+}
+
 export function deleteWorkspaceAgentProfile(groupFolder: string): void {
   db.transaction(() => {
     db.prepare(

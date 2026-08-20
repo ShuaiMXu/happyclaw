@@ -3,10 +3,24 @@ import { api } from '../api/client';
 import { withBasePath } from '../utils/url';
 import { toBase64Url } from './files';
 
+/** A reference image used for a generation, kept for "reuse recipe". */
+export interface ImageRecipeReference {
+  path: string;
+  mimeType: string;
+  note?: string;
+}
+
+/** The inputs that produced a generated image: prompt plus any references. */
+export interface ImageRecipe {
+  prompt: string;
+  references?: ImageRecipeReference[];
+}
+
 /**
  * One generated-image entry. New rows reference a workspace-relative file
  * path (cheap listing, browser-cached preview); legacy rows may still carry
- * inline base64 data.
+ * inline base64 data. `recipe` is absent on rows generated before this field
+ * existed.
  */
 export interface GeneratedImageEntry {
   messageId: string;
@@ -14,6 +28,7 @@ export interface GeneratedImageEntry {
   path?: string;
   data?: string;
   mimeType: string;
+  recipe?: ImageRecipe;
 }
 
 interface ImageStudioState {
@@ -26,6 +41,8 @@ interface ImageStudioState {
   loadGallery: (jid: string, limit?: number) => Promise<void>;
   /** Insert or refresh entries received via WebSocket without a refetch. */
   upsertEntries: (jid: string, entries: GeneratedImageEntry[]) => void;
+  /** Drop an entry locally after a successful delete request. */
+  removeEntry: (jid: string, messageId: string) => void;
   clearGallery: (jid: string) => void;
 }
 
@@ -36,13 +53,26 @@ function entriesFromAttachments(
   timestamp: string,
   attachmentsRaw:
     | string
-    | Array<{ type?: string; path?: string; data?: string; mimeType?: string }>,
+    | Array<{
+        type?: string;
+        path?: string;
+        data?: string;
+        mimeType?: string;
+        recipe?: {
+          prompt?: string;
+          references?: ImageRecipeReference[];
+        };
+      }>,
 ): GeneratedImageEntry[] {
   let attachments: Array<{
     type?: string;
     path?: string;
     data?: string;
     mimeType?: string;
+    recipe?: {
+      prompt?: string;
+      references?: ImageRecipeReference[];
+    };
   }>;
   try {
     attachments =
@@ -61,6 +91,14 @@ function entriesFromAttachments(
       timestamp,
       path: att.path,
       mimeType: att.mimeType || 'image/png',
+      ...(att.recipe && typeof att.recipe.prompt === 'string'
+        ? {
+            recipe: {
+              prompt: att.recipe.prompt,
+              references: att.recipe.references,
+            },
+          }
+        : {}),
     });
   }
   return out;
@@ -73,7 +111,13 @@ export function entriesFromMessageRow(row: {
   sender?: string;
   attachments?:
     | string
-    | Array<{ type?: string; path?: string; data?: string; mimeType?: string }>;
+    | Array<{
+        type?: string;
+        path?: string;
+        data?: string;
+        mimeType?: string;
+        recipe?: { prompt?: string; references?: ImageRecipeReference[] };
+      }>;
 }): GeneratedImageEntry[] {
   if (row.sender !== '__image_generation__' || !row.attachments) return [];
   return entriesFromAttachments(row.id, row.timestamp, row.attachments);
@@ -82,7 +126,12 @@ export function entriesFromMessageRow(row: {
 /** Resolve an entry to a renderable <img src>, reusing inline base64 if present. */
 export function imageEntrySrc(jid: string, entry: GeneratedImageEntry): string {
   if (entry.data) return `data:${entry.mimeType};base64,${entry.data}`;
-  const encoded = toBase64Url(entry.path ?? '');
+  return filePreviewUrl(jid, entry.path ?? '');
+}
+
+/** Resolve a workspace-relative file path to a `/files/preview/...` URL. */
+export function filePreviewUrl(jid: string, relativePath: string): string {
+  const encoded = toBase64Url(relativePath);
   return withBasePath(
     `/api/groups/${encodeURIComponent(jid)}/files/preview/${encoded}`,
   );
@@ -137,6 +186,17 @@ export const useImageStudioStore = create<ImageStudioState>((set) => ({
       galleries: {
         ...s.galleries,
         [jid]: dedupeSorted([...entries, ...(s.galleries[jid] ?? [])]),
+      },
+    }));
+  },
+
+  removeEntry: (jid, messageId) => {
+    set((s) => ({
+      galleries: {
+        ...s.galleries,
+        [jid]: (s.galleries[jid] ?? []).filter(
+          (e) => e.messageId !== messageId,
+        ),
       },
     }));
   },

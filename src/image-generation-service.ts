@@ -1,4 +1,5 @@
 import { getImageGenerationBackendConfig } from './runtime-config.js';
+import { logger } from './logger.js';
 
 const REQUEST_TIMEOUT_MS = 120_000;
 const MAX_GENERATED_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -132,6 +133,36 @@ export async function generateWorkspaceImage(
   }
 
   if (!response.ok) {
+    const bodyText = await response.text().catch(() => '');
+    let upstreamMessage: string | undefined;
+    let upstreamCode: string | undefined;
+    try {
+      const parsedBody = JSON.parse(bodyText) as {
+        error?: { message?: string; code?: string };
+      };
+      upstreamMessage = parsedBody?.error?.message;
+      upstreamCode = parsedBody?.error?.code;
+    } catch {
+      // Upstream error body wasn't JSON; fall through with no parsed detail.
+    }
+    // The route handler swallows ImageGenerationError without logging (to
+    // avoid noise for expected validation failures), so this is the only
+    // place an upstream failure reason is captured for operators.
+    logger.error(
+      {
+        status: response.status,
+        upstreamCode,
+        upstreamMessage,
+        bodyPreview: bodyText.slice(0, 500),
+      },
+      'Image generation upstream returned an error response',
+    );
+    if (upstreamCode === 'moderation_blocked') {
+      throw new ImageGenerationError(
+        '生成请求被上游内容安全审核拦截（可能涉及受版权保护的角色/IP 或敏感内容），请调整提示词或参考图后重试。',
+        400,
+      );
+    }
     throw new ImageGenerationError(
       '图像生成服务未能完成请求，请稍后重试。',
       502,

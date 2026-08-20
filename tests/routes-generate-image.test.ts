@@ -166,6 +166,47 @@ describe('POST /:jid/generate-image', () => {
     expect(attachments[0].type).toBe('image');
     expect(attachments[0].path).toBe(body.image.path);
     expect(attachments[0].data).toBeUndefined();
+    // No references were sent, so the recipe carries only the prompt.
+    expect(attachments[0].recipe).toEqual({ prompt: 'a hedgehog' });
+  });
+
+  test('persists reference images and attaches a reusable recipe', async () => {
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: 'merge the scenes',
+        references: [
+          {
+            data: TINY_PNG.toString('base64'),
+            mimeType: 'image/png',
+            note: '角色造型',
+          },
+          { data: TINY_PNG.toString('base64'), mimeType: 'image/png' },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const imageRow = db
+      .getMessagesPage(JID, undefined, 10)
+      .find((m) => m.sender === '__image_generation__');
+    const attachments = JSON.parse(imageRow!.attachments as string);
+    const recipe = attachments[0].recipe as {
+      prompt: string;
+      references: Array<{ path: string; mimeType: string; note?: string }>;
+    };
+    // The recipe keeps the original (un-composed) prompt, separate from the
+    // per-reference notes, so "reuse recipe" restores clean editable inputs.
+    expect(recipe.prompt).toBe('merge the scenes');
+    expect(recipe.references).toHaveLength(2);
+    expect(recipe.references[0].note).toBe('角色造型');
+    expect(recipe.references[1].note).toBeUndefined();
+    for (const ref of recipe.references) {
+      expect(ref.path).toMatch(/^generated-images\/ref-.*\.png$/);
+      const absolute = path.join(SHARED_TMP, 'groups', FOLDER, ref.path);
+      expect(fs.existsSync(absolute)).toBe(true);
+    }
   });
 
   test('forwards references to the service and composes per-image notes into the prompt', async () => {
@@ -268,6 +309,167 @@ describe('GET /:jid/generated-images', () => {
   test('hidden for non-owners', async () => {
     process.env.HAPPYCLAW_TEST_USER_ID = 'charlie';
     const res = await groupRoutes.request(`/${JID}/generated-images`);
+    expect(res.status).toBe(404);
+  });
+
+  test('passes through a well-formed recipe and drops a malformed one', async () => {
+    db.storeMessageDirect(
+      'gen-recipe',
+      JID,
+      '__image_generation__',
+      '图像生成',
+      '图片已生成。',
+      new Date().toISOString(),
+      true,
+      {
+        attachments: JSON.stringify([
+          {
+            type: 'image',
+            path: 'generated-images/b.png',
+            mimeType: 'image/png',
+            recipe: {
+              prompt: 'a hedgehog',
+              references: [
+                {
+                  path: 'generated-images/ref-1.png',
+                  mimeType: 'image/png',
+                  note: 'x',
+                },
+                { path: 42, mimeType: 'image/png' }, // malformed: dropped
+              ],
+            },
+          },
+        ]),
+      },
+    );
+    db.storeMessageDirect(
+      'gen-legacy-no-recipe',
+      JID,
+      '__image_generation__',
+      '图像生成',
+      '图片已生成。',
+      new Date(Date.now() - 1000).toISOString(),
+      true,
+      {
+        attachments: JSON.stringify([
+          {
+            type: 'image',
+            path: 'generated-images/c.png',
+            mimeType: 'image/png',
+          },
+        ]),
+      },
+    );
+
+    const res = await groupRoutes.request(`/${JID}/generated-images`);
+    const body = (await res.json()) as {
+      images: Array<{
+        path?: string;
+        recipe?: {
+          prompt: string;
+          references?: Array<{ path: string; note?: string }>;
+        };
+      }>;
+    };
+    const withRecipe = body.images.find(
+      (i) => i.path === 'generated-images/b.png',
+    );
+    expect(withRecipe?.recipe?.prompt).toBe('a hedgehog');
+    expect(withRecipe?.recipe?.references).toHaveLength(1);
+    expect(withRecipe?.recipe?.references?.[0].path).toBe(
+      'generated-images/ref-1.png',
+    );
+    const legacy = body.images.find((i) => i.path === 'generated-images/c.png');
+    expect(legacy?.recipe).toBeUndefined();
+  });
+});
+
+describe('DELETE /:jid/generated-images/:messageId', () => {
+  beforeEach(() => {
+    seedGroup();
+    db.getOrCreateDefaultAgentProfile(OWNER_ID);
+    db.assignWorkspaceAgentProfile(
+      FOLDER,
+      db.getOrCreateDefaultAgentProfile(OWNER_ID).id,
+    );
+    seedImageEnabled();
+    generateWorkspaceImage.mockResolvedValue({
+      data: TINY_PNG.toString('base64'),
+      mimeType: 'image/png',
+    });
+  });
+
+  async function generateOne(): Promise<{
+    messageId: string;
+    path: string;
+  }> {
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'a hedgehog' }),
+    });
+    const body = (await res.json()) as {
+      messageId: string;
+      image: { path: string };
+    };
+    return { messageId: body.messageId, path: body.image.path };
+  }
+
+  test('removes the message row and the backing file', async () => {
+    const { messageId, path: imagePath } = await generateOne();
+    const absolute = path.join(SHARED_TMP, 'groups', FOLDER, imagePath);
+    expect(fs.existsSync(absolute)).toBe(true);
+
+    const res = await groupRoutes.request(
+      `/${JID}/generated-images/${messageId}`,
+      { method: 'DELETE' },
+    );
+    expect(res.status).toBe(200);
+    expect(fs.existsSync(absolute)).toBe(false);
+
+    const stillThere = db
+      .getMessagesPage(JID, undefined, 10)
+      .find((m) => m.id === messageId);
+    expect(stillThere).toBeUndefined();
+  });
+
+  test('404s for an unknown message id', async () => {
+    const res = await groupRoutes.request(
+      `/${JID}/generated-images/does-not-exist`,
+      { method: 'DELETE' },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  test('cannot be used to delete an unrelated chat message', async () => {
+    const ts = new Date().toISOString();
+    db.storeMessageDirect(
+      'regular-message',
+      JID,
+      OWNER_ID,
+      'Alice',
+      'hello',
+      ts,
+      false,
+    );
+    const res = await groupRoutes.request(
+      `/${JID}/generated-images/regular-message`,
+      { method: 'DELETE' },
+    );
+    expect(res.status).toBe(404);
+    const stillThere = db
+      .getMessagesPage(JID, undefined, 10)
+      .find((m) => m.id === 'regular-message');
+    expect(stillThere).toBeDefined();
+  });
+
+  test('hidden for non-owners', async () => {
+    const { messageId } = await generateOne();
+    process.env.HAPPYCLAW_TEST_USER_ID = 'charlie';
+    const res = await groupRoutes.request(
+      `/${JID}/generated-images/${messageId}`,
+      { method: 'DELETE' },
+    );
     expect(res.status).toBe(404);
   });
 });
