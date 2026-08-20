@@ -25,7 +25,7 @@ describe('frontend identity ownership', () => {
 
   test('uses the branded avatar as the final global fallback', () => {
     expect(resolveAgentDisplayIdentity()).toMatchObject({
-      name: 'HappyClaw',
+      name: 'SoftopiaAI',
       imageUrl: expect.stringContaining('icons/icon-192.png'),
     });
   });

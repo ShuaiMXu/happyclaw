@@ -9,8 +9,13 @@ export interface AgentWorkspaceSection {
   items: GroupEntry[];
 }
 
+// Legacy built-in profile names (pre-rebrand) shown as the current brand.
+const LEGACY_DEFAULT_AGENT_NAMES = ['Default Agent', 'HappyClaw'];
+
 export function getAgentProfileDisplayName(name?: string | null): string {
-  return !name || name === 'Default Agent' ? 'SoftopiaAI' : name;
+  return !name || LEGACY_DEFAULT_AGENT_NAMES.includes(name)
+    ? 'SoftopiaAI'
+    : name;
 }
 
 export function getCustomAgentProfiles<T extends { is_default: boolean }>(

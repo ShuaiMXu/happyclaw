@@ -53,9 +53,10 @@ describe('Agent-first frontend product contracts', () => {
     });
   });
 
-  it('shows the legacy built-in Agent name as HappyClaw', () => {
-    expect(getAgentProfileDisplayName('Default Agent')).toBe('HappyClaw');
-    expect(getAgentProfileDisplayName(undefined)).toBe('HappyClaw');
+  it('shows legacy built-in Agent names as the current brand', () => {
+    expect(getAgentProfileDisplayName('Default Agent')).toBe('SoftopiaAI');
+    expect(getAgentProfileDisplayName('HappyClaw')).toBe('SoftopiaAI');
+    expect(getAgentProfileDisplayName(undefined)).toBe('SoftopiaAI');
     expect(getAgentProfileDisplayName('代码审查员')).toBe('代码审查员');
   });
 
@@ -135,21 +136,21 @@ describe('Agent-first frontend product contracts', () => {
     ]);
   });
 
-  it('keeps the default HappyClaw Agent first and retains its internal home context', () => {
-    const home = workspace('web:main', 'agent-happyclaw', 'HappyClaw');
+  it('keeps the default Agent first and retains its internal home context', () => {
+    const home = workspace('web:main', 'agent-default', 'HappyClaw');
     home.is_my_home = true;
 
     const sections = groupWorkspacesByAgent(
       [
         workspace('web:review', 'agent-reviewer', '代码审查员'),
-        workspace('web:project', 'agent-happyclaw', 'HappyClaw'),
+        workspace('web:project', 'agent-default', 'HappyClaw'),
         home,
       ],
-      'agent-happyclaw',
+      'agent-default',
     );
 
     expect(sections.map((section) => section.name)).toEqual([
-      'HappyClaw',
+      'SoftopiaAI',
       '代码审查员',
     ]);
     expect(sections[0]).toMatchObject({
@@ -159,11 +160,11 @@ describe('Agent-first frontend product contracts', () => {
   });
 
   it('keeps the home context separate from additional Agent workspaces for navigation', () => {
-    const home = workspace('web:main', 'agent-happyclaw', 'HappyClaw');
+    const home = workspace('web:main', 'agent-default', 'HappyClaw');
     home.is_my_home = true;
     const [section] = groupWorkspacesByAgent(
-      [workspace('web:project', 'agent-happyclaw', 'HappyClaw'), home],
-      'agent-happyclaw',
+      [workspace('web:project', 'agent-default', 'HappyClaw'), home],
+      'agent-default',
     );
 
     expect(getAgentNavigationTargets(section)).toMatchObject({
@@ -173,11 +174,11 @@ describe('Agent-first frontend product contracts', () => {
   });
 
   it('presents the home context as the named main workspace of the primary Agent', () => {
-    const home = workspace('web:main', 'agent-happyclaw', 'HappyClaw');
+    const home = workspace('web:main', 'agent-default', 'HappyClaw');
     home.is_my_home = true;
     const [section] = groupWorkspacesByAgent(
-      [workspace('web:project', 'agent-happyclaw', 'HappyClaw'), home],
-      'agent-happyclaw',
+      [workspace('web:project', 'agent-default', 'HappyClaw'), home],
+      'agent-default',
     );
 
     expect(
@@ -186,28 +187,28 @@ describe('Agent-first frontend product contracts', () => {
         name,
       })),
     ).toEqual([
-      { jid: 'web:main', name: 'HappyClaw' },
+      { jid: 'web:main', name: 'SoftopiaAI' },
       { jid: 'web:project', name: 'web:project' },
     ]);
   });
 
-  it('separates HappyClaw as the primary Agent from custom Agents', () => {
+  it('separates the primary Agent from custom Agents', () => {
     const sections = groupWorkspacesByAgent(
       [
-        workspace('web:main', 'agent-happyclaw', 'HappyClaw'),
+        workspace('web:main', 'agent-default', 'HappyClaw'),
         workspace('web:review', 'agent-reviewer', '代码审查员'),
       ],
-      'agent-happyclaw',
+      'agent-default',
     );
 
     const partitioned = partitionAgentWorkspaceSections(sections);
-    expect(partitioned.primary?.name).toBe('HappyClaw');
+    expect(partitioned.primary?.name).toBe('SoftopiaAI');
     expect(partitioned.custom.map((section) => section.name)).toEqual([
       '代码审查员',
     ]);
   });
 
-  it('keeps the primary HappyClaw Agent fixed open while custom Agents remain collapsible', () => {
+  it('keeps the primary Agent fixed open while custom Agents remain collapsible', () => {
     expect(isAgentSectionCollapsible({ isDefault: true })).toBe(false);
     expect(isAgentSectionCollapsible({ isDefault: false })).toBe(true);
   });

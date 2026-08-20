@@ -4142,7 +4142,7 @@ export function getUsageAnalytics(filters: UsageQueryFilters): {
         ? `COALESCE(
             (SELECT a.name FROM agents a WHERE a.id = r.agent_id LIMIT 1),
             (SELECT ap.name FROM agent_profiles ap WHERE ap.id = r.agent_id LIMIT 1),
-            CAST(r.agent_id AS TEXT), 'HappyClaw')`
+            CAST(r.agent_id AS TEXT), 'SoftopiaAI')`
         : column === 'group_folder'
           ? `COALESCE(
               (SELECT rg.name FROM registered_groups rg
@@ -8765,8 +8765,11 @@ export function commitAgentBuilderDraft(
   })();
 }
 
-const DEFAULT_AGENT_PROFILE_NAME = 'HappyClaw';
+const DEFAULT_AGENT_PROFILE_NAME = 'SoftopiaAI';
 const LEGACY_DEFAULT_AGENT_PROFILE_NAME = 'Default Agent';
+// Pre-rebrand built-in profile name still found in existing databases; migrate
+// it forward alongside 'Default Agent'.
+const DEPRECATED_DEFAULT_AGENT_PROFILE_NAME = 'HappyClaw';
 
 export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
   const existing = db
@@ -8776,7 +8779,9 @@ export function getOrCreateDefaultAgentProfile(userId: string): AgentProfile {
     .get(userId) as Record<string, unknown> | undefined;
   if (existing) {
     const profile = mapAgentProfileRow(existing);
-    const migrateName = profile.name === LEGACY_DEFAULT_AGENT_PROFILE_NAME;
+    const migrateName =
+      profile.name === LEGACY_DEFAULT_AGENT_PROFILE_NAME ||
+      profile.name === DEPRECATED_DEFAULT_AGENT_PROFILE_NAME;
     if (!migrateName) return profile;
 
     const now = new Date().toISOString();

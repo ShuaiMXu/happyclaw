@@ -70,7 +70,7 @@ describe('AgentProfile DB model', () => {
 
     expect(profiles).toHaveLength(1);
     expect(profiles[0].is_default).toBe(true);
-    expect(profiles[0].name).toBe('HappyClaw');
+    expect(profiles[0].name).toBe('SoftopiaAI');
     expect(profiles[0].identity_prompt).toBe('');
     expect(profiles[0].include_claude_preset).toBe(true);
     expect(profiles[0].model_config_id).toBeNull();
@@ -85,7 +85,7 @@ describe('AgentProfile DB model', () => {
       mcp: { mode: 'inherit', ids: [] },
     });
     expect(profiles[0].identity_hash).toBe(
-      computeAgentProfileIdentityHash('', true, undefined, 'HappyClaw'),
+      computeAgentProfileIdentityHash('', true, undefined, 'SoftopiaAI'),
     );
   });
 
@@ -154,7 +154,7 @@ describe('AgentProfile DB model', () => {
     expect(legacy?.name).toBe('Default Agent');
 
     const migrated = listAgentProfilesForUser(userId)[0];
-    expect(migrated.name).toBe('HappyClaw');
+    expect(migrated.name).toBe('SoftopiaAI');
     expect(migrated.version).toBe((legacy?.version ?? 0) + 1);
     expect(listAgentProfilePromptVersions(migrated.id, userId)).toHaveLength(1);
     expect(migrated.identity_hash).toBe(
@@ -162,9 +162,18 @@ describe('AgentProfile DB model', () => {
         migrated.identity_prompt,
         migrated.include_claude_preset,
         migrated.runtime_policy,
-        'HappyClaw',
+        'SoftopiaAI',
       ),
     );
+
+    // Pre-rebrand 'HappyClaw' profiles migrate forward the same way.
+    const rebranded = updateAgentProfile(migrated.id, userId, {
+      name: '我的默认助手',
+    });
+    expect(rebranded?.name).toBe('我的默认助手');
+    updateAgentProfile(migrated.id, userId, { name: 'HappyClaw' });
+    const remigrated = listAgentProfilesForUser(userId)[0];
+    expect(remigrated.name).toBe('SoftopiaAI');
 
     const custom = updateAgentProfile(migrated.id, userId, {
       name: '我的默认助手',
