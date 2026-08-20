@@ -18,13 +18,16 @@ export function AboutSection() {
       {/* 项目信息 */}
       <div>
         <h2 className="text-lg font-semibold text-foreground mb-1">
-          HappyClaw
+          SoftopiaAI
         </h2>
         <p className="text-sm text-muted-foreground">
           基于 Claude Agent SDK 的自托管多智能体工作平台
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
           版本 1.0.0 · MIT License
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          技术支持来自 HappyClaw
         </p>
       </div>
 

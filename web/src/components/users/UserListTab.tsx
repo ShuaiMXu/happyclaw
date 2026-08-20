@@ -488,7 +488,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                         )}
                         <button
                           onClick={() => handleRevokeAll(user)}
-                          className="p-2 hover:bg-muted rounded-lg text-muted-foreground hover:text-orange-600 cursor-pointer"
+                          className="p-2 hover:bg-muted rounded-lg text-muted-foreground hover:text-primary cursor-pointer"
                           title="撤销全部会话"
                         >
                           <LogOut className="w-4 h-4" />

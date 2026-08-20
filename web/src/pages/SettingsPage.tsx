@@ -142,7 +142,7 @@ export function SettingsPage() {
     registration: '注册策略',
     appearance: '常规与品牌',
     system: '运行与容量',
-    'main-agent': '主 HappyClaw',
+    'main-agent': '主 SoftopiaAI',
     'host-integration': '宿主机集成',
     billing: '计费管理',
     profile: '个人资料',

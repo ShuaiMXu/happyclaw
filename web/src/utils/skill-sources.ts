@@ -2,7 +2,7 @@ import type { Skill } from '../stores/skills';
 
 export const SKILL_SOURCE_LABELS: Record<Skill['source'], string> = {
   user: '我的 Skills',
-  project: 'HappyClaw 内置',
+  project: 'SoftopiaAI 内置',
   external: '宿主机',
 };
 
@@ -12,7 +12,7 @@ const SKILL_SOURCE_PRIORITY: Skill['source'][] = [
   'user',
 ];
 
-/** Runtime order is host -> HappyClaw project -> managed user. */
+/** Runtime order is host -> SoftopiaAI project -> managed user. */
 export function effectiveSkillSource(skill: Skill): Skill['source'] | null {
   if (skill.effectiveSource !== undefined) return skill.effectiveSource;
   const sources = new Set<Skill['source']>([

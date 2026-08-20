@@ -58,11 +58,11 @@ export function AgentSkillsPolicyEditor({
   return (
     <div className="space-y-6">
       <SkillSourceSection
-        title="HappyClaw Skills"
-        description="控制 HappyClaw 为这个智能体附加的用户级 Skills；系统内置 Skills 始终生效。"
+        title="SoftopiaAI Skills"
+        description="控制 SoftopiaAI 为这个智能体附加的用户级 Skills；系统内置 Skills 始终生效。"
       >
         <PolicyModeCards
-          label="HappyClaw Skills 使用方式"
+          label="SoftopiaAI Skills 使用方式"
           value={managedPolicy.mode}
           onChange={onManagedModeChange}
           options={[
@@ -85,7 +85,7 @@ export function AgentSkillsPolicyEditor({
         />
         {managedPolicy.mode === 'custom' && (
           <PolicyResourcePicker
-            label="选择 HappyClaw Skills"
+            label="选择 SoftopiaAI Skills"
             options={managedOptions}
             selectedIds={managedPolicy.ids}
             onChange={onManagedIdsChange}

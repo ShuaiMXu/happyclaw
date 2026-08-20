@@ -607,7 +607,7 @@ export function HostIntegrationSettingsSection({
       );
       toast.success(
         scope === 'main-agent'
-          ? '主 HappyClaw 默认策略已保存'
+          ? '主 SoftopiaAI 默认策略已保存'
           : draft.pluginAutoScan !== settings.pluginAutoScan
             ? '宿主机集成设置已保存；Plugin 自动扫描将在服务重启后生效'
             : '宿主机集成设置已保存',
@@ -636,15 +636,15 @@ export function HostIntegrationSettingsSection({
             <div className="flex min-h-16 items-start justify-between gap-6">
               <div className="min-w-0">
                 <Label htmlFor="host-integration-main-agent-context">
-                  主 HappyClaw 继承宿主机 Claude Code 配置
+                  主 SoftopiaAI 继承宿主机 Claude Code 配置
                 </Label>
                 <p
                   id="host-integration-main-agent-context-description"
                   className="mt-1 text-xs leading-5 text-muted-foreground"
                 >
                   开启后自动继承宿主机提示词、Rules、全部 Skills 与 MCP，
-                  无需再逐项选择；HappyClaw 管理的能力继续附加。普通用户的 默认
-                  HappyClaw 始终使用托管配置。
+                  无需再逐项选择；SoftopiaAI 管理的能力继续附加。普通用户的 默认
+                  SoftopiaAI 始终使用托管配置。
                 </p>
               </div>
               <Switch
@@ -676,7 +676,7 @@ export function HostIntegrationSettingsSection({
                     id="main-agent-auto-compact-default-description"
                     className="mt-1 text-xs leading-5 text-muted-foreground"
                   >
-                    全局作用于所有用户的默认 HappyClaw。SDK
+                    全局作用于所有用户的默认 SoftopiaAI。SDK
                     根据当前模型决定压缩时机：普通模型通常为 200K
                     上下文；模型名带 [1m] 时按 1M 处理。
                   </p>

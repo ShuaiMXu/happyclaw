@@ -37,16 +37,16 @@ const LIGHT_BASE_VARS: Record<string, string> = {
   '--ring': '#a3a3a3',
 };
 
-/** Default brand fallbacks (classic orange) in case CSS vars are unavailable. */
+/** Default brand fallbacks (#FF6600 scale) in case CSS vars are unavailable. */
 const BRAND_DEFAULTS: Record<string, string> = {
-  '--brand-50': '#fff7ed',
-  '--brand-100': '#ffedd5',
-  '--brand-200': '#fed7aa',
-  '--brand-300': '#fdba74',
-  '--brand-400': '#fb923c',
-  '--brand-500': '#f97316',
-  '--brand-600': '#ea580c',
-  '--brand-700': '#c2410c',
+  '--brand-50': '#fff4eb',
+  '--brand-100': '#ffe6d1',
+  '--brand-200': '#ffc9a3',
+  '--brand-300': '#ffac73',
+  '--brand-400': '#ff8e42',
+  '--brand-500': '#ff6600',
+  '--brand-600': '#e55a00',
+  '--brand-700': '#b34700',
 };
 
 /**
@@ -190,11 +190,11 @@ export const ShareCardRenderer = forwardRef<HTMLDivElement, ShareCardRendererPro
         >
           <img
             src="/icons/icon-192.png"
-            alt="HappyClaw"
+            alt="SoftopiaAI"
             style={{ width: 16, height: 16, borderRadius: 3 }}
           />
           <span style={{ fontSize: 12, color: '#94a3b8' }}>
-            HappyClaw · github.com/riba2534/happyclaw
+            SoftopiaAI · 技术支持来自 HappyClaw
           </span>
         </div>
       </div>

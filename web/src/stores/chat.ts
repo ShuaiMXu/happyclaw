@@ -2861,7 +2861,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (typeof document === 'undefined' || !document.hidden) {
           showToast(`${desc} ${status}`, event.taskSummary);
         }
-        notifyIfHidden(`HappyClaw: ${desc} ${status}`, event.taskSummary);
+        notifyIfHidden(`SoftopiaAI: ${desc} ${status}`, event.taskSummary);
       }
 
       set((s) => {

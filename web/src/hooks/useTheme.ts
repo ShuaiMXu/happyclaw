@@ -49,11 +49,10 @@ function syncMetaThemeColor() {
   if (!meta) return;
   const isDark = document.documentElement.classList.contains('dark');
   const isNeutral = document.documentElement.classList.contains('theme-neutral');
-  const isOrange = document.documentElement.classList.contains('theme-orange');
   if (isDark) {
-    meta.setAttribute('content', isNeutral ? '#09090b' : '#0f172a');
+    meta.setAttribute('content', isNeutral ? '#09090b' : '#0b0d10');
   } else {
-    meta.setAttribute('content', isOrange ? '#FAF9F5' : isNeutral ? '#ffffff' : '#ffffff');
+    meta.setAttribute('content', '#ffffff');
   }
 }
 

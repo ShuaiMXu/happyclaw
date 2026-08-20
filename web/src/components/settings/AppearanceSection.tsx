@@ -228,7 +228,7 @@ export function AppearanceSection() {
   return (
     <div className="space-y-4">
       <p className="text-sm text-muted-foreground bg-muted rounded-lg px-4 py-3">
-        系统品牌影响站点标题、欢迎文案和侧边栏 Logo，不会改变 HappyClaw
+        系统品牌影响站点标题、欢迎文案和侧边栏 Logo，不会改变 SoftopiaAI
         或自定义智能体的名称。
       </p>
 
@@ -250,7 +250,7 @@ export function AppearanceSection() {
             value={appName}
             onChange={(e) => setAppName(e.target.value)}
             maxLength={32}
-            placeholder="HappyClaw"
+            placeholder="SoftopiaAI"
           />
         </div>
       </Section>

@@ -230,14 +230,14 @@ export function UnifiedSidebar({
   return (
     <TooltipProvider delayDuration={200}>
       <div className="h-full flex flex-shrink-0">
-        <nav className="w-[4.5rem] h-full bg-white border-r border-border flex flex-col items-center py-3 gap-1 flex-shrink-0">
+        <nav className="w-[4.5rem] h-full bg-sidebar border-r border-border flex flex-col items-center py-3 gap-1 flex-shrink-0">
           <div className="w-[50px] h-[50px] mb-3 flex-shrink-0 flex items-center justify-center">
             <img
               src={
                 appearance?.brandIconUrl ||
                 `${import.meta.env.BASE_URL}icons/icon-192.png`
               }
-              alt={appearance?.appName || 'HappyClaw'}
+              alt={appearance?.appName || 'SoftopiaAI'}
               className="w-[50px] h-[50px] rounded-xl object-cover"
             />
           </div>
@@ -248,8 +248,8 @@ export function UnifiedSidebar({
             const baseClass =
               'w-12 h-12 rounded-xl flex flex-col items-center justify-center gap-0.5 transition-colors';
             const activeClass = isActive
-              ? 'bg-orange-50 text-orange-600'
-              : 'text-muted-foreground hover:bg-orange-50 hover:text-orange-600';
+              ? 'bg-accent text-primary'
+              : 'text-muted-foreground hover:bg-accent hover:text-primary';
 
             return (
               <Tooltip key={path}>
@@ -294,7 +294,7 @@ export function UnifiedSidebar({
             <TooltipTrigger asChild>
               <button
                 onClick={() => setShowBugReport(true)}
-                className="w-10 h-10 rounded-lg flex items-center justify-center text-muted-foreground hover:text-orange-600 hover:bg-orange-50 transition-colors"
+                className="w-10 h-10 rounded-lg flex items-center justify-center text-muted-foreground hover:text-primary hover:bg-accent transition-colors"
               >
                 <Bug className="w-4 h-4" />
               </button>
@@ -343,14 +343,14 @@ export function UnifiedSidebar({
           className="h-full overflow-hidden transition-[width] duration-200 ease-linear"
           style={{ width: panelWidth }}
         >
-          <div className="w-[16.5rem] h-full flex flex-col bg-white border-r border-border">
+          <div className="w-[16.5rem] h-full flex flex-col bg-sidebar border-r border-border">
             <div className="flex items-center gap-1 px-4 pt-3 mb-3 flex-shrink-0">
               <img
                 src={
                   appearance?.brandBannerUrl ||
                   `${import.meta.env.BASE_URL}icons/logo-text.svg`
                 }
-                alt={appearance?.appName || 'HappyClaw'}
+                alt={appearance?.appName || 'SoftopiaAI'}
                 className="h-[60px] w-[200px] flex-none object-contain object-left"
               />
               <div className="flex-1" />
@@ -436,7 +436,7 @@ export function UnifiedSidebar({
         onClose={closeClear}
         onConfirm={handleClearConfirm}
         title="重建工作区"
-        message={`确认重建「${clearState.name}」？会永久删除全部聊天记录、上下文、所有子对话及其消息、工作目录文件，以及该工作区的全部 Memory（含版本历史、遗忘记录和 HappyClaw 称呼偏好）；Home 还会重置首次唤醒状态。关联定时任务会停止并移入回收站，运行历史与持久化目录 (data/extra/) 保留。不可撤销。`}
+        message={`确认重建「${clearState.name}」？会永久删除全部聊天记录、上下文、所有子对话及其消息、工作目录文件，以及该工作区的全部 Memory（含版本历史、遗忘记录和 SoftopiaAI 称呼偏好）；Home 还会重置首次唤醒状态。关联定时任务会停止并移入回收站，运行历史与持久化目录 (data/extra/) 保留。不可撤销。`}
         confirmText="确认重建"
         confirmVariant="danger"
         loading={clearLoading}

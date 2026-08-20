@@ -37,7 +37,7 @@ function PlanCard({ plan, isCurrent, fmt }: { plan: BillingPlan; isCurrent: bool
     <div
       className={`relative rounded-lg border p-5 flex flex-col transition-shadow ${
         isHighlighted
-          ? 'border-brand-500 dark:border-brand-400 shadow-[0_0_12px_rgba(249,115,22,0.25)] dark:shadow-[0_0_12px_rgba(251,146,60,0.2)]'
+          ? 'border-brand-500 dark:border-brand-400 shadow-[0_0_12px_rgba(255,102,0,0.25)] dark:shadow-[0_0_12px_rgba(255,122,47,0.2)]'
           : 'border-zinc-200 dark:border-zinc-700'
       } bg-white dark:bg-zinc-800`}
     >

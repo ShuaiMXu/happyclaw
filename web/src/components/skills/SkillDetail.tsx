@@ -172,7 +172,7 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
                   ? '我的 Skills'
                   : detail.source === 'external'
                     ? '宿主机'
-                    : 'HappyClaw 内置'}
+                    : 'SoftopiaAI 内置'}
               </span>
               {detail.userInvocable && (
                 <span className="px-2 py-0.5 rounded text-xs font-medium bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300">

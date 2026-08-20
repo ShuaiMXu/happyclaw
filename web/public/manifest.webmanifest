@@ -1,6 +1,6 @@
 {
-  "name": "HappyClaw",
-  "short_name": "HappyClaw",
+  "name": "SoftopiaAI",
+  "short_name": "SoftopiaAI",
   "description": "Personal Claude Assistant",
   "start_url": "./chat",
   "display": "standalone",
