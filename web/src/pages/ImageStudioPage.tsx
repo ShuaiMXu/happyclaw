@@ -313,10 +313,106 @@ export function ImageStudioPage() {
   // Whether the lightbox shows the full-resolution image instead of the
   // low-res preview; reset every time a different image is opened.
   const [lightboxOriginal, setLightboxOriginal] = useState(false);
+  // Zoom (wheel) / pan (drag with the left button held) state for the
+  // lightbox image. Reset whenever a different image is opened.
+  const [lightboxZoom, setLightboxZoom] = useState(1);
+  const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
+  const [isPanningLightbox, setIsPanningLightbox] = useState(false);
+  const panStartRef = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const openLightbox = useCallback((entry: GeneratedImageEntry) => {
     setLightboxOriginal(false);
+    setLightboxZoom(1);
+    setLightboxPan({ x: 0, y: 0 });
     setLightbox(entry);
   }, []);
+  // Dragging is only meaningful once zoomed in; reset pan whenever zoom
+  // returns to the fitted (1x) view so the image re-centers.
+  useEffect(() => {
+    if (lightboxZoom <= 1) setLightboxPan({ x: 0, y: 0 });
+  }, [lightboxZoom]);
+  const handleLightboxWheel = useCallback((e: React.WheelEvent) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    setLightboxZoom((z) => Math.min(8, Math.max(1, z * factor)));
+  }, []);
+  const handleLightboxMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (lightboxZoom <= 1 || e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      panStartRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        panX: lightboxPan.x,
+        panY: lightboxPan.y,
+      };
+      setIsPanningLightbox(true);
+    },
+    [lightboxZoom, lightboxPan],
+  );
+  useEffect(() => {
+    if (!isPanningLightbox) return;
+    const handleMove = (e: MouseEvent) => {
+      setLightboxPan({
+        x: panStartRef.current.panX + (e.clientX - panStartRef.current.x),
+        y: panStartRef.current.panY + (e.clientY - panStartRef.current.y),
+      });
+    };
+    const handleUp = () => setIsPanningLightbox(false);
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+  }, [isPanningLightbox]);
+
+  // Original-file metadata (byte size + pixel dimensions) shown next to
+  // "查看原图": fetched once per opened image and cached as an object URL so
+  // clicking "查看原图" afterwards doesn't re-download the same bytes.
+  const [originalMeta, setOriginalMeta] = useState<{
+    url: string;
+    width: number;
+    height: number;
+    sizeBytes: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!lightbox || !selectedJid || !lightbox.path) {
+      setOriginalMeta(null);
+      return;
+    }
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    setOriginalMeta(null);
+    (async () => {
+      try {
+        const res = await fetch(fileDownloadUrl(selectedJid, lightbox.path!), {
+          credentials: 'include',
+        });
+        if (!res.ok) throw new Error('failed to load original');
+        const blob = await res.blob();
+        const bitmap = await createImageBitmap(blob);
+        const { width, height } = bitmap;
+        bitmap.close();
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setOriginalMeta({
+          url: objectUrl,
+          width,
+          height,
+          sizeBytes: blob.size,
+        });
+      } catch {
+        // Metadata is a nice-to-have label suffix; silently fall back to
+        // the plain "查看原图" button with no appended size/dimensions.
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [lightbox, selectedJid]);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // "下载原图": always fetches the full-resolution bytes regardless of
@@ -1114,18 +1210,33 @@ export function ImageStudioPage() {
           <div
             role="dialog"
             aria-modal="true"
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+            className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden bg-black/80 p-4"
             onClick={() => setLightbox(null)}
+            onWheel={handleLightboxWheel}
           >
             <img
               src={
                 lightboxOriginal
-                  ? imageEntrySrc(selectedJid, lightbox)
+                  ? (originalMeta?.url ?? imageEntrySrc(selectedJid, lightbox))
                   : imageEntryThumbSrc(selectedJid, lightbox)
               }
               alt="生成的图片"
-              className="max-h-full max-w-full rounded-lg object-contain"
+              draggable={false}
+              onDragStart={(e) => e.preventDefault()}
+              className={cn(
+                'max-h-full max-w-full rounded-lg object-contain select-none',
+                isPanningLightbox
+                  ? 'cursor-grabbing'
+                  : lightboxZoom > 1
+                    ? 'cursor-grab'
+                    : 'cursor-default',
+                !isPanningLightbox && 'transition-transform duration-100',
+              )}
+              style={{
+                transform: `translate(${lightboxPan.x}px, ${lightboxPan.y}px) scale(${lightboxZoom})`,
+              }}
               onClick={(e) => e.stopPropagation()}
+              onMouseDown={handleLightboxMouseDown}
             />
             <div
               className="absolute bottom-6 left-1/2 flex max-w-full -translate-x-1/2 flex-wrap justify-center gap-2 px-2"
@@ -1138,6 +1249,8 @@ export function ImageStudioPage() {
                 >
                   <ZoomIn />
                   查看原图
+                  {originalMeta &&
+                    ` (${Math.round(originalMeta.sizeBytes / 1024)} KB, ${originalMeta.width}×${originalMeta.height})`}
                 </Button>
               )}
               <Button
@@ -1146,37 +1259,6 @@ export function ImageStudioPage() {
               >
                 <Download />
                 下载原图
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() =>
-                  void addReferenceFromGalleryImage(selectedJid, lightbox)
-                }
-              >
-                <ImagePlus />
-                设为参考图
-              </Button>
-              <Button
-                variant="secondary"
-                disabled={applyingRecipeId === lightbox.messageId}
-                onClick={() => void applyRecipe(selectedJid, lightbox)}
-              >
-                {applyingRecipeId === lightbox.messageId ? (
-                  <Loader2 className="animate-spin" />
-                ) : (
-                  <RotateCcw />
-                )}
-                复用配方
-              </Button>
-              <Button
-                variant="destructive"
-                onClick={() => {
-                  setDeleteError(null);
-                  setDeleteTarget(lightbox);
-                }}
-              >
-                <Trash2 />
-                删除
               </Button>
             </div>
             <button

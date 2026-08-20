@@ -357,7 +357,16 @@ export function UnifiedSidebar({
                   `${import.meta.env.BASE_URL}icons/logo-text.svg`
                 }
                 alt={appearance?.appName || 'SoftopiaAI'}
-                className="h-[60px] w-[200px] flex-none object-contain object-left"
+                className={cn(
+                  'h-[60px] w-[200px] flex-none object-contain object-left',
+                  // Custom-uploaded wordmarks are typically drawn in a fixed
+                  // dark color for a light background; the built-in default
+                  // (orange "S" wordmark) already reads fine on dark
+                  // backgrounds, so only force-invert the custom asset —
+                  // `brightness(0) invert(1)` turns any opaque color into
+                  // solid white while leaving transparency untouched.
+                  appearance?.brandBannerUrl && 'dark:brightness-0 dark:invert',
+                )}
               />
               <div className="flex-1" />
               <button
