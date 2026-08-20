@@ -8,7 +8,7 @@ import {
   Wand2,
   X,
 } from 'lucide-react';
-import { api, type ApiError } from '../api/client';
+import { api, computeUploadTimeoutMs, type ApiError } from '../api/client';
 import { wsManager } from '../api/ws';
 import { useGroupsStore } from '../stores/groups';
 import {
@@ -44,6 +44,12 @@ const PROMPT_MAX_LENGTH = 8_000;
 const NOTE_MAX_LENGTH = 1_000;
 const MAX_REFERENCES = 6;
 const MAX_REFERENCE_FILE_BYTES = 8 * 1024 * 1024;
+// References above this size are downscaled/re-encoded in the browser before
+// upload: base64 inflates payloads by ~33% and slow uplinks otherwise never
+// finish uploading within the request timeout (nginx logs 408/499).
+const REFERENCE_COMPRESSION_THRESHOLD_BYTES = 512 * 1024;
+const REFERENCE_MAX_DIMENSION = 2048;
+const REFERENCE_ENCODE_QUALITY = 0.9;
 
 const REFERENCE_ACCEPTED_MIME = new Set([
   'image/png',
@@ -84,18 +90,64 @@ async function blobToBase64(blob: Blob): Promise<string> {
   return btoa(binary);
 }
 
+/**
+ * Downscale and re-encode a reference image in the browser before upload.
+ * Keeps the longest edge at 2048px and re-encodes as WebP q0.9. Returns null
+ * when compression is unavailable (no canvas/decode support or the result
+ * would not shrink) — the caller then uploads the original bytes.
+ */
+async function compressReferenceImage(
+  blob: Blob,
+): Promise<{ blob: Blob; mimeType: ReferenceDraft['mimeType'] } | null> {
+  if (
+    blob.size <= REFERENCE_COMPRESSION_THRESHOLD_BYTES ||
+    typeof createImageBitmap === 'undefined' ||
+    typeof document === 'undefined'
+  ) {
+    return null;
+  }
+  try {
+    const bitmap = await createImageBitmap(blob);
+    try {
+      const scale = Math.min(
+        1,
+        REFERENCE_MAX_DIMENSION / Math.max(bitmap.width, bitmap.height),
+      );
+      const width = Math.max(1, Math.round(bitmap.width * scale));
+      const height = Math.max(1, Math.round(bitmap.height * scale));
+      const target = document.createElement('canvas');
+      target.width = width;
+      target.height = height;
+      target.getContext('2d')?.drawImage(bitmap, 0, 0, width, height);
+      const webp = await new Promise<Blob | null>((resolve) =>
+        target.toBlob(resolve, 'image/webp', REFERENCE_ENCODE_QUALITY),
+      );
+      if (webp && webp.size < blob.size) {
+        return { blob: webp, mimeType: 'image/webp' };
+      }
+      return null;
+    } finally {
+      bitmap.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
 function draftId(name: string, size: number): string {
   return `${name}-${size}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 async function fileToReference(file: File): Promise<ReferenceDraft> {
+  const compressed = await compressReferenceImage(file);
+  const source = compressed?.blob ?? file;
   return {
-    id: draftId(file.name, file.size),
+    id: draftId(file.name, source.size),
     name: file.name,
-    mimeType: file.type as ReferenceDraft['mimeType'],
-    data: await blobToBase64(file),
+    mimeType: compressed?.mimeType ?? (file.type as ReferenceDraft['mimeType']),
+    data: await blobToBase64(source),
     note: '',
-    previewUrl: URL.createObjectURL(file),
+    previewUrl: URL.createObjectURL(source),
   };
 }
 
@@ -105,13 +157,15 @@ async function blobToGalleryReference(
   name: string,
 ): Promise<ReferenceDraft | null> {
   if (!REFERENCE_ACCEPTED_MIME.has(blob.type)) return null;
+  const compressed = await compressReferenceImage(blob);
+  const source = compressed?.blob ?? blob;
   return {
-    id: draftId(name, blob.size),
+    id: draftId(name, source.size),
     name,
-    mimeType: blob.type as ReferenceDraft['mimeType'],
-    data: await blobToBase64(blob),
+    mimeType: compressed?.mimeType ?? (blob.type as ReferenceDraft['mimeType']),
+    data: await blobToBase64(source),
     note: '',
-    previewUrl: URL.createObjectURL(blob),
+    previewUrl: URL.createObjectURL(source),
   };
 }
 
@@ -340,10 +394,13 @@ export function ImageStudioPage() {
           ...(ref.note.trim() ? { note: ref.note.trim() } : {}),
         }));
       }
+      // Upload size scales with base64 reference images; timeout accordingly.
+      const payloadBytes = JSON.stringify(body).length;
+      const timeoutMs = Math.max(130_000, computeUploadTimeoutMs(payloadBytes));
       await api.post(
         `/api/groups/${encodeURIComponent(jid)}/generate-image`,
         body,
-        130_000,
+        timeoutMs,
       );
       setPrompt('');
       // Keep references attached: iterative image-to-image workflows usually

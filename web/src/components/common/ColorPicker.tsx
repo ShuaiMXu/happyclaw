@@ -7,9 +7,18 @@ export interface ColorPickerProps {
 }
 
 const COLORS = [
-  '#ff6600', '#0ea5e9', '#6366f1', '#8b5cf6',
-  '#ec4899', '#f43f5e', '#ef4444', '#0d9488',
-  '#eab308', '#22c55e', '#14b8a6', '#64748b',
+  '#ff6600',
+  '#0ea5e9',
+  '#6366f1',
+  '#8b5cf6',
+  '#ec4899',
+  '#f43f5e',
+  '#ef4444',
+  '#0d9488',
+  '#eab308',
+  '#22c55e',
+  '#14b8a6',
+  '#64748b',
 ];
 
 export function ColorPicker({ value, onChange }: ColorPickerProps) {
@@ -23,11 +32,14 @@ export function ColorPicker({ value, onChange }: ColorPickerProps) {
           onClick={() => onChange(color)}
           className={cn(
             'w-8 h-8 rounded-full cursor-pointer transition-transform hover:scale-110 flex items-center justify-center',
-            value === color && 'ring-2 ring-primary ring-offset-2 ring-offset-background',
+            value === color &&
+              'ring-2 ring-primary ring-offset-2 ring-offset-background',
           )}
           style={{ backgroundColor: color }}
         >
-          {value === color && <Check className="w-4 h-4 text-white" strokeWidth={2.5} />}
+          {value === color && (
+            <Check className="w-4 h-4 text-white" strokeWidth={2.5} />
+          )}
         </button>
       ))}
     </div>

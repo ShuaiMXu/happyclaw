@@ -23,13 +23,22 @@ import {
 import { Card } from '@/components/ui/card';
 import type { Permission, UserPublic } from '../../stores/auth';
 import { useUsersStore, type UserQuery } from '../../stores/users';
-import { getErrorMessage, samePermissions, PERMISSION_LABELS, type TabNotification } from './utils';
+import {
+  getErrorMessage,
+  samePermissions,
+  PERMISSION_LABELS,
+  type TabNotification,
+} from './utils';
 
 interface UserListTabProps extends TabNotification {
   currentUser: UserPublic | null;
 }
 
-export function UserListTab({ currentUser, setNotice, setError }: UserListTabProps) {
+export function UserListTab({
+  currentUser,
+  setNotice,
+  setError,
+}: UserListTabProps) {
   const {
     users,
     totalUsers,
@@ -47,7 +56,13 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
     revokeUserSessions,
   } = useUsersStore();
 
-  const [query, setQuery] = useState<UserQuery>({ q: '', role: 'all', status: 'all', page: 1, pageSize: 20 });
+  const [query, setQuery] = useState<UserQuery>({
+    q: '',
+    role: 'all',
+    status: 'all',
+    page: 1,
+    pageSize: 20,
+  });
   const [showCreate, setShowCreate] = useState(false);
   const [creating, setCreating] = useState(false);
   const [newUsername, setNewUsername] = useState('');
@@ -64,12 +79,15 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
   const [editNotes, setEditNotes] = useState('');
   const [editPermissions, setEditPermissions] = useState<Permission[]>([]);
   const [editDisableReason, setEditDisableReason] = useState('');
-  const [changingPasswordId, setChangingPasswordId] = useState<string | null>(null);
+  const [changingPasswordId, setChangingPasswordId] = useState<string | null>(
+    null,
+  );
   const [changePasswordValue, setChangePasswordValue] = useState('');
   const [changingPasswordLoading, setChangingPasswordLoading] = useState(false);
   const isAdmin = currentUser?.role === 'admin';
   const ownPermissions = currentUser?.permissions || [];
-  const canOperateTargetUser = (user: UserPublic) => isAdmin || user.role !== 'admin';
+  const canOperateTargetUser = (user: UserPublic) =>
+    isAdmin || user.role !== 'admin';
   const assignablePermissions = useMemo(() => {
     if (isAdmin) return permissions;
     const ownSet = new Set(ownPermissions);
@@ -217,11 +235,17 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
     }
   };
 
-  const changeStatus = async (user: UserPublic, status: 'active' | 'disabled' | 'deleted') => {
+  const changeStatus = async (
+    user: UserPublic,
+    status: 'active' | 'disabled' | 'deleted',
+  ) => {
     try {
       await updateUser(user.id, {
         status,
-        disable_reason: status === 'disabled' ? user.disable_reason || 'disabled_by_admin' : null,
+        disable_reason:
+          status === 'disabled'
+            ? user.disable_reason || 'disabled_by_admin'
+            : null,
       });
       setNotice(`用户 ${user.username} 状态已更新`);
       await fetchUsers(query);
@@ -271,16 +295,30 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
           placeholder="搜索用户名/显示名/备注"
           className="w-full sm:w-64"
         />
-        <Select value={query.role || 'all'} onValueChange={(value) => applyQuery({ role: value as UserQuery['role'], page: 1 })}>
-          <SelectTrigger className="w-auto"><SelectValue /></SelectTrigger>
+        <Select
+          value={query.role || 'all'}
+          onValueChange={(value) =>
+            applyQuery({ role: value as UserQuery['role'], page: 1 })
+          }
+        >
+          <SelectTrigger className="w-auto">
+            <SelectValue />
+          </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">全部角色</SelectItem>
             <SelectItem value="admin">管理员</SelectItem>
             <SelectItem value="member">成员</SelectItem>
           </SelectContent>
         </Select>
-        <Select value={query.status || 'all'} onValueChange={(value) => applyQuery({ status: value as UserQuery['status'], page: 1 })}>
-          <SelectTrigger className="w-auto"><SelectValue /></SelectTrigger>
+        <Select
+          value={query.status || 'all'}
+          onValueChange={(value) =>
+            applyQuery({ status: value as UserQuery['status'], page: 1 })
+          }
+        >
+          <SelectTrigger className="w-auto">
+            <SelectValue />
+          </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">全部状态</SelectItem>
             <SelectItem value="active">启用</SelectItem>
@@ -292,7 +330,11 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
           <UserPlus className="w-4 h-4" />
           创建用户
         </Button>
-        <Button variant="outline" onClick={() => fetchUsers(query)} disabled={loading}>
+        <Button
+          variant="outline"
+          onClick={() => fetchUsers(query)}
+          disabled={loading}
+        >
           <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           刷新
         </Button>
@@ -323,7 +365,10 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
               placeholder="显示名称（可选）"
               className="text-sm"
             />
-            <Select value={newRole} onValueChange={(value) => setNewRole(value as 'admin' | 'member')}>
+            <Select
+              value={newRole}
+              onValueChange={(value) => setNewRole(value as 'admin' | 'member')}
+            >
               <SelectTrigger className="text-sm">
                 <SelectValue />
               </SelectTrigger>
@@ -351,23 +396,25 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
 
           {templates.length > 0 && (
             <div>
-              <div className="text-xs text-muted-foreground mb-1">快捷权限模板</div>
+              <div className="text-xs text-muted-foreground mb-1">
+                快捷权限模板
+              </div>
               <div className="flex flex-wrap gap-2">
                 {templates
                   .filter((item) => isAdmin || item.role !== 'admin')
                   .map((item) => (
-                  <button
-                    key={item.key}
-                    type="button"
-                    onClick={() => {
-                      setNewRole(item.role);
-                      setNewPermissions(item.permissions);
-                    }}
-                    className="px-2.5 py-1.5 rounded-md border border-border text-xs hover:bg-muted/50 cursor-pointer"
-                  >
-                    {item.label}
-                  </button>
-                ))}
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={() => {
+                        setNewRole(item.role);
+                        setNewPermissions(item.permissions);
+                      }}
+                      className="px-2.5 py-1.5 rounded-md border border-border text-xs hover:bg-muted/50 cursor-pointer"
+                    >
+                      {item.label}
+                    </button>
+                  ))}
               </div>
             </div>
           )}
@@ -377,11 +424,20 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
               <div className="text-xs text-muted-foreground mb-1">权限明细</div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 {assignablePermissions.map((perm) => (
-                  <label key={perm} className="inline-flex items-center gap-2 text-xs text-foreground">
+                  <label
+                    key={perm}
+                    className="inline-flex items-center gap-2 text-xs text-foreground"
+                  >
                     <input
                       type="checkbox"
                       checked={newPermissions.includes(perm)}
-                      onChange={() => togglePermission(newPermissions, setNewPermissions, perm)}
+                      onChange={() =>
+                        togglePermission(
+                          newPermissions,
+                          setNewPermissions,
+                          perm,
+                        )
+                      }
                     />
                     {PERMISSION_LABELS[perm] || perm}
                   </label>
@@ -395,31 +451,47 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
               {creating && <Loader2 className="w-4 h-4 animate-spin" />}
               创建
             </Button>
-            <Button variant="outline" onClick={() => setShowCreate(false)}>取消</Button>
+            <Button variant="outline" onClick={() => setShowCreate(false)}>
+              取消
+            </Button>
           </div>
         </Card>
       )}
 
       <Card className="divide-y divide-border overflow-hidden">
         {users.length === 0 ? (
-          <div className="p-6 text-center text-sm text-muted-foreground">暂无用户</div>
+          <div className="p-6 text-center text-sm text-muted-foreground">
+            暂无用户
+          </div>
         ) : (
           users.map((user) => (
             <div key={user.id} className="px-5 py-4 space-y-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-sm font-medium text-foreground">{user.display_name || user.username}</span>
-                    <span className="text-xs text-muted-foreground">@{user.username}</span>
-                    <span className={`text-xs px-1.5 py-0.5 rounded ${
-                      user.role === 'admin' ? 'bg-brand-100 text-primary' : 'bg-muted text-foreground'
-                    }`}>
+                    <span className="text-sm font-medium text-foreground">
+                      {user.display_name || user.username}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      @{user.username}
+                    </span>
+                    <span
+                      className={`text-xs px-1.5 py-0.5 rounded ${
+                        user.role === 'admin'
+                          ? 'bg-brand-100 text-primary'
+                          : 'bg-muted text-foreground'
+                      }`}
+                    >
                       {user.role}
                     </span>
                     {user.status !== 'active' && (
-                      <span className={`text-xs px-1.5 py-0.5 rounded ${
-                        user.status === 'deleted' ? 'bg-error-bg text-error' : 'bg-warning-bg text-warning'
-                      }`}>
+                      <span
+                        className={`text-xs px-1.5 py-0.5 rounded ${
+                          user.status === 'deleted'
+                            ? 'bg-error-bg text-error'
+                            : 'bg-warning-bg text-warning'
+                        }`}
+                      >
                         {user.status}
                       </span>
                     )}
@@ -430,10 +502,25 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                     )}
                   </div>
                   <div className="text-xs text-muted-foreground mt-1">
-                    最近登录: {user.last_login_at ? new Date(user.last_login_at).toLocaleString('zh-CN') : '-'} · 最后活跃: {user.last_active_at ? new Date(user.last_active_at).toLocaleString('zh-CN') : '-'}
+                    最近登录:{' '}
+                    {user.last_login_at
+                      ? new Date(user.last_login_at).toLocaleString('zh-CN')
+                      : '-'}{' '}
+                    · 最后活跃:{' '}
+                    {user.last_active_at
+                      ? new Date(user.last_active_at).toLocaleString('zh-CN')
+                      : '-'}
                   </div>
-                  {user.notes && <div className="text-xs text-muted-foreground mt-1">备注: {user.notes}</div>}
-                  {user.disable_reason && <div className="text-xs text-warning mt-1">禁用原因: {user.disable_reason}</div>}
+                  {user.notes && (
+                    <div className="text-xs text-muted-foreground mt-1">
+                      备注: {user.notes}
+                    </div>
+                  )}
+                  {user.disable_reason && (
+                    <div className="text-xs text-warning mt-1">
+                      禁用原因: {user.disable_reason}
+                    </div>
+                  )}
                 </div>
 
                 {canOperateTargetUser(user) && (
@@ -515,20 +602,27 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                     onChange={(e) => setChangePasswordValue(e.target.value)}
                     placeholder="输入新密码"
                     className="flex-1 text-sm h-auto px-2.5 py-1.5"
-                    onKeyDown={(e) => e.key === 'Enter' && handleChangePassword(user)}
+                    onKeyDown={(e) =>
+                      e.key === 'Enter' && handleChangePassword(user)
+                    }
                   />
                   <Button
                     size="sm"
                     onClick={() => handleChangePassword(user)}
                     disabled={changingPasswordLoading}
                   >
-                    {changingPasswordLoading && <Loader2 className="w-4 h-4 animate-spin" />}
+                    {changingPasswordLoading && (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    )}
                     确认
                   </Button>
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => { setChangingPasswordId(null); setChangePasswordValue(''); }}
+                    onClick={() => {
+                      setChangingPasswordId(null);
+                      setChangePasswordValue('');
+                    }}
                   >
                     取消
                   </Button>
@@ -546,7 +640,12 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                       className="text-sm h-auto px-2.5 py-1.5"
                     />
                     {isAdmin ? (
-                      <Select value={editRole} onValueChange={(value) => setEditRole(value as 'admin' | 'member')}>
+                      <Select
+                        value={editRole}
+                        onValueChange={(value) =>
+                          setEditRole(value as 'admin' | 'member')
+                        }
+                      >
                         <SelectTrigger className="text-sm h-auto px-2.5 py-1.5">
                           <SelectValue />
                         </SelectTrigger>
@@ -588,11 +687,20 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                   {assignablePermissions.length > 0 && (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                       {assignablePermissions.map((perm) => (
-                        <label key={perm} className="inline-flex items-center gap-2 text-xs">
+                        <label
+                          key={perm}
+                          className="inline-flex items-center gap-2 text-xs"
+                        >
                           <input
                             type="checkbox"
                             checked={editPermissions.includes(perm)}
-                            onChange={() => togglePermission(editPermissions, setEditPermissions, perm)}
+                            onChange={() =>
+                              togglePermission(
+                                editPermissions,
+                                setEditPermissions,
+                                perm,
+                              )
+                            }
                           />
                           {PERMISSION_LABELS[perm] || perm}
                         </label>
@@ -601,7 +709,12 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                   )}
                   <div className="flex gap-2">
                     <Button onClick={() => submitEdit(user)}>保存</Button>
-                    <Button variant="outline" onClick={() => setEditingId(null)}>取消</Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => setEditingId(null)}
+                    >
+                      取消
+                    </Button>
                   </div>
                 </div>
               )}
@@ -615,7 +728,9 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
         <div className="flex items-center gap-2">
           <Button
             variant="outline"
-            onClick={() => applyQuery({ page: Math.max(1, (query.page || 1) - 1) })}
+            onClick={() =>
+              applyQuery({ page: Math.max(1, (query.page || 1) - 1) })
+            }
             disabled={(query.page || 1) <= 1}
           >
             上一页
