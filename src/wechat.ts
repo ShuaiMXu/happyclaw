@@ -39,6 +39,11 @@ const MSG_SPLIT_LIMIT = 2000; // WeChat has stricter text limits than other chan
 
 const LONGPOLL_EXTRA_TIMEOUT_MS = 5000;
 const DEFAULT_LONGPOLL_TIMEOUT_MS = 35000;
+// Same class of bug as the Feishu `defaultHttpInstance` fix: callers of `apiPost`
+// that omitted `timeoutMs` (sendMessageApi, sendTypingApi, getTypingTicket, media
+// sends) relied entirely on the undici dispatcher's own defaults, which are not
+// configured with a bound here — a stalled connection would hang indefinitely.
+const DEFAULT_API_REQUEST_TIMEOUT_MS = 30000;
 
 const RECONNECT_MIN_DELAY_MS = 3000;
 const RECONNECT_MAX_DELAY_MS = 60000;
@@ -536,7 +541,7 @@ export function createWeChatConnection(
   async function apiPost<T = any>(
     endpoint: string,
     body: Record<string, unknown>,
-    timeoutMs?: number,
+    timeoutMs: number = DEFAULT_API_REQUEST_TIMEOUT_MS,
     trackAsPollRequest = false,
   ): Promise<T> {
     const bodyStr = JSON.stringify(body);
@@ -545,9 +550,7 @@ export function createWeChatConnection(
 
     const controller = new AbortController();
     if (trackAsPollRequest) activePollController = controller;
-    const timer = timeoutMs
-      ? setTimeout(() => controller.abort(), timeoutMs)
-      : undefined;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const res = await fetchImpl(url.toString(), {

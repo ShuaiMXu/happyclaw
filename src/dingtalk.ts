@@ -54,6 +54,12 @@ const MSG_SPLIT_LIMIT = 4000; // DingTalk markdown card limit
 const IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024;
 // Minimum valid image size (bytes) — discard responses that are too small to be real images
 const MIN_IMAGE_SIZE = 500;
+// Same class of bug as the Feishu `defaultHttpInstance` fix: raw `https.request`
+// calls below have no socket timeout, so a stalled TCP/TLS handshake hangs the
+// underlying promise forever instead of surfacing a real error.
+const DINGTALK_TOKEN_REQUEST_TIMEOUT_MS = 15_000;
+const DINGTALK_API_REQUEST_TIMEOUT_MS = 30_000;
+const DINGTALK_TRANSFER_TIMEOUT_MS = 60_000; // file/image upload & download
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -492,6 +498,9 @@ export function createDingTalkConnection(
         },
       );
       req.on('error', reject);
+      req.setTimeout(DINGTALK_TOKEN_REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error('DingTalk token request timed out'));
+      });
       req.end();
     });
   }
@@ -554,6 +563,9 @@ export function createDingTalkConnection(
         },
       );
       req.on('error', reject);
+      req.setTimeout(DINGTALK_API_REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error(`DingTalk API ${method} ${path} timed out`));
+      });
       if (bodyStr) req.write(bodyStr);
       req.end();
     });
@@ -757,6 +769,9 @@ export function createDingTalkConnection(
         },
       );
       req.on('error', reject);
+      req.setTimeout(DINGTALK_API_REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error('DingTalk sendViaSessionWebhook timed out'));
+      });
       req.write(JSON.stringify(body));
       req.end();
     });
@@ -817,6 +832,9 @@ export function createDingTalkConnection(
         },
       );
       req.on('error', reject);
+      req.setTimeout(DINGTALK_API_REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error('DingTalk batchSend request timed out'));
+      });
       req.write(body);
       req.end();
     });
@@ -903,6 +921,9 @@ export function createDingTalkConnection(
         },
       );
       req.on('error', reject);
+      req.setTimeout(DINGTALK_API_REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error('DingTalk sendViaGroupMessagesAPI timed out'));
+      });
       req.write(body);
       req.end();
     });
@@ -922,7 +943,7 @@ export function createDingTalkConnection(
           }
           const parsedUrl = new URL(reqUrl);
           const protocol = parsedUrl.protocol === 'https:' ? https : http;
-          protocol
+          const req = protocol
             .get(reqUrl, (res) => {
               if (
                 res.statusCode &&
@@ -947,6 +968,9 @@ export function createDingTalkConnection(
               res.on('error', reject);
             })
             .on('error', reject);
+          req.setTimeout(DINGTALK_TRANSFER_TIMEOUT_MS, () => {
+            req.destroy(new Error('DingTalk image download timed out'));
+          });
         };
         doRequest(url);
       });
@@ -1017,6 +1041,9 @@ export function createDingTalkConnection(
           },
         );
         req.on('error', reject);
+        req.setTimeout(DINGTALK_API_REQUEST_TIMEOUT_MS, () => {
+          req.destroy(new Error('DingTalk download URL request timed out'));
+        });
         req.write(body);
         req.end();
       },
@@ -1088,6 +1115,9 @@ export function createDingTalkConnection(
           },
         );
         req.on('error', reject);
+        req.setTimeout(DINGTALK_TRANSFER_TIMEOUT_MS, () => {
+          req.destroy(new Error('DingTalk image download timed out'));
+        });
         req.end();
       });
 
@@ -1177,6 +1207,9 @@ export function createDingTalkConnection(
           },
         );
         req.on('error', reject);
+        req.setTimeout(DINGTALK_TRANSFER_TIMEOUT_MS, () => {
+          req.destroy(new Error('DingTalk file download timed out'));
+        });
         req.end();
       });
 
@@ -1259,6 +1292,9 @@ export function createDingTalkConnection(
           },
         );
         req.on('error', reject);
+        req.setTimeout(DINGTALK_TRANSFER_TIMEOUT_MS, () => {
+          req.destroy(new Error('DingTalk media upload timed out'));
+        });
         req.write(body);
         req.end();
       });
@@ -2005,6 +2041,13 @@ export function createDingTalkConnection(
             logger.debug(
               'Temporarily disabled axios global proxy for dingtalk-stream SDK',
             );
+          }
+          // `dingtalk-stream` calls the bare `axios` module internally (token
+          // fetch + WS endpoint resolution) with no timeout configured, same
+          // failure mode as the Feishu `defaultHttpInstance` bug — bound it
+          // once, permanently, unlike the proxy setting which is restored below.
+          if (axios.defaults && !axios.defaults.timeout) {
+            axios.defaults.timeout = DINGTALK_API_REQUEST_TIMEOUT_MS;
           }
 
           // Create DWClient
