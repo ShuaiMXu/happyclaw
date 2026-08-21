@@ -19,12 +19,17 @@ export type ImageReference = {
 
 /** Resolution tier: "4k" targets ~8.3MP (4K UHD budget), "2k" is exactly a
  * quarter of that (half the linear resolution in each dimension), matching
- * the conventional 3840x2160 / 1920x1080 relationship. */
+ * the conventional 3840x2160 / 1920x1080 relationship. Both are still
+ * accepted here (and by the studio composer's recipe-reuse path, for old
+ * generations) but '4k' is no longer offered as a fresh choice — the
+ * upstream image backend ignores the `size` request and caps real output
+ * well below either nominal tier regardless, so requesting '4k' buys
+ * nothing over '2k' in practice. */
 export const IMAGE_QUALITIES = ['2k', '4k'] as const;
 export type ImageQuality = (typeof IMAGE_QUALITIES)[number];
-export const DEFAULT_IMAGE_QUALITY: ImageQuality = '4k';
+export const DEFAULT_IMAGE_QUALITY: ImageQuality = '2k';
 
-export const IMAGE_ASPECT_RATIOS = [
+export const IMAGE_ASPECT_RATIO_PRESETS = [
   '21:9',
   '16:9',
   '3:2',
@@ -33,6 +38,15 @@ export const IMAGE_ASPECT_RATIOS = [
   '3:4',
   '2:3',
   '9:16',
+] as const;
+export type ImageAspectRatioPreset =
+  (typeof IMAGE_ASPECT_RATIO_PRESETS)[number];
+// 'original' means "no fixed ratio — match the first reference image's exact
+// aspect ratio", resolved dynamically in resolveImageSize() below instead of
+// through the preset lookup table.
+export const IMAGE_ASPECT_RATIOS = [
+  'original',
+  ...IMAGE_ASPECT_RATIO_PRESETS,
 ] as const;
 export type ImageAspectRatio = (typeof IMAGE_ASPECT_RATIOS)[number];
 export const DEFAULT_IMAGE_ASPECT_RATIO: ImageAspectRatio = '4:3';
@@ -43,7 +57,7 @@ export const DEFAULT_IMAGE_ASPECT_RATIO: ImageAspectRatio = '4:3';
 // overall image size the way a fixed long-edge would.
 const IMAGE_SIZE_BY_QUALITY: Record<
   ImageQuality,
-  Record<ImageAspectRatio, string>
+  Record<ImageAspectRatioPreset, string>
 > = {
   '4k': {
     '21:9': '4396x1884',
@@ -67,12 +81,45 @@ const IMAGE_SIZE_BY_QUALITY: Record<
   },
 };
 
+// Same pixel budgets as the preset table above, expressed directly so an
+// arbitrary ("original") ratio can be fit into them too.
+const PIXEL_BUDGET: Record<ImageQuality, number> = {
+  '4k': 3840 * 2160,
+  '2k': 1920 * 1080,
+};
+
+/** Fit an arbitrary width:height ratio into a quality tier's pixel budget,
+ * rounding to the nearest multiple of 16 like the preset table does. Used
+ * for 'original' mode, which matches a reference image's exact ratio instead
+ * of snapping to one of the fixed presets above. */
+function computeSizeForRatio(
+  quality: ImageQuality,
+  refWidth: number,
+  refHeight: number,
+): string {
+  const budget = PIXEL_BUDGET[quality];
+  const ratio = refWidth > 0 && refHeight > 0 ? refWidth / refHeight : 1;
+  const rawWidth = Math.sqrt(budget * ratio);
+  const rawHeight = rawWidth / ratio;
+  const width = Math.max(16, Math.round(rawWidth / 16) * 16);
+  const height = Math.max(16, Math.round(rawHeight / 16) * 16);
+  return `${width}x${height}`;
+}
+
 /** Resolve a quality tier + aspect ratio into the "WxH" string the upstream
- * Images API expects for `size`. */
+ * Images API expects for `size`. For 'original', `refDimensions` (the first
+ * reference image's actual pixel size) drives the ratio instead of a preset;
+ * when it's unavailable this falls back to the 4:3 preset. */
 export function resolveImageSize(
   quality: ImageQuality,
   aspectRatio: ImageAspectRatio,
+  refDimensions?: { width: number; height: number },
 ): string {
+  if (aspectRatio === 'original') {
+    return refDimensions
+      ? computeSizeForRatio(quality, refDimensions.width, refDimensions.height)
+      : IMAGE_SIZE_BY_QUALITY[quality]['4:3'];
+  }
   return IMAGE_SIZE_BY_QUALITY[quality][aspectRatio];
 }
 
@@ -88,6 +135,9 @@ export function describeImageRequirements(
   aspectRatio: ImageAspectRatio,
 ): string {
   const qualityLabel = quality === '4k' ? '4K 高清' : '2K';
+  if (aspectRatio === 'original') {
+    return `请生成画质为 ${qualityLabel} 的图片，画面比例需与第一张参考图完全一致，不要裁剪、留白或改变构图比例。`;
+  }
   const [w, h] = aspectRatio.split(':').map(Number);
   const orientation = w === h ? '正方形' : w > h ? '横版' : '竖版';
   return `请生成画质为 ${qualityLabel}、画面比例为 ${aspectRatio}（${orientation}）的图片。`;

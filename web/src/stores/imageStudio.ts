@@ -11,7 +11,10 @@ export interface ImageRecipeReference {
 }
 
 export type ImageQuality = '2k' | '4k';
+// 'original' means "no fixed ratio — match the first reference image's exact
+// aspect ratio" instead of one of the fixed presets below.
 export type ImageAspectRatio =
+  | 'original'
   | '21:9'
   | '16:9'
   | '3:2'
@@ -44,6 +47,29 @@ export interface GeneratedImageEntry {
   recipe?: ImageRecipe;
 }
 
+/** A reference image staged in the composer, not yet submitted. */
+export interface ReferenceDraft {
+  id: string;
+  name: string;
+  mimeType: 'image/png' | 'image/jpeg' | 'image/webp';
+  data: string; // base64
+  note: string;
+  previewUrl: string;
+  // Pixel dimensions of the original (pre-compression) image, when
+  // decodable — drives aspect-ratio auto-detection when this becomes the
+  // first reference image.
+  width?: number;
+  height?: number;
+}
+
+/** Either a plain value or a React-setState-style updater function. */
+type Updater<T> = T | ((prev: T) => T);
+function resolveUpdater<T>(updater: Updater<T>, prev: T): T {
+  return typeof updater === 'function'
+    ? (updater as (prev: T) => T)(prev)
+    : updater;
+}
+
 interface ImageStudioState {
   /** Gallery cache per workspace JID; survives page navigations. */
   galleries: Record<string, GeneratedImageEntry[]>;
@@ -57,6 +83,20 @@ interface ImageStudioState {
   /** Drop an entry locally after a successful delete request. */
   removeEntry: (jid: string, messageId: string) => void;
   clearGallery: (jid: string) => void;
+
+  // Compose-panel draft (prompt, quality, aspect ratio, staged reference
+  // images). Kept here rather than as page-local useState so it survives
+  // navigating away from and back to the studio page — only a successful
+  // generate reuses the same references on purpose; nothing should silently
+  // wipe the draft on unmount.
+  composePrompt: string;
+  composeQuality: ImageQuality;
+  composeAspectRatio: ImageAspectRatio;
+  composeReferences: ReferenceDraft[];
+  setComposePrompt: (updater: Updater<string>) => void;
+  setComposeQuality: (updater: Updater<ImageQuality>) => void;
+  setComposeAspectRatio: (updater: Updater<ImageAspectRatio>) => void;
+  setComposeReferences: (updater: Updater<ReferenceDraft[]>) => void;
 }
 
 const STALE_MS = 30_000;
@@ -253,6 +293,28 @@ export const useImageStudioStore = create<ImageStudioState>((set) => ({
       error: { ...s.error, [jid]: null },
     }));
   },
+
+  composePrompt: '',
+  // Only '2k' is actually offered in the composer UI right now — the
+  // upstream image backend ignores the size request and caps real output
+  // well below "4K" regardless, so a 4K default would be misleading.
+  composeQuality: '2k',
+  composeAspectRatio: '4:3',
+  composeReferences: [],
+  setComposePrompt: (updater) =>
+    set((s) => ({ composePrompt: resolveUpdater(updater, s.composePrompt) })),
+  setComposeQuality: (updater) =>
+    set((s) => ({
+      composeQuality: resolveUpdater(updater, s.composeQuality),
+    })),
+  setComposeAspectRatio: (updater) =>
+    set((s) => ({
+      composeAspectRatio: resolveUpdater(updater, s.composeAspectRatio),
+    })),
+  setComposeReferences: (updater) =>
+    set((s) => ({
+      composeReferences: resolveUpdater(updater, s.composeReferences),
+    })),
 }));
 
 /**

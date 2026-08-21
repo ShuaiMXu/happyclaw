@@ -28,6 +28,7 @@ import {
   type GeneratedImageEntry,
   type ImageAspectRatio,
   type ImageQuality,
+  type ReferenceDraft,
 } from '../stores/imageStudio';
 import { cn } from '@/lib/utils';
 import { EmptyState } from '@/components/common/EmptyState';
@@ -74,24 +75,19 @@ const REFERENCE_ACCEPTED_MIME = new Set([
 // 100%-pixel zoom level when the viewport is small.
 const LIGHTBOX_MAX_ZOOM = 32;
 
-interface ReferenceDraft {
-  id: string;
-  name: string;
-  mimeType: 'image/png' | 'image/jpeg' | 'image/webp';
-  data: string; // base64
-  note: string;
-  previewUrl: string;
-}
-
 interface PromptPreset {
   id: string;
   label: string;
   prompt: string;
 }
 
+// Only one real tier right now: the upstream image backend ignores the
+// `size` request parameter and caps actual output well below "4K" (or even
+// nominal "2K") regardless of what's asked for, so a real 4K/2K choice would
+// be cosmetic. Kept as an array (rather than a bare constant) so recipe
+// validation below stays a one-line `.some()` check.
 const QUALITY_OPTIONS: Array<{ value: ImageQuality; label: string }> = [
-  { value: '4k', label: '4K' },
-  { value: '2k', label: '2K' },
+  { value: '2k', label: '标准2K' },
 ];
 
 // Aspect ratio picker: a segmented control matching the quality control's
@@ -99,11 +95,15 @@ const QUALITY_OPTIONS: Array<{ value: ImageQuality; label: string }> = [
 // shape) when idle; the selected option shows its ratio text instead (see
 // the render below). The ratio value is also revealed on hover (desktop) or
 // tap (touch) via a small floating label — see `ratioHint` below.
+// 'original' has no fixed w/h glyph of its own (it means "whatever the first
+// reference image's ratio is") — its w/h here are unused placeholders, the
+// render below special-cases it to a "原图" label instead of a glyph.
 const ASPECT_RATIO_OPTIONS: Array<{
   value: ImageAspectRatio;
   w: number;
   h: number;
 }> = [
+  { value: 'original', w: 1, h: 1 },
   { value: '21:9', w: 21, h: 9 },
   { value: '16:9', w: 16, h: 9 },
   { value: '3:2', w: 3, h: 2 },
@@ -113,6 +113,29 @@ const ASPECT_RATIO_OPTIONS: Array<{
   { value: '2:3', w: 2, h: 3 },
   { value: '9:16', w: 9, h: 16 },
 ];
+
+/** Nearest fixed preset (excluding 'original' itself) for a reference
+ * image's actual pixel dimensions, compared in log-ratio space so e.g. a
+ * slightly-off-square image doesn't get pulled toward 21:9 over 1:1. */
+function detectAspectRatioOption(dimensions: {
+  width?: number;
+  height?: number;
+}): ImageAspectRatio | null {
+  const { width, height } = dimensions;
+  if (!width || !height) return null;
+  const targetLogRatio = Math.log(width / height);
+  let best: ImageAspectRatio = '1:1';
+  let bestDiff = Infinity;
+  for (const opt of ASPECT_RATIO_OPTIONS) {
+    if (opt.value === 'original') continue;
+    const diff = Math.abs(Math.log(opt.w / opt.h) - targetLogRatio);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = opt.value;
+    }
+  }
+  return best;
+}
 
 /** Small rectangle glyph whose proportions mirror the aspect ratio itself. */
 function AspectRatioGlyph({ w, h }: { w: number; h: number }) {
@@ -194,8 +217,26 @@ function draftId(name: string, size: number): string {
   return `${name}-${size}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Decode an image blob just far enough to read its pixel dimensions. */
+async function readImageDimensions(
+  blob: Blob,
+): Promise<{ width: number; height: number } | null> {
+  if (typeof createImageBitmap === 'undefined') return null;
+  try {
+    const bitmap = await createImageBitmap(blob);
+    const { width, height } = bitmap;
+    bitmap.close();
+    return { width, height };
+  } catch {
+    return null;
+  }
+}
+
 async function fileToReference(file: File): Promise<ReferenceDraft> {
-  const compressed = await compressReferenceImage(file);
+  const [compressed, dimensions] = await Promise.all([
+    compressReferenceImage(file),
+    readImageDimensions(file),
+  ]);
   const source = compressed?.blob ?? file;
   return {
     id: draftId(file.name, source.size),
@@ -204,6 +245,8 @@ async function fileToReference(file: File): Promise<ReferenceDraft> {
     data: await blobToBase64(source),
     note: '',
     previewUrl: URL.createObjectURL(source),
+    width: dimensions?.width,
+    height: dimensions?.height,
   };
 }
 
@@ -213,7 +256,10 @@ async function blobToGalleryReference(
   name: string,
 ): Promise<ReferenceDraft | null> {
   if (!REFERENCE_ACCEPTED_MIME.has(blob.type)) return null;
-  const compressed = await compressReferenceImage(blob);
+  const [compressed, dimensions] = await Promise.all([
+    compressReferenceImage(blob),
+    readImageDimensions(blob),
+  ]);
   const source = compressed?.blob ?? blob;
   return {
     id: draftId(name, source.size),
@@ -222,6 +268,8 @@ async function blobToGalleryReference(
     data: await blobToBase64(source),
     note: '',
     previewUrl: URL.createObjectURL(source),
+    width: dimensions?.width,
+    height: dimensions?.height,
   };
 }
 
@@ -290,9 +338,15 @@ export function ImageStudioPage() {
     };
   }, [upsertEntries]);
 
-  const [prompt, setPrompt] = useState('');
-  const [quality, setQuality] = useState<ImageQuality>('4k');
-  const [aspectRatio, setAspectRatio] = useState<ImageAspectRatio>('4:3');
+  // Compose-panel draft (prompt/quality/aspect ratio/staged references)
+  // lives in the shared store, not page-local useState, so it survives
+  // navigating away from and back to this page — see stores/imageStudio.ts.
+  const prompt = useImageStudioStore((s) => s.composePrompt);
+  const setPrompt = useImageStudioStore((s) => s.setComposePrompt);
+  const quality = useImageStudioStore((s) => s.composeQuality);
+  const setQuality = useImageStudioStore((s) => s.setComposeQuality);
+  const aspectRatio = useImageStudioStore((s) => s.composeAspectRatio);
+  const setAspectRatio = useImageStudioStore((s) => s.setComposeAspectRatio);
   // Floating label shown above an aspect-ratio glyph: on hover for desktop,
   // briefly on tap for touch devices (which have no hover state).
   const [ratioHint, setRatioHint] = useState<ImageAspectRatio | null>(null);
@@ -310,7 +364,8 @@ export function ImageStudioPage() {
         clearTimeout(ratioHintTimeoutRef.current);
     };
   }, []);
-  const [references, setReferences] = useState<ReferenceDraft[]>([]);
+  const references = useImageStudioStore((s) => s.composeReferences);
+  const setReferences = useImageStudioStore((s) => s.setComposeReferences);
   const [referenceError, setReferenceError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
@@ -513,41 +568,52 @@ export function ImageStudioPage() {
   const draggedImageRef = useRef<GeneratedImageEntry | null>(null);
   const [isDraggingOverRefZone, setIsDraggingOverRefZone] = useState(false);
 
-  // Revoke object URLs on unmount to avoid leaking blobs.
-  useEffect(() => {
-    return () => {
-      for (const ref of references) URL.revokeObjectURL(ref.previewUrl);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // Reference preview blob URLs are intentionally *not* revoked on unmount:
+  // the draft (references included) now lives in the shared store and must
+  // still render correctly if the user navigates away and back to this page.
+  // They're revoked individually instead, wherever a reference is actually
+  // removed or replaced (removeReference, applyRecipe below) and otherwise
+  // released by the browser when the tab closes.
 
-  const addReferenceFiles = useCallback(async (files: FileList | File[]) => {
-    setReferenceError(null);
-    const incoming = Array.from(files);
-    const accepted: ReferenceDraft[] = [];
-    for (const file of incoming) {
-      if (!REFERENCE_ACCEPTED_MIME.has(file.type)) {
-        setReferenceError(
-          `「${file.name}」不是支持的图片格式（仅 PNG / JPEG / WebP）。`,
-        );
-        continue;
+  const addReferenceFiles = useCallback(
+    async (files: FileList | File[]) => {
+      setReferenceError(null);
+      const incoming = Array.from(files);
+      const accepted: ReferenceDraft[] = [];
+      for (const file of incoming) {
+        if (!REFERENCE_ACCEPTED_MIME.has(file.type)) {
+          setReferenceError(
+            `「${file.name}」不是支持的图片格式（仅 PNG / JPEG / WebP）。`,
+          );
+          continue;
+        }
+        if (file.size > MAX_REFERENCE_FILE_BYTES) {
+          setReferenceError(`「${file.name}」超过 8 MB 参考图大小限制。`);
+          continue;
+        }
+        accepted.push(await fileToReference(file));
       }
-      if (file.size > MAX_REFERENCE_FILE_BYTES) {
-        setReferenceError(`「${file.name}」超过 8 MB 参考图大小限制。`);
-        continue;
+      if (accepted.length === 0) return;
+      // The very first reference image sets the composition's aspect ratio
+      // (matches the semantics of the "原图" option below): auto-select the
+      // preset closest to its actual pixel dimensions instead of leaving
+      // whatever ratio was previously selected.
+      const isFirstReference = references.length === 0;
+      setReferences((prev) => {
+        const next = [...prev, ...accepted];
+        if (next.length > MAX_REFERENCES) {
+          setReferenceError(`参考图最多 ${MAX_REFERENCES} 张。`);
+          return next.slice(0, MAX_REFERENCES);
+        }
+        return next;
+      });
+      if (isFirstReference) {
+        const detected = detectAspectRatioOption(accepted[0]);
+        if (detected) setAspectRatio(detected);
       }
-      accepted.push(await fileToReference(file));
-    }
-    if (accepted.length === 0) return;
-    setReferences((prev) => {
-      const next = [...prev, ...accepted];
-      if (next.length > MAX_REFERENCES) {
-        setReferenceError(`参考图最多 ${MAX_REFERENCES} 张。`);
-        return next.slice(0, MAX_REFERENCES);
-      }
-      return next;
-    });
-  }, []);
+    },
+    [references.length],
+  );
 
   const addReferenceFromGalleryImage = useCallback(
     async (jid: string, entry: GeneratedImageEntry) => {
@@ -574,6 +640,8 @@ export function ImageStudioPage() {
           );
           return;
         }
+        // Same first-reference auto-detection as addReferenceFiles above.
+        const isFirstReference = references.length === 0;
         setReferences((prev) => {
           if (prev.length >= MAX_REFERENCES) {
             setReferenceError(`参考图最多 ${MAX_REFERENCES} 张。`);
@@ -581,6 +649,10 @@ export function ImageStudioPage() {
           }
           return [...prev, ref];
         });
+        if (isFirstReference) {
+          const detected = detectAspectRatioOption(ref);
+          if (detected) setAspectRatio(detected);
+        }
       } catch (err) {
         setReferenceError(errorMessage(err, '添加参考图失败，请稍后重试。'));
       }
@@ -592,7 +664,14 @@ export function ImageStudioPage() {
     setReferences((prev) => {
       const target = prev.find((r) => r.id === id);
       if (target) URL.revokeObjectURL(target.previewUrl);
-      return prev.filter((r) => r.id !== id);
+      const next = prev.filter((r) => r.id !== id);
+      // "原图" has no meaning without a reference image to match — fall back
+      // once the last one is removed instead of leaving a selection that
+      // would fail at generate time.
+      if (next.length === 0) {
+        setAspectRatio((cur) => (cur === 'original' ? '4:3' : cur));
+      }
+      return next;
     });
   }, []);
 
@@ -621,7 +700,7 @@ export function ImageStudioPage() {
         setQuality(
           QUALITY_OPTIONS.some((o) => o.value === recipe.quality)
             ? (recipe.quality as ImageQuality)
-            : '4k',
+            : '2k',
         );
         setAspectRatio(
           ASPECT_RATIO_OPTIONS.some((o) => o.value === recipe.aspectRatio)
@@ -725,9 +804,10 @@ export function ImageStudioPage() {
         body,
         timeoutMs,
       );
-      setPrompt('');
-      // Keep references attached: iterative image-to-image workflows usually
-      // tweak the prompt between runs with the same source images.
+      // Keep the prompt and references attached after a successful
+      // generation — iterative image-to-image workflows usually tweak the
+      // prompt between runs with the same source images, and clearing them
+      // immediately loses that context.
       await refresh();
     } catch (err) {
       setGenerateError(errorMessage(err, '图片生成失败，请稍后重试。'));
@@ -1014,25 +1094,28 @@ export function ImageStudioPage() {
                       <span className="text-xs text-muted-foreground">
                         画质
                       </span>
-                      <div className="flex overflow-hidden rounded-md border border-border">
-                        {QUALITY_OPTIONS.map((opt, index) => (
+                      {/* Only one real tier exists right now (see
+                          QUALITY_OPTIONS above) — this isn't a picker, just a
+                          fixed, already-selected label. Clicking it explains
+                          why instead of doing nothing silently. */}
+                      <Popover>
+                        <PopoverTrigger asChild>
                           <button
-                            key={opt.value}
                             type="button"
                             disabled={generating}
-                            onClick={() => setQuality(opt.value)}
-                            className={cn(
-                              'px-2.5 py-1 text-xs font-medium transition-colors',
-                              index > 0 && 'border-l border-border',
-                              quality === opt.value
-                                ? 'bg-primary text-primary-foreground'
-                                : 'bg-background text-muted-foreground hover:bg-accent hover:text-foreground',
-                            )}
+                            className="rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground"
                           >
-                            {opt.label}
+                            {QUALITY_OPTIONS[0].label}
                           </button>
-                        ))}
-                      </div>
+                        </PopoverTrigger>
+                        <PopoverContent
+                          side="top"
+                          align="start"
+                          className="w-auto px-3 py-1.5 text-xs"
+                        >
+                          暂不支持更高分辨率
+                        </PopoverContent>
+                      </Popover>
                     </div>
                     <div className="flex items-center gap-1.5">
                       <span className="text-xs text-muted-foreground">
@@ -1042,50 +1125,67 @@ export function ImageStudioPage() {
                           Idle options show a bold shape glyph; the selected
                           option shows its ratio text instead of the glyph. */}
                       <div className="flex overflow-hidden rounded-md border border-border">
-                        {ASPECT_RATIO_OPTIONS.map((opt, index) => (
-                          <div key={opt.value} className="relative">
-                            <button
-                              type="button"
-                              disabled={generating}
-                              aria-label={`画幅 ${opt.value}`}
-                              onMouseEnter={() => setRatioHint(opt.value)}
-                              onMouseLeave={() =>
-                                setRatioHint((cur) =>
-                                  cur === opt.value ? null : cur,
-                                )
-                              }
-                              onFocus={() => setRatioHint(opt.value)}
-                              onBlur={() =>
-                                setRatioHint((cur) =>
-                                  cur === opt.value ? null : cur,
-                                )
-                              }
-                              onClick={() => {
-                                setAspectRatio(opt.value);
-                                flashRatioHint(opt.value);
-                              }}
-                              className={cn(
-                                'flex h-7 min-w-7 items-center justify-center px-2 text-xs font-medium transition-colors',
-                                index > 0 && 'border-l border-border',
-                                aspectRatio === opt.value
-                                  ? 'bg-primary text-primary-foreground'
-                                  : 'bg-background text-muted-foreground hover:bg-accent hover:text-foreground',
-                              )}
-                            >
-                              {aspectRatio === opt.value ? (
-                                opt.value
-                              ) : (
-                                <AspectRatioGlyph w={opt.w} h={opt.h} />
-                              )}
-                            </button>
-                            {ratioHint === opt.value &&
-                              aspectRatio !== opt.value && (
-                                <span className="pointer-events-none absolute -top-6 left-1/2 z-10 -translate-x-1/2 whitespace-nowrap rounded bg-foreground px-1.5 py-0.5 text-[10px] font-medium text-background">
-                                  {opt.value}
-                                </span>
-                              )}
-                          </div>
-                        ))}
+                        {ASPECT_RATIO_OPTIONS.map((opt, index) => {
+                          const isOriginal = opt.value === 'original';
+                          // "原图" has no ratio of its own to show as a
+                          // glyph — always render its text label — and
+                          // needs a reference image to derive a ratio from.
+                          const needsReference =
+                            isOriginal && references.length === 0;
+                          const label = isOriginal ? '原图' : opt.value;
+                          return (
+                            <div key={opt.value} className="relative">
+                              <button
+                                type="button"
+                                disabled={generating || needsReference}
+                                aria-label={`画幅 ${label}`}
+                                title={
+                                  needsReference
+                                    ? '需要先添加一张参考图，才能按其比例生成'
+                                    : isOriginal
+                                      ? '不限制比例，与第一张参考图完全一致'
+                                      : undefined
+                                }
+                                onMouseEnter={() => setRatioHint(opt.value)}
+                                onMouseLeave={() =>
+                                  setRatioHint((cur) =>
+                                    cur === opt.value ? null : cur,
+                                  )
+                                }
+                                onFocus={() => setRatioHint(opt.value)}
+                                onBlur={() =>
+                                  setRatioHint((cur) =>
+                                    cur === opt.value ? null : cur,
+                                  )
+                                }
+                                onClick={() => {
+                                  setAspectRatio(opt.value);
+                                  flashRatioHint(opt.value);
+                                }}
+                                className={cn(
+                                  'flex h-7 min-w-7 items-center justify-center px-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40',
+                                  index > 0 && 'border-l border-border',
+                                  aspectRatio === opt.value
+                                    ? 'bg-primary text-primary-foreground'
+                                    : 'bg-background text-muted-foreground hover:bg-accent hover:text-foreground',
+                                )}
+                              >
+                                {isOriginal || aspectRatio === opt.value ? (
+                                  label
+                                ) : (
+                                  <AspectRatioGlyph w={opt.w} h={opt.h} />
+                                )}
+                              </button>
+                              {ratioHint === opt.value &&
+                                aspectRatio !== opt.value &&
+                                !isOriginal && (
+                                  <span className="pointer-events-none absolute -top-6 left-1/2 z-10 -translate-x-1/2 whitespace-nowrap rounded bg-foreground px-1.5 py-0.5 text-[10px] font-medium text-background">
+                                    {opt.value}
+                                  </span>
+                                )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   </div>

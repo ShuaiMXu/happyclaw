@@ -119,6 +119,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import sharp from 'sharp';
 // SSRF helpers 抽到 ../url-safety.ts；本文件 re-export isPrivateHostname 以保留旧导入路径。
 import { z } from 'zod';
 import { broadcastNewMessage } from '../web.js';
@@ -2197,9 +2198,35 @@ groupRoutes.post('/:jid/generate-image', authMiddleware, async (c) => {
     });
   }
 
+  // 'original' has no fixed ratio of its own — it means "match the first
+  // reference image exactly" — so it requires at least one reference and its
+  // real pixel dimensions, read directly from the uploaded bytes.
+  let originalRefDimensions: { width: number; height: number } | undefined;
+  if (parsed.data.aspectRatio === 'original') {
+    if (references.length === 0) {
+      return c.json(
+        {
+          error:
+            '「原图」画幅需要至少一张参考图片，请先添加参考图或选择其他画幅。',
+        },
+        400,
+      );
+    }
+    try {
+      const meta = await sharp(Buffer.from(references[0].data)).metadata();
+      if (meta.width && meta.height) {
+        originalRefDimensions = { width: meta.width, height: meta.height };
+      }
+    } catch {
+      // Falls back to the 4:3 preset inside resolveImageSize() below when
+      // the reference's dimensions can't be read.
+    }
+  }
+
   const imageSize = resolveImageSize(
     parsed.data.quality,
     parsed.data.aspectRatio,
+    originalRefDimensions,
   );
 
   try {

@@ -265,6 +265,46 @@ describe('resolveImageSize', () => {
     expect(resolveImageSize('4k', '3:4')).toBe('2496x3328');
     expect(resolveImageSize('4k', '21:9')).toBe('4396x1884');
   });
+
+  test('"original" fits the reference image\'s exact ratio into the same pixel budget', () => {
+    const parse = (size: string) =>
+      size.split('x').map(Number) as [number, number];
+    const [w, h] = parse(
+      resolveImageSize('4k', 'original', { width: 1000, height: 1000 }),
+    );
+    expect(w).toBe(h); // square reference -> square output
+    expect(w * h).toBeCloseTo(3840 * 2160, -3);
+
+    const [w2, h2] = parse(
+      resolveImageSize('4k', 'original', { width: 4500, height: 1000 }),
+    );
+    expect(w2 / h2).toBeCloseTo(4500 / 1000, 1);
+    // 16px rounding has a bigger relative effect on area at extreme ratios
+    // like this 4.5:1 one, so assert a relative tolerance instead of an
+    // absolute one.
+    expect(Math.abs(w2 * h2 - 3840 * 2160) / (3840 * 2160)).toBeLessThan(0.01);
+
+    // 2k stays a quarter of 4k for "original" too, same as every preset.
+    const px4k = (() => {
+      const [w, h] = parse(
+        resolveImageSize('4k', 'original', { width: 3, height: 2 }),
+      );
+      return w * h;
+    })();
+    const px2k = (() => {
+      const [w, h] = parse(
+        resolveImageSize('2k', 'original', { width: 3, height: 2 }),
+      );
+      return w * h;
+    })();
+    expect(Math.abs(px2k - px4k / 4) / (px4k / 4)).toBeLessThan(0.01);
+  });
+
+  test('"original" without a reference falls back to the 4:3 preset', () => {
+    expect(resolveImageSize('4k', 'original')).toBe(
+      resolveImageSize('4k', '4:3'),
+    );
+  });
 });
 
 describe('describeImageRequirements', () => {
@@ -277,6 +317,12 @@ describe('describeImageRequirements', () => {
     );
     expect(describeImageRequirements('4k', '1:1')).toBe(
       '请生成画质为 4K 高清、画面比例为 1:1（正方形）的图片。',
+    );
+  });
+
+  test('"original" describes matching the first reference instead of a fixed ratio', () => {
+    expect(describeImageRequirements('4k', 'original')).toContain(
+      '与第一张参考图完全一致',
     );
   });
 });

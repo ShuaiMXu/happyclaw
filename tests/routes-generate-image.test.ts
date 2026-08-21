@@ -182,7 +182,7 @@ describe('POST /:jid/generate-image', () => {
     // the (default) quality/aspectRatio used for this generation.
     expect(attachments[0].recipe).toEqual({
       prompt: 'a hedgehog',
-      quality: '4k',
+      quality: '2k',
       aspectRatio: '4:3',
     });
   });
@@ -246,10 +246,10 @@ describe('POST /:jid/generate-image', () => {
     expect(generateWorkspaceImage).toHaveBeenCalledTimes(1);
     const [prompt, model, refs] = generateWorkspaceImage.mock.calls[0];
     // The service prompt also carries an explicit quality/aspect-ratio
-    // directive (default 4K / 4:3 here) — `size` alone doesn't reliably
+    // directive (default 2K / 4:3 here) — `size` alone doesn't reliably
     // steer every upstream model.
     expect(prompt).toBe(
-      'merge the scenes\n\n参考图 1：角色造型\n\n请生成画质为 4K 高清、画面比例为 4:3（横版）的图片。',
+      'merge the scenes\n\n参考图 1：角色造型\n\n请生成画质为 2K、画面比例为 4:3（横版）的图片。',
     );
     expect(model).toBe('gpt-image-2');
     expect(refs).toHaveLength(2);
@@ -258,7 +258,7 @@ describe('POST /:jid/generate-image', () => {
     expect(refs[1].note).toBeUndefined();
   });
 
-  test('defaults to 4K / 4:3 when quality and aspectRatio are omitted', async () => {
+  test('defaults to 2K / 4:3 when quality and aspectRatio are omitted', async () => {
     const res = await groupRoutes.request(`/${JID}/generate-image`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -266,35 +266,38 @@ describe('POST /:jid/generate-image', () => {
     });
     expect(res.status).toBe(200);
     const [, , , size] = generateWorkspaceImage.mock.calls[0];
-    expect(size).toBe('3328x2496');
-
-    const imageRow = db
-      .getMessagesPage(JID, undefined, 10)
-      .find((m) => m.sender === '__image_generation__');
-    const attachments = JSON.parse(imageRow!.attachments as string);
-    expect(attachments[0].recipe.quality).toBe('4k');
-    expect(attachments[0].recipe.aspectRatio).toBe('4:3');
-  });
-
-  test('threads a custom quality/aspectRatio through to the size and the recipe', async () => {
-    const res = await groupRoutes.request(`/${JID}/generate-image`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prompt: 'a hedgehog',
-        quality: '2k',
-        aspectRatio: '16:9',
-      }),
-    });
-    expect(res.status).toBe(200);
-    const [, , , size] = generateWorkspaceImage.mock.calls[0];
-    expect(size).toBe('1920x1080');
+    expect(size).toBe('1664x1248');
 
     const imageRow = db
       .getMessagesPage(JID, undefined, 10)
       .find((m) => m.sender === '__image_generation__');
     const attachments = JSON.parse(imageRow!.attachments as string);
     expect(attachments[0].recipe.quality).toBe('2k');
+    expect(attachments[0].recipe.aspectRatio).toBe('4:3');
+  });
+
+  test('threads a custom quality/aspectRatio through to the size and the recipe', async () => {
+    // '4k' is no longer offered by the composer UI (see QUALITY_OPTIONS in
+    // ImageStudioPage.tsx) but the API still accepts it — both for direct
+    // callers and for "reuse recipe" on images generated before that change.
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: 'a hedgehog',
+        quality: '4k',
+        aspectRatio: '16:9',
+      }),
+    });
+    expect(res.status).toBe(200);
+    const [, , , size] = generateWorkspaceImage.mock.calls[0];
+    expect(size).toBe('3840x2160');
+
+    const imageRow = db
+      .getMessagesPage(JID, undefined, 10)
+      .find((m) => m.sender === '__image_generation__');
+    const attachments = JSON.parse(imageRow!.attachments as string);
+    expect(attachments[0].recipe.quality).toBe('4k');
     expect(attachments[0].recipe.aspectRatio).toBe('16:9');
   });
 
@@ -305,6 +308,52 @@ describe('POST /:jid/generate-image', () => {
       body: JSON.stringify({ prompt: 'a hedgehog', aspectRatio: '5:4' }),
     });
     expect(res.status).toBe(400);
+  });
+
+  test('rejects "original" aspectRatio without any reference image', async () => {
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: 'a hedgehog', aspectRatio: 'original' }),
+    });
+    expect(res.status).toBe(400);
+    expect(generateWorkspaceImage).not.toHaveBeenCalled();
+  });
+
+  test('"original" aspectRatio derives size from the first reference image\'s real dimensions', async () => {
+    // A real 16:9 PNG (not the truncated TINY_PNG signature) so sharp can
+    // actually read its width/height.
+    const wideRef = await sharp({
+      create: { width: 1600, height: 900, channels: 3, background: 'blue' },
+    })
+      .png()
+      .toBuffer();
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: 'match my reference',
+        aspectRatio: 'original',
+        references: [
+          { data: wideRef.toString('base64'), mimeType: 'image/png' },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const [, , , size] = generateWorkspaceImage.mock.calls[0];
+    const [w, h] = (size as string).split('x').map(Number);
+    expect(w / h).toBeCloseTo(1600 / 900, 1);
+    // No explicit quality was sent, so this falls into the default '2k'
+    // pixel budget (1920x1080's ~2.07MP), not '4k'. 16px rounding has a
+    // small relative effect at this ratio, so compare with a tolerance
+    // instead of an exact/near-exact match.
+    expect(Math.abs(w * h - 1920 * 1080) / (1920 * 1080)).toBeLessThan(0.01);
+
+    const imageRow = db
+      .getMessagesPage(JID, undefined, 10)
+      .find((m) => m.sender === '__image_generation__');
+    const attachments = JSON.parse(imageRow!.attachments as string);
+    expect(attachments[0].recipe.aspectRatio).toBe('original');
   });
 
   test('rejects a non-web workspace', async () => {
