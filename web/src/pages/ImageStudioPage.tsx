@@ -69,6 +69,11 @@ const REFERENCE_ACCEPTED_MIME = new Set([
   'image/webp',
 ]);
 
+// Upper bound for the lightbox zoom, both via mouse-wheel and the "1:1"
+// button below — high enough that a 4K original still reaches its true
+// 100%-pixel zoom level when the viewport is small.
+const LIGHTBOX_MAX_ZOOM = 32;
+
 interface ReferenceDraft {
   id: string;
   name: string;
@@ -310,6 +315,11 @@ export function ImageStudioPage() {
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<GeneratedImageEntry | null>(null);
+  // Big-view for a reference-image tile (composer above), separate from the
+  // generated-image lightbox below: reference images are local blob URLs
+  // with no server-side original/thumbnail pair, so this just shows the
+  // already-loaded image full-size with no extra actions.
+  const [refLightboxUrl, setRefLightboxUrl] = useState<string | null>(null);
   // Whether the lightbox shows the full-resolution image instead of the
   // low-res preview; reset every time a different image is opened.
   const [lightboxOriginal, setLightboxOriginal] = useState(false);
@@ -333,8 +343,14 @@ export function ImageStudioPage() {
   const handleLightboxWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-    setLightboxZoom((z) => Math.min(8, Math.max(1, z * factor)));
+    setLightboxZoom((z) =>
+      Math.min(LIGHTBOX_MAX_ZOOM, Math.max(1, z * factor)),
+    );
   }, []);
+  // Ref to the rendered <img> so the "1:1" button can measure its current
+  // (fitted) box size and compute the zoom factor that makes one image
+  // pixel map to one screen pixel — for pixel-level quality review.
+  const lightboxImgRef = useRef<HTMLImageElement>(null);
   const handleLightboxMouseDown = useCallback(
     (e: React.MouseEvent) => {
       if (lightboxZoom <= 1 || e.button !== 0) return;
@@ -412,6 +428,24 @@ export function ImageStudioPage() {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [lightbox, selectedJid]);
+
+  // "1:1": switches to the original image and zooms so its real pixel
+  // dimensions map 1-for-1 to screen pixels, for precise quality review.
+  // Measures the currently-rendered (fitted) box — switching between the
+  // thumbnail and the original doesn't change that box since both share the
+  // same aspect ratio, so this works whether or not the original is already
+  // loaded.
+  const handleLightbox1to1 = useCallback(() => {
+    const el = lightboxImgRef.current;
+    if (!el || !originalMeta) return;
+    const rect = el.getBoundingClientRect();
+    const unscaledWidth = rect.width / lightboxZoom;
+    if (!unscaledWidth) return;
+    const targetZoom = originalMeta.width / unscaledWidth;
+    setLightboxOriginal(true);
+    setLightboxPan({ x: 0, y: 0 });
+    setLightboxZoom(Math.min(LIGHTBOX_MAX_ZOOM, Math.max(1, targetZoom)));
+  }, [originalMeta, lightboxZoom]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -823,7 +857,11 @@ export function ImageStudioPage() {
                             <img
                               src={ref.previewUrl}
                               alt={ref.name}
-                              className="aspect-square w-full object-cover"
+                              // object-contain (not cover) so the longest edge
+                              // fills the frame and the whole image — including
+                              // its true aspect ratio — stays visible.
+                              className="aspect-square w-full cursor-zoom-in bg-muted object-contain"
+                              onClick={() => setRefLightboxUrl(ref.previewUrl)}
                             />
                             <button
                               type="button"
@@ -1215,6 +1253,7 @@ export function ImageStudioPage() {
             onWheel={handleLightboxWheel}
           >
             <img
+              ref={lightboxImgRef}
               src={
                 lightboxOriginal
                   ? (originalMeta?.url ?? imageEntrySrc(selectedJid, lightbox))
@@ -1242,6 +1281,15 @@ export function ImageStudioPage() {
               className="absolute bottom-6 left-1/2 flex max-w-full -translate-x-1/2 flex-wrap justify-center gap-2 px-2"
               onClick={(e) => e.stopPropagation()}
             >
+              {originalMeta && (
+                <Button
+                  variant="secondary"
+                  onClick={handleLightbox1to1}
+                  title="按图片实际像素 100% 显示，方便逐像素校对画质"
+                >
+                  1:1
+                </Button>
+              )}
               {!lightboxOriginal && lightbox.path && (
                 <Button
                   variant="secondary"
@@ -1264,6 +1312,32 @@ export function ImageStudioPage() {
             <button
               type="button"
               onClick={() => setLightbox(null)}
+              aria-label="关闭"
+              className="absolute right-4 top-4 rounded-full bg-black/50 p-2 text-white hover:bg-black/70"
+            >
+              <X />
+            </button>
+          </div>
+        )}
+
+        {refLightboxUrl && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden bg-black/80 p-4"
+            onClick={() => setRefLightboxUrl(null)}
+          >
+            <img
+              src={refLightboxUrl}
+              alt="参考图"
+              draggable={false}
+              onDragStart={(e) => e.preventDefault()}
+              className="max-h-full max-w-full rounded-lg object-contain select-none"
+              onClick={(e) => e.stopPropagation()}
+            />
+            <button
+              type="button"
+              onClick={() => setRefLightboxUrl(null)}
               aria-label="关闭"
               className="absolute right-4 top-4 rounded-full bg-black/50 p-2 text-white hover:bg-black/70"
             >
