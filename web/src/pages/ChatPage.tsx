@@ -317,13 +317,7 @@ export function ChatPage() {
           {hasAnyGroup ? (
             <div className="px-2 pb-nav-safe">
               {agentPartitions.primary && (
-                <section aria-labelledby="mobile-primary-agent-heading">
-                  <h2
-                    id="mobile-primary-agent-heading"
-                    className="px-3 pb-1 pt-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
-                  >
-                    主智能体 · {agentPartitions.primary.name}
-                  </h2>
+                <section aria-label="主智能体工作区">
                   {renderMobilePrimaryAgentWorkspaces(agentPartitions.primary)}
                 </section>
               )}

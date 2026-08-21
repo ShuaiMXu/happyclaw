@@ -400,13 +400,7 @@ export function UnifiedSidebar({
               ) : (
                 <div className="pt-1">
                   {agentPartitions.primary && (
-                    <section aria-labelledby="primary-agent-heading">
-                      <h2
-                        id="primary-agent-heading"
-                        className="px-3 pb-1 pt-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
-                      >
-                        主智能体 · {agentPartitions.primary.name}
-                      </h2>
+                    <section aria-label="主智能体工作区">
                       {renderPrimaryAgentWorkspaces(agentPartitions.primary)}
                     </section>
                   )}
