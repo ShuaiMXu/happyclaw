@@ -253,12 +253,18 @@ export function ChatPage() {
       {/* Mobile workspace list when no group selected */}
       {!groupFolder && (
         <div className="block lg:hidden w-full overflow-y-auto">
-          {/* Mobile header: horizontal logo + actions */}
+          {/* Mobile header: square brand mark + actions. Uses the same
+              400x400 square icon as the desktop collapsed sidebar rail
+              (UnifiedSidebar.tsx) rather than the wordmark banner — it's a
+              self-contained colored mark, so no dark-mode inversion. */}
           <div className="flex items-center gap-3 px-4 pt-5 pb-3">
             <img
-              src={`${import.meta.env.BASE_URL}icons/logo-text.svg`}
+              src={
+                appearance?.brandIconUrl ||
+                `${import.meta.env.BASE_URL}icons/icon-192.png`
+              }
               alt={appearance?.appName || 'SoftopiaAI'}
-              className="h-8"
+              className="h-10 w-10 rounded-xl object-cover"
             />
             <div className="flex-1" />
             <button
@@ -339,9 +345,12 @@ export function ChatPage() {
           ) : (
             <div className="flex flex-col items-center justify-center h-64 px-4">
               <img
-                src={`${import.meta.env.BASE_URL}icons/logo-text.svg`}
+                src={
+                  appearance?.brandIconUrl ||
+                  `${import.meta.env.BASE_URL}icons/icon-192.png`
+                }
                 alt={appearance?.appName || 'SoftopiaAI'}
-                className="h-12 mb-6"
+                className="mb-6 h-16 w-16 rounded-xl object-cover"
               />
               <p className="text-muted-foreground text-sm">暂无智能体工作区</p>
             </div>

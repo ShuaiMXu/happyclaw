@@ -947,7 +947,11 @@ export function ImageStudioPage() {
                               type="button"
                               aria-label="移除参考图"
                               onClick={() => removeReference(ref.id)}
-                              className="absolute right-1 top-1 rounded-full bg-black/60 p-1 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                              // Hover-to-reveal only works with a mouse — on
+                              // touch there's no hover state, so the button
+                              // would never become reachable. Show it
+                              // unconditionally below the desktop breakpoint.
+                              className="absolute right-1 top-1 rounded-full bg-black/60 p-1 text-white opacity-100 transition-opacity lg:opacity-0 lg:group-hover:opacity-100"
                             >
                               <X className="h-3.5 w-3.5" />
                             </button>
@@ -1117,15 +1121,18 @@ export function ImageStudioPage() {
                         </PopoverContent>
                       </Popover>
                     </div>
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-xs text-muted-foreground">
+                    <div className="flex flex-wrap items-start gap-1.5">
+                      <span className="pt-1 text-xs text-muted-foreground">
                         画幅
                       </span>
-                      {/* Same segmented-control look as the quality group.
-                          Idle options show a bold shape glyph; the selected
-                          option shows its ratio text instead of the glyph. */}
-                      <div className="flex overflow-hidden rounded-md border border-border">
-                        {ASPECT_RATIO_OPTIONS.map((opt, index) => {
+                      {/* Individually-bordered pills (not one continuous
+                          strip) so this wraps onto a second line cleanly on
+                          narrow/portrait screens instead of overflowing or
+                          getting clipped — 9 options don't fit one row on a
+                          phone. Idle options show a bold shape glyph; the
+                          selected option shows its ratio text instead. */}
+                      <div className="flex flex-wrap gap-1">
+                        {ASPECT_RATIO_OPTIONS.map((opt) => {
                           const isOriginal = opt.value === 'original';
                           // "原图" has no ratio of its own to show as a
                           // glyph — always render its text label — and
@@ -1163,11 +1170,10 @@ export function ImageStudioPage() {
                                   flashRatioHint(opt.value);
                                 }}
                                 className={cn(
-                                  'flex h-7 min-w-7 items-center justify-center px-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40',
-                                  index > 0 && 'border-l border-border',
+                                  'flex h-7 min-w-7 items-center justify-center rounded-md border px-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40',
                                   aspectRatio === opt.value
-                                    ? 'bg-primary text-primary-foreground'
-                                    : 'bg-background text-muted-foreground hover:bg-accent hover:text-foreground',
+                                    ? 'border-primary bg-primary text-primary-foreground'
+                                    : 'border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground',
                                 )}
                               >
                                 {isOriginal || aspectRatio === opt.value ? (
@@ -1278,7 +1284,11 @@ export function ImageStudioPage() {
                         className="h-full w-full object-cover transition-transform group-hover:scale-105"
                       />
                     </button>
-                    <div className="pointer-events-none absolute right-1 top-1 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                    {/* Same hover-reveal-on-desktop-only treatment as the
+                        reference-image remove button above: there's no
+                        hover on touch, so these need to stay visible on
+                        mobile or they're simply unreachable. */}
+                    <div className="pointer-events-none absolute right-1 top-1 flex gap-1 opacity-100 transition-opacity lg:opacity-0 lg:group-hover:opacity-100">
                       <button
                         type="button"
                         aria-label="设为参考图"
@@ -1348,7 +1358,12 @@ export function ImageStudioPage() {
           <div
             role="dialog"
             aria-modal="true"
-            className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden bg-black/80 p-4"
+            /* The mobile floating bottom nav bar (.floating-nav-container)
+               sits at z-index 10000 at roughly the same bottom offset as
+               this lightbox's action buttons — without a higher z-index
+               here it visually overlaps and intercepts taps meant for
+               "下载原图" etc. */
+            className="fixed inset-0 z-[10050] flex items-center justify-center overflow-hidden bg-black/80 p-4"
             onClick={() => setLightbox(null)}
             onWheel={handleLightboxWheel}
           >
@@ -1424,7 +1439,9 @@ export function ImageStudioPage() {
           <div
             role="dialog"
             aria-modal="true"
-            className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden bg-black/80 p-4"
+            // Same z-index reasoning as the lightbox above — stay above the
+            // mobile floating bottom nav bar.
+            className="fixed inset-0 z-[10050] flex items-center justify-center overflow-hidden bg-black/80 p-4"
             onClick={() => setRefLightboxUrl(null)}
           >
             <img
