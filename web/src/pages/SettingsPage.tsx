@@ -1,9 +1,11 @@
 import { lazy, Suspense, useCallback, useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
 import { Navigate, useSearchParams } from 'react-router-dom';
-import { Menu } from 'lucide-react';
+import { ChevronDown, Menu } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { useAuthStore } from '../stores/auth';
+import { useMediaQuery } from '../hooks/useMediaQuery';
 import { SettingsNav } from '../components/settings/SettingsNav';
 import { ClaudeProviderSection } from '../components/settings/ClaudeProviderSection';
 import { RegistrationSection } from '../components/settings/RegistrationSection';
@@ -71,6 +73,34 @@ const LEGACY_TAB_ROUTES: Partial<Record<SettingsTab, string>> = {
   bindings: '/settings?tab=my-channels&view=bindings',
   usage: '/usage',
 };
+
+/**
+ * Collapses a top-level section behind a tap-to-expand header on mobile
+ * portrait screens — some settings tabs (`system`, `main-agent`/
+ * `host-integration`) stack several large section components in one long
+ * scroll, which doesn't fit "1-2 screens" on a phone. Desktop is untouched
+ * (renders children directly, same as before this existed) since the
+ * scroll-length problem is mobile-specific.
+ */
+function MobileCollapsibleSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: ReactNode;
+}) {
+  const isDesktop = useMediaQuery('(min-width: 1024px)');
+  if (isDesktop) return <>{children}</>;
+  return (
+    <details className="group rounded-lg border border-border">
+      <summary className="flex list-none cursor-pointer select-none items-center justify-between rounded-lg px-3 py-2.5 text-sm font-semibold text-foreground [&::-webkit-details-marker]:hidden">
+        {title}
+        <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+      </summary>
+      <div className="border-t border-border px-3 pb-4 pt-3">{children}</div>
+    </details>
+  );
+}
 
 export function SettingsPage() {
   const { user: currentUser } = useAuthStore();
@@ -236,26 +266,46 @@ export function SettingsPage() {
               )}
 
               {activeTab === 'system' ? (
-                <div className="space-y-8">
-                  <SystemSettingsSection scope="runtime" />
-                  <div className="border-t border-border pt-6">
-                    <ImageGenerationBackendSection />
+                <div className="space-y-3 lg:space-y-8">
+                  <MobileCollapsibleSection title="运行边界与容量">
+                    <SystemSettingsSection scope="runtime" />
+                  </MobileCollapsibleSection>
+                  <div className="lg:border-t lg:border-border lg:pt-6">
+                    <MobileCollapsibleSection title="图像生成后端">
+                      <ImageGenerationBackendSection />
+                    </MobileCollapsibleSection>
                   </div>
-                  <div className="border-t border-border pt-6">
-                    <ImagePromptPresetsSection />
+                  <div className="lg:border-t lg:border-border lg:pt-6">
+                    <MobileCollapsibleSection title="常用提示词">
+                      <ImagePromptPresetsSection />
+                    </MobileCollapsibleSection>
                   </div>
                 </div>
               ) : activeTab === 'main-agent' ||
                 activeTab === 'host-integration' ? (
-                <div>
-                  {activeTab === 'main-agent' && <MainAgentIdentitySection />}
+                <div className="space-y-3 lg:space-y-0">
                   {activeTab === 'main-agent' && (
-                    <MainAgentCapabilitiesSection />
+                    <MobileCollapsibleSection title="主智能体身份">
+                      <MainAgentIdentitySection />
+                    </MobileCollapsibleSection>
                   )}
-                  <div className={activeTab === 'main-agent' ? 'pt-6' : ''}>
-                    <HostIntegrationSettingsSection
-                      scope={activeTab === 'main-agent' ? 'main-agent' : 'host'}
-                    />
+                  {activeTab === 'main-agent' && (
+                    <MobileCollapsibleSection title="主智能体能力">
+                      <MainAgentCapabilitiesSection />
+                    </MobileCollapsibleSection>
+                  )}
+                  <div className={activeTab === 'main-agent' ? 'lg:pt-6' : ''}>
+                    <MobileCollapsibleSection
+                      title={
+                        activeTab === 'main-agent' ? '宿主机集成' : '宿主机设置'
+                      }
+                    >
+                      <HostIntegrationSettingsSection
+                        scope={
+                          activeTab === 'main-agent' ? 'main-agent' : 'host'
+                        }
+                      />
+                    </MobileCollapsibleSection>
                   </div>
                 </div>
               ) : (
@@ -267,10 +317,12 @@ export function SettingsPage() {
                     />
                   )}
                   {activeTab === 'registration' && (
-                    <div className="space-y-8">
+                    <div className="space-y-3 lg:space-y-8">
                       <RegistrationSection />
-                      <div className="border-t border-border pt-6">
-                        <SystemSettingsSection scope="security" />
+                      <div className="lg:border-t lg:border-border lg:pt-6">
+                        <MobileCollapsibleSection title="认证限流策略">
+                          <SystemSettingsSection scope="security" />
+                        </MobileCollapsibleSection>
                       </div>
                     </div>
                   )}

@@ -1173,7 +1173,10 @@ export function ImageStudioPage() {
                                   'flex h-7 min-w-7 items-center justify-center rounded-md border px-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40',
                                   aspectRatio === opt.value
                                     ? 'border-primary bg-primary text-primary-foreground'
-                                    : 'border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground',
+                                    : // text-muted-foreground was too light for
+                                      // the glyph's border-current outline to
+                                      // read clearly — darker gray instead.
+                                      'border-border bg-background text-slate-600 hover:bg-accent hover:text-foreground dark:text-slate-300',
                                 )}
                               >
                                 {isOriginal || aspectRatio === opt.value ? (
