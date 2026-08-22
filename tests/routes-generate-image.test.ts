@@ -247,9 +247,13 @@ describe('POST /:jid/generate-image', () => {
     const [prompt, model, refs] = generateWorkspaceImage.mock.calls[0];
     // The service prompt also carries an explicit quality/aspect-ratio
     // directive (default 2K / 4:3 here) — `size` alone doesn't reliably
-    // steer every upstream model.
-    expect(prompt).toBe(
-      'merge the scenes\n\n参考图 1：角色造型\n\n请生成画质为 2K、画面比例为 4:3（横版）的图片。',
+    // steer every upstream model — plus a real-current-date-time directive
+    // (see describeCurrentDateTime), so a prompt asking for "当前时间戳" is
+    // grounded instead of the model fabricating one. The date/time portion
+    // is real wall-clock time, so it's matched with a pattern instead of an
+    // exact string.
+    expect(prompt).toMatch(
+      /^merge the scenes\n\n参考图 1：角色造型\n\n请生成画质为 2K、画面比例为 4:3（横版）的图片。\n\n如果图片中需要显示当前日期、时间或时间戳，请使用：\d{4}年\d{2}月\d{2}日（星期[日一二三四五六]）\d{2}:\d{2}，不要凭空编造其他年份或日期。$/,
     );
     expect(model).toBe('gpt-image-2');
     expect(refs).toHaveLength(2);

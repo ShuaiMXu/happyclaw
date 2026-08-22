@@ -133,6 +133,7 @@ import {
   DEFAULT_IMAGE_ASPECT_RATIO,
   resolveImageSize,
   describeImageRequirements,
+  describeCurrentDateTime,
   type ImageQuality,
   type ImageAspectRatio,
 } from '../image-generation-service.js';
@@ -2383,9 +2384,12 @@ function buildReferenceAwarePrompt(
 
 /**
  * Compose the final prompt sent to the image model: user prompt + reference
- * notes + an explicit quality/aspect-ratio directive. The `size` request
- * parameter alone doesn't reliably steer every upstream model, so the
- * requirement is also spelled out in the prompt text itself.
+ * notes + an explicit quality/aspect-ratio directive + the real current
+ * date/time. The `size` request parameter alone doesn't reliably steer every
+ * upstream model, so the quality/ratio requirement is also spelled out in
+ * the prompt text itself — and image models have no clock of their own, so
+ * a prompt asking for "当前时间戳" needs the real date grounded in text too,
+ * or the model fabricates one (commonly landing in its own training era).
  */
 function buildImageGenerationPrompt(
   prompt: string,
@@ -2394,7 +2398,7 @@ function buildImageGenerationPrompt(
   aspectRatio: ImageAspectRatio,
 ): string {
   const withReferences = buildReferenceAwarePrompt(prompt, references);
-  return `${withReferences}\n\n${describeImageRequirements(quality, aspectRatio)}`;
+  return `${withReferences}\n\n${describeImageRequirements(quality, aspectRatio)}\n\n${describeCurrentDateTime()}`;
 }
 
 // GET /api/groups/:jid/generated-images - lightweight gallery listing

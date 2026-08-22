@@ -143,6 +143,37 @@ export function describeImageRequirements(
   return `请生成画质为 ${qualityLabel}、画面比例为 ${aspectRatio}（${orientation}）的图片。`;
 }
 
+const WEEKDAY_LABELS = [
+  '星期日',
+  '星期一',
+  '星期二',
+  '星期三',
+  '星期四',
+  '星期五',
+  '星期六',
+];
+
+/**
+ * Ground the model in the real current date/time. Image models have no
+ * clock of their own — asked to stamp "当前时间" onto a poster, they'll
+ * otherwise fabricate a plausible-looking but wrong date (commonly landing
+ * somewhere in their own training era). Always appended, same as the
+ * quality/aspect-ratio directive above: harmless for prompts that don't
+ * reference a date, and grounds the ones that do.
+ *
+ * `now` defaults to the real clock but is overridable for deterministic
+ * tests.
+ */
+export function describeCurrentDateTime(now: Date = new Date()): string {
+  const weekday = WEEKDAY_LABELS[now.getDay()];
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  return `如果图片中需要显示当前日期、时间或时间戳，请使用：${year}年${month}月${day}日（${weekday}）${hours}:${minutes}，不要凭空编造其他年份或日期。`;
+}
+
 function imageMimeType(bytes: Uint8Array): GeneratedImage['mimeType'] | null {
   if (
     bytes.length >= 8 &&

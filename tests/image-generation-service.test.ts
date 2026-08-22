@@ -10,6 +10,7 @@ const {
   ImageGenerationError,
   resolveImageSize,
   describeImageRequirements,
+  describeCurrentDateTime,
 } = await import('../src/image-generation-service.js');
 
 afterEach(() => {
@@ -323,6 +324,33 @@ describe('describeImageRequirements', () => {
   test('"original" describes matching the first reference instead of a fixed ratio', () => {
     expect(describeImageRequirements('4k', 'original')).toContain(
       '与第一张参考图完全一致',
+    );
+  });
+});
+
+describe('describeCurrentDateTime', () => {
+  test('grounds the real date/time so the model does not fabricate one', () => {
+    // Image models have no clock of their own — a prompt asking to stamp
+    // "当前时间" onto a poster otherwise gets whatever date the model
+    // fabricates (commonly landing in its own training era, e.g. 2025).
+    const fixed = new Date(2026, 7, 22, 17, 14); // 2026-08-22 17:14, a Saturday
+    expect(describeCurrentDateTime(fixed)).toBe(
+      '如果图片中需要显示当前日期、时间或时间戳，请使用：2026年08月22日（星期六）17:14，不要凭空编造其他年份或日期。',
+    );
+  });
+
+  test('defaults to the real current time when no date is passed', () => {
+    const before = Date.now();
+    const text = describeCurrentDateTime();
+    const after = Date.now();
+    const match = text.match(/(\d{4})年(\d{2})月(\d{2})日/);
+    expect(match).not.toBeNull();
+    const [, y, m, d] = match!;
+    const parsed = new Date(Number(y), Number(m) - 1, Number(d)).getTime();
+    // Loose bound: the parsed date should fall within the same UTC day as
+    // "now" — exact-to-the-minute comparison would be flaky near midnight.
+    expect(Math.abs(parsed - before)).toBeLessThan(
+      Math.max(after - before, 0) + 24 * 60 * 60 * 1000,
     );
   });
 });
