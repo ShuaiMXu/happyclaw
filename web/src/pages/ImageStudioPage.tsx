@@ -441,6 +441,107 @@ export function ImageStudioPage() {
     };
   }, [isPanningLightbox]);
 
+  // Touch equivalents of the wheel-zoom / mouse-drag-pan above: two-finger
+  // pinch to zoom, one-finger drag to pan once zoomed in. Kept as an
+  // imperative ref (not state) since gesture math needs the exact starting
+  // distance/position, not a value that's re-derived from re-renders.
+  const touchGestureRef = useRef<{
+    mode: 'none' | 'pinch' | 'pan';
+    startDistance: number;
+    startZoom: number;
+    startX: number;
+    startY: number;
+    startPanX: number;
+    startPanY: number;
+  }>({
+    mode: 'none',
+    startDistance: 0,
+    startZoom: 1,
+    startX: 0,
+    startY: 0,
+    startPanX: 0,
+    startPanY: 0,
+  });
+
+  function touchDistance(touches: React.TouchList): number {
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.hypot(dx, dy);
+  }
+
+  const handleLightboxTouchStart = useCallback(
+    (e: React.TouchEvent) => {
+      if (e.touches.length === 2) {
+        touchGestureRef.current = {
+          mode: 'pinch',
+          startDistance: touchDistance(e.touches),
+          startZoom: lightboxZoom,
+          startX: 0,
+          startY: 0,
+          startPanX: lightboxPan.x,
+          startPanY: lightboxPan.y,
+        };
+      } else if (e.touches.length === 1 && lightboxZoom > 1) {
+        touchGestureRef.current = {
+          mode: 'pan',
+          startDistance: 0,
+          startZoom: lightboxZoom,
+          startX: e.touches[0].clientX,
+          startY: e.touches[0].clientY,
+          startPanX: lightboxPan.x,
+          startPanY: lightboxPan.y,
+        };
+      }
+    },
+    [lightboxZoom, lightboxPan],
+  );
+
+  const handleLightboxTouchMove = useCallback((e: React.TouchEvent) => {
+    const gesture = touchGestureRef.current;
+    if (gesture.mode === 'pinch' && e.touches.length === 2) {
+      e.preventDefault();
+      const distance = touchDistance(e.touches);
+      if (gesture.startDistance > 0) {
+        const scale = distance / gesture.startDistance;
+        setLightboxZoom(
+          Math.min(LIGHTBOX_MAX_ZOOM, Math.max(1, gesture.startZoom * scale)),
+        );
+      }
+    } else if (gesture.mode === 'pan' && e.touches.length === 1) {
+      e.preventDefault();
+      setLightboxPan({
+        x: gesture.startPanX + (e.touches[0].clientX - gesture.startX),
+        y: gesture.startPanY + (e.touches[0].clientY - gesture.startY),
+      });
+    }
+  }, []);
+
+  const handleLightboxTouchEnd = useCallback(
+    (e: React.TouchEvent) => {
+      if (e.touches.length === 0) {
+        touchGestureRef.current.mode = 'none';
+        return;
+      }
+      // One finger lifted mid-pinch: if still zoomed in, hand off to
+      // panning with whichever finger remains instead of just stopping.
+      if (e.touches.length === 1 && touchGestureRef.current.mode === 'pinch') {
+        touchGestureRef.current =
+          lightboxZoom > 1
+            ? {
+                mode: 'pan',
+                startDistance: 0,
+                startZoom: lightboxZoom,
+                startX: e.touches[0].clientX,
+                startY: e.touches[0].clientY,
+                startPanX: lightboxPan.x,
+                startPanY: lightboxPan.y,
+              }
+            : { ...touchGestureRef.current, mode: 'none' };
+      }
+    },
+    [lightboxZoom, lightboxPan],
+  );
+
   // Original-file metadata (byte size + pixel dimensions) shown next to
   // "查看原图": fetched once per opened image and cached as an object URL so
   // clicking "查看原图" afterwards doesn't re-download the same bytes.
@@ -1390,7 +1491,10 @@ export function ImageStudioPage() {
               draggable={false}
               onDragStart={(e) => e.preventDefault()}
               className={cn(
-                'max-h-full max-w-full rounded-lg object-contain select-none',
+                // touch-none hands pinch/pan entirely to our own gesture
+                // handlers below — without it the browser's native
+                // pinch-zoom/scroll fights with (or just wins over) ours.
+                'max-h-full max-w-full touch-none rounded-lg object-contain select-none',
                 isPanningLightbox
                   ? 'cursor-grabbing'
                   : lightboxZoom > 1
@@ -1403,6 +1507,9 @@ export function ImageStudioPage() {
               }}
               onClick={(e) => e.stopPropagation()}
               onMouseDown={handleLightboxMouseDown}
+              onTouchStart={handleLightboxTouchStart}
+              onTouchMove={handleLightboxTouchMove}
+              onTouchEnd={handleLightboxTouchEnd}
             />
             <div
               className="absolute bottom-6 left-1/2 flex max-w-full -translate-x-1/2 flex-wrap justify-center gap-2 px-2"
