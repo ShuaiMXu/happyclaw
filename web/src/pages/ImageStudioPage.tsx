@@ -14,7 +14,10 @@ import {
 } from 'lucide-react';
 import { api, computeUploadTimeoutMs, type ApiError } from '../api/client';
 import { wsManager } from '../api/ws';
-import { downloadFromDataUrl, downloadFromUrl } from '../utils/download';
+import {
+  shareOrDownloadFromDataUrl,
+  shareOrDownloadFromUrl,
+} from '../utils/download';
 import { showToast } from '../utils/toast';
 import { useGroupsStore } from '../stores/groups';
 import {
@@ -506,16 +509,22 @@ export function ImageStudioPage() {
 
   // "下载原图": always fetches the full-resolution bytes regardless of
   // whether the grid/lightbox is currently showing the low-res preview.
+  // Prefers the native share sheet on mobile (see shareOrDownloadFile's
+  // docs) so "存储图像" reliably saves into the phone's photo album instead
+  // of the synthetic <a download> click, which doesn't on iOS Safari.
   const downloadImageEntry = useCallback(
     async (jid: string, entry: GeneratedImageEntry) => {
       try {
         if (entry.path) {
           const filename =
             entry.path.split('/').pop() || `${entry.messageId}.png`;
-          await downloadFromUrl(fileDownloadUrl(jid, entry.path), filename);
+          await shareOrDownloadFromUrl(
+            fileDownloadUrl(jid, entry.path),
+            filename,
+          );
         } else if (entry.data) {
           const ext = entry.mimeType.split('/')[1] || 'png';
-          await downloadFromDataUrl(
+          await shareOrDownloadFromDataUrl(
             `data:${entry.mimeType};base64,${entry.data}`,
             `${entry.messageId}.${ext}`,
           );

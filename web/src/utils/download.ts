@@ -94,6 +94,65 @@ export async function downloadFromUrl(
 }
 
 /**
+ * Save a Blob via the native share sheet when available, falling back to
+ * the synthetic `<a download>` blob click otherwise.
+ *
+ * On mobile — especially iOS Safari, including installed-PWA mode — the
+ * `<a download>` blob-click pattern above does NOT reliably save into the
+ * Photos/相册 app; it tends to just open the file in-place or silently do
+ * nothing. `navigator.share({ files })` surfaces the OS share sheet, which
+ * offers "存储图像/Save Image" straight into the photo library — the
+ * standard, reliable way to get this on mobile. Desktop browsers mostly
+ * don't implement file sharing (or don't have a photo library to save
+ * into), so they fall through to the existing blob-download path.
+ */
+export async function shareOrDownloadFile(
+  blob: Blob,
+  filename: string,
+): Promise<void> {
+  if (
+    typeof navigator !== 'undefined' &&
+    typeof navigator.share === 'function' &&
+    typeof navigator.canShare === 'function'
+  ) {
+    try {
+      const file = new File([blob], filename, {
+        type: blob.type || 'application/octet-stream',
+      });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file] });
+        return;
+      }
+    } catch (err) {
+      // The user dismissing the share sheet throws AbortError — that's a
+      // deliberate cancel, not a failure, so don't fall through to also
+      // triggering a second (blob-download) save attempt.
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      // Any other share failure (unsupported file type, etc.): fall
+      // through to the blob-download path below.
+    }
+  }
+  triggerBlobDownload(blob, filename);
+}
+
+/**
+ * Like `downloadFromUrl`, but saves via `shareOrDownloadFile` — prefer this
+ * for user-facing "save this image" actions (see its docs above).
+ */
+export async function shareOrDownloadFromUrl(
+  url: string,
+  filename: string,
+): Promise<void> {
+  const fullUrl = url.startsWith('http') ? url : withBasePath(url);
+  const res = await fetch(fullUrl, { credentials: 'include' });
+  if (!res.ok) {
+    throw new DownloadError(res.status, await readDownloadErrorMessage(res));
+  }
+  const blob = await res.blob();
+  await shareOrDownloadFile(blob, filename);
+}
+
+/**
  * Download a data-URL (e.g. from html-to-image / canvas) as a file.
  * Converts to Blob first to avoid browser data-URL size limits.
  */
@@ -104,4 +163,14 @@ export async function downloadFromDataUrl(
   const res = await fetch(dataUrl);
   const blob = await res.blob();
   triggerBlobDownload(blob, filename);
+}
+
+/** Like `downloadFromDataUrl`, but saves via `shareOrDownloadFile`. */
+export async function shareOrDownloadFromDataUrl(
+  dataUrl: string,
+  filename: string,
+): Promise<void> {
+  const res = await fetch(dataUrl);
+  const blob = await res.blob();
+  await shareOrDownloadFile(blob, filename);
 }
