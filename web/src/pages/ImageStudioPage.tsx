@@ -1198,9 +1198,15 @@ export function ImageStudioPage() {
                   >
                     <div className="mb-2 flex items-center justify-between gap-2">
                       <span className="text-sm font-medium">
-                        参考图（可选，最多 {MAX_REFERENCES} 张）
+                        {/* Mobile: just "参考图" — the count/explanation
+                            text crowded the row on narrow screens. Desktop
+                            keeps the fuller label. */}
+                        <span className="sm:hidden">参考图</span>
+                        <span className="hidden sm:inline">
+                          参考图（可选，最多 {MAX_REFERENCES} 张）
+                        </span>
                       </span>
-                      <span className="text-xs text-muted-foreground">
+                      <span className="hidden text-xs text-muted-foreground sm:inline">
                         图生图模式：可为每张参考图单独填写要参考的内容；也可把下方已生成的图片或电脑里的图片文件拖到这里
                       </span>
                     </div>
@@ -1295,7 +1301,7 @@ export function ImageStudioPage() {
                     maxLength={PROMPT_MAX_LENGTH}
                     rows={3}
                     disabled={generating}
-                    className="pb-6"
+                    className="pb-6 pr-8"
                     onKeyDown={(e) => {
                       if (
                         (e.metaKey || e.ctrlKey) &&
@@ -1307,6 +1313,20 @@ export function ImageStudioPage() {
                       }
                     }}
                   />
+                  {/* One-tap clear — holding backspace to empty a long
+                      prompt is painful on a mobile keyboard. */}
+                  {prompt.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setPrompt('')}
+                      disabled={generating}
+                      aria-label="清空提示词"
+                      title="清空提示词"
+                      className="absolute right-2 top-2 rounded-full p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                   {/* Character count, tucked into the textarea's own corner
                       instead of a separate row, to save vertical space. */}
                   <span className="pointer-events-none absolute bottom-1.5 right-2 rounded bg-background/80 px-1 text-[11px] text-muted-foreground">

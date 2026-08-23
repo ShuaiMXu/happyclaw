@@ -258,14 +258,25 @@ export function ChatPage() {
               (UnifiedSidebar.tsx) rather than the wordmark banner — it's a
               self-contained colored mark, so no dark-mode inversion. */}
           <div className="flex items-center gap-3 px-4 pt-5 pb-3">
-            <img
-              src={
-                appearance?.brandIconUrl ||
-                `${import.meta.env.BASE_URL}icons/icon-192.png`
-              }
-              alt={appearance?.appName || 'SoftopiaAI'}
-              className="h-10 w-10 rounded-xl object-cover"
-            />
+            <button
+              type="button"
+              onClick={() => {
+                navigate('/chat');
+                void loadGroups();
+              }}
+              title="返回首页并刷新"
+              aria-label="返回首页并刷新"
+              className="cursor-pointer transition-opacity hover:opacity-80"
+            >
+              <img
+                src={
+                  appearance?.brandIconUrl ||
+                  `${import.meta.env.BASE_URL}icons/icon-192.png`
+                }
+                alt={appearance?.appName || 'SoftopiaAI'}
+                className="h-10 w-10 rounded-xl object-cover"
+              />
+            </button>
             <div className="flex-1" />
             <button
               type="button"
@@ -344,14 +355,22 @@ export function ChatPage() {
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center h-64 px-4">
-              <img
-                src={
-                  appearance?.brandIconUrl ||
-                  `${import.meta.env.BASE_URL}icons/icon-192.png`
-                }
-                alt={appearance?.appName || 'SoftopiaAI'}
-                className="mb-6 h-16 w-16 rounded-xl object-cover"
-              />
+              <button
+                type="button"
+                onClick={() => void loadGroups()}
+                title="刷新"
+                aria-label="刷新"
+                className="cursor-pointer transition-opacity hover:opacity-80"
+              >
+                <img
+                  src={
+                    appearance?.brandIconUrl ||
+                    `${import.meta.env.BASE_URL}icons/icon-192.png`
+                  }
+                  alt={appearance?.appName || 'SoftopiaAI'}
+                  className="mb-6 h-16 w-16 rounded-xl object-cover"
+                />
+              </button>
               <p className="text-muted-foreground text-sm">暂无智能体工作区</p>
             </div>
           )}

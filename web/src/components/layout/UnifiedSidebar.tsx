@@ -231,7 +231,16 @@ export function UnifiedSidebar({
     <TooltipProvider delayDuration={200}>
       <div className="h-full flex flex-shrink-0">
         <nav className="w-[4.5rem] h-full bg-sidebar border-r border-border flex flex-col items-center py-3 gap-1 flex-shrink-0">
-          <div className="mt-[5px] w-[50px] h-[50px] mb-3 flex-shrink-0 flex items-center justify-center">
+          <button
+            type="button"
+            onClick={() => {
+              navigate('/chat');
+              void loadGroups();
+            }}
+            title="返回首页并刷新"
+            aria-label="返回首页并刷新"
+            className="mt-[5px] w-[50px] h-[50px] mb-3 flex-shrink-0 flex items-center justify-center rounded-xl transition-opacity hover:opacity-80 cursor-pointer"
+          >
             <img
               src={
                 appearance?.brandIconUrl ||
@@ -240,7 +249,7 @@ export function UnifiedSidebar({
               alt={appearance?.appName || 'SoftopiaAI'}
               className="w-[50px] h-[50px] rounded-xl object-cover"
             />
-          </div>
+          </button>
 
           <div className="mt-[5px] flex flex-col items-center gap-1">
             {navItems.map(({ path, icon: Icon, label }) => {
