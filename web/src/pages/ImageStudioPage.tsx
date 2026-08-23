@@ -79,7 +79,7 @@ const REFERENCE_ACCEPTED_MIME = new Set([
 // only screenshots come out as PNG. Neither our own byte-sniffing
 // (imageMimeType() server-side) nor sharp's build supports decoding HEIC,
 // so it's accepted for *selection* here but must always be converted to
-// WebP client-side before upload (see isHeicFile/compressReferenceImage
+// WebP/JPEG client-side before upload (see isHeicFile/compressReferenceImage
 // below) — raw HEIC bytes can never reach the server.
 const HEIC_HEIF_MIME = new Set([
   'image/heic',
@@ -91,18 +91,93 @@ const HEIC_HEIF_MIME = new Set([
 function isHeicFile(file: File): boolean {
   if (HEIC_HEIF_MIME.has(file.type.toLowerCase())) return true;
   // Some browsers/OS file pickers report an empty or generic `type` for
-  // HEIC files (seen on some Android WebViews and older iOS Safari) —
-  // fall back to sniffing the extension.
+  // HEIC files (seen on some Android WebViews, WeChat's embedded browser,
+  // and older iOS Safari) — fall back to sniffing the extension. This is
+  // only a *hint* for the size-threshold bypass in compressReferenceImage
+  // below — decodeToBitmap() below doesn't depend on it being right, since
+  // it tries native decode first regardless and only reaches for the
+  // heic2any fallback when that actually fails.
   return /\.(heic|heif)$/i.test(file.name);
 }
 
-/** Thrown when a HEIC/HEIF file can't be decoded client-side — no native
- * codec support (mainly non-Safari browsers; Safari itself can). There's
- * no server-side fallback, so this surfaces as an actionable error instead
- * of silently uploading bytes the server can't read either. */
-class HeicUnsupportedError extends Error {
+/** Loose "is this even worth attempting to decode" pre-filter for the file
+ * picker/drop zone — real gatekeeping happens at decode time
+ * (fileToReference/decodeToBitmap), this just weeds out obviously-wrong
+ * picks (e.g. a PDF) before spending any work on them. */
+function looksLikeImageFile(file: File): boolean {
+  if (file.type.startsWith('image/')) return true;
+  if (isHeicFile(file)) return true;
+  return /\.(png|jpe?g|webp|heic|heif|gif|bmp|tiff?|avif)$/i.test(file.name);
+}
+
+/** Thrown when an image file can't be decoded client-side at all (neither
+ * natively nor via the heic2any fallback below). There's no server-side
+ * fallback either, so this surfaces as an actionable error instead of
+ * silently uploading bytes nothing can read. */
+class ReferenceImageUndecodableError extends Error {
   constructor(readonly fileName: string) {
-    super(`HEIC/HEIF not decodable in this browser: ${fileName}`);
+    super(`Could not decode image file: ${fileName}`);
+  }
+}
+
+// Lazily loaded, cached — this pulls in a WASM HEIC/HEIF decoder (~2-3MB),
+// so it's only fetched the first time it's actually needed, not bundled
+// into the main chunk for every visitor.
+let heic2anyModulePromise: Promise<typeof import('heic2any').default> | null =
+  null;
+function loadHeic2any() {
+  if (!heic2anyModulePromise) {
+    heic2anyModulePromise = import('heic2any').then((m) => m.default);
+  }
+  return heic2anyModulePromise;
+}
+
+/**
+ * Convert a HEIC/HEIF blob to JPEG using a WASM decoder, for browsers whose
+ * own `createImageBitmap` can't decode it. Safari has a native HEIC codec
+ * (it's Apple's own format), but plenty of iOS *WebViews* embedded inside
+ * other apps — WeChat's being the most common one users hit — run on
+ * Chromium/X5 instead of Safari's engine and have no native HEIC support
+ * despite running on an iPhone. Also decodes Live Photos' still frame (a
+ * HEIC image sequence with the still as the primary image).
+ */
+async function convertHeicToJpeg(blob: Blob): Promise<Blob | null> {
+  try {
+    const heic2any = await loadHeic2any();
+    const result = await heic2any({
+      blob,
+      toType: 'image/jpeg',
+      quality: REFERENCE_ENCODE_QUALITY,
+    });
+    return (Array.isArray(result) ? result[0] : result) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decode a blob to an ImageBitmap, falling back to the heic2any WASM
+ * decoder when native decode fails (see convertHeicToJpeg above) instead
+ * of giving up outright. Returns the already-JPEG-converted blob too, when
+ * that fallback was used, so callers that need to re-encode reuse those
+ * bytes rather than the original undecodable ones.
+ */
+async function decodeToBitmap(
+  blob: Blob,
+): Promise<{ bitmap: ImageBitmap; convertedBlob: Blob | null } | null> {
+  try {
+    return { bitmap: await createImageBitmap(blob), convertedBlob: null };
+  } catch {
+    const converted = await convertHeicToJpeg(blob);
+    if (!converted) return null;
+    try {
+      return {
+        bitmap: await createImageBitmap(converted),
+        convertedBlob: converted,
+      };
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -256,30 +331,34 @@ async function compressReferenceImage(
   ) {
     return null;
   }
+  const decoded = await decodeToBitmap(blob);
+  if (!decoded) return null;
+  // Compare against the heic2any-converted JPEG's size (if that fallback
+  // was used), not the original HEIC bytes — HEIC's HEVC compression makes
+  // it routinely *smaller* than any JPEG/WebP re-encode of the same photo,
+  // so comparing against the original would almost always (wrongly) look
+  // like the re-encode "grew" the file even though it's the only usable
+  // form we have.
+  const compareSize = decoded.convertedBlob?.size ?? blob.size;
+  const { bitmap } = decoded;
   try {
-    const bitmap = await createImageBitmap(blob);
-    try {
-      const scale = Math.min(
-        1,
-        REFERENCE_MAX_DIMENSION / Math.max(bitmap.width, bitmap.height),
-      );
-      const width = Math.max(1, Math.round(bitmap.width * scale));
-      const height = Math.max(1, Math.round(bitmap.height * scale));
-      const target = document.createElement('canvas');
-      target.width = width;
-      target.height = height;
-      target.getContext('2d')?.drawImage(bitmap, 0, 0, width, height);
-      const encoded = await encodeCanvas(target);
-      if (encoded && (options.force || encoded.blob.size < blob.size)) {
-        return encoded;
-      }
-      return null;
-    } finally {
-      bitmap.close();
+    const scale = Math.min(
+      1,
+      REFERENCE_MAX_DIMENSION / Math.max(bitmap.width, bitmap.height),
+    );
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+    const target = document.createElement('canvas');
+    target.width = width;
+    target.height = height;
+    target.getContext('2d')?.drawImage(bitmap, 0, 0, width, height);
+    const encoded = await encodeCanvas(target);
+    if (encoded && (options.force || encoded.blob.size < compareSize)) {
+      return encoded;
     }
-  } catch {
-    // Decode failed — e.g. no native HEIC/HEIF codec in this browser.
     return null;
+  } finally {
+    bitmap.close();
   }
 }
 
@@ -292,26 +371,31 @@ async function readImageDimensions(
   blob: Blob,
 ): Promise<{ width: number; height: number } | null> {
   if (typeof createImageBitmap === 'undefined') return null;
-  try {
-    const bitmap = await createImageBitmap(blob);
-    const { width, height } = bitmap;
-    bitmap.close();
-    return { width, height };
-  } catch {
-    return null;
-  }
+  const decoded = await decodeToBitmap(blob);
+  if (!decoded) return null;
+  const { width, height } = decoded.bitmap;
+  decoded.bitmap.close();
+  return { width, height };
 }
 
 async function fileToReference(file: File): Promise<ReferenceDraft> {
-  const forceConvert = isHeicFile(file);
+  // Anything not already a known-good format must be converted client-side
+  // before upload. HEIC/HEIF (iPhone's camera default) is the common case,
+  // but forcing this off `REFERENCE_ACCEPTED_MIME` rather than isHeicFile's
+  // guess also covers oddly-typed/named exports (e.g. some Live Photo
+  // shares report an empty or unexpected `file.type`) — decodeToBitmap
+  // tries native decode first regardless, so this doesn't cost anything
+  // for files that turn out to already be fine.
+  const forceConvert = !REFERENCE_ACCEPTED_MIME.has(file.type);
   const [compressed, dimensions] = await Promise.all([
     compressReferenceImage(file, { force: forceConvert }),
     readImageDimensions(file),
   ]);
   if (forceConvert && !compressed) {
-    // Couldn't decode HEIC/HEIF client-side — there's no server-side
-    // fallback, so this browser genuinely can't use this file as-is.
-    throw new HeicUnsupportedError(file.name);
+    // Couldn't decode this file client-side at all — neither natively nor
+    // via the heic2any fallback — and there's no server-side fallback
+    // either, so this browser genuinely can't use this file as-is.
+    throw new ReferenceImageUndecodableError(file.name);
   }
   const source = compressed?.blob ?? file;
   return {
@@ -764,10 +848,8 @@ export function ImageStudioPage() {
       const incoming = Array.from(files);
       const accepted: ReferenceDraft[] = [];
       for (const file of incoming) {
-        if (!REFERENCE_ACCEPTED_MIME.has(file.type) && !isHeicFile(file)) {
-          setReferenceError(
-            `「${file.name}」不是支持的图片格式（仅 PNG / JPEG / WebP / HEIC）。`,
-          );
+        if (!looksLikeImageFile(file)) {
+          setReferenceError(`「${file.name}」不是支持的图片格式。`);
           continue;
         }
         if (file.size > MAX_REFERENCE_FILE_BYTES) {
@@ -777,9 +859,9 @@ export function ImageStudioPage() {
         try {
           accepted.push(await fileToReference(file));
         } catch (err) {
-          if (err instanceof HeicUnsupportedError) {
+          if (err instanceof ReferenceImageUndecodableError) {
             setReferenceError(
-              `「${err.fileName}」是 HEIC/HEIF 格式，这台设备的浏览器无法转换（iPhone 上请用 Safari 上传，或先在相册里把照片导出/另存为 JPG 再上传）。`,
+              `「${err.fileName}」无法在这台设备上解析（常见于 HEIC/实况照片遇到不支持的浏览器）。请改用 Safari 上传，或先在相册里把照片导出/另存为 JPG 再试。`,
             );
           } else {
             setReferenceError(
