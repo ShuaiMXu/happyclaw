@@ -73,6 +73,37 @@ const REFERENCE_ACCEPTED_MIME = new Set([
   'image/webp',
 ]);
 
+// iPhones save camera photos (and Live Photos) as HEIC/HEIF by default —
+// only screenshots come out as PNG. Neither our own byte-sniffing
+// (imageMimeType() server-side) nor sharp's build supports decoding HEIC,
+// so it's accepted for *selection* here but must always be converted to
+// WebP client-side before upload (see isHeicFile/compressReferenceImage
+// below) — raw HEIC bytes can never reach the server.
+const HEIC_HEIF_MIME = new Set([
+  'image/heic',
+  'image/heif',
+  'image/heic-sequence',
+  'image/heif-sequence',
+]);
+
+function isHeicFile(file: File): boolean {
+  if (HEIC_HEIF_MIME.has(file.type.toLowerCase())) return true;
+  // Some browsers/OS file pickers report an empty or generic `type` for
+  // HEIC files (seen on some Android WebViews and older iOS Safari) —
+  // fall back to sniffing the extension.
+  return /\.(heic|heif)$/i.test(file.name);
+}
+
+/** Thrown when a HEIC/HEIF file can't be decoded client-side — no native
+ * codec support (mainly non-Safari browsers; Safari itself can). There's
+ * no server-side fallback, so this surfaces as an actionable error instead
+ * of silently uploading bytes the server can't read either. */
+class HeicUnsupportedError extends Error {
+  constructor(readonly fileName: string) {
+    super(`HEIC/HEIF not decodable in this browser: ${fileName}`);
+  }
+}
+
 // Upper bound for the lightbox zoom, both via mouse-wheel and the "1:1"
 // button below — high enough that a 4K original still reaches its true
 // 100%-pixel zoom level when the viewport is small.
@@ -177,12 +208,18 @@ async function blobToBase64(blob: Blob): Promise<string> {
  * Keeps the longest edge at 2048px and re-encodes as WebP q0.9. Returns null
  * when compression is unavailable (no canvas/decode support or the result
  * would not shrink) — the caller then uploads the original bytes.
+ *
+ * `force` bypasses both the size-threshold skip and the "only keep it if
+ * smaller" check — used for HEIC/HEIF input, which can never be uploaded
+ * as-is regardless of size (the server can't decode it), so re-encoding is
+ * mandatory rather than an optional size optimization.
  */
 async function compressReferenceImage(
   blob: Blob,
+  options: { force?: boolean } = {},
 ): Promise<{ blob: Blob; mimeType: ReferenceDraft['mimeType'] } | null> {
   if (
-    blob.size <= REFERENCE_COMPRESSION_THRESHOLD_BYTES ||
+    (!options.force && blob.size <= REFERENCE_COMPRESSION_THRESHOLD_BYTES) ||
     typeof createImageBitmap === 'undefined' ||
     typeof document === 'undefined'
   ) {
@@ -204,7 +241,7 @@ async function compressReferenceImage(
       const webp = await new Promise<Blob | null>((resolve) =>
         target.toBlob(resolve, 'image/webp', REFERENCE_ENCODE_QUALITY),
       );
-      if (webp && webp.size < blob.size) {
+      if (webp && (options.force || webp.size < blob.size)) {
         return { blob: webp, mimeType: 'image/webp' };
       }
       return null;
@@ -212,6 +249,7 @@ async function compressReferenceImage(
       bitmap.close();
     }
   } catch {
+    // Decode failed — e.g. no native HEIC/HEIF codec in this browser.
     return null;
   }
 }
@@ -236,10 +274,16 @@ async function readImageDimensions(
 }
 
 async function fileToReference(file: File): Promise<ReferenceDraft> {
+  const forceConvert = isHeicFile(file);
   const [compressed, dimensions] = await Promise.all([
-    compressReferenceImage(file),
+    compressReferenceImage(file, { force: forceConvert }),
     readImageDimensions(file),
   ]);
+  if (forceConvert && !compressed) {
+    // Couldn't decode HEIC/HEIF client-side — there's no server-side
+    // fallback, so this browser genuinely can't use this file as-is.
+    throw new HeicUnsupportedError(file.name);
+  }
   const source = compressed?.blob ?? file;
   return {
     id: draftId(file.name, source.size),
@@ -691,9 +735,9 @@ export function ImageStudioPage() {
       const incoming = Array.from(files);
       const accepted: ReferenceDraft[] = [];
       for (const file of incoming) {
-        if (!REFERENCE_ACCEPTED_MIME.has(file.type)) {
+        if (!REFERENCE_ACCEPTED_MIME.has(file.type) && !isHeicFile(file)) {
           setReferenceError(
-            `「${file.name}」不是支持的图片格式（仅 PNG / JPEG / WebP）。`,
+            `「${file.name}」不是支持的图片格式（仅 PNG / JPEG / WebP / HEIC）。`,
           );
           continue;
         }
@@ -701,7 +745,19 @@ export function ImageStudioPage() {
           setReferenceError(`「${file.name}」超过 8 MB 参考图大小限制。`);
           continue;
         }
-        accepted.push(await fileToReference(file));
+        try {
+          accepted.push(await fileToReference(file));
+        } catch (err) {
+          if (err instanceof HeicUnsupportedError) {
+            setReferenceError(
+              `「${err.fileName}」是 HEIC/HEIF 格式，这台设备的浏览器无法转换（iPhone 上请用 Safari 上传，或先在相册里把照片导出/另存为 JPG 再上传）。`,
+            );
+          } else {
+            setReferenceError(
+              errorMessage(err, `「${file.name}」处理失败，请稍后重试。`),
+            );
+          }
+        }
       }
       if (accepted.length === 0) return;
       // The very first reference image sets the composition's aspect ratio
@@ -1098,7 +1154,7 @@ export function ImageStudioPage() {
                     <input
                       ref={fileInputRef}
                       type="file"
-                      accept="image/png,image/jpeg,image/webp"
+                      accept="image/png,image/jpeg,image/webp,image/heic,image/heif,.heic,.heif"
                       multiple
                       className="hidden"
                       onChange={(e) => {
