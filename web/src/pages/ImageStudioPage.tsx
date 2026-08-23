@@ -62,8 +62,10 @@ const MAX_REFERENCES = 6;
 const MAX_REFERENCE_FILE_BYTES = 8 * 1024 * 1024;
 // References above this size are downscaled/re-encoded in the browser before
 // upload: base64 inflates payloads by ~33% and slow uplinks otherwise never
-// finish uploading within the request timeout (nginx logs 408/499).
-const REFERENCE_COMPRESSION_THRESHOLD_BYTES = 512 * 1024;
+// finish uploading within the request timeout (nginx logs 408/499). This is
+// only the compression trigger, not a hard cap — anything under it uploads
+// at full native quality; MAX_REFERENCE_FILE_BYTES above is the real ceiling.
+const REFERENCE_COMPRESSION_THRESHOLD_BYTES = 1024 * 1024;
 const REFERENCE_MAX_DIMENSION = 2048;
 const REFERENCE_ENCODE_QUALITY = 0.9;
 
@@ -204,10 +206,39 @@ async function blobToBase64(blob: Blob): Promise<string> {
 }
 
 /**
+ * Encode a canvas to a Blob, preferring WebP but verifying the browser
+ * actually honored that request.
+ *
+ * Some WebViews (most notably WeChat's embedded browser) accept
+ * `canvas.toBlob(resolve, 'image/webp', …)` without error but silently
+ * encode as PNG instead — per spec, an unsupported requested type falls
+ * back to PNG with no way to detect that from the call itself. Blindly
+ * trusting the requested type (rather than checking the returned blob's
+ * actual `.type`) mislabels the upload, which the server then rejects as
+ * neither valid WebP nor matching its declared mimeType. Falling back to
+ * an explicit JPEG re-encode attempt covers browsers with no WebP encoder
+ * at all — JPEG canvas encoding is close to universally supported.
+ */
+async function encodeCanvas(
+  canvas: HTMLCanvasElement,
+): Promise<{ blob: Blob; mimeType: ReferenceDraft['mimeType'] } | null> {
+  for (const mimeType of ['image/webp', 'image/jpeg'] as const) {
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, mimeType, REFERENCE_ENCODE_QUALITY),
+    );
+    if (blob && blob.type === mimeType) {
+      return { blob, mimeType };
+    }
+  }
+  return null;
+}
+
+/**
  * Downscale and re-encode a reference image in the browser before upload.
- * Keeps the longest edge at 2048px and re-encodes as WebP q0.9. Returns null
- * when compression is unavailable (no canvas/decode support or the result
- * would not shrink) — the caller then uploads the original bytes.
+ * Keeps the longest edge at 2048px and re-encodes as WebP q0.9 (falling
+ * back to JPEG — see encodeCanvas above). Returns null when compression is
+ * unavailable (no canvas/decode support or the result would not shrink) —
+ * the caller then uploads the original bytes.
  *
  * `force` bypasses both the size-threshold skip and the "only keep it if
  * smaller" check — used for HEIC/HEIF input, which can never be uploaded
@@ -238,11 +269,9 @@ async function compressReferenceImage(
       target.width = width;
       target.height = height;
       target.getContext('2d')?.drawImage(bitmap, 0, 0, width, height);
-      const webp = await new Promise<Blob | null>((resolve) =>
-        target.toBlob(resolve, 'image/webp', REFERENCE_ENCODE_QUALITY),
-      );
-      if (webp && (options.force || webp.size < blob.size)) {
-        return { blob: webp, mimeType: 'image/webp' };
+      const encoded = await encodeCanvas(target);
+      if (encoded && (options.force || encoded.blob.size < blob.size)) {
+        return encoded;
       }
       return null;
     } finally {
