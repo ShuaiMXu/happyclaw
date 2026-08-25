@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   Download,
+  Eraser,
   ImagePlus,
   Loader2,
   RefreshCw,
@@ -952,6 +953,22 @@ export function ImageStudioPage() {
     });
   }, []);
 
+  // Prompt/references intentionally persist across generations (so an
+  // iterative image-to-image session doesn't lose its inputs) — but that
+  // means a new, unrelated generation has to be started by hand, or it
+  // otherwise reuses the previous prompt/reference images. This clears
+  // everything in one tap for that "start fresh" case.
+  const resetComposer = useCallback(() => {
+    setPrompt('');
+    setAspectRatio('4:3');
+    setReferences((prev) => {
+      for (const ref of prev) URL.revokeObjectURL(ref.previewUrl);
+      return [];
+    });
+    setReferenceError(null);
+    setGenerateError(null);
+  }, []);
+
   const updateReferenceNote = useCallback((id: string, note: string) => {
     setReferences((prev) =>
       prev.map((r) => (r.id === id ? { ...r, note } : r)),
@@ -1497,6 +1514,23 @@ export function ImageStudioPage() {
                   </div>
 
                   <div className="flex items-center gap-2">
+                    {/* Prompt/references persist across generations by
+                        design (see resetComposer above) — this is the
+                        "start a totally unrelated generation" escape
+                        hatch, so results don't unintentionally carry over
+                        old context. */}
+                    {(prompt.length > 0 || references.length > 0) && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={resetComposer}
+                        disabled={generating}
+                        title="清空提示词和参考图，开始全新的一次生成"
+                      >
+                        <Eraser />
+                        清空全部
+                      </Button>
+                    )}
                     <Button
                       onClick={() => void handleGenerate()}
                       disabled={generating || !prompt.trim()}
