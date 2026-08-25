@@ -2382,14 +2382,35 @@ function buildReferenceAwarePrompt(
   return `${prompt}\n\n${notes.join('\n')}`;
 }
 
+// Matches prompts/notes that actually ask for a date, time, weekday, or
+// timestamp to appear in the image — the current-date-time directive below
+// is only appended when this matches. Appending it unconditionally caused a
+// regression: some upstream models treat the mere presence of a date/time
+// string in the prompt as an implicit instruction to render it somewhere,
+// so ordinary generations that never asked for a date started getting one
+// stamped on anyway.
+const DATE_TIME_MENTION_RE =
+  /(时间戳|时间|日期|星期几|周[一二三四五六日天]|几点|几号|年月日|timestamp|\bdate\b|\btime\b|\bclock\b)/i;
+
+function promptMentionsDateTime(
+  prompt: string,
+  references: Array<{ note?: string }>,
+): boolean {
+  if (DATE_TIME_MENTION_RE.test(prompt)) return true;
+  return references.some(
+    (ref) => !!ref.note && DATE_TIME_MENTION_RE.test(ref.note),
+  );
+}
+
 /**
  * Compose the final prompt sent to the image model: user prompt + reference
- * notes + an explicit quality/aspect-ratio directive + the real current
- * date/time. The `size` request parameter alone doesn't reliably steer every
- * upstream model, so the quality/ratio requirement is also spelled out in
- * the prompt text itself — and image models have no clock of their own, so
- * a prompt asking for "当前时间戳" needs the real date grounded in text too,
- * or the model fabricates one (commonly landing in its own training era).
+ * notes + an explicit quality/aspect-ratio directive +, only when the
+ * prompt/notes actually reference a date/time, the real current date/time.
+ * The `size` request parameter alone doesn't reliably steer every upstream
+ * model, so the quality/ratio requirement is also spelled out in the prompt
+ * text itself — and image models have no clock of their own, so a prompt
+ * asking for "当前时间戳" needs the real date grounded in text too, or the
+ * model fabricates one (commonly landing in its own training era).
  */
 function buildImageGenerationPrompt(
   prompt: string,
@@ -2398,7 +2419,14 @@ function buildImageGenerationPrompt(
   aspectRatio: ImageAspectRatio,
 ): string {
   const withReferences = buildReferenceAwarePrompt(prompt, references);
-  return `${withReferences}\n\n${describeImageRequirements(quality, aspectRatio)}\n\n${describeCurrentDateTime()}`;
+  const parts = [
+    withReferences,
+    describeImageRequirements(quality, aspectRatio),
+  ];
+  if (promptMentionsDateTime(prompt, references)) {
+    parts.push(describeCurrentDateTime());
+  }
+  return parts.join('\n\n');
 }
 
 // GET /api/groups/:jid/generated-images - lightweight gallery listing

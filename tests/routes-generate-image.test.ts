@@ -247,19 +247,51 @@ describe('POST /:jid/generate-image', () => {
     const [prompt, model, refs] = generateWorkspaceImage.mock.calls[0];
     // The service prompt also carries an explicit quality/aspect-ratio
     // directive (default 2K / 4:3 here) — `size` alone doesn't reliably
-    // steer every upstream model — plus a real-current-date-time directive
-    // (see describeCurrentDateTime), so a prompt asking for "当前时间戳" is
-    // grounded instead of the model fabricating one. The date/time portion
-    // is real wall-clock time, so it's matched with a pattern instead of an
-    // exact string.
-    expect(prompt).toMatch(
-      /^merge the scenes\n\n参考图 1：角色造型\n\n请生成画质为 2K、画面比例为 4:3（横版）的图片。\n\n如果图片中需要显示当前日期、时间或时间戳，请使用：\d{4}年\d{2}月\d{2}日（星期[日一二三四五六]）\d{2}:\d{2}，不要凭空编造其他年份或日期。$/,
+    // steer every upstream model. The current-date-time directive is
+    // deliberately absent here — neither the prompt nor the reference note
+    // mentions a date/time, and always appending it caused some upstream
+    // models to stamp a date onto images that never asked for one.
+    expect(prompt).toBe(
+      'merge the scenes\n\n参考图 1：角色造型\n\n请生成画质为 2K、画面比例为 4:3（横版）的图片。',
     );
     expect(model).toBe('gpt-image-2');
     expect(refs).toHaveLength(2);
     expect(Buffer.from(refs[0].data)).toEqual(TINY_PNG);
     expect(refs[0].mimeType).toBe('image/png');
     expect(refs[1].note).toBeUndefined();
+  });
+
+  test('appends the current-date-time directive only when the prompt mentions a date/time', async () => {
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: '海报右下角打上当前时间戳' }),
+    });
+    expect(res.status).toBe(200);
+    const [prompt] = generateWorkspaceImage.mock.calls[0];
+    expect(prompt).toMatch(
+      /如果图片中需要显示当前日期、时间或时间戳，请使用：\d{4}年\d{2}月\d{2}日（星期[日一二三四五六]）\d{2}:\d{2}，不要凭空编造其他年份或日期。$/,
+    );
+  });
+
+  test('appends the current-date-time directive when only a reference note mentions a date/time', async () => {
+    const res = await groupRoutes.request(`/${JID}/generate-image`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: 'a hedgehog',
+        references: [
+          {
+            data: TINY_PNG.toString('base64'),
+            mimeType: 'image/png',
+            note: '参考这张的日期水印样式',
+          },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const [prompt] = generateWorkspaceImage.mock.calls[0];
+    expect(prompt).toMatch(/如果图片中需要显示当前日期/);
   });
 
   test('defaults to 2K / 4:3 when quality and aspectRatio are omitted', async () => {
