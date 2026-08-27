@@ -30,7 +30,7 @@ describe('Feishu route safety integration', () => {
     // forever. See channel-admission.ts's "pairing establishes ownership
     // before routing" contract.
     const bootstrapIdx = source.indexOf(
-      "chatType === 'p2p' &&\n        resolveEffectiveChatJid &&\n        !resolveEffectiveChatJid(chatJid)",
+      "if (chatType === 'p2p' && resolveEffectiveChatJid) {",
     );
     const routeCheckIdx = source.indexOf(
       'resolveAdmittedChannelRoute<FeishuMessageMeta>',
@@ -39,5 +39,26 @@ describe('Feishu route safety integration', () => {
     expect(bootstrapIdx).toBeGreaterThan(-1);
     expect(routeCheckIdx).toBeGreaterThan(-1);
     expect(bootstrapIdx).toBeLessThan(routeCheckIdx);
+  });
+
+  test('treats resolveEffectiveChatJid throwing (account-scoped wrapper) the same as a null/no-route result in the P2P bootstrap check', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'src/feishu.ts'),
+      'utf8',
+    );
+
+    // im-manager.ts's scopeConnectOpts wrapper throws
+    // ChannelRouteRejectedError instead of returning null when a chat has
+    // no route yet. Calling it unguarded in the P2P bootstrap pre-check
+    // (before any registration has happened) would let that throw escape,
+    // skip onNewChat/onP2pSender, and get caught by the outer handler as a
+    // scheduled retry — repeating forever since registration never runs.
+    const bootstrapBlock = source.slice(
+      source.indexOf("if (chatType === 'p2p' && resolveEffectiveChatJid) {"),
+      source.indexOf('resolveAdmittedChannelRoute<FeishuMessageMeta>'),
+    );
+
+    expect(bootstrapBlock).toContain('try {');
+    expect(bootstrapBlock).toContain('hasExistingRoute = false');
   });
 });

@@ -2344,11 +2344,26 @@ export function createFeishuConnection(
       // onNewChat/onP2pSender are idempotent no-ops once already
       // registered, so calling them again in their normal position below
       // is safe and keeps this bootstrap narrowly scoped to P2P.
-      if (
-        chatType === 'p2p' &&
-        resolveEffectiveChatJid &&
-        !resolveEffectiveChatJid(chatJid)
-      ) {
+      //
+      // resolveEffectiveChatJid's declared type is `{...} | null`, but the
+      // account-scoped connection wrapper installed by
+      // im-manager.ts#scopeConnectOpts throws ChannelRouteRejectedError
+      // instead of returning null when a chat has no route yet (that throw
+      // is intentional for the *admitted* lookup below, where the outer
+      // catch turns it into a scheduled retry). Called here — before any
+      // registration has happened — an unguarded call synchronously throws
+      // out of this bootstrap check, so onNewChat/onP2pSender never run and
+      // every message from that brand-new P2P chat gets stuck retrying
+      // forever. Treat a throw the same as a null/no-route result.
+      let hasExistingRoute = true;
+      if (chatType === 'p2p' && resolveEffectiveChatJid) {
+        try {
+          hasExistingRoute = !!resolveEffectiveChatJid(chatJid);
+        } catch {
+          hasExistingRoute = false;
+        }
+      }
+      if (chatType === 'p2p' && !hasExistingRoute) {
         onNewChat?.(chatJid, resolvedChatName);
         if (senderOpenId && onP2pSender) {
           onP2pSender(senderOpenId);
