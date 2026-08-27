@@ -151,11 +151,17 @@ describe('Feishu owner discovery is per channel account', () => {
       'feishu-account-b',
     );
 
-    first.getOptions().onP2pSender?.('ou_first');
-    expect(firstOwner).toHaveBeenCalledWith('ou_first');
+    first.getOptions().onP2pSender?.('ou_first', 'feishu:oc_first_chat');
+    expect(firstOwner).toHaveBeenCalledWith(
+      'ou_first',
+      'feishu:oc_first_chat#account:feishu-account-a',
+    );
     expect(secondOwner).not.toHaveBeenCalled();
-    second.getOptions().onP2pSender?.('ou_second');
-    expect(secondOwner).toHaveBeenCalledWith('ou_second');
+    second.getOptions().onP2pSender?.('ou_second', 'feishu:oc_second_chat');
+    expect(secondOwner).toHaveBeenCalledWith(
+      'ou_second',
+      'feishu:oc_second_chat#account:feishu-account-b',
+    );
     expect(firstOwner).toHaveBeenCalledTimes(1);
     await manager.disconnectAll();
   });
@@ -173,7 +179,9 @@ describe('Feishu owner discovery is per channel account', () => {
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const reload = source.slice(start, end);
-    expect(reload).toContain('onP2pSender: (senderOpenId: string) =>');
+    expect(reload).toContain(
+      'onP2pSender: (senderOpenId: string, chatJid: string) =>',
+    );
     expect(reload).toContain(
       'saveChannelAccountSecret(account.secret_ref, secret)',
     );

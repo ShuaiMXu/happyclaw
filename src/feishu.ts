@@ -159,8 +159,12 @@ export interface ConnectOptions {
     chatJid: string,
     operatorImId: string,
   ) => FollowUpActionResult;
-  /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
-  onP2pSender?: (senderOpenId: string) => void;
+  /**
+   * P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id。
+   * chatJid 是触发这条消息的具体私聊会话，用于让调用方把该会话自己的
+   * owner_im_id 纠正为它真实的发送者，而不是整个渠道账号共享的 owner。
+   */
+  onP2pSender?: (senderOpenId: string, chatJid: string) => void;
   normalizeIncomingJid?: (jid: string) => string;
   /** Recovery gate: durable Inbox remains replayable instead of ignored. */
   shouldDeferInbound?: () => boolean;
@@ -2366,7 +2370,7 @@ export function createFeishuConnection(
       if (chatType === 'p2p' && !hasExistingRoute) {
         onNewChat?.(chatJid, resolvedChatName);
         if (senderOpenId && onP2pSender) {
-          onP2pSender(senderOpenId);
+          onP2pSender(senderOpenId, chatJid);
         }
       }
 
@@ -2441,7 +2445,7 @@ export function createFeishuConnection(
 
       onNewChat?.(chatJid, resolvedChatName);
       if (chatType === 'p2p' && senderOpenId && onP2pSender) {
-        onP2pSender(senderOpenId);
+        onP2pSender(senderOpenId, chatJid);
       }
       lastMessageIdByChat.set(chatId, messageId);
       const resolvedCreateTimeMs = createTimeMs > 0 ? createTimeMs : Date.now();

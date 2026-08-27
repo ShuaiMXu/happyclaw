@@ -188,7 +188,7 @@ export interface ConnectFeishuOptions {
     chatJid: string,
     operatorImId: string,
   ) => FollowUpActionResult;
-  onP2pSender?: (senderOpenId: string) => void;
+  onP2pSender?: (senderOpenId: string, chatJid: string) => void;
 }
 
 export class IMConnectionManager {
@@ -526,8 +526,9 @@ export class IMConnectionManager {
         : {}),
       ...(opts.onP2pSender
         ? {
-            onP2pSender: (senderOpenId: string) => {
-              if (inboundAllowed()) opts.onP2pSender!(senderOpenId);
+            onP2pSender: (senderOpenId: string, chatJid: string) => {
+              if (inboundAllowed())
+                opts.onP2pSender!(senderOpenId, scope(chatJid));
             },
           }
         : {}),
