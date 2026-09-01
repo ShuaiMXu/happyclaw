@@ -527,6 +527,22 @@ export function MessageInput({
 
     if (imageItems.length > 0) {
       e.preventDefault();
+      const pastedText = e.clipboardData.getData('text/plain');
+      if (pastedText) {
+        const textarea = textareaRef.current;
+        const start = textarea?.selectionStart ?? content.length;
+        const end = textarea?.selectionEnd ?? content.length;
+        const next = content.slice(0, start) + pastedText + content.slice(end);
+        setContent(next);
+        debouncedSaveDraft(next);
+        requestAnimationFrame(() => {
+          const el = textareaRef.current;
+          if (!el) return;
+          const pos = start + pastedText.length;
+          el.setSelectionRange(pos, pos);
+        });
+      }
+
       const newImages: PendingImage[] = [];
 
       for (const item of imageItems) {

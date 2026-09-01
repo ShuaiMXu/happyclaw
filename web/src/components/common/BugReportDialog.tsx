@@ -139,6 +139,19 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
       for (const item of items) {
         if (item.type.startsWith('image/')) {
           e.preventDefault();
+          const pastedText = e.clipboardData.getData('text/plain');
+          const target = e.target;
+          if (pastedText && target instanceof HTMLTextAreaElement) {
+            const start = target.selectionStart ?? description.length;
+            const end = target.selectionEnd ?? description.length;
+            const next =
+              description.slice(0, start) + pastedText + description.slice(end);
+            setDescription(next);
+            requestAnimationFrame(() => {
+              const pos = start + pastedText.length;
+              target.setSelectionRange(pos, pos);
+            });
+          }
           const file = item.getAsFile();
           if (!file) continue;
           if (file.size > MAX_SCREENSHOT_SIZE) {
@@ -156,7 +169,7 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
         }
       }
     },
-    [addScreenshot],
+    [addScreenshot, description],
   );
 
   const removeScreenshot = useCallback((index: number) => {
