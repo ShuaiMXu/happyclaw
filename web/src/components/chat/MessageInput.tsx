@@ -42,6 +42,7 @@ import {
   FOLLOW_UP_MODE_CHANGED_EVENT,
   getDefaultFollowUpMode,
 } from '../../lib/follow-up-preferences';
+import { planImageClipboardPaste } from '../../lib/mixed-paste';
 
 interface PendingFile {
   /** Display name: relative path for folder uploads, file name otherwise */
@@ -525,43 +526,46 @@ export function MessageInput({
       }
     }
 
-    if (imageItems.length > 0) {
-      e.preventDefault();
-      const pastedText = e.clipboardData.getData('text/plain');
-      if (pastedText) {
-        const textarea = textareaRef.current;
-        const start = textarea?.selectionStart ?? content.length;
-        const end = textarea?.selectionEnd ?? content.length;
-        const next = content.slice(0, start) + pastedText + content.slice(end);
-        setContent(next);
-        debouncedSaveDraft(next);
-        requestAnimationFrame(() => {
-          const el = textareaRef.current;
-          if (!el) return;
-          const pos = start + pastedText.length;
-          el.setSelectionRange(pos, pos);
+    if (imageItems.length === 0) return;
+
+    const textarea = e.currentTarget;
+    const pastePlan = planImageClipboardPaste({
+      value: textarea.value,
+      selectionStart: textarea.selectionStart,
+      selectionEnd: textarea.selectionEnd,
+      text: e.clipboardData.getData('text/plain'),
+      imageItemCount: imageItems.length,
+    });
+    e.preventDefault();
+
+    if (pastePlan.value !== textarea.value) {
+      setContent(pastePlan.value);
+      debouncedSaveDraft(pastePlan.value);
+    }
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.setSelectionRange(pastePlan.selectionStart, pastePlan.selectionEnd);
+    });
+
+    const newImages: PendingImage[] = [];
+    for (const item of imageItems) {
+      const file = item.getAsFile();
+      if (!file) continue;
+      try {
+        const base64 = await readFileAsBase64(file);
+        newImages.push({
+          name: file.name || `pasted-${Date.now()}.png`,
+          data: base64,
+          mimeType: file.type,
+          preview: URL.createObjectURL(file),
         });
+      } catch {
+        // Skip failed images
       }
+    }
 
-      const newImages: PendingImage[] = [];
-
-      for (const item of imageItems) {
-        const file = item.getAsFile();
-        if (file) {
-          try {
-            const base64 = await readFileAsBase64(file);
-            newImages.push({
-              name: file.name || `pasted-${Date.now()}.png`,
-              data: base64,
-              mimeType: file.type,
-              preview: URL.createObjectURL(file),
-            });
-          } catch {
-            // Skip failed images
-          }
-        }
-      }
-
+    if (newImages.length > 0) {
       setPendingImages((prev) => [...prev, ...newImages]);
     }
   };

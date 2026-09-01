@@ -1,11 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import {
-  Bug,
-  ImagePlus,
-  X,
-  Loader2,
-  Copy,
-} from 'lucide-react';
+import { Bug, ImagePlus, X, Loader2, Copy } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '@/api/client';
 import { Button } from '@/components/ui/button';
@@ -19,6 +13,7 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { showToast } from '@/utils/toast';
+import { planImageClipboardPaste } from '@/lib/mixed-paste';
 
 interface BugReportDialogProps {
   open: boolean;
@@ -44,6 +39,7 @@ interface SubmitResult {
 
 const MAX_SCREENSHOTS = 3;
 const MAX_SCREENSHOT_SIZE = 5 * 1024 * 1024; // 5MB
+const MAX_DESCRIPTION_LENGTH = 5000;
 
 export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
   // Capabilities (pre-fetched on open)
@@ -71,9 +67,16 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
   // Pre-fetch capabilities when dialog opens
   useEffect(() => {
     if (open) {
-      api.get<Capabilities>('/api/bug-report/capabilities').then(setCaps).catch(() => {
-        setCaps({ ghAvailable: false, ghUsername: null, claudeAvailable: false });
-      });
+      api
+        .get<Capabilities>('/api/bug-report/capabilities')
+        .then(setCaps)
+        .catch(() => {
+          setCaps({
+            ghAvailable: false,
+            ghUsername: null,
+            claudeAvailable: false,
+          });
+        });
     }
   }, [open]);
 
@@ -103,7 +106,9 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
         toast.error(`最多上传 ${MAX_SCREENSHOTS} 张截图`);
         return;
       }
-      setScreenshots((prev) => [...prev, base64]);
+      setScreenshots((prev) =>
+        prev.length >= MAX_SCREENSHOTS ? prev : [...prev, base64],
+      );
     },
     [screenshots.length],
   );
@@ -136,40 +141,56 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
     (e: React.ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (!items) return;
-      for (const item of items) {
-        if (item.type.startsWith('image/')) {
-          e.preventDefault();
-          const pastedText = e.clipboardData.getData('text/plain');
-          const target = e.target;
-          if (pastedText && target instanceof HTMLTextAreaElement) {
-            const start = target.selectionStart ?? description.length;
-            const end = target.selectionEnd ?? description.length;
-            const next =
-              description.slice(0, start) + pastedText + description.slice(end);
-            setDescription(next);
-            requestAnimationFrame(() => {
-              const pos = start + pastedText.length;
-              target.setSelectionRange(pos, pos);
-            });
-          }
-          const file = item.getAsFile();
-          if (!file) continue;
-          if (file.size > MAX_SCREENSHOT_SIZE) {
-            toast.error('粘贴的截图不能超过 5MB');
-            return;
-          }
-          const reader = new FileReader();
-          reader.onload = () => {
-            const result = reader.result as string;
-            const base64 = result.includes(',') ? result.split(',')[1] : result;
-            addScreenshot(base64);
-          };
-          reader.readAsDataURL(file);
-          return;
+      const imageItems = Array.from(items).filter((item) =>
+        item.type.startsWith('image/'),
+      );
+      if (imageItems.length === 0) return;
+
+      e.preventDefault();
+      const target = e.target;
+      if (target instanceof HTMLTextAreaElement) {
+        const pastePlan = planImageClipboardPaste({
+          value: target.value,
+          selectionStart: target.selectionStart,
+          selectionEnd: target.selectionEnd,
+          text: e.clipboardData.getData('text/plain'),
+          imageItemCount: imageItems.length,
+          maxLength: MAX_DESCRIPTION_LENGTH,
+        });
+        if (pastePlan.value !== target.value) {
+          setDescription(pastePlan.value);
         }
+        requestAnimationFrame(() => {
+          target.setSelectionRange(
+            pastePlan.selectionStart,
+            pastePlan.selectionEnd,
+          );
+        });
+      }
+
+      const availableSlots = Math.max(0, MAX_SCREENSHOTS - screenshots.length);
+      const files = imageItems
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => file !== null);
+      const validFiles = files.filter((file) => {
+        if (file.size <= MAX_SCREENSHOT_SIZE) return true;
+        toast.error('粘贴的截图不能超过 5MB');
+        return false;
+      });
+      if (validFiles.length > availableSlots) {
+        toast.error(`最多上传 ${MAX_SCREENSHOTS} 张截图`);
+      }
+      for (const file of validFiles.slice(0, availableSlots)) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = reader.result as string;
+          const base64 = result.includes(',') ? result.split(',')[1] : result;
+          addScreenshot(base64);
+        };
+        reader.readAsDataURL(file);
       }
     },
-    [addScreenshot, description],
+    [addScreenshot, screenshots.length],
   );
 
   const removeScreenshot = useCallback((index: number) => {
@@ -178,24 +199,25 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
 
   // --- Generate report (Claude analysis) ---
 
-  const generateReport = useCallback(async (): Promise<GenerateResult | null> => {
-    try {
-      return await api.post<GenerateResult>(
-        '/api/bug-report/generate',
-        {
-          description: description.trim(),
-          screenshots: screenshots.length > 0 ? screenshots : undefined,
-        },
-        90000,
-      );
-    } catch (err) {
-      const msg =
-        typeof err === 'object' && err !== null && 'message' in err
-          ? (err as { message: string }).message
-          : '生成报告失败';
-      throw new Error(msg);
-    }
-  }, [description, screenshots]);
+  const generateReport =
+    useCallback(async (): Promise<GenerateResult | null> => {
+      try {
+        return await api.post<GenerateResult>(
+          '/api/bug-report/generate',
+          {
+            description: description.trim(),
+            screenshots: screenshots.length > 0 ? screenshots : undefined,
+          },
+          90000,
+        );
+      } catch (err) {
+        const msg =
+          typeof err === 'object' && err !== null && 'message' in err
+            ? (err as { message: string }).message
+            : '生成报告失败';
+        throw new Error(msg);
+      }
+    }, [description, screenshots]);
 
   // --- Submit flow ---
 
@@ -263,8 +285,7 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
         showToast('已打开 GitHub', '请在新标签页中登录并提交 Issue', 6000);
       }
     } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : '提交失败，请重试';
+      const msg = err instanceof Error ? err.message : '提交失败，请重试';
       showToast('提交失败', msg, 6000);
     }
   }, [generateReport, handleClose]);
@@ -340,10 +361,10 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="请描述你遇到的问题..."
                 rows={4}
-                maxLength={5000}
+                maxLength={MAX_DESCRIPTION_LENGTH}
               />
               <p className="text-xs text-muted-foreground mt-1">
-                {description.length}/5000
+                {description.length}/{MAX_DESCRIPTION_LENGTH}
               </p>
             </div>
 
@@ -396,7 +417,11 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
         {step === 1 && showConfirm && (
           <div className="text-center py-4 space-y-3">
             <p className="text-sm text-foreground">
-              将以 <span className="font-semibold text-foreground">{caps?.ghUsername || 'GitHub'}</span> 的身份提交 Issue 到
+              将以{' '}
+              <span className="font-semibold text-foreground">
+                {caps?.ghUsername || 'GitHub'}
+              </span>{' '}
+              的身份提交 Issue 到
             </p>
             <p className="text-sm text-muted-foreground">riba2534/happyclaw</p>
           </div>
@@ -466,12 +491,16 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
               <Button variant="outline" onClick={() => setShowConfirm(false)}>
                 取消
               </Button>
-              <Button variant="outline" onClick={() => { setShowConfirm(false); handleGenerateForPreview(); }}>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setShowConfirm(false);
+                  handleGenerateForPreview();
+                }}
+              >
                 手动编辑
               </Button>
-              <Button onClick={handleConfirmSubmit}>
-                确认提交
-              </Button>
+              <Button onClick={handleConfirmSubmit}>确认提交</Button>
             </>
           )}
           {step === 2 && (
