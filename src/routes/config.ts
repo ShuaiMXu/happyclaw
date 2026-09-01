@@ -110,6 +110,8 @@ import {
   getEffectiveExternalDir,
   getContainerEnvConfig,
   saveSystemSettings,
+  buildClaudeAiOauthPayload,
+  updateProviderOAuthCredentialsIfCurrent,
   getUserFeishuConfig,
   saveUserFeishuConfig,
   getUserTelegramConfig,
@@ -124,15 +126,16 @@ import {
   saveUserDiscordConfig,
   getUserWhatsAppConfig,
   saveUserWhatsAppConfig,
-  updateAllSessionCredentials,
   appendImConfigAudit,
 } from '../runtime-config.js';
 import type {
   ClaudeOAuthCredentials,
   CachedOAuthUsage,
-  OAuthUsageResponse,
 } from '../runtime-config.js';
-import { parseOAuthUsageBucket } from '../runtime-config.js';
+import {
+  hasOAuthUsageSignals,
+  parseOAuthUsageResponse,
+} from '../runtime-config.js';
 import type { AudienceMode, AuthUser, RegisteredGroup } from '../types.js';
 import { logger } from '../logger.js';
 import brandAssetRoutes from './brand-assets.js';
@@ -151,6 +154,8 @@ import {
 } from '../channel-mount-service.js';
 import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
 import { providerPool } from '../provider-pool.js';
+import { getProviderQuotaObservation } from '../provider-quota-observation.js';
+import { updateProviderSessionCredentials } from '../provider-session-credentials.js';
 import { getClientIp } from '../utils.js';
 import {
   getWorkspaceRuntimeJids,
@@ -769,23 +774,210 @@ setInterval(() => {
 
 const OAUTH_USAGE_API = 'https://api.anthropic.com/api/oauth/usage';
 const USAGE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
+const OAUTH_USAGE_TIMEOUT_MS = 5_000;
+const OAUTH_TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 const usageCache = new Map<string, CachedOAuthUsage>();
 const inFlightUsageRequests = new Map<string, Promise<CachedOAuthUsage>>();
+const usageCacheEpochs = new Map<string, number>();
+const MAX_USAGE_CACHE_EPOCHS = 256;
+let nextUsageCacheEpoch = 1;
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of usageCache) {
-    if (now - entry.fetchedAt >= USAGE_CACHE_TTL_MS) {
-      usageCache.delete(key);
+function enforceUsageEpochCapacity(): void {
+  while (usageCacheEpochs.size > MAX_USAGE_CACHE_EPOCHS) {
+    const oldestProviderId = usageCacheEpochs.keys().next().value as
+      | string
+      | undefined;
+    if (oldestProviderId === undefined) break;
+    usageCacheEpochs.delete(oldestProviderId);
+  }
+}
+
+function getProviderUsageEpoch(providerId: string): number {
+  const existing = usageCacheEpochs.get(providerId);
+  if (existing !== undefined) return existing;
+  const epoch = nextUsageCacheEpoch++;
+  usageCacheEpochs.set(providerId, epoch);
+  enforceUsageEpochCapacity();
+  return epoch;
+}
+
+function advanceProviderUsageEpoch(providerId: string): number {
+  const epoch = nextUsageCacheEpoch++;
+  usageCacheEpochs.delete(providerId);
+  usageCacheEpochs.set(providerId, epoch);
+  enforceUsageEpochCapacity();
+  return epoch;
+}
+
+function invalidateProviderUsageCache(providerId: string): void {
+  usageCache.delete(providerId);
+  inFlightUsageRequests.delete(providerId);
+  advanceProviderUsageEpoch(providerId);
+}
+
+async function fetchOAuthEndpoint(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<{ response: Response; release: () => void }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    clearTimeout(timeout);
+  };
+  try {
+    const response = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+    // Keep the abort timer alive until the caller finishes consuming the
+    // response body. Receiving headers alone is not a completed request.
+    return { response, release };
+  } catch (err) {
+    release();
+    throw err;
+  }
+}
+
+function usageFailureFallback(
+  providerId: string,
+  cached: CachedOAuthUsage | undefined,
+  error: string,
+): CachedOAuthUsage | null {
+  const observation = getProviderQuotaObservation(providerId);
+  if (cached) return { ...cached, error, observation };
+  if (!observation) return null;
+  return {
+    data: parseOAuthUsageResponse({}),
+    fetchedAt: observation.observedAt,
+    error,
+    observation,
+  };
+}
+
+class ProviderOAuthCredentialsChangedError extends Error {
+  constructor() {
+    super('Provider OAuth credentials changed during refresh');
+    this.name = 'ProviderOAuthCredentialsChangedError';
+  }
+}
+
+async function refreshProviderOAuthCredentials(
+  providerId: string,
+  expected: ClaudeOAuthCredentials,
+): Promise<void> {
+  const endpoint = await fetchOAuthEndpoint(
+    OAUTH_TOKEN_URL,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        refresh_token: expected.refreshToken,
+        client_id: OAUTH_CLIENT_ID,
+        scope: expected.scopes.join(' '),
+      }),
+    },
+    OAUTH_TOKEN_REFRESH_TIMEOUT_MS,
+  );
+  let raw: Record<string, unknown>;
+  try {
+    if (!endpoint.response.ok) {
+      throw new Error(
+        `OAuth token refresh returned ${endpoint.response.status}`,
+      );
+    }
+    raw = (await endpoint.response.json()) as Record<string, unknown>;
+  } finally {
+    endpoint.release();
+  }
+  const accessToken =
+    typeof raw.access_token === 'string' ? raw.access_token.trim() : '';
+  if (!accessToken) {
+    throw new Error('OAuth token refresh returned no access_token');
+  }
+  const refreshToken =
+    typeof raw.refresh_token === 'string' && raw.refresh_token.trim()
+      ? raw.refresh_token.trim()
+      : expected.refreshToken;
+  const expiresIn =
+    typeof raw.expires_in === 'number' &&
+    Number.isFinite(raw.expires_in) &&
+    raw.expires_in > 0
+      ? raw.expires_in
+      : 8 * 60 * 60;
+  const responseScopes =
+    typeof raw.scope === 'string'
+      ? raw.scope.split(/\s+/).filter(Boolean)
+      : expected.scopes;
+  const refreshed: ClaudeOAuthCredentials = {
+    ...expected,
+    accessToken,
+    refreshToken,
+    expiresAt: Date.now() + expiresIn * 1000,
+    scopes: responseScopes,
+  };
+
+  let persisted = false;
+  try {
+    persisted = updateProviderOAuthCredentialsIfCurrent(
+      providerId,
+      expected,
+      refreshed,
+    );
+  } catch {
+    throw new ProviderOAuthCredentialsChangedError();
+  }
+  if (!persisted) {
+    throw new ProviderOAuthCredentialsChangedError();
+  }
+  invalidateProviderUsageCache(providerId);
+  const updated = getProviders().find((provider) => provider.id === providerId);
+  if (updated) {
+    try {
+      updateProviderSessionCredentials(providerId, providerToConfig(updated));
+    } catch (err) {
+      logger.warn(
+        { err, providerId },
+        'Failed to project refreshed OAuth credentials into sessions',
+      );
+    }
+    // A rotated refresh token may invalidate a credential cached inside a
+    // running SDK process. Drain only this Provider's runners after their
+    // current query; a settings-page GET must never interrupt active work.
+    try {
+      deps?.queue?.drainProviderRunnersForCredentialRefresh?.(providerId);
+    } catch (err) {
+      logger.warn(
+        { err, providerId },
+        'Failed to drain runners after OAuth credential refresh',
+      );
     }
   }
-}, 5 * 60_000);
+}
 
-async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
-  const cached = usageCache.get(providerId);
-  if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) {
-    return cached;
+async function fetchOAuthUsage(
+  providerId: string,
+  refreshAttempted = false,
+  inheritedFallback?: CachedOAuthUsage,
+): Promise<CachedOAuthUsage> {
+  const storedCached = usageCache.get(providerId);
+  if (
+    storedCached &&
+    Date.now() - storedCached.fetchedAt < USAGE_CACHE_TTL_MS
+  ) {
+    return {
+      ...storedCached,
+      observation: getProviderQuotaObservation(providerId),
+    };
   }
+  const cached = storedCached ?? inheritedFallback;
 
   // Deduplicate concurrent requests for the same provider
   const inFlight = inFlightUsageRequests.get(providerId);
@@ -796,45 +988,102 @@ async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
   if (!provider) {
     throw new Error('Provider not found');
   }
-  if (!provider.claudeOAuthCredentials) {
-    throw new Error('Provider has no OAuth credentials');
+  const oauthCredentials = buildClaudeAiOauthPayload(
+    providerToConfig(provider),
+  );
+  if (!oauthCredentials) {
+    const observation = getProviderQuotaObservation(providerId);
+    return {
+      data: parseOAuthUsageResponse({}),
+      fetchedAt: observation?.observedAt ?? Date.now(),
+      observation,
+    };
   }
 
-  const requestPromise = (async () => {
-    try {
-      const resp = await fetch(OAUTH_USAGE_API, {
-        headers: {
-          Authorization: `Bearer ${provider.claudeOAuthCredentials!.accessToken}`,
-          'anthropic-beta': 'oauth-2025-04-20',
-        },
-      });
+  const requestEpoch = getProviderUsageEpoch(providerId);
 
-      if (!resp.ok) {
-        // Return stale cache if available, otherwise throw
-        if (cached) {
-          const stale: CachedOAuthUsage = {
-            ...cached,
-            error: `HTTP ${resp.status}`,
-          };
-          usageCache.set(providerId, stale);
-          return stale;
-        }
-        throw new Error(`Usage API returned ${resp.status}`);
+  let requestPromise!: Promise<CachedOAuthUsage>;
+  requestPromise = (async () => {
+    try {
+      if (!refreshAttempted && oauthCredentials.expiresAt <= Date.now()) {
+        await refreshProviderOAuthCredentials(providerId, oauthCredentials);
+        return fetchOAuthUsage(providerId, true, cached);
       }
 
-      const raw = (await resp.json()) as Record<string, unknown>;
-      const data: OAuthUsageResponse = {
-        five_hour: parseOAuthUsageBucket(raw.five_hour),
-        seven_day: parseOAuthUsageBucket(raw.seven_day),
-        seven_day_opus: parseOAuthUsageBucket(raw.seven_day_opus),
-        seven_day_sonnet: parseOAuthUsageBucket(raw.seven_day_sonnet),
-      };
+      const endpoint = await fetchOAuthEndpoint(
+        OAUTH_USAGE_API,
+        {
+          headers: {
+            Authorization: `Bearer ${oauthCredentials.accessToken}`,
+            'anthropic-beta': 'oauth-2025-04-20',
+          },
+        },
+        OAUTH_USAGE_TIMEOUT_MS,
+      );
+      let raw: Record<string, unknown>;
+      try {
+        // A credential update/delete invalidates the request that was started
+        // with the old token. Join (or start) the current epoch's request so
+        // the original caller cannot receive a stale account's usage body.
+        if (getProviderUsageEpoch(providerId) !== requestEpoch) {
+          return fetchOAuthUsage(providerId);
+        }
 
-      const result: CachedOAuthUsage = { data, fetchedAt: Date.now() };
-      usageCache.set(providerId, result);
+        if (endpoint.response.status === 401 && !refreshAttempted) {
+          endpoint.release();
+          await refreshProviderOAuthCredentials(providerId, oauthCredentials);
+          return fetchOAuthUsage(providerId, true, cached);
+        }
+        if (!endpoint.response.ok) {
+          throw new Error(`Usage API returned ${endpoint.response.status}`);
+        }
+        raw = (await endpoint.response.json()) as Record<string, unknown>;
+      } finally {
+        endpoint.release();
+      }
+      if (getProviderUsageEpoch(providerId) !== requestEpoch) {
+        return fetchOAuthUsage(providerId);
+      }
+      if (!hasOAuthUsageSignals(raw)) {
+        throw new Error('Usage API returned no recognized quota data');
+      }
+      const data = parseOAuthUsageResponse(raw);
+
+      const result: CachedOAuthUsage = {
+        data,
+        fetchedAt: Date.now(),
+        observation: getProviderQuotaObservation(providerId),
+      };
+      if (getProviderUsageEpoch(providerId) === requestEpoch) {
+        usageCache.set(providerId, result);
+      }
       return result;
+    } catch (err) {
+      if (getProviderUsageEpoch(providerId) !== requestEpoch) {
+        return fetchOAuthUsage(providerId);
+      }
+      if (err instanceof ProviderOAuthCredentialsChangedError) {
+        // A refresh performed outside this route can change the Provider
+        // without advancing our request epoch. Detach this exact promise
+        // before retrying so fetchOAuthUsage cannot join itself. Preserve the
+        // full snapshot because a token refresh stays within one account.
+        if (inFlightUsageRequests.get(providerId) === requestPromise) {
+          inFlightUsageRequests.delete(providerId);
+          advanceProviderUsageEpoch(providerId);
+        }
+        return fetchOAuthUsage(providerId, false, cached);
+      }
+      const message = err instanceof Error ? err.message : 'Usage API failed';
+      const fallback = usageFailureFallback(providerId, cached, message);
+      if (fallback) {
+        if (cached) usageCache.set(providerId, fallback);
+        return fallback;
+      }
+      throw err;
     } finally {
-      inFlightUsageRequests.delete(providerId);
+      if (inFlightUsageRequests.get(providerId) === requestPromise) {
+        inFlightUsageRequests.delete(providerId);
+      }
     }
   })();
 
@@ -1099,13 +1348,14 @@ configRoutes.put(
 
         const commit = () => {
           const updated = updateProviderSecrets(id, validation.data);
+          invalidateProviderUsageCache(id);
           appendClaudeConfigAuditBestEffort(actor, 'update_provider_secrets', [
             `id:${id}`,
             ...changedFields,
           ]);
           return runAfterProviderPersistence(updated, () => {
             if (validation.data.claudeOAuthCredentials && updated.enabled) {
-              updateAllSessionCredentials(providerToConfig(updated));
+              updateProviderSessionCredentials(id, providerToConfig(updated));
               deps?.queue?.closeAllActiveForCredentialRefresh();
             }
           });
@@ -1195,6 +1445,7 @@ configRoutes.delete(
           () => {
             if (previous) {
               deleteProvider(id);
+              invalidateProviderUsageCache(id);
               appendClaudeConfigAuditBestEffort(actor, 'delete_provider', [
                 `id:${id}`,
               ]);
@@ -1515,6 +1766,7 @@ configRoutes.post(
             : tokenData.access_token,
           clearAnthropicApiKey: true,
         });
+        invalidateProviderUsageCache(flow.targetProviderId);
       } else {
         // Create new official provider
         provider = createProvider({
@@ -1528,7 +1780,10 @@ configRoutes.post(
 
       // Write .credentials.json to all sessions
       if (oauthCredentials) {
-        updateAllSessionCredentials(providerToConfig(provider));
+        updateProviderSessionCredentials(
+          provider.id,
+          providerToConfig(provider),
+        );
         deps?.queue?.closeAllActiveForCredentialRefresh();
       }
 

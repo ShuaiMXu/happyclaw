@@ -821,6 +821,55 @@ describe('scheduled task workspace/session contract', () => {
     expect(runContainerAgentMock).toHaveBeenCalledOnce();
   });
 
+  test('treats Provider quota control frames as activity-only scheduler output', async () => {
+    const taskId = createTask({ id: 'task-provider-quota-control-frame' });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    runContainerAgentMock.mockImplementationOnce(
+      async (_group, input, onProcess, onOutput) => {
+        onProcess?.({} as never, `container-${input.taskRunId}`, null);
+        await onOutput?.({
+          status: 'stream',
+          result: 'must-not-project',
+          streamEvent: { type: 'text', text: 'must-not-broadcast' },
+          providerQuotaObservation: {
+            source: 'sdk_rate_limit_event',
+            observedAt: Date.now(),
+            status: 'allowed_warning',
+            utilization: 0.75,
+          },
+        });
+        return {
+          status: 'success',
+          result: 'task result after quota control',
+          inputTurnCompleted: true,
+        };
+      },
+    );
+    const { deps, waitForRun } = makeDeps(groups);
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+
+    expect(trigger.success).toBe(true);
+    expect(deps.broadcastStreamEvent).not.toHaveBeenCalled();
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      result: 'task result after quota control',
+    });
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('task result after quota control'),
+      expect.any(Object),
+    );
+    expect(deps.storeResultAndNotify).not.toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('must-not-project'),
+      expect.any(Object),
+    );
+  });
+
   test('persists and retries a failed canonical workspace result without rerunning isolated Agent work', async () => {
     const taskId = createTask({ id: 'task-workspace-projection-retry' });
     const groups = {

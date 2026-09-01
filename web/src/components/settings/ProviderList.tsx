@@ -315,8 +315,11 @@ export function ProviderList({
                     )}
 
                   {/* OAuth 用量 */}
-                  {provider.hasClaudeOAuthCredentials && (
-                    <UsageBars providerId={provider.id} />
+                  {provider.type === 'official' && (
+                    <UsageBars
+                      providerId={provider.id}
+                      providerVersion={provider.updatedAt}
+                    />
                   )}
                 </div>
               );

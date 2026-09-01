@@ -121,6 +121,10 @@ import {
   type ProviderFallbackRetryTurn,
 } from './provider-fallback.js';
 import {
+  isTerminalSdkRateLimitRejection,
+  normalizeSdkRateLimitObservation,
+} from './provider-quota-observation.js';
+import {
   runSdkControlWithTimeout,
   SdkFirstResponseWatchdog,
 } from './sdk-control.js';
@@ -1841,6 +1845,19 @@ async function runQueryAttempt(
     }
     if (emitOutput) writeOutput(output);
   };
+  const publishProviderQuotaObservation = (info: SDKRateLimitInfo): void => {
+    // Passive provider observations are host control-plane state, including
+    // internal maintenance queries whose user-visible output is suppressed.
+    writeOutput(
+      outputCorrelation.correlate({
+        status: 'stream',
+        result: null,
+        providerQuotaObservation: normalizeSdkRateLimitObservation(info),
+        turnId: containerInput.turnId,
+        sessionId: newSessionId || sessionId,
+      }),
+    );
+  };
   let providerFailurePublished = false;
   /**
    * Publish one provider failure control signal.
@@ -2880,7 +2897,8 @@ async function runQueryAttempt(
       // the original indefinite "thinking" state.
       if (message.type === 'rate_limit_event') {
         const info: SDKRateLimitInfo = message.rate_limit_info;
-        if (info.status === 'rejected') {
+        publishProviderQuotaObservation(info);
+        if (isTerminalSdkRateLimitRejection(info)) {
           const limitDecision = decideProviderLimitAction({
             structuredRejection: { rateLimitType: info.rateLimitType },
             result: null,

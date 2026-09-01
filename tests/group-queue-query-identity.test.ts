@@ -22,6 +22,52 @@ vi.mock('../src/db.js', () => ({ getTaskById: () => undefined }));
 const { GroupQueue } = await import('../src/group-queue.js');
 
 describe('GroupQueue query identity', () => {
+  test('drains only matching Provider runners without interrupting the current query', () => {
+    const queue = new GroupQueue();
+    const matchingJid = 'web:credential-drain-match';
+    const otherJid = 'web:credential-drain-other';
+    const matching = (queue as any).getGroup(matchingJid);
+    matching.active = true;
+    matching.groupFolder = 'credential-drain-match';
+    matching.selectedProviderId = 'provider-refresh';
+    matching.queryInFlight = true;
+    matching.queryId = 'query-in-progress';
+    const other = (queue as any).getGroup(otherJid);
+    other.active = true;
+    other.groupFolder = 'credential-drain-other';
+    other.selectedProviderId = 'provider-other';
+
+    expect(
+      queue.drainProviderRunnersForCredentialRefresh('provider-refresh'),
+    ).toBe(1);
+
+    const matchingInput = path.join(
+      '/tmp/happyclaw-query-identity-test',
+      'ipc',
+      'credential-drain-match',
+      'input',
+    );
+    const otherInput = path.join(
+      '/tmp/happyclaw-query-identity-test',
+      'ipc',
+      'credential-drain-other',
+      'input',
+    );
+    expect(fs.existsSync(path.join(matchingInput, '_drain'))).toBe(true);
+    expect(fs.existsSync(path.join(matchingInput, '_close'))).toBe(false);
+    expect(fs.existsSync(path.join(otherInput, '_drain'))).toBe(false);
+    expect(matching.queryInFlight).toBe(true);
+    expect(matching.pendingMessages).toBe(false);
+    expect(
+      queue.drainProviderRunnersForCredentialRefresh('provider-refresh'),
+    ).toBe(0);
+
+    fs.rmSync(path.join('/tmp/happyclaw-query-identity-test', 'ipc'), {
+      recursive: true,
+      force: true,
+    });
+  });
+
   test('matches coalescing only against physical inputs covered by the active query', () => {
     const queue = new GroupQueue();
     const jid = 'web:query-covered-input';

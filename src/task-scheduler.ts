@@ -21,6 +21,7 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
+import { isProviderQuotaControlOutput } from './provider-quota-observation.js';
 import {
   cancelDeliveredGroupTaskRunWithWorkspaceIntent,
   cancelTaskRun,
@@ -1308,6 +1309,11 @@ async function runTaskInner(
           selectedProviderId,
         ),
       async (streamedOutput: ContainerOutput) => {
+        if (isProviderQuotaControlOutput(streamedOutput)) {
+          lastOutputTime = Date.now();
+          resetIdleTimer();
+          return;
+        }
         // Broadcast stream events to WebSocket clients viewing the task workspace
         if (streamedOutput.status === 'stream' && streamedOutput.streamEvent) {
           deps.broadcastStreamEvent?.(effectiveJid, streamedOutput.streamEvent);
