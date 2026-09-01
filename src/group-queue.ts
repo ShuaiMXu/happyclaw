@@ -2258,6 +2258,33 @@ export class GroupQueue {
   }
 
   /**
+   * Gracefully retire only runners using the refreshed Provider. The drain
+   * sentinel is consumed after the current query, so a read-only usage poll
+   * can rotate credentials without interrupting unrelated or in-flight work.
+   */
+  drainProviderRunnersForCredentialRefresh(providerId: string): number {
+    let drained = 0;
+    for (const [jid, state] of this.groups) {
+      if (
+        !state.active ||
+        !state.groupFolder ||
+        state.selectedProviderId !== providerId ||
+        state.drainSentinelWritten
+      ) {
+        continue;
+      }
+      if (!this.writeDrainSentinel(state as ActiveGroupState)) continue;
+      state.drainSentinelWritten = true;
+      drained++;
+      logger.info(
+        { groupJid: jid, groupFolder: state.groupFolder, providerId },
+        'Sent drain signal after provider credential refresh',
+      );
+    }
+    return drained;
+  }
+
+  /**
    * Interrupt the current query for the same chat only (do not cross-interrupt
    * sibling chats that share a serialized runner/folder).
    *

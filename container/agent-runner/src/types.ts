@@ -333,6 +333,30 @@ export interface ContainerOutput {
   error?: string;
   providerFailure?: boolean;
   /**
+   * Passive SDK rate-limit observation. `utilization` is the SDK/header
+   * fraction (0..1), not the OAuth usage endpoint's 0..100 percentage.
+   */
+  providerQuotaObservation?: {
+    source: 'sdk_rate_limit_event';
+    /** Unix epoch milliseconds. */
+    observedAt: number;
+    status: 'allowed' | 'allowed_warning' | 'rejected';
+    rateLimitType?: string;
+    utilization?: number;
+    /** Unix epoch seconds. */
+    resetsAt?: number;
+    overageStatus?: 'allowed' | 'allowed_warning' | 'rejected';
+    /** Unix epoch seconds. */
+    overageResetsAt?: number;
+    overageDisabledReason?: string;
+    isUsingOverage?: boolean;
+    overageInUse?: boolean;
+    surpassedThreshold?: number;
+    errorCode?: string;
+    canUserPurchaseCredits?: boolean;
+    hasChargeableSavedPaymentMethod?: boolean;
+  };
+  /**
    * Upstream `rate_limit_event.resetsAt` for an account-scope rejection. The
    * host quarantines the provider until this instant instead of the flat
    * recovery interval, so a five-hour account limit cannot re-enter rotation

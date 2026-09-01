@@ -1,8 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/api/client';
-import type { CachedOAuthUsage, OAuthUsageBucket } from './types';
+import type {
+  CachedOAuthUsage,
+  OAuthExtraUsage,
+  OAuthUsageBucket,
+  ProviderQuotaObservation,
+} from './types';
 
-const POLL_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
+const POLL_INTERVAL_MS = 3 * 60 * 1000;
+const LIVE_OBSERVATION_FRESHNESS_MS = 5 * 60 * 1000;
+
+export function clampUsagePercentage(value: number | null): number | null {
+  if (value === null || !Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(100, value));
+}
 
 function barColor(utilization: number): string {
   if (utilization >= 80) return 'bg-red-500';
@@ -10,8 +21,11 @@ function barColor(utilization: number): string {
   return 'bg-emerald-500';
 }
 
-function formatResetTime(resetsAt: string): string {
-  const diff = new Date(resetsAt).getTime() - Date.now();
+export function formatResetTime(resetsAt: string | null): string | null {
+  if (!resetsAt) return null;
+  const resetMs = new Date(resetsAt).getTime();
+  if (!Number.isFinite(resetMs)) return null;
+  const diff = resetMs - Date.now();
   if (diff <= 0) return '现在';
 
   const totalMinutes = Math.floor(diff / 60_000);
@@ -29,42 +43,236 @@ function formatResetTime(resetsAt: string): string {
   return `${minutes}m`;
 }
 
+export function sdkUtilizationPercentage(
+  observation: ProviderQuotaObservation,
+): number | null {
+  if (
+    observation.utilization === undefined ||
+    !Number.isFinite(observation.utilization) ||
+    observation.utilization < 0 ||
+    observation.utilization > 1
+  ) {
+    return null;
+  }
+  return observation.utilization * 100;
+}
+
+export function extraUsagePercentage(extra: OAuthExtraUsage): number | null {
+  if (!extra.is_enabled) return null;
+  const reported = clampUsagePercentage(extra.utilization);
+  if (reported !== null) return reported;
+  if (
+    extra.used_credits === null ||
+    extra.monthly_limit === null ||
+    !Number.isFinite(extra.used_credits) ||
+    !Number.isFinite(extra.monthly_limit) ||
+    extra.monthly_limit <= 0
+  ) {
+    return null;
+  }
+  return clampUsagePercentage((extra.used_credits / extra.monthly_limit) * 100);
+}
+
+export function isCurrentProviderQuotaObservation(
+  observation: ProviderQuotaObservation,
+  now = Date.now(),
+): boolean {
+  if (
+    !Number.isFinite(observation.observedAt) ||
+    observation.observedAt <= 0 ||
+    now - observation.observedAt > LIVE_OBSERVATION_FRESHNESS_MS
+  ) {
+    return false;
+  }
+  if (
+    observation.resetsAt !== undefined &&
+    Number.isFinite(observation.resetsAt) &&
+    observation.resetsAt > 0 &&
+    observation.resetsAt * 1000 <= now
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function formatEpochReset(value: number | undefined): string | null {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return null;
+  const milliseconds = value < 1e11 ? value * 1000 : value;
+  return formatResetTime(new Date(milliseconds).toISOString());
+}
+
 function UsageColumn({
   label,
   bucket,
+  detail,
 }: {
   label: string;
   bucket: OAuthUsageBucket;
+  detail?: string | null;
 }) {
-  const pct = Math.round(bucket.utilization);
+  const pct = clampUsagePercentage(bucket.utilization);
+  const reset = formatResetTime(bucket.resets_at);
   return (
-    <div className="flex items-center gap-1.5 flex-1 min-w-0 justify-center">
-      <span className="text-[11px] font-medium text-muted-foreground shrink-0">
-        {label}
-      </span>
-      <div className="w-16 h-1.5 rounded-full bg-muted overflow-hidden shrink-0">
-        <div
-          className={`h-full rounded-full transition-all ${barColor(pct)}`}
-          style={{ width: `${Math.min(pct, 100)}%` }}
-        />
+    <div className="min-w-0 rounded-md bg-muted/35 px-2.5 py-2">
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span
+          className="truncate text-[11px] font-medium text-muted-foreground"
+          title={label}
+        >
+          {label}
+        </span>
+        <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+          {pct === null ? '—' : `${Math.round(pct)}%`}
+        </span>
       </div>
-      <span className="text-[11px] font-mono text-muted-foreground shrink-0">
-        {pct}%
-      </span>
-      <span className="text-[10px] text-muted-foreground/60 shrink-0">
-        {formatResetTime(bucket.resets_at)}
-      </span>
+      <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
+        {pct !== null && (
+          <div
+            className={`h-full rounded-full transition-all ${barColor(pct)}`}
+            style={{ width: `${pct}%` }}
+          />
+        )}
+      </div>
+      {(reset || detail) && (
+        <div className="mt-1 truncate text-[10px] text-muted-foreground/60">
+          {detail ?? (reset ? `${reset} 后重置` : null)}
+        </div>
+      )}
     </div>
   );
 }
 
-export function UsageBars({ providerId }: { providerId: string }) {
+function formatMinorCurrency(
+  value: number | null,
+  currency: string | null,
+): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  const normalizedCurrency =
+    currency && /^[A-Za-z]{3}$/.test(currency) ? currency.toUpperCase() : 'USD';
+  try {
+    const zeroDecimalCurrency = ['JPY', 'KRW', 'VND'].includes(
+      normalizedCurrency,
+    );
+    const formatter = new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: normalizedCurrency,
+      minimumFractionDigits: zeroDecimalCurrency ? 0 : 2,
+      maximumFractionDigits: zeroDecimalCurrency ? 0 : 2,
+    });
+    return formatter.format(value / (zeroDecimalCurrency ? 1 : 100));
+  } catch {
+    return `${new Intl.NumberFormat(undefined, {
+      maximumFractionDigits: 2,
+    }).format(value / 100)} ${normalizedCurrency}`;
+  }
+}
+
+export function formatExtraUsageDetail(extra: OAuthExtraUsage): string {
+  if (!extra.is_enabled) return '未启用';
+  if (extra.monthly_limit === null) {
+    return extra.used_credits === null
+      ? '无月度上限'
+      : `已用 ${formatMinorCurrency(extra.used_credits, extra.currency)} · 无月度上限`;
+  }
+  return `${formatMinorCurrency(extra.used_credits, extra.currency)} / ${formatMinorCurrency(extra.monthly_limit, extra.currency)}`;
+}
+
+function ExtraUsageColumn({ extra }: { extra: OAuthExtraUsage }) {
+  return (
+    <UsageColumn
+      label="Extra"
+      bucket={{ utilization: extraUsagePercentage(extra), resets_at: null }}
+      detail={formatExtraUsageDetail(extra)}
+    />
+  );
+}
+
+function displayRateLimitType(type: string | undefined): string {
+  switch (type) {
+    case 'five_hour':
+      return '5h';
+    case 'seven_day':
+      return '7d';
+    case 'seven_day_opus':
+      return 'Opus';
+    case 'seven_day_sonnet':
+      return 'Sonnet';
+    case 'seven_day_overage_included':
+      return '模型周期';
+    case 'overage':
+      return 'Extra';
+    default:
+      return type?.replaceAll('_', ' ') || '整体额度';
+  }
+}
+
+function LiveStatus({
+  observation,
+}: {
+  observation: ProviderQuotaObservation;
+}) {
+  const usingOverage =
+    observation.isUsingOverage === true || observation.overageInUse === true;
+  const current = isCurrentProviderQuotaObservation(observation);
+  const currentStatus = usingOverage
+    ? '正在使用额外用量'
+    : observation.status === 'rejected'
+      ? '已受限'
+      : observation.status === 'allowed_warning'
+        ? '接近限额'
+        : '可用';
+  const status = current ? currentStatus : `上次观测：${currentStatus}`;
+  const color = !current
+    ? 'bg-muted-foreground/50'
+    : usingOverage
+      ? 'bg-blue-500'
+      : observation.status === 'rejected'
+        ? 'bg-red-500'
+        : observation.status === 'allowed_warning'
+          ? 'bg-amber-500'
+          : 'bg-emerald-500';
+  const pct = sdkUtilizationPercentage(observation);
+  const reset = formatEpochReset(observation.resetsAt);
+
+  return (
+    <div
+      className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border/60 px-2.5 py-1.5 text-[11px] text-muted-foreground"
+      title={new Date(observation.observedAt).toLocaleString()}
+    >
+      <span className={`size-1.5 shrink-0 rounded-full ${color}`} />
+      <span className="shrink-0 font-medium">{current ? 'Live' : 'Last'}</span>
+      <span className="min-w-0 truncate">{status}</span>
+      <span className="shrink-0">
+        {displayRateLimitType(observation.rateLimitType)}
+      </span>
+      {pct !== null && (
+        <span className="shrink-0 font-mono">{Math.round(pct)}%</span>
+      )}
+      {current && reset && <span className="shrink-0">{reset} 后重置</span>}
+      {observation.overageStatus && !usingOverage && (
+        <span className="min-w-0 truncate">
+          Extra: {observation.overageStatus}
+        </span>
+      )}
+    </div>
+  );
+}
+
+export function UsageBars({
+  providerId,
+  providerVersion,
+}: {
+  providerId: string;
+  providerVersion?: string;
+}) {
   const [usage, setUsage] = useState<CachedOAuthUsage | null>(null);
   const [loading, setLoading] = useState(true);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    setUsage(null);
+    setLoading(true);
 
     const fetchUsage = async () => {
       if (document.visibilityState !== 'visible') return;
@@ -74,7 +282,8 @@ export function UsageBars({ providerId }: { providerId: string }) {
         );
         if (!cancelled) setUsage(data);
       } catch {
-        // Silent — usage is optional
+        // Usage observation is optional and must not disrupt provider settings.
+        if (!cancelled) setUsage(null);
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -93,30 +302,60 @@ export function UsageBars({ providerId }: { providerId: string }) {
       document.removeEventListener('visibilitychange', onVisible);
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [providerId]);
+  }, [providerId, providerVersion]);
 
   if (loading || !usage?.data) return null;
 
-  const USAGE_BUCKET_LABELS = {
-    five_hour: '5h',
-    seven_day: '7d',
-    seven_day_opus: '7dO',
-    seven_day_sonnet: '7dS',
-  } as const;
-
   const buckets: { label: string; bucket: OAuthUsageBucket }[] = [];
-  if (usage.data.five_hour) buckets.push({ label: USAGE_BUCKET_LABELS.five_hour, bucket: usage.data.five_hour });
-  if (usage.data.seven_day) buckets.push({ label: USAGE_BUCKET_LABELS.seven_day, bucket: usage.data.seven_day });
-  if (usage.data.seven_day_opus) buckets.push({ label: USAGE_BUCKET_LABELS.seven_day_opus, bucket: usage.data.seven_day_opus });
-  if (usage.data.seven_day_sonnet) buckets.push({ label: USAGE_BUCKET_LABELS.seven_day_sonnet, bucket: usage.data.seven_day_sonnet });
+  if (usage.data.five_hour)
+    buckets.push({ label: '5h', bucket: usage.data.five_hour });
+  if (usage.data.seven_day)
+    buckets.push({ label: '7d', bucket: usage.data.seven_day });
+  if (usage.data.seven_day_oauth_apps)
+    buckets.push({
+      label: 'OAuth apps',
+      bucket: usage.data.seven_day_oauth_apps,
+    });
+  if (usage.data.seven_day_opus)
+    buckets.push({ label: 'Opus', bucket: usage.data.seven_day_opus });
+  if (usage.data.seven_day_sonnet)
+    buckets.push({ label: 'Sonnet', bucket: usage.data.seven_day_sonnet });
+  for (const bucket of usage.data.model_scoped) {
+    buckets.push({ label: bucket.display_name, bucket });
+  }
 
-  if (buckets.length === 0) return null;
+  if (buckets.length === 0 && !usage.data.extra_usage && !usage.observation) {
+    return null;
+  }
 
   return (
-    <div className="mt-1.5 ml-4 flex items-center gap-3">
-      {buckets.map((b) => (
-        <UsageColumn key={b.label} label={b.label} bucket={b.bucket} />
-      ))}
+    <div className="mt-2 ml-4 min-w-0 space-y-2">
+      {usage.error && (
+        <div
+          className="text-[10px] text-amber-600 dark:text-amber-400"
+          title={usage.error}
+        >
+          暂时无法刷新，显示上次数据
+          {Number.isFinite(usage.fetchedAt)
+            ? `（${new Date(usage.fetchedAt).toLocaleString()}）`
+            : ''}
+        </div>
+      )}
+      {usage.observation && <LiveStatus observation={usage.observation} />}
+      {(buckets.length > 0 || usage.data.extra_usage) && (
+        <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+          {buckets.map(({ label, bucket }, index) => (
+            <UsageColumn
+              key={`${label}-${index}`}
+              label={label}
+              bucket={bucket}
+            />
+          ))}
+          {usage.data.extra_usage && (
+            <ExtraUsageColumn extra={usage.data.extra_usage} />
+          )}
+        </div>
+      )}
     </div>
   );
 }

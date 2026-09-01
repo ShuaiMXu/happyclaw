@@ -5,6 +5,7 @@ import os from 'os';
 
 import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
+import { clearProviderQuotaObservation } from './provider-quota-observation.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
@@ -225,21 +226,43 @@ export interface ClaudeOAuthCredentials {
 }
 
 export interface OAuthUsageBucket {
-  utilization: number; // 0-100
-  resets_at: string; // ISO 8601
+  /** Percentage reported by the OAuth usage endpoint, in the 0..100 unit. */
+  utilization: number | null;
+  resets_at: string | null;
+}
+
+export interface OAuthModelUsageBucket extends OAuthUsageBucket {
+  /** Server-supplied label. Do not infer model buckets from fixed field names. */
+  display_name: string;
+}
+
+export interface OAuthExtraUsage {
+  is_enabled: boolean;
+  monthly_limit: number | null;
+  used_credits: number | null;
+  /** Percentage reported by the OAuth usage endpoint, in the 0..100 unit. */
+  utilization: number | null;
+  currency: string | null;
 }
 
 export interface OAuthUsageResponse {
   five_hour: OAuthUsageBucket | null;
   seven_day: OAuthUsageBucket | null;
+  seven_day_oauth_apps: OAuthUsageBucket | null;
   seven_day_opus: OAuthUsageBucket | null;
   seven_day_sonnet: OAuthUsageBucket | null;
+  model_scoped: OAuthModelUsageBucket[];
+  extra_usage: OAuthExtraUsage | null;
 }
 
 export interface CachedOAuthUsage {
   data: OAuthUsageResponse;
   fetchedAt: number; // Unix timestamp ms
   error?: string;
+  /** Latest bounded SDK rate_limit_event snapshot for this provider. */
+  observation?:
+    | import('./provider-quota-observation.js').ProviderQuotaSnapshot
+    | null;
 }
 
 export interface ClaudeProviderConfig {
@@ -1494,6 +1517,7 @@ export function updateProviderSecrets(
 
   state.providers[idx] = updated;
   writeStoredStateV4(state.providers, state.balancing);
+  clearProviderQuotaObservation(id);
   return updated;
 }
 
@@ -1578,6 +1602,7 @@ export function deleteProvider(id: string): void {
 
   state.providers.splice(idx, 1);
   writeStoredStateV4(state.providers, state.balancing);
+  clearProviderQuotaObservation(id);
 }
 
 /** Convert a UnifiedProvider to the flat ClaudeProviderConfig used by container runner */
@@ -2465,59 +2490,6 @@ export function writeCredentialsFile(
   } catch {
     /* ignore — best effort */
   }
-}
-
-/**
- * Update .credentials.json in all existing session directories + host ~/.claude/
- */
-export function updateAllSessionCredentials(
-  config: ClaudeProviderConfig,
-): void {
-  if (!config.claudeOAuthCredentials) return;
-
-  const sessionsDir = path.join(DATA_DIR, 'sessions');
-  try {
-    if (!fs.existsSync(sessionsDir)) return;
-    for (const folder of fs.readdirSync(sessionsDir)) {
-      const claudeDir = path.join(sessionsDir, folder, '.claude');
-      if (fs.existsSync(claudeDir) && fs.statSync(claudeDir).isDirectory()) {
-        try {
-          writeCredentialsFile(claudeDir, config);
-        } catch (err) {
-          logger.warn(
-            { err, folder },
-            'Failed to write .credentials.json for session',
-          );
-        }
-      }
-      // Also update sub-agent session dirs
-      const agentsDir = path.join(sessionsDir, folder, 'agents');
-      if (fs.existsSync(agentsDir) && fs.statSync(agentsDir).isDirectory()) {
-        for (const agentId of fs.readdirSync(agentsDir)) {
-          const agentClaudeDir = path.join(agentsDir, agentId, '.claude');
-          if (
-            fs.existsSync(agentClaudeDir) &&
-            fs.statSync(agentClaudeDir).isDirectory()
-          ) {
-            try {
-              writeCredentialsFile(agentClaudeDir, config);
-            } catch (err) {
-              logger.warn(
-                { err, folder, agentId },
-                'Failed to write .credentials.json for agent session',
-              );
-            }
-          }
-        }
-      }
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to update session credentials');
-  }
-
-  // Host mode uses CLAUDE_CONFIG_DIR=data/sessions/{folder}/.claude for isolation,
-  // so we must NOT touch ~/.claude/.credentials.json to avoid interfering with
-  // the user's local Claude Code installation.
 }
 
 // ─── Appearance config (plain JSON, no encryption) ────────────────
@@ -3600,9 +3572,25 @@ export function saveSystemSettings(
 
 // ─── OAuth Usage Types ─────────────────────────────────────────────────────
 
-export interface OAuthUsageBucket {
-  utilization: number;
-  resets_at: string;
+const MAX_OAUTH_MODEL_WINDOWS = 32;
+const MAX_OAUTH_MODEL_LABEL_LENGTH = 100;
+
+function parseNullableFiniteNumber(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+function parseNullableResetAt(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  if (typeof value === 'string' && value.trim()) return value;
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    const milliseconds = value < 1e11 ? value * 1000 : value;
+    const parsed = new Date(milliseconds);
+    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+  }
+  return undefined;
 }
 
 /**
@@ -3612,7 +3600,143 @@ export interface OAuthUsageBucket {
 export function parseOAuthUsageBucket(v: unknown): OAuthUsageBucket | null {
   if (!v || typeof v !== 'object') return null;
   const obj = v as Record<string, unknown>;
-  if (typeof obj.utilization !== 'number' || typeof obj.resets_at !== 'string')
+  const utilization = parseNullableFiniteNumber(obj.utilization);
+  const resetsAt = parseNullableResetAt(obj.resets_at);
+  if (utilization === undefined && resetsAt === undefined) return null;
+  return {
+    utilization: utilization === undefined ? null : utilization,
+    resets_at: resetsAt === undefined ? null : resetsAt,
+  };
+}
+
+export function parseOAuthExtraUsage(v: unknown): OAuthExtraUsage | null {
+  if (!v || typeof v !== 'object') return null;
+  const obj = v as Record<string, unknown>;
+  if (typeof obj.is_enabled !== 'boolean') return null;
+  const monthlyLimit = parseNullableFiniteNumber(obj.monthly_limit);
+  const usedCredits = parseNullableFiniteNumber(obj.used_credits);
+  const utilization = parseNullableFiniteNumber(obj.utilization);
+  const currency =
+    obj.currency === null
+      ? null
+      : typeof obj.currency === 'string' && obj.currency.trim().length <= 16
+        ? obj.currency.trim()
+        : null;
+  return {
+    is_enabled: obj.is_enabled,
+    monthly_limit: monthlyLimit === undefined ? null : monthlyLimit,
+    used_credits: usedCredits === undefined ? null : usedCredits,
+    utilization: utilization === undefined ? null : utilization,
+    currency,
+  };
+}
+
+function parseOAuthModelWindow(v: unknown): OAuthModelUsageBucket | null {
+  if (!v || typeof v !== 'object') return null;
+  const obj = v as Record<string, unknown>;
+  const displayName =
+    typeof obj.display_name === 'string' ? obj.display_name.trim() : '';
+  if (!displayName || displayName.length > MAX_OAUTH_MODEL_LABEL_LENGTH)
     return null;
-  return { utilization: obj.utilization, resets_at: obj.resets_at };
+  const bucket = parseOAuthUsageBucket(obj);
+  return bucket ? { display_name: displayName, ...bucket } : null;
+}
+
+/**
+ * Project dynamic weekly model windows from either the current SDK shape
+ * (`model_scoped`) or the raw OAuth endpoint's `limits[]` shape. The endpoint
+ * owns the labels; HappyClaw deliberately does not invent fields such as
+ * `seven_day_sonnet_max`.
+ */
+export function parseOAuthModelWindows(raw: unknown): OAuthModelUsageBucket[] {
+  if (!raw || typeof raw !== 'object') return [];
+  const obj = raw as Record<string, unknown>;
+  const projected: OAuthModelUsageBucket[] = [];
+
+  if (Array.isArray(obj.model_scoped)) {
+    for (const candidate of obj.model_scoped) {
+      const bucket = parseOAuthModelWindow(candidate);
+      if (bucket) projected.push(bucket);
+      if (projected.length >= MAX_OAUTH_MODEL_WINDOWS) break;
+    }
+  } else if (Array.isArray(obj.limits)) {
+    for (const candidate of obj.limits) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      const limit = candidate as Record<string, unknown>;
+      if (limit.kind !== 'weekly_scoped') continue;
+      const scope = limit.scope;
+      if (!scope || typeof scope !== 'object') continue;
+      const model = (scope as Record<string, unknown>).model;
+      if (!model || typeof model !== 'object') continue;
+      const displayName = (model as Record<string, unknown>).display_name;
+      const bucket = parseOAuthModelWindow({
+        display_name: displayName,
+        utilization: limit.percent,
+        resets_at: limit.resets_at,
+      });
+      if (bucket) projected.push(bucket);
+      if (projected.length >= MAX_OAUTH_MODEL_WINDOWS) break;
+    }
+  }
+
+  const unique = new Map<string, OAuthModelUsageBucket>();
+  for (const bucket of projected) {
+    const key = bucket.display_name.toLowerCase();
+    if (!unique.has(key)) unique.set(key, bucket);
+  }
+  return [...unique.values()];
+}
+
+/**
+ * Whether an upstream body contains a recognized usage snapshot. A 200 body
+ * can still be an in-band error (`{ error: ... }`) or an unrelated object;
+ * those responses must not replace the last known snapshot with empty data.
+ */
+export function hasOAuthUsageSignals(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const obj = raw as Record<string, unknown>;
+  for (const key of [
+    'five_hour',
+    'seven_day',
+    'seven_day_oauth_apps',
+    'seven_day_opus',
+    'seven_day_sonnet',
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+    if (obj[key] === null || parseOAuthUsageBucket(obj[key]) !== null) {
+      return true;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(obj, 'extra_usage')) {
+    if (
+      obj.extra_usage === null ||
+      parseOAuthExtraUsage(obj.extra_usage) !== null
+    ) {
+      return true;
+    }
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(obj, 'model_scoped') &&
+    Array.isArray(obj.model_scoped)
+  ) {
+    return true;
+  }
+  return (
+    Object.prototype.hasOwnProperty.call(obj, 'limits') &&
+    Array.isArray(obj.limits)
+  );
+}
+
+export function parseOAuthUsageResponse(raw: unknown): OAuthUsageResponse {
+  const obj =
+    raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  return {
+    five_hour: parseOAuthUsageBucket(obj.five_hour),
+    seven_day: parseOAuthUsageBucket(obj.seven_day),
+    seven_day_oauth_apps: parseOAuthUsageBucket(obj.seven_day_oauth_apps),
+    seven_day_opus: parseOAuthUsageBucket(obj.seven_day_opus),
+    seven_day_sonnet: parseOAuthUsageBucket(obj.seven_day_sonnet),
+    model_scoped: parseOAuthModelWindows(obj),
+    extra_usage: parseOAuthExtraUsage(obj.extra_usage),
+  };
 }

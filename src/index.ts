@@ -124,6 +124,7 @@ import {
   PROVIDER_FAILURE_USER_NOTICE,
   resolveProviderFailureClass,
 } from './provider-failure.js';
+import { isProviderQuotaControlOutput } from './provider-quota-observation.js';
 import {
   closeDatabase,
   createTask,
@@ -10248,6 +10249,7 @@ async function runAgent(
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = async (output: ContainerOutput) => {
     queue.markRunnerActivity(chatJid);
+    if (isProviderQuotaControlOutput(output)) return;
     bindRunnerActiveIpcCoverage(chatJid, output.activeIpcReceipts);
     const outputTurnId = output.turnId || output.streamEvent?.turnId;
     const isInterruptStatus =
@@ -16309,6 +16311,7 @@ async function processAgentConversation(
     // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
     // a substantive result / interruption so the runner can be kept warm.
     queue.markRunnerActivity(virtualJid);
+    if (isProviderQuotaControlOutput(output)) return;
     bindRunnerActiveIpcCoverage(virtualJid, output.activeIpcReceipts);
     const isInterruptStatus =
       output.status === 'stream' &&

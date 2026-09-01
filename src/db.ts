@@ -8507,6 +8507,28 @@ export function setSessionProviderId(
   })();
 }
 
+/** Persisted session namespaces currently bound to one Provider account. */
+export function listSessionNamespacesForProviderId(providerId: string): Array<{
+  groupFolder: string;
+  agentId: string | null;
+}> {
+  if (!isDatabaseInitialized()) return [];
+  const rows = db
+    .prepare(
+      `SELECT group_folder, agent_id
+       FROM sessions
+       WHERE provider_id = ?`,
+    )
+    .all(providerId) as Array<{
+    group_folder: string;
+    agent_id: string | null;
+  }>;
+  return rows.map((row) => ({
+    groupFolder: row.group_folder,
+    agentId: row.agent_id || null,
+  }));
+}
+
 export function deleteAllSessionsForFolder(groupFolder: string): void {
   db.transaction(() => {
     db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);

@@ -109,21 +109,53 @@ export interface HostIntegrationSettings {
 // ─── OAuth Usage ────────────────────────────────────────────
 
 export interface OAuthUsageBucket {
-  utilization: number;
-  resets_at: string;
+  utilization: number | null;
+  resets_at: string | null;
+}
+
+export interface OAuthModelUsageBucket extends OAuthUsageBucket {
+  display_name: string;
+}
+
+export interface OAuthExtraUsage {
+  is_enabled: boolean;
+  monthly_limit: number | null;
+  used_credits: number | null;
+  utilization: number | null;
+  currency: string | null;
+}
+
+export interface ProviderQuotaObservation {
+  source: 'sdk_rate_limit_event';
+  observedAt: number;
+  status: 'allowed' | 'allowed_warning' | 'rejected';
+  rateLimitType?: string;
+  /** SDK/header fraction in the 0..1 unit, unlike OAuth buckets. */
+  utilization?: number;
+  /** Unix epoch seconds. */
+  resetsAt?: number;
+  overageStatus?: 'allowed' | 'allowed_warning' | 'rejected';
+  overageResetsAt?: number;
+  overageDisabledReason?: string;
+  isUsingOverage?: boolean;
+  overageInUse?: boolean;
 }
 
 export interface OAuthUsageResponse {
   five_hour: OAuthUsageBucket | null;
   seven_day: OAuthUsageBucket | null;
+  seven_day_oauth_apps: OAuthUsageBucket | null;
   seven_day_opus: OAuthUsageBucket | null;
   seven_day_sonnet: OAuthUsageBucket | null;
+  model_scoped: OAuthModelUsageBucket[];
+  extra_usage: OAuthExtraUsage | null;
 }
 
 export interface CachedOAuthUsage {
   data: OAuthUsageResponse;
   fetchedAt: number;
   error?: string;
+  observation?: ProviderQuotaObservation | null;
 }
 
 export type SettingsTab =

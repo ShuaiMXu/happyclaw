@@ -54,8 +54,10 @@ import {
   shellQuoteEnvLines,
   writeCredentialsFile,
   buildClaudeAiOauthPayload,
+  providerToConfig,
   updateProviderOAuthCredentialsIfCurrent,
 } from './runtime-config.js';
+import { updateProviderSessionCredentials } from './provider-session-credentials.js';
 import {
   removeClaudeKeychainOAuth,
   syncClaudeKeychainOAuth,
@@ -84,7 +86,10 @@ import {
   resolveTerminalProviderFailureNotice,
   resolveTransientRetryKey,
 } from './provider-failure.js';
-import type { ClaudeProviderConfig } from './runtime-config.js';
+import type {
+  ClaudeOAuthCredentials,
+  ClaudeProviderConfig,
+} from './runtime-config.js';
 import {
   loadManagedMcpLayers,
   resolveManagedMcpPolicy,
@@ -122,6 +127,16 @@ import { validateSkillId, validateSkillPath } from './skill-utils.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import type { ContainerOutput } from './agent-runtime-contracts.js';
 export type { ContainerOutput } from './agent-runtime-contracts.js';
+import {
+  captureProviderQuotaObservationEpoch,
+  consumeProviderQuotaControlOutput,
+} from './provider-quota-observation.js';
+import {
+  dockerOAuthCredentialsEqual,
+  readDockerClaudeOAuthCredentials,
+  reconcileDockerOAuthCredentials,
+  type DockerOAuthReconcileOutcome,
+} from './docker-oauth-credentials.js';
 import {
   resolveHostSkillPolicy,
   type HostSkillPolicy,
@@ -1569,11 +1584,17 @@ export function cleanupContainerTaskRuntimeEnvDirs(
   }
 }
 
+export interface DockerOauthLaunchSnapshot {
+  credentialsFilePath: string;
+  launchCredentials: ClaudeOAuthCredentials;
+}
+
 interface PreparedVolumeMounts {
   mounts: VolumeMount[];
   claudeContextPlan: ReturnType<typeof buildClaudeContextPlan>;
   runtimeMcpServers: Record<string, Record<string, unknown>>;
   hostPlugins: SdkPluginConfig[];
+  dockerOauthLaunch: DockerOauthLaunchSnapshot | null;
 }
 
 function prepareVolumeMounts(
@@ -1625,6 +1646,7 @@ function prepareVolumeMounts(
 
   const mounts: VolumeMount[] = [];
   let feishuCliBinding: FeishuCliRuntimeBinding | null = null;
+  let dockerOauthLaunch: PreparedVolumeMounts['dockerOauthLaunch'] = null;
   const projectRoot = process.cwd();
   const ownerId = group.created_by;
 
@@ -1942,6 +1964,13 @@ function prepareVolumeMounts(
   if (mergedConfig.claudeOAuthCredentials) {
     try {
       writeCredentialsFile(groupSessionsDir, mergedConfig);
+      const launchCredentials = buildClaudeAiOauthPayload(mergedConfig);
+      if (launchCredentials) {
+        dockerOauthLaunch = {
+          credentialsFilePath: path.join(groupSessionsDir, '.credentials.json'),
+          launchCredentials,
+        };
+      }
     } catch (err) {
       logger.warn(
         { group: group.name, err },
@@ -2024,6 +2053,7 @@ function prepareVolumeMounts(
     claudeContextPlan,
     runtimeMcpServers,
     hostPlugins: pluginSkills,
+    dockerOauthLaunch,
   };
 }
 
@@ -2280,6 +2310,78 @@ export function buildContainerArgs(
   return args;
 }
 
+/**
+ * Reconcile a Docker SDK credential rotation at a safe output/exit boundary.
+ * The lower-level helper performs the launch-snapshot CAS; on success, fan the
+ * adopted credential out to other persisted sessions so the next runner does
+ * not start from an invalidated refresh token.
+ */
+export function reconcileDockerOAuthAfterExit(
+  providerId: string | null,
+  launch: DockerOauthLaunchSnapshot | null,
+  dependencies: {
+    reconcile?: typeof reconcileDockerOAuthCredentials;
+    fanOutUpdatedCredentials?: (providerId: string) => void;
+  } = {},
+): DockerOAuthReconcileOutcome | 'error' | null {
+  if (!providerId || !launch) return null;
+  try {
+    const outcome = (dependencies.reconcile ?? reconcileDockerOAuthCredentials)(
+      {
+        providerId,
+        credentialsFilePath: launch.credentialsFilePath,
+        launchCredentials: launch.launchCredentials,
+      },
+    );
+    if (outcome === 'updated') {
+      const adopted = readDockerClaudeOAuthCredentials(
+        launch.credentialsFilePath,
+      );
+      if (adopted) launch.launchCredentials = adopted;
+      const fanOut =
+        dependencies.fanOutUpdatedCredentials ??
+        ((updatedProviderId: string) => {
+          const provider = getProviders().find(
+            (candidate) => candidate.id === updatedProviderId,
+          );
+          if (provider) {
+            updateProviderSessionCredentials(
+              updatedProviderId,
+              providerToConfig(provider),
+            );
+          }
+        });
+      fanOut(providerId);
+    } else if (outcome === 'stale') {
+      // A sibling Runner may already have adopted this exact rotation and
+      // fanned it into our mounted file. Advance this warm Runner's CAS base
+      // only when disk and current Provider agree; an administrator change or
+      // unrelated account can never be treated as our credential lineage.
+      const diskCredentials = readDockerClaudeOAuthCredentials(
+        launch.credentialsFilePath,
+      );
+      const currentProvider = getProviders().find(
+        (candidate) => candidate.id === providerId,
+      );
+      const currentCredentials = currentProvider
+        ? buildClaudeAiOauthPayload(providerToConfig(currentProvider))
+        : null;
+      if (
+        diskCredentials &&
+        currentCredentials &&
+        dockerOAuthCredentialsEqual(diskCredentials, currentCredentials)
+      ) {
+        launch.launchCredentials = diskCredentials;
+      }
+    }
+    return outcome;
+  } catch {
+    // Credential reconciliation is post-run best effort. It must never escape
+    // the EventEmitter close callback or prevent the completed turn settling.
+    return 'error';
+  }
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
@@ -2305,6 +2407,9 @@ export async function runContainerAgent(
     transientRetryProfileForInput(input.turnId),
   );
   const selectedProfileId = poolResult?.profileId ?? null;
+  const selectedProviderQuotaEpoch = selectedProfileId
+    ? captureProviderQuotaObservationEpoch(selectedProfileId)
+    : null;
   const resolvedProvider = poolResult?.resolved;
   const modelSelectionPinned = !!resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
@@ -2492,119 +2597,171 @@ export async function runContainerAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
-      const handleOutput = onOutput
-        ? async (output: ContainerOutput): Promise<void> => {
-            if (
-              !output.providerFailure &&
-              output.inputTurnCompleted !== undefined
-            ) {
-              healthyInputTurnCompleted = output.inputTurnCompleted;
-            }
-            if (output.providerFailureRetrying) {
-              if (output.providerFailure && selectedProfileId) {
-                if (!providerFailureReported) {
-                  providerFailureReported = true;
-                  quarantineFromOutput(selectedProfileId, output);
-                  logger.warn(
-                    {
-                      group: group.name,
-                      containerName,
-                      providerId: selectedProfileId,
-                    },
-                    'Provider failure detected; agent runner is retrying the failed turn with fallback model',
-                  );
-                }
-              }
-              // This is host-control metadata, never a user-visible output.
-              return;
-            }
-            if (output.providerFailure && selectedProfileId) {
-              if (!providerFailureReported) {
-                providerFailureReported = true;
-                quarantineFromOutput(selectedProfileId, output);
-                logger.warn(
-                  {
-                    group: group.name,
-                    containerName,
-                    providerId: selectedProfileId,
-                    result: output.result,
-                  },
-                  'Provider failure detected from streamed output, stopping container',
-                );
-              }
-            }
-            if (
-              output.providerFailureMaintenance &&
-              healthyInputTurnCompleted
-            ) {
-              providerFailureMaintenance = true;
+      const reconcileDockerOAuth = (
+        phase: 'output' | 'exit',
+      ): DockerOAuthReconcileOutcome | 'error' | null => {
+        const outcome = reconcileDockerOAuthAfterExit(
+          selectedProfileId,
+          preparedLaunch.dockerOauthLaunch,
+        );
+        if (outcome === 'updated') {
+          logger.info(
+            { group: group.name, providerId: selectedProfileId, phase },
+            'Persisted Docker SDK-refreshed OAuth credentials',
+          );
+        } else if (outcome === 'invalid' || outcome === 'not_newer') {
+          logger.warn(
+            {
+              group: group.name,
+              providerId: selectedProfileId,
+              outcome,
+              phase,
+            },
+            'Ignored invalid Docker OAuth credential rewrite',
+          );
+        } else if (outcome === 'stale') {
+          logger.info(
+            { group: group.name, providerId: selectedProfileId, phase },
+            'Ignored Docker OAuth refresh after Provider credentials changed',
+          );
+        } else if (outcome === 'error') {
+          logger.warn(
+            { group: group.name, providerId: selectedProfileId, phase },
+            'Docker OAuth credential reconciliation failed',
+          );
+        }
+        return outcome;
+      };
+      const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        if (
+          output.providerQuotaObservation ||
+          output.inputTurnCompleted === true ||
+          output.status === 'success' ||
+          output.status === 'error'
+        ) {
+          reconcileDockerOAuth('output');
+        }
+        if (
+          consumeProviderQuotaControlOutput(
+            selectedProfileId,
+            output,
+            selectedProviderQuotaEpoch,
+          )
+        ) {
+          // Let the caller refresh its warm-runner activity clock, but keep
+          // the frame on the control path (callers return before projection).
+          if (onOutput) await onOutput(output);
+          resetTimeout();
+          return;
+        }
+        if (!onOutput) return;
+        if (
+          !output.providerFailure &&
+          output.inputTurnCompleted !== undefined
+        ) {
+          healthyInputTurnCompleted = output.inputTurnCompleted;
+        }
+        if (output.providerFailureRetrying) {
+          if (output.providerFailure && selectedProfileId) {
+            if (!providerFailureReported) {
+              providerFailureReported = true;
+              quarantineFromOutput(selectedProfileId, output);
               logger.warn(
                 {
                   group: group.name,
                   containerName,
                   providerId: selectedProfileId,
                 },
-                'Provider failed during internal maintenance; quarantining without user projection or replay',
+                'Provider failure detected; agent runner is retrying the failed turn with fallback model',
               );
-              exec(`docker stop ${containerName}`, (err) => {
-                if (err) {
-                  logger.warn(
-                    { group: group.name, containerName, err },
-                    'Failed to stop container after maintenance provider failure',
-                  );
-                  container.kill('SIGTERM');
-                }
-              });
-              return;
-            }
-            if (output.providerFailureMaintenance) {
-              logger.warn(
-                {
-                  group: group.name,
-                  containerName,
-                  providerId: selectedProfileId,
-                },
-                'Maintenance query failed before durable input completion; treating as replayable provider failure',
-              );
-            }
-            if (output.providerFailure) {
-              const terminal = applyProviderFailureDisposition(
-                output,
-                selectedProfileId,
-                !modelSelectionPinned,
-              );
-              providerFailureTerminal = terminal;
-              logger.warn(
-                {
-                  group: group.name,
-                  containerName,
-                  providerId: selectedProfileId,
-                  terminal,
-                },
-                providerFailureDispositionLogMessage(output, terminal),
-              );
-            }
-            // Quarantine and classify before awaiting any IM/card projection so
-            // concurrent sessions cannot keep selecting a provider that just
-            // returned an account-level failure.
-            await onOutput(output);
-            // The foreground projection resets its idle-close timer during
-            // onOutput. Reset the outer watchdog afterwards so graceful idle
-            // reclamation always wins, even when provider delivery was slow.
-            resetTimeout();
-            if (output.providerFailure) {
-              exec(`docker stop ${containerName}`, (err) => {
-                if (err) {
-                  logger.warn(
-                    { group: group.name, containerName, err },
-                    'Failed to stop container after provider failure',
-                  );
-                  container.kill('SIGTERM');
-                }
-              });
             }
           }
-        : undefined;
+          // This is host-control metadata, never a user-visible output.
+          return;
+        }
+        if (output.providerFailure && selectedProfileId) {
+          if (!providerFailureReported) {
+            providerFailureReported = true;
+            quarantineFromOutput(selectedProfileId, output);
+            logger.warn(
+              {
+                group: group.name,
+                containerName,
+                providerId: selectedProfileId,
+                result: output.result,
+              },
+              'Provider failure detected from streamed output, stopping container',
+            );
+          }
+        }
+        if (output.providerFailureMaintenance && healthyInputTurnCompleted) {
+          providerFailureMaintenance = true;
+          logger.warn(
+            {
+              group: group.name,
+              containerName,
+              providerId: selectedProfileId,
+            },
+            'Provider failed during internal maintenance; quarantining without user projection or replay',
+          );
+          exec(`docker stop ${containerName}`, (err) => {
+            if (err) {
+              logger.warn(
+                { group: group.name, containerName, err },
+                'Failed to stop container after maintenance provider failure',
+              );
+              container.kill('SIGTERM');
+            }
+          });
+          return;
+        }
+        if (output.providerFailureMaintenance) {
+          logger.warn(
+            {
+              group: group.name,
+              containerName,
+              providerId: selectedProfileId,
+            },
+            'Maintenance query failed before durable input completion; treating as replayable provider failure',
+          );
+        }
+        if (output.providerFailure) {
+          const terminal = applyProviderFailureDisposition(
+            output,
+            selectedProfileId,
+            !modelSelectionPinned,
+          );
+          providerFailureTerminal = terminal;
+          logger.warn(
+            {
+              group: group.name,
+              containerName,
+              providerId: selectedProfileId,
+              terminal,
+            },
+            providerFailureDispositionLogMessage(output, terminal),
+          );
+        }
+        // Quarantine and classify before awaiting any IM/card projection so
+        // concurrent sessions cannot keep selecting a provider that just
+        // returned an account-level failure.
+        await onOutput(output);
+        // The foreground projection resets its idle-close timer during
+        // onOutput. Reset the outer watchdog afterwards so graceful idle
+        // reclamation always wins, even when provider delivery was slow.
+        resetTimeout();
+        if (output.providerFailure) {
+          exec(`docker stop ${containerName}`, (err) => {
+            if (err) {
+              logger.warn(
+                { group: group.name, containerName, err },
+                'Failed to stop container after provider failure',
+              );
+              container.kill('SIGTERM');
+            }
+          });
+        }
+      };
 
       // Attach stdout/stderr handlers using shared parser
       attachStdoutHandler(container.stdout, stdoutState, {
@@ -2620,6 +2777,7 @@ export async function runContainerAgent(
       container.on('close', (code, signal) => {
         clearTimeout(timeout);
         const duration = Date.now() - startTime;
+        reconcileDockerOAuth('exit');
 
         const closeCtx: CloseHandlerContext = {
           groupName: group.name,
@@ -3365,6 +3523,9 @@ export async function runHostAgent(
     transientRetryProfileForInput(input.turnId),
   );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
+  const hostProviderQuotaEpoch = hostSelectedProfileId
+    ? captureProviderQuotaObservationEpoch(hostSelectedProfileId)
+    : null;
   const hostModelSelectionPinned = !!resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
   );
@@ -3749,101 +3910,111 @@ export async function runHostAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
-      const handleOutput = onOutput
-        ? async (output: ContainerOutput): Promise<void> => {
-            if (
-              !output.providerFailure &&
-              output.inputTurnCompleted !== undefined
-            ) {
-              hostHealthyInputTurnCompleted = output.inputTurnCompleted;
-            }
-            if (output.providerFailureRetrying) {
-              if (output.providerFailure && hostSelectedProfileId) {
-                if (!hostProviderFailureReported) {
-                  hostProviderFailureReported = true;
-                  quarantineFromOutput(hostSelectedProfileId, output);
-                  logger.warn(
-                    {
-                      group: group.name,
-                      processId,
-                      providerId: hostSelectedProfileId,
-                    },
-                    'Provider failure detected; agent runner is retrying the failed turn with fallback model',
-                  );
-                }
-              }
-              // This is host-control metadata, never a user-visible output.
-              return;
-            }
-            if (output.providerFailure && hostSelectedProfileId) {
-              if (!hostProviderFailureReported) {
-                hostProviderFailureReported = true;
-                quarantineFromOutput(hostSelectedProfileId, output);
-                logger.warn(
-                  {
-                    group: group.name,
-                    processId,
-                    providerId: hostSelectedProfileId,
-                    result: output.result,
-                  },
-                  'Provider failure detected from streamed output, stopping host agent',
-                );
-              }
-            }
-            if (
-              output.providerFailureMaintenance &&
-              hostHealthyInputTurnCompleted
-            ) {
-              hostProviderFailureMaintenance = true;
+      const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        if (
+          consumeProviderQuotaControlOutput(
+            hostSelectedProfileId,
+            output,
+            hostProviderQuotaEpoch,
+          )
+        ) {
+          if (onOutput) await onOutput(output);
+          resetTimeout();
+          return;
+        }
+        if (!onOutput) return;
+        if (
+          !output.providerFailure &&
+          output.inputTurnCompleted !== undefined
+        ) {
+          hostHealthyInputTurnCompleted = output.inputTurnCompleted;
+        }
+        if (output.providerFailureRetrying) {
+          if (output.providerFailure && hostSelectedProfileId) {
+            if (!hostProviderFailureReported) {
+              hostProviderFailureReported = true;
+              quarantineFromOutput(hostSelectedProfileId, output);
               logger.warn(
                 {
                   group: group.name,
                   processId,
                   providerId: hostSelectedProfileId,
                 },
-                'Provider failed during internal maintenance; quarantining without user projection or replay',
+                'Provider failure detected; agent runner is retrying the failed turn with fallback model',
               );
-              killProcessTree(proc, 'SIGTERM');
-              return;
-            }
-            if (output.providerFailureMaintenance) {
-              logger.warn(
-                {
-                  group: group.name,
-                  processId,
-                  providerId: hostSelectedProfileId,
-                },
-                'Maintenance query failed before durable input completion; treating as replayable provider failure',
-              );
-            }
-            if (output.providerFailure) {
-              const terminal = applyProviderFailureDisposition(
-                output,
-                hostSelectedProfileId,
-                !hostModelSelectionPinned,
-              );
-              hostProviderFailureTerminal = terminal;
-              logger.warn(
-                {
-                  group: group.name,
-                  processId,
-                  providerId: hostSelectedProfileId,
-                  terminal,
-                },
-                providerFailureDispositionLogMessage(output, terminal),
-              );
-            }
-            // Keep provider selection safe while the user-facing projection is
-            // awaiting a network ACK.
-            await onOutput(output);
-            // See the container path above: start the watchdog after the
-            // foreground projection has reset its graceful idle timer.
-            resetTimeout();
-            if (output.providerFailure) {
-              killProcessTree(proc, 'SIGTERM');
             }
           }
-        : undefined;
+          // This is host-control metadata, never a user-visible output.
+          return;
+        }
+        if (output.providerFailure && hostSelectedProfileId) {
+          if (!hostProviderFailureReported) {
+            hostProviderFailureReported = true;
+            quarantineFromOutput(hostSelectedProfileId, output);
+            logger.warn(
+              {
+                group: group.name,
+                processId,
+                providerId: hostSelectedProfileId,
+                result: output.result,
+              },
+              'Provider failure detected from streamed output, stopping host agent',
+            );
+          }
+        }
+        if (
+          output.providerFailureMaintenance &&
+          hostHealthyInputTurnCompleted
+        ) {
+          hostProviderFailureMaintenance = true;
+          logger.warn(
+            {
+              group: group.name,
+              processId,
+              providerId: hostSelectedProfileId,
+            },
+            'Provider failed during internal maintenance; quarantining without user projection or replay',
+          );
+          killProcessTree(proc, 'SIGTERM');
+          return;
+        }
+        if (output.providerFailureMaintenance) {
+          logger.warn(
+            {
+              group: group.name,
+              processId,
+              providerId: hostSelectedProfileId,
+            },
+            'Maintenance query failed before durable input completion; treating as replayable provider failure',
+          );
+        }
+        if (output.providerFailure) {
+          const terminal = applyProviderFailureDisposition(
+            output,
+            hostSelectedProfileId,
+            !hostModelSelectionPinned,
+          );
+          hostProviderFailureTerminal = terminal;
+          logger.warn(
+            {
+              group: group.name,
+              processId,
+              providerId: hostSelectedProfileId,
+              terminal,
+            },
+            providerFailureDispositionLogMessage(output, terminal),
+          );
+        }
+        // Keep provider selection safe while the user-facing projection is
+        // awaiting a network ACK.
+        await onOutput(output);
+        // See the container path above: start the watchdog after the
+        // foreground projection has reset its graceful idle timer.
+        resetTimeout();
+        if (output.providerFailure) {
+          killProcessTree(proc, 'SIGTERM');
+        }
+      };
 
       // 10. stdout/stderr 解析
       attachStdoutHandler(proc.stdout, stdoutState, {
