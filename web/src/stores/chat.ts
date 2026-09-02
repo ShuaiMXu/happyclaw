@@ -815,6 +815,19 @@ interface PendingDelta {
 }
 const pendingDeltas = new Map<string, PendingDelta>();
 
+const STICKY_API_RETRY_STATUS_RE = /API\s*重试|retry/i;
+
+function clearStickyApiRetryStatus(
+  state: Pick<StreamingState, 'systemStatus'>,
+): void {
+  if (
+    state.systemStatus &&
+    STICKY_API_RETRY_STATUS_RE.test(state.systemStatus)
+  ) {
+    state.systemStatus = null;
+  }
+}
+
 function cancelPendingDelta(key: string): void {
   const entry = pendingDeltas.get(key);
   if (!entry) return;
@@ -856,6 +869,7 @@ function flushPendingDelta(
         return s;
       const prev = s.agentStreaming[agentId] || { ...DEFAULT_STREAMING_STATE };
       const next = { ...prev };
+      clearStickyApiRetryStatus(next);
       if (mergedText) {
         const combined = prev.partialText + mergedText;
         next.partialText =
@@ -891,6 +905,7 @@ function flushPendingDelta(
       if (s.streaming[chatJid]?.interrupted) return s;
       const prev = s.streaming[chatJid] || { ...DEFAULT_STREAMING_STATE };
       const next = { ...prev };
+      clearStickyApiRetryStatus(next);
       if (mergedText) {
         const combined = prev.partialText + mergedText;
         next.partialText =
@@ -1299,7 +1314,12 @@ function updateTaskRuntime(
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (patch?.status === 'failed' || patch?.status === 'killed')
+    else if (
+      patch?.status === 'failed' ||
+      patch?.status === 'killed' ||
+      patch?.status === 'stopped' ||
+      patch?.status === 'aborted'
+    )
       task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
     else if (patch?.status === 'running' || patch?.status === 'pending')
@@ -1378,6 +1398,13 @@ function applyStreamEvent(
   if (event.turnId) next.turnId = event.turnId;
   if (event.sessionId) next.sessionId = event.sessionId;
   next.traceEvents = pushTrace(prev.traceEvents || [], event);
+  if (
+    event.eventType === 'text_delta' ||
+    event.eventType === 'thinking_delta' ||
+    event.eventType === 'tool_use_start'
+  ) {
+    clearStickyApiRetryStatus(next);
+  }
   switch (event.eventType) {
     case 'text_delta': {
       if (event.parentToolUseId) {
@@ -2912,7 +2939,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (
         patchStatus === 'completed' ||
         patchStatus === 'failed' ||
-        patchStatus === 'killed'
+        patchStatus === 'killed' ||
+        patchStatus === 'stopped' ||
+        patchStatus === 'aborted'
       ) {
         finalizeSdkTask(
           resolvedTaskId,

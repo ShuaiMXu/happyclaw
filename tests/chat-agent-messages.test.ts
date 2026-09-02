@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Message } from '../web/src/stores/chat';
 
@@ -822,5 +822,169 @@ describe('held Workflow acknowledgements', () => {
       { status: 'running', phases: runningWorkflow.phases },
     );
     expect(state.messages[jid][0].workflow_runs).toBeUndefined();
+  });
+});
+
+describe('SDK task terminal status and sticky API retry', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetChatStore();
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const baseStreaming = {
+    partialText: '',
+    thinkingText: '',
+    isThinking: false,
+    activeTools: [] as [],
+    activeHook: null,
+    systemStatus: null as string | null,
+    recentEvents: [] as [],
+    traceEvents: [] as [],
+    taskStates: {},
+  };
+
+  it('finalizes stopped and aborted task_updated so they leave running counts', () => {
+    const jid = 'web:main';
+    const runId = 'run-terminal-tasks';
+    useChatStore.setState({
+      activeRuns: {
+        [jid]: {
+          chatJid: jid,
+          runId,
+          startedAt: '2026-07-25T00:00:00.000Z',
+          phase: 'running',
+        },
+      },
+      waiting: { [jid]: true },
+      streaming: { [jid]: { ...baseStreaming } },
+      sdkTasks: {
+        'task-stopped': {
+          chatJid: jid,
+          description: 'stopped task',
+          status: 'running',
+        },
+        'task-aborted': {
+          chatJid: jid,
+          description: 'aborted task',
+          status: 'running',
+        },
+      },
+    });
+
+    useChatStore.getState().handleStreamEvent(
+      jid,
+      {
+        eventType: 'task_updated',
+        toolUseId: 'task-stopped',
+        taskId: 'task-stopped',
+        taskPatch: { status: 'stopped' },
+      },
+      undefined,
+      runId,
+    );
+    useChatStore.getState().handleStreamEvent(
+      jid,
+      {
+        eventType: 'task_updated',
+        toolUseId: 'task-aborted',
+        taskId: 'task-aborted',
+        taskPatch: { status: 'aborted' },
+      },
+      undefined,
+      runId,
+    );
+
+    const state = useChatStore.getState();
+    expect(state.sdkTasks['task-stopped']?.status).toBe('error');
+    expect(state.sdkTasks['task-aborted']?.status).toBe('error');
+    expect(state.streaming[jid]?.taskStates['task-stopped']?.status).toBe(
+      'error',
+    );
+    expect(state.streaming[jid]?.taskStates['task-aborted']?.status).toBe(
+      'error',
+    );
+    expect(
+      Object.values(state.sdkTasks).filter((task) => task.status === 'running'),
+    ).toHaveLength(0);
+  });
+
+  it('clears sticky API retry status when generation resumes', () => {
+    const jid = 'web:main';
+    const runId = 'run-retry-clear';
+    useChatStore.setState({
+      activeRuns: {
+        [jid]: {
+          chatJid: jid,
+          runId,
+          startedAt: '2026-07-25T00:00:00.000Z',
+          phase: 'running',
+        },
+      },
+      waiting: { [jid]: true },
+      streaming: {
+        [jid]: {
+          ...baseStreaming,
+          systemStatus: 'API 重试中 (1/3)，2s 后重试',
+        },
+      },
+    });
+
+    useChatStore.getState().handleStreamEvent(
+      jid,
+      {
+        eventType: 'text_delta',
+        text: 'hello',
+      },
+      undefined,
+      runId,
+    );
+
+    expect(useChatStore.getState().streaming[jid]?.systemStatus).toBeNull();
+    expect(useChatStore.getState().streaming[jid]?.partialText).toBe('hello');
+  });
+
+  it('does not clear unrelated system status on text_delta', () => {
+    const jid = 'web:main';
+    const runId = 'run-keep-status';
+    useChatStore.setState({
+      activeRuns: {
+        [jid]: {
+          chatJid: jid,
+          runId,
+          startedAt: '2026-07-25T00:00:00.000Z',
+          phase: 'running',
+        },
+      },
+      waiting: { [jid]: true },
+      streaming: {
+        [jid]: {
+          ...baseStreaming,
+          systemStatus: '正在整理上下文…',
+        },
+      },
+    });
+
+    useChatStore.getState().handleStreamEvent(
+      jid,
+      {
+        eventType: 'text_delta',
+        text: 'still compacting context note',
+      },
+      undefined,
+      runId,
+    );
+
+    expect(useChatStore.getState().streaming[jid]?.systemStatus).toBe(
+      '正在整理上下文…',
+    );
   });
 });
