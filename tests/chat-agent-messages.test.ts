@@ -826,19 +826,29 @@ describe('held Workflow acknowledgements', () => {
 });
 
 describe('SDK task terminal status and sticky API retry', () => {
+  const rafCbs: FrameRequestCallback[] = [];
+
   beforeEach(() => {
     vi.clearAllMocks();
     resetChatStore();
+    rafCbs.length = 0;
     vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
-      cb(0);
-      return 1;
+      rafCbs.push(cb);
+      return rafCbs.length;
     });
-    vi.stubGlobal('cancelAnimationFrame', () => {});
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => {
+      rafCbs[id - 1] = () => {};
+    });
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
   });
+
+  function flushRaf(): void {
+    const pending = rafCbs.splice(0);
+    for (const cb of pending) cb(0);
+  }
 
   const baseStreaming = {
     partialText: '',
@@ -947,9 +957,45 @@ describe('SDK task terminal status and sticky API retry', () => {
       undefined,
       runId,
     );
+    flushRaf();
 
     expect(useChatStore.getState().streaming[jid]?.systemStatus).toBeNull();
     expect(useChatStore.getState().streaming[jid]?.partialText).toBe('hello');
+  });
+
+  it('clears sticky API retry status on tool_use_start without waiting for rAF', () => {
+    const jid = 'web:main';
+    const runId = 'run-retry-tool';
+    useChatStore.setState({
+      activeRuns: {
+        [jid]: {
+          chatJid: jid,
+          runId,
+          startedAt: '2026-07-25T00:00:00.000Z',
+          phase: 'running',
+        },
+      },
+      waiting: { [jid]: true },
+      streaming: {
+        [jid]: {
+          ...baseStreaming,
+          systemStatus: 'API retry in progress (2/5)',
+        },
+      },
+    });
+
+    useChatStore.getState().handleStreamEvent(
+      jid,
+      {
+        eventType: 'tool_use_start',
+        toolName: 'Read',
+        toolUseId: 'tool-1',
+      },
+      undefined,
+      runId,
+    );
+
+    expect(useChatStore.getState().streaming[jid]?.systemStatus).toBeNull();
   });
 
   it('does not clear unrelated system status on text_delta', () => {
@@ -982,9 +1028,13 @@ describe('SDK task terminal status and sticky API retry', () => {
       undefined,
       runId,
     );
+    flushRaf();
 
     expect(useChatStore.getState().streaming[jid]?.systemStatus).toBe(
       '正在整理上下文…',
+    );
+    expect(useChatStore.getState().streaming[jid]?.partialText).toBe(
+      'still compacting context note',
     );
   });
 });
