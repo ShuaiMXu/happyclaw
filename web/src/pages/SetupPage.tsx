@@ -24,8 +24,11 @@ function getErrorMessage(err: unknown, fallback: string): string {
 
 export function SetupPage() {
   const navigate = useNavigate();
-  const { initialized, authenticated, setupAdmin, checkStatus } =
+  const { initialized, authenticated, setupAdmin, checkStatus, appearance } =
     useAuthStore();
+  const brandIconSrc =
+    appearance?.brandIconUrl || `${import.meta.env.BASE_URL}icons/icon-192.png`;
+  const brandName = appearance?.appName || 'SoftopiaAI';
 
   // Check initialization status on mount (this is a public page, no AuthGuard)
   useEffect(() => {
@@ -58,14 +61,14 @@ export function SetupPage() {
           <div className="flex justify-center mb-4">
             <div className="w-16 h-16 rounded-2xl overflow-hidden">
               <img
-                src={`${import.meta.env.BASE_URL}icons/icon-192.png`}
-                alt="SoftopiaAI"
+                src={brandIconSrc}
+                alt={brandName}
                 className="w-full h-full object-cover"
               />
             </div>
           </div>
           <h1 className="text-2xl font-bold text-foreground mb-1">
-            SoftopiaAI 初始设置
+            {brandName} 初始设置
           </h1>
           <p className="text-sm text-muted-foreground">
             先创建管理员账号，完成后进入后台继续配置飞书 Token 与 Claude Key

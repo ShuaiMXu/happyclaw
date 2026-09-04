@@ -123,7 +123,7 @@ import type { ExpandContext } from './plugin-expander-context.js';
 import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
 import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
-import { renderIndexHtml } from './index-html-template.js';
+import { renderIndexHtml, renderManifest } from './index-html-template.js';
 import { recordRunContextSnapshot } from './run-context-snapshot.js';
 import { RunStreamFence } from './run-stream-fence.js';
 import {
@@ -1365,6 +1365,27 @@ function serveIndexHtml() {
   };
 }
 
+// manifest.webmanifest 同理：PWA "添加到主屏幕" 用的 name/icons 也从静态
+// 文件改成服务端按品牌配置渲染。
+function serveManifest() {
+  return async (
+    c: Parameters<Parameters<typeof app.use>[1]>[0],
+    next: () => Promise<void>,
+  ) => {
+    if (c.req.method !== 'GET' || c.req.path !== '/manifest.webmanifest') {
+      await next();
+      return;
+    }
+    try {
+      return c.body(renderManifest(), 200, {
+        'Content-Type': 'application/manifest+json',
+      });
+    } catch {
+      await next();
+    }
+  };
+}
+
 // SPA shell、manifest 和旧 Service Worker 清理脚本必须每次走网络。
 app.use(
   '/*',
@@ -1388,6 +1409,7 @@ app.use(
     }
   },
   serveIndexHtml(),
+  serveManifest(),
   serveStatic({
     root: './web/dist',
     rewriteRequestPath: (p) => {

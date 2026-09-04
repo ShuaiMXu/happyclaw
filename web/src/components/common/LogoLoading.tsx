@@ -26,10 +26,12 @@ interface LogoLoadingProps {
  *
  * The icon is admin-configurable (Settings → 外观 → 加载动画图标); this
  * renders before login on the very first paint, so it reads the appearance
- * config straight from the store rather than fetching — `useDynamicFavicon`
- * already kicks off `fetchAppearance()` on app mount, and the sidebar/login
- * page share the same store field once it resolves. Falls back to the
- * built-in mark until then or if nothing is configured.
+ * config straight from the store rather than fetching. The store's initial
+ * value comes from `window.__appearancePrewarm` (embedded server-side in
+ * `index.html`, see `src/index-html-template.ts`), so it's already correct
+ * on this very first render — no flash of the built-in default mark while
+ * waiting on a fetch. Falls back to the built-in mark only if nothing is
+ * configured at all.
  */
 export function LogoLoading({
   full,
