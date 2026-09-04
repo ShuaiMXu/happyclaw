@@ -1,5 +1,6 @@
 import type { GroupInfo } from '../types';
 import type { GroupEntry } from './group-utils';
+import { naturalCompare } from './naturalSort';
 
 export interface AgentWorkspaceSection {
   id: string;
@@ -54,7 +55,7 @@ export function groupWorkspacesByAgent(
     }))
     .sort((a, b) => {
       const defaultOrder = Number(b.isDefault) - Number(a.isDefault);
-      return defaultOrder || a.name.localeCompare(b.name, 'zh-CN');
+      return defaultOrder || naturalCompare(a.name, b.name, 'zh-CN');
     });
 }
 

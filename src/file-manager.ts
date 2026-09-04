@@ -3,6 +3,7 @@ import fs from 'fs';
 import { DATA_DIR, GROUPS_DIR, MAX_FILE_SIZE } from './config.js';
 import { deleteContainerEnvConfig } from './runtime-config.js';
 import { logger } from './logger.js';
+import { naturalCompare } from './natural-sort.js';
 
 // --- Storage usage cache (5 minute TTL) ---
 const _storageCache = new Map<string, { bytes: number; expires: number }>();
@@ -182,12 +183,13 @@ export function listFiles(
     });
   }
 
-  // 文件夹在前，文件在后，按名称排序
+  // 文件夹在前，文件在后，按名称自然排序（数字部分按数值比较，
+  // 而不是逐字符比较，避免 "1.10" 排到 "1.2" 前面）
   files.sort((a, b) => {
     if (a.type !== b.type) {
       return a.type === 'directory' ? -1 : 1;
     }
-    return a.name.localeCompare(b.name);
+    return naturalCompare(a.name, b.name);
   });
 
   return {

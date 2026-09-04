@@ -123,6 +123,7 @@ import type { ExpandContext } from './plugin-expander-context.js';
 import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
 import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
+import { renderIndexHtml } from './index-html-template.js';
 import { recordRunContextSnapshot } from './run-context-snapshot.js';
 import { RunStreamFence } from './run-stream-fence.js';
 import {
@@ -1334,6 +1335,36 @@ app.use(
   serveStatic({ root: './web/dist' }),
 );
 
+// index.html 走服务端模板渲染，把当前品牌配置（favicon/apple-touch-icon/
+// appName）直接写进首次响应字节，而不是像 useDynamicFavicon.ts 那样等 JS
+// 加载完再异步 patch DOM——那种做法总会有一段浏览器已经画出/取到内置默认
+// 图标的窗口期，patch 不掉那次"闪烁"。GET 请求命中 index.html（含 SPA
+// fallback）时直接返回渲染结果，其余请求原样交给 serveStatic。
+function serveIndexHtml() {
+  return async (
+    c: Parameters<Parameters<typeof app.use>[1]>[0],
+    next: () => Promise<void>,
+  ) => {
+    const p = c.req.path;
+    const isIndexHtmlRequest =
+      c.req.method === 'GET' &&
+      !p.startsWith('/api') &&
+      !p.startsWith('/ws') &&
+      (p === '/' || p === '/index.html' || !p.match(/\.\w+$/));
+    if (!isIndexHtmlRequest) {
+      await next();
+      return;
+    }
+    try {
+      return c.html(renderIndexHtml());
+    } catch {
+      // dist/index.html missing (e.g. dev environment before a build) —
+      // fall back to the previous static-file behavior.
+      await next();
+    }
+  };
+}
+
 // SPA shell、manifest 和旧 Service Worker 清理脚本必须每次走网络。
 app.use(
   '/*',
@@ -1356,6 +1387,7 @@ app.use(
       }
     }
   },
+  serveIndexHtml(),
   serveStatic({
     root: './web/dist',
     rewriteRequestPath: (p) => {

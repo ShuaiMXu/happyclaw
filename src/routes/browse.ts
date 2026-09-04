@@ -6,6 +6,7 @@ import { hasHostExecutionPermission } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import type { AuthUser } from '../types.js';
 import { logger } from '../logger.js';
+import { naturalCompare } from '../natural-sort.js';
 import {
   loadMountAllowlist,
   expandPath,
@@ -98,7 +99,7 @@ function listSubdirectories(
     if (dirs.length >= MAX_ENTRIES) break;
   }
 
-  dirs.sort((a, b) => a.name.localeCompare(b.name));
+  dirs.sort((a, b) => naturalCompare(a.name, b.name));
   return dirs;
 }
 

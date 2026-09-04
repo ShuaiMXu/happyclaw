@@ -48,6 +48,7 @@ import { FileUploadZone } from './FileUploadZone';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { PreviewDialog } from './PreviewDialog';
 import { ScrollEdgeAffordance } from '../common/ScrollEdgeAffordance';
+import { naturalCompare } from '../../utils/naturalSort';
 
 interface FilePanelProps {
   groupJid: string;
@@ -874,7 +875,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
   const sortedFiles = useMemo(() => {
     return [...fileList].sort((a, b) => {
       if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
-      return a.name.localeCompare(b.name);
+      return naturalCompare(a.name, b.name);
     });
   }, [fileList]);
 

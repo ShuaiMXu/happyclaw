@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useUsageStore } from '../stores/usage';
+import { naturalCompare } from '../utils/naturalSort';
 import type {
   UsageBreakdown,
   UsageAttributionItem,
@@ -455,7 +456,7 @@ export function UsagePage() {
           : sortBy === 'tokens'
             ? b.tokens
             : b.runCount;
-      return (left - right) * multiplier || a.label.localeCompare(b.label);
+      return (left - right) * multiplier || naturalCompare(a.label, b.label);
     });
   }, [
     attributions,
