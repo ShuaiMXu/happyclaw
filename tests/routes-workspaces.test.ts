@@ -10,6 +10,7 @@ import {
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-workspaces-'));
 const tmpStoreDir = path.join(tmpDir, 'db');
@@ -199,5 +200,56 @@ describe('/api/workspaces canonical read routes', () => {
         channel_jid: 'telegram:canonical-other-chat',
       }),
     );
+  });
+
+  test('a legacy cross-owner binding never exposes the foreign Agent policy', async () => {
+    const foreignProfile = db.createAgentProfile({
+      ownerUserId: OTHER_OWNER_ID,
+      name: 'Private Agent of another owner',
+      runtimePolicy: {
+        skills: { mode: 'custom', ids: ['private-owner-skill'] },
+      },
+    });
+    const jid = 'web:legacy-foreign-profile';
+    const folder = 'legacy-foreign-profile';
+    db.setRegisteredGroup(jid, {
+      name: 'Workspace with an invalid legacy binding',
+      folder,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+    });
+    db.assignWorkspaceAgentProfile(
+      folder,
+      db.getOrCreateDefaultAgentProfile(OWNER_ID).id,
+    );
+    // Simulate pre-validation persisted data, independently of the current
+    // assignment API's write guard. A read must not disclose another owner.
+    const legacyDb = new Database(path.join(tmpStoreDir, 'messages.db'));
+    try {
+      legacyDb
+        .prepare(
+          'UPDATE workspace_agent_profiles SET agent_profile_id = ? WHERE group_folder = ?',
+        )
+        .run(foreignProfile.id, folder);
+    } finally {
+      legacyDb.close();
+    }
+
+    asUser(OWNER_ID);
+    const detail = await routes.request(`/${jid}`);
+    expect(detail.status).toBe(200);
+    const detailBody = await detail.json();
+    expect(detailBody.workspace.agent_profile).toBeNull();
+    const list = await routes.request('/');
+    const listBody = await list.json();
+    expect(listBody.workspaces).toContainEqual(
+      expect.objectContaining({ jid, agent_profile: null }),
+    );
+    for (const body of [detailBody, listBody]) {
+      expect(JSON.stringify(body)).not.toContain(foreignProfile.name);
+      expect(JSON.stringify(body)).not.toContain('private-owner-skill');
+    }
+    // Reporting a broken binding must not silently reassign the workspace.
+    expect(db.getWorkspaceAgentProfileId(folder)).toBe(foreignProfile.id);
   });
 });

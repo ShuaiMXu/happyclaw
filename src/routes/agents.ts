@@ -33,6 +33,7 @@ import {
   listImContextBindingsByAgent,
   listChannelMountsBySession,
   getChannelAccount,
+  VALID_ACTIVATION_MODES,
 } from '../db.js';
 import { DATA_DIR } from '../config.js';
 import type {
@@ -54,7 +55,7 @@ import {
   hasWorkspaceMountConflict,
   isNativeContextContainer,
   matchesWorkspaceMount,
-  restoreDefaultChannelMount,
+  unbindChannelMount,
   resolveWorkspaceJid,
   type NativeContextMetadata,
 } from '../channel-mount-service.js';
@@ -78,14 +79,46 @@ type ChannelChatInfo = NativeContextMetadata & {
   user_count?: string;
 };
 
+/** Preserve omitted policies and normalize legacy Feishu owner-only mentions. */
+function parseBindingResponsePolicy(
+  imJid: string,
+  body: Record<string, unknown>,
+): {
+  activationMode?: RegisteredGroup['activation_mode'];
+  audienceMode?: AudienceMode;
+} {
+  const rawActivationMode = body.activation_mode;
+  const activationMode =
+    typeof rawActivationMode === 'string' &&
+    VALID_ACTIVATION_MODES.has(rawActivationMode)
+      ? (rawActivationMode as RegisteredGroup['activation_mode'])
+      : undefined;
+  const audienceMode: AudienceMode | undefined =
+    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
+      ? body.audience_mode
+      : undefined;
+  const policy = { activationMode, audienceMode };
+  return getChannelType(imJid) === 'feishu'
+    ? normalizeLegacyOwnerMention(policy)
+    : policy;
+}
+
 function getConversationKind(
   imJid: string,
-  group: Pick<RegisteredGroup, 'feishu_chat_mode'>,
+  group: Pick<
+    RegisteredGroup,
+    'feishu_chat_mode' | 'feishu_group_message_type' | 'native_context_type'
+  >,
   chatInfo?: ChannelChatInfo | null,
 ): ChannelConversationKind {
   return resolveChannelConversationKind(imJid, {
     feishu_chat_mode: group.feishu_chat_mode,
+    feishu_group_message_type: group.feishu_group_message_type,
+    native_context_type:
+      chatInfo?.native_context_type ?? group.native_context_type,
     chat_mode: chatInfo?.chat_mode,
+    group_message_type: chatInfo?.group_message_type,
+    thread_capable: chatInfo?.thread_capable,
   });
 }
 
@@ -225,63 +258,33 @@ function isNativeManagedSession(
   );
 }
 
-async function restoreBindingDefault(
+async function unbindBinding(
   user: Pick<AuthUser, 'id' | 'role'>,
   imJid: string,
-  imGroup: RegisteredGroup,
+  _imGroup: RegisteredGroup,
 ): Promise<
-  | {
-      status: 'resolved';
-      workspaceJid: string;
-      routingMode: 'single_session' | 'thread_map';
-    }
-  | {
-      status: 'unavailable';
-      reason: string;
-    }
+  | { status: 'resolved'; workspaceJid: null }
+  | { status: 'unavailable'; reason: string }
 > {
-  const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
-  // Re-read + re-authorize after the await — fetchLiveChatInfo
-  // yields the event loop on a live network call, during which ownership
-  // may have changed. restoreDefaultChannelMount commits whatever `group`
-  // it's given, so a stale pre-await snapshot could silently clobber a
-  // concurrent write or cross the caller's original authorization boundary.
-  const freshImGroup = getRegisteredGroup(imJid);
-  if (!freshImGroup) {
-    return { status: 'unavailable', reason: 'im_group_not_found' };
-  }
-  if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+  // This operation requires no provider lookup/default workspace and performs
+  // no await before the authorization check and atomic binding update.
+  const fresh = getRegisteredGroup(imJid);
+  if (!fresh) return { status: 'unavailable', reason: 'im_group_not_found' };
+  if (
+    !canModifyGroup(user, { ...fresh, jid: imJid }) ||
+    !hasConsistentChannelAccount(user.id, imJid, fresh)
+  ) {
     return { status: 'unavailable', reason: 'account_mismatch' };
   }
-  const restored = restoreDefaultChannelMount(
-    imJid,
-    freshImGroup,
-    user.id,
-    chatInfo ?? {},
-  );
-  if (restored.status !== 'resolved') return restored;
-
-  detachPreviousThreadMapIfLast(
-    imJid,
-    freshImGroup,
-    restored.workspaceJid,
-    restored.routingMode,
-  );
-  if (restored.routingMode === 'thread_map') {
-    markNativeContextWorkspace(restored.workspaceJid);
-  }
-  return {
-    status: 'resolved',
-    workspaceJid: restored.workspaceJid,
-    routingMode: restored.routingMode,
-  };
+  unbindChannelMount(imJid, fresh);
+  detachPreviousThreadMapIfLast(imJid, fresh);
+  return { status: 'resolved', workspaceJid: null };
 }
 
-function restoreDefaultError(restored: { reason: string }): string {
-  if (restored.reason === 'account_mismatch') {
-    return 'Channel account does not match this chat or owner';
-  }
-  return 'Channel account has no default or owner home workspace';
+function unbindError(result: { reason: string }): string {
+  return result.reason === 'account_mismatch'
+    ? 'Channel account does not match this chat or owner'
+    : 'IM group no longer exists';
 }
 
 // GET /api/groups/:jid/agents — list all agents for a group
@@ -1073,7 +1076,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       binding_mode: g.binding_mode ?? 'single_context',
       routing_mode:
         g.binding_mode === 'thread_map' ? 'thread_map' : 'single_session',
-      reply_policy: g.reply_policy === 'mirror' ? 'mirror' : 'source_only',
+      reply_policy: 'source_only',
       bound_target_name: boundTargetName,
       bound_workspace_name: boundWorkspaceName,
       avatar: g.avatar_url,
@@ -1246,8 +1249,7 @@ router.put(
     }
 
     const force = body.force === true;
-    const replyPolicy =
-      body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+    const replyPolicy = 'source_only' as const;
 
     if (sessionId !== 'main') {
       const session = getAgent(sessionId);
@@ -1322,8 +1324,25 @@ router.put(
         return c.json({ error: 'IM group is already bound elsewhere' }, 409);
       }
 
+      const { activationMode, audienceMode } = parseBindingResponsePolicy(
+        imJid,
+        body,
+      );
+      if (
+        getChannelType(imJid) === 'feishu' &&
+        (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
+        isMentionActivationMode(activationMode)
+      ) {
+        return c.json(
+          { error: 'Feishu private chats do not support mention activation' },
+          400,
+        );
+      }
+
       const updated = buildSessionMountUpdate(freshImGroup, sessionId, {
         replyPolicy,
+        activationMode,
+        audienceMode,
       });
       commitChannelMountUpdate(imJid, updated);
       detachPreviousThreadMapIfLast(imJid, freshImGroup);
@@ -1382,33 +1401,10 @@ router.put(
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
-    const validActivationModes = [
-      'always',
-      'when_mentioned',
-      'owner_mentioned',
-      'auto',
-      'disabled',
-    ] as const;
-    const rawActivationMode = body.activation_mode;
-    let activationMode =
-      typeof rawActivationMode === 'string' &&
-      validActivationModes.includes(
-        rawActivationMode as (typeof validActivationModes)[number],
-      )
-        ? (rawActivationMode as (typeof validActivationModes)[number])
-        : undefined;
-    let audienceMode: AudienceMode | undefined =
-      body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
-        ? body.audience_mode
-        : undefined;
-    if (getChannelType(imJid) === 'feishu') {
-      const normalized = normalizeLegacyOwnerMention({
-        activationMode,
-        audienceMode,
-      });
-      activationMode = normalized.activationMode;
-      audienceMode = normalized.audienceMode;
-    }
+    const { activationMode, audienceMode } = parseBindingResponsePolicy(
+      imJid,
+      body,
+    );
     if (
       getChannelType(imJid) === 'feishu' &&
       (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
@@ -1508,19 +1504,19 @@ router.delete(
       if (imGroup.target_agent_id !== sessionId) {
         return c.json({ error: 'IM group is not bound to this session' }, 400);
       }
-      const restored = await restoreBindingDefault(user, imJid, imGroup);
+      const restored = await unbindBinding(user, imJid, imGroup);
       if (restored.status !== 'resolved') {
-        return c.json({ error: restoreDefaultError(restored) }, 409);
+        return c.json({ error: unbindError(restored) }, 409);
       }
       refreshAgentLastImJid(sessionId);
       logger.info(
         {
           imJid,
           sessionId,
-          defaultWorkspaceJid: restored.workspaceJid,
+          unbound: true,
           userId: user.id,
         },
-        'IM group restored to channel account default workspace',
+        'IM channel unbound',
       );
       return c.json({ success: true, target_main_jid: restored.workspaceJid });
     }
@@ -1530,19 +1526,19 @@ router.delete(
     if (!matchesWorkspaceMount(imGroup, targetMainJid, legacyMainJid)) {
       return c.json({ error: 'IM group is not bound to this workspace' }, 400);
     }
-    const restored = await restoreBindingDefault(user, imJid, imGroup);
+    const restored = await unbindBinding(user, imJid, imGroup);
     if (restored.status !== 'resolved') {
-      return c.json({ error: restoreDefaultError(restored) }, 409);
+      return c.json({ error: unbindError(restored) }, 409);
     }
 
     logger.info(
       {
         imJid,
         targetMainJid,
-        defaultWorkspaceJid: restored.workspaceJid,
+        unbound: true,
         userId: user.id,
       },
-      'IM group restored to channel account default workspace',
+      'IM channel unbound',
     );
     return c.json({ success: true, target_main_jid: restored.workspaceJid });
   },
@@ -1643,10 +1639,25 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
     return c.json({ error: bindingPolicyError }, 400);
   }
   const force = body.force === true;
-  const replyPolicy = body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+  const replyPolicy = 'source_only' as const;
   const hasConflict = hasSessionMountConflict(freshImGroup, agentId);
   if (hasConflict && !force) {
     return c.json({ error: 'IM group is already bound elsewhere' }, 409);
+  }
+
+  const { activationMode, audienceMode } = parseBindingResponsePolicy(
+    imJid,
+    body,
+  );
+  if (
+    getChannelType(imJid) === 'feishu' &&
+    (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
+    isMentionActivationMode(activationMode)
+  ) {
+    return c.json(
+      { error: 'Feishu private chats do not support mention activation' },
+      400,
+    );
   }
 
   // Update DB + in-memory cache — clear target_main_jid to avoid conflicts
@@ -1655,6 +1666,8 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
     agentId,
     {
       replyPolicy,
+      activationMode,
+      audienceMode,
     },
   );
   commitChannelMountUpdate(imJid, updated);
@@ -1708,9 +1721,9 @@ router.delete(
       return c.json({ error: 'IM group is not bound to this session' }, 400);
     }
 
-    const restored = await restoreBindingDefault(user, imJid, imGroup);
+    const restored = await unbindBinding(user, imJid, imGroup);
     if (restored.status !== 'resolved') {
-      return c.json({ error: restoreDefaultError(restored) }, 409);
+      return c.json({ error: unbindError(restored) }, 409);
     }
 
     // Clear persisted IM routing so restart won't route to unbound channel (#225)
@@ -1720,10 +1733,10 @@ router.delete(
       {
         imJid,
         sessionId: agentId,
-        defaultWorkspaceJid: restored.workspaceJid,
+        unbound: true,
         userId: user.id,
       },
-      'IM group restored to channel account default workspace',
+      'IM channel unbound',
     );
     return c.json({ success: true, target_main_jid: restored.workspaceJid });
   },
@@ -1808,13 +1821,7 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   const targetMainJid = jid; // Use actual registered JID (not folder-based)
   const legacyMainJid = `web:${freshTargetGroup.folder}`;
   const force = body.force === true;
-  // Only update reply_policy if explicitly provided; otherwise preserve existing value
-  const replyPolicy =
-    body.reply_policy === 'mirror'
-      ? 'mirror'
-      : body.reply_policy === 'source_only'
-        ? 'source_only'
-        : undefined;
+  const replyPolicy = 'source_only' as const;
   const hasConflict = hasWorkspaceMountConflict(
     freshImGroup,
     targetMainJid,
@@ -1824,33 +1831,10 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
     return c.json({ error: 'IM group is already bound elsewhere' }, 409);
   }
   // Parse activation_mode from request body
-  const validActivationModes = [
-    'always',
-    'when_mentioned',
-    'owner_mentioned',
-    'auto',
-    'disabled',
-  ] as const;
-  const rawActivationMode = body.activation_mode;
-  let activationMode =
-    typeof rawActivationMode === 'string' &&
-    validActivationModes.includes(
-      rawActivationMode as (typeof validActivationModes)[number],
-    )
-      ? (rawActivationMode as (typeof validActivationModes)[number])
-      : undefined;
-  let audienceMode: AudienceMode | undefined =
-    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
-      ? body.audience_mode
-      : undefined;
-  if (getChannelType(imJid) === 'feishu') {
-    const normalized = normalizeLegacyOwnerMention({
-      activationMode,
-      audienceMode,
-    });
-    activationMode = normalized.activationMode;
-    audienceMode = normalized.audienceMode;
-  }
+  const { activationMode, audienceMode } = parseBindingResponsePolicy(
+    imJid,
+    body,
+  );
   if (
     getChannelType(imJid) === 'feishu' &&
     (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
@@ -1949,19 +1933,19 @@ router.delete('/:jid/im-binding/:imJid', authMiddleware, async (c) => {
     return c.json({ error: 'IM group is not bound to this workspace' }, 400);
   }
 
-  const restored = await restoreBindingDefault(user, imJid, imGroup);
+  const restored = await unbindBinding(user, imJid, imGroup);
   if (restored.status !== 'resolved') {
-    return c.json({ error: restoreDefaultError(restored) }, 409);
+    return c.json({ error: unbindError(restored) }, 409);
   }
 
   logger.info(
     {
       imJid,
       targetMainJid,
-      defaultWorkspaceJid: restored.workspaceJid,
+      unbound: true,
       userId: user.id,
     },
-    'IM group restored to channel account default workspace',
+    'IM channel unbound',
   );
   return c.json({ success: true, target_main_jid: restored.workspaceJid });
 });

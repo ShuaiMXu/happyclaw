@@ -150,7 +150,6 @@ import {
   getNewMessages,
   resolveMessageCursorSequence,
   getRouterState,
-  getSessionChannelOwner,
   getRouterStateByPrefix,
   deleteRouterState,
   getTaskById,
@@ -169,7 +168,6 @@ import {
   setRegisteredGroup,
   setRouterState,
   setRouterStateBatch,
-  setSessionChannelOwnerOnce,
   setSession,
   setSessionProviderId,
   deleteSession,
@@ -189,7 +187,6 @@ import {
   updateAgentStatus,
   updateAgentLastImJid,
   updateAgentInfo,
-  deleteAgent,
   archiveInactiveConversationAgents,
   deleteCompletedAgents,
   deleteImGroupRecord,
@@ -275,9 +272,9 @@ import {
   buildWorkspaceMountUpdate,
   hasRemainingThreadMapMount,
   isNativeContextContainer,
-  resolveChannelMountTarget,
-  restoreDefaultChannelMount,
+  unbindChannelMount,
   attachDefaultChannelAccountMount,
+  normalizeChannelBindingPolicy,
   upgradeNativeContextChannelMount,
   injectChannelMountRuntimePort,
 } from './channel-mount-service.js';
@@ -311,7 +308,17 @@ import {
 } from './channel-reliability-store.js';
 import { prepareWeChatTextChunks } from './wechat-outbound.js';
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
-import { resolveStickyChannelOwner } from './channel-session-owner.js';
+import {
+  createChannelInboundRouter,
+  hasExplicitChannelBinding as hasExplicitChannelBindingForRoute,
+  type ChannelInboundRoutingDeps,
+} from './channel-inbound-routing.js';
+import {
+  resolveInputChannelReplySource,
+  resolveOutputChannelReplySource,
+  resolveBatchChannelReplySource,
+  selectChannelReplyBatch,
+} from './channel-reply-source.js';
 import { migrateLegacyWhatsAppAuthDir } from './whatsapp-auth.js';
 import {
   canonicalizeWhatsAppConversationJid,
@@ -383,20 +390,13 @@ import {
   type TaskNotificationDeliveryAttempt,
 } from './task-notification.js';
 import { resolveImGroupDefaults } from './im-group-defaults.js';
-import {
-  applyAutoIsolateContextForGroups,
-  getUserContextIsolationConfig,
-} from './im-context-isolation.js';
 import { canSendCrossGroupMessage as canSendCrossGroupMessagePure } from './cross-group-acl.js';
 import {
   canIpcActorAccessGroup,
   canIpcActorManageTask,
   type TaskAclDeps,
 } from './task-acl.js';
-import {
-  resolveIpcDeliveryTargetGroup,
-  resolveIpcImRoute,
-} from './ipc-delivery-routing.js';
+import { resolveIpcDeliveryTargetGroup } from './ipc-delivery-routing.js';
 import {
   invalidateSessionCache,
   getWebDeps,
@@ -542,12 +542,10 @@ import {
 } from './types.js';
 import {
   buildNativeThreadRouteJid,
-  resolveNativeThreadContext,
   type NativeThreadContext,
 } from './channel-native-context.js';
 import {
   resolveFeishuConversationPlan,
-  requiresMention as feishuRequiresMention,
   type ActiveFeishuContext,
   type FeishuConversationPlan,
 } from './feishu-conversation-policy.js';
@@ -582,7 +580,6 @@ import {
   broadcastTyping,
   broadcastStreamEvent,
   broadcastAgentStatus,
-  broadcastAgentRemoved,
   broadcastTitleGenerating,
   broadcastGroupCreated,
   broadcastBillingUpdate,
@@ -1969,29 +1966,21 @@ const RELATIVE_IMAGE_EXTENSIONS = new Set([
   '.svg',
 ]);
 
-/**
- * Resolve the IM JID that send_image / send_file / other media MCP tools
- * should target. Three cases:
- * - Conversation agent: use the agent-bound route map (IM channel the
- *   conversation agent was started on).
- * - Home container: prefer the route map because ctx.chatJid is frozen to
- *   the first IM source, while the home container serves multiple channels
- *   concurrently. Fall back to chatJid if it's an IM JID.
- * - Regular group: prefer chatJid when it's an IM JID, fall back to the
- *   route map.
- */
+/** Reply tools use the immutable source captured for their exact input. */
 function resolveImRoute(opts: {
   ipcAgentId: string | null | undefined;
   isHome: boolean;
   chatJid: string;
   sourceGroup: string;
+  inputTurnId?: string;
 }): string | null {
-  return resolveIpcImRoute({
-    ...opts,
-    getActiveRoute: (runtimeJid) => activeImReplyRoutes.get(runtimeJid) ?? null,
-    getAgentChatJid: (agentId) => getAgent(agentId)?.chat_jid ?? null,
-    isImJid: (jid) => getChannelType(jid) !== null,
-  });
+  if (!opts.inputTurnId) return null;
+  return (
+    activeChannelOutboxScopes.resolveInputScope(
+      channelTurnScope(opts.sourceGroup, opts.ipcAgentId),
+      opts.inputTurnId,
+    )?.sourceJid ?? null
+  );
 }
 
 function detachThreadMapWorkspace(
@@ -2058,35 +2047,17 @@ function persistActivationAwareGroupUpdate(
   return true;
 }
 
-/** Restore an authorized chat to its channel account's default workspace. */
+/** Unbinding leaves a discoverable, silent channel with no runtime target. */
 function unbindImGroup(jid: string, reason: string): boolean {
   const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
   if (!group) return false;
-  const agentId = group.target_agent_id;
-  const targetMainJid = group.target_main_jid;
+  const previousWorkspace = group.target_main_jid;
   const wasThreadMap = group.binding_mode === 'thread_map';
-  const restored = restoreDefaultChannelMount(jid, group, group.created_by);
-  if (restored.status !== 'resolved') {
-    logger.warn({ jid, reason: restored.reason }, `${reason}: restore failed`);
-    return false;
-  }
-  registeredGroups[jid] = restored.updated;
-  if (restored.routingMode === 'thread_map') {
-    markThreadMapWorkspace(restored.workspaceJid);
-  }
-  if (
-    wasThreadMap &&
-    (restored.routingMode !== 'thread_map' ||
-      resolveWorkspaceJid(targetMainJid || '') !== restored.workspaceJid)
-  ) {
-    detachThreadMapWorkspace(targetMainJid, jid);
-  }
+  registeredGroups[jid] = unbindChannelMount(jid, group);
+  if (wasThreadMap) detachThreadMapWorkspace(previousWorkspace, jid);
   imSendFailCounts.delete(jid);
   imHealthCheckFailCounts.delete(jid);
-  logger.info(
-    { jid, agentId, targetMainJid, restoredWorkspace: restored.workspaceJid },
-    reason,
-  );
+  logger.info({ jid }, reason);
   return true;
 }
 
@@ -4232,10 +4203,10 @@ function handleWhereCommand(chatJid: string): string {
 function handleUnbindCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
-  if (!unbindImGroup(chatJid, 'IM slash command restore default')) {
-    return '无法恢复 Bot 默认工作区，已保留当前绑定。请检查渠道账号的默认工作区设置。';
+  if (!unbindImGroup(chatJid, 'IM slash command unbind')) {
+    return '解绑失败，请稍后重试。';
   }
-  return '已恢复 Bot 默认工作区。';
+  return '已解绑。后续消息不会触发回复，请在 HappyClaw 中重新绑定后使用。';
 }
 
 function isAdminHostOnlyOwner(ownerId: string | null | undefined): boolean {
@@ -4256,21 +4227,10 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
     return '未找到目标。先用 /list 查看工作区和会话短 ID，再执行 /bind <workspace>/<会话短ID>';
   }
 
-  const channelType = getChannelType(chatJid);
-  const threadMapCapable =
-    group.binding_mode === 'thread_map' ||
-    isThreadMapCapableChat({
-      channel_type: channelType,
-      chat_mode: group.feishu_chat_mode,
-      group_message_type: group.feishu_group_message_type,
-    });
+  const threadMapCapable = isNativeContextContainer(chatJid, group);
   if (threadMapCapable && resolved.target_agent_id) {
     return '飞书话题群只能绑定工作区，不能绑定单个会话。请使用 /bind <workspace>。';
   }
-  if (!threadMapCapable && resolved.target_main_jid) {
-    return '普通群和私聊只能绑定具体会话。请使用 /bind <workspace>/<会话短ID>。';
-  }
-
   const updated: RegisteredGroup = resolved.target_agent_id
     ? buildSessionMountUpdate(group, resolved.target_agent_id, {
         replyPolicy: 'source_only',
@@ -4278,7 +4238,7 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
     : buildWorkspaceMountUpdate(
         group,
         resolved.target_main_jid!,
-        'thread_map',
+        threadMapCapable ? 'thread_map' : 'single_session',
         { replyPolicy: 'source_only' },
       );
   setRegisteredGroup(chatJid, updated);
@@ -5338,6 +5298,22 @@ function loadState(): void {
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
 
+  // Preserve chosen sessions and their transcripts while retiring legacy
+  // mention-created thread maps and mirror reply policies.
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (!getChannelType(jid)) continue;
+    const updated = normalizeChannelBindingPolicy(jid, group);
+    if (updated === group) continue;
+    setRegisteredGroup(jid, updated);
+    registeredGroups[jid] = updated;
+    if (
+      group.binding_mode === 'thread_map' &&
+      updated.binding_mode !== 'thread_map'
+    ) {
+      detachThreadMapWorkspace(group.target_main_jid, jid);
+    }
+  }
+
   // Restore persisted OOM counters
   for (const { key, value } of getRouterStateByPrefix('oom_exits:')) {
     const folder = key.slice('oom_exits:'.length);
@@ -6086,11 +6062,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     liveInteractionMode,
     getTaskRunById,
   );
-  missedMessages = interactionBatch.messages;
+  missedMessages = selectChannelReplyBatch(interactionBatch.messages);
   const interactionMode = interactionBatch.interactionMode;
   const scheduledGroupDeliveryContract =
     resolveScheduledGroupDeliveryContract(interactionMode);
-  if (interactionBatch.hasDeferredMessages) {
+  if (
+    interactionBatch.hasDeferredMessages ||
+    missedMessages.length < interactionBatch.messages.length
+  ) {
     // A runner has one system/MCP/output contract for its lifetime. Keep the
     // incompatible suffix behind the durable cursor and force a fresh runner
     // after this prefix, rather than coalescing both contracts into one query.
@@ -6112,41 +6091,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  // Direct IM chats reply to themselves. Routed IM messages keep their original
-  // source_jid so workspace-bound conversations can reply back to the sender
-  // without mirroring every Web reply into IM.
-  //
-  // When messages from multiple sources (web + IM) are batched together, only
-  // route replies to IM if ALL messages came from the same IM source. If any
-  // message originated from web, the web user expects replies on web only — do
-  // not broadcast to IM (#99).
+  // A reply belongs to this exact input batch. Persisted session owners and
+  // last_im_jid are navigation metadata, never an alternative recipient.
   const directImReply = getChannelType(chatJid) !== null;
-  let incomingImOwner: string | null = null;
-  if (!directImReply) {
-    // chatJid is a web channel — check if ALL messages share the same IM source
-    const firstSourceJid = missedMessages[0]?.source_jid || chatJid;
-    const allSameImSource =
-      getChannelType(firstSourceJid) !== null &&
-      missedMessages.every((m) => (m.source_jid || chatJid) === firstSourceJid);
-    if (allSameImSource) {
-      incomingImOwner = firstSourceJid;
-    } else {
-      const linkedForwardAnchor =
-        resolveForwardBundleBatchAnchor(missedMessages);
-      const linkedSourceJid =
-        linkedForwardAnchor?.context.sourceJid ??
-        resolveCompatibleChannelBatchAnchor(missedMessages)?.context.sourceJid;
-      if (linkedSourceJid && getChannelType(linkedSourceJid) !== null) {
-        // Root and note intentionally have different native route fragments.
-        // Reply to the authored note, which is the user-visible bundle anchor.
-        incomingImOwner = linkedSourceJid;
-      }
-    }
-  } else {
-    // chatJid is an IM channel — reply directly
-    incomingImOwner = chatJid;
-  }
-  const persistedMainOwner = getSessionChannelOwner(effectiveGroup.folder);
   const scheduledGroupDeliveryRoute = resolveScheduledGroupDeliveryRoute(
     missedMessages,
     effectiveGroup.folder,
@@ -6155,14 +6102,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
   let replySourceImJid =
     scheduledGroupDeliveryRoute ??
-    resolveStickyChannelOwner(persistedMainOwner ?? null, incomingImOwner);
-  if (!scheduledGroupDeliveryRoute && !persistedMainOwner && replySourceImJid) {
-    replySourceImJid = setSessionChannelOwnerOnce(
-      effectiveGroup.folder,
-      null,
-      replySourceImJid,
-    );
-  }
+    resolveBatchChannelReplySource(missedMessages);
+  const initialReplySourceImJid = replySourceImJid;
   // Publish the current IM reply route so the IPC watcher can forward
   // send_message outputs to the correct IM channel.
   activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
@@ -6779,7 +6720,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return {
       inputId,
       scope: channelOutboxScopesByInput.get(inputId),
-      rejected: inputIds.some((id) => rejectedChannelInputTurns.has(id)),
+      rejected:
+        rejectedChannelInputTurns.has(inputId) ||
+        inputIds.some((id) => rejectedChannelInputTurns.has(id)),
     };
   };
   if (
@@ -6887,7 +6830,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       logicalChatJid: chatJid,
       scopeKey: channelTurnScope(effectiveGroup.folder),
       inputTurnId,
-      targetJid: scope?.sourceJid ?? replySourceImJid,
+      targetJid: scope?.sourceJid ?? null,
       scope,
     });
   };
@@ -7142,8 +7085,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         getChannelType,
       );
       const newImJid =
-        scheduledRoute ??
-        resolveStickyChannelOwner(replySourceImJid, newSourceJid);
+        scheduledRoute ?? resolveInputChannelReplySource(newSourceJid);
       let nextRuntime: ChannelTurnRuntime | undefined;
       let nextScope: ActiveChannelOutboxScope | undefined;
       let nextLifecycle: typeof activeDurableCardLifecycle;
@@ -7320,19 +7262,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         );
         await typingReady;
       }
-      // Web is a public control surface, not a transport ownership change. A
-      // session first opened from Feishu/QQ/etc. keeps that exact account and
-      // thread route when its next input is submitted from Web.
-      let newImJid =
-        admittedInput?.imJid ??
-        resolveStickyChannelOwner(replySourceImJid, newSourceJid);
-      if (!replySourceImJid && newImJid) {
-        newImJid = setSessionChannelOwnerOnce(
-          effectiveGroup.folder,
-          null,
-          newImJid,
-        );
-      }
+      // An explicitly admitted Web input has a null IM destination. Do not
+      // fall through to the previous input when that null is intentional.
+      const newImJid = admittedInput
+        ? admittedInput.imJid
+        : resolveInputChannelReplySource(newSourceJid);
       if (acceptedNewInput && inputTurnId && admittedInput) {
         channelTurnRuntime = admittedInput.runtime;
         channelOutboxScope = admittedInput.scope;
@@ -7463,8 +7397,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
 
       // Rebuild streaming session if the target channel changed.
-      // A route changes only when another concrete IM route takes ownership.
-      // Web follow-ups keep the existing transport/account/thread identity.
+      // Web follow-ups explicitly release the previous IM transport. Each
+      // prior input keeps its immutable scope for any delayed output.
       const newStreamingJid =
         replySourceImJid ??
         (directImReply ? `web:${effectiveGroup.folder}` : chatJid);
@@ -8512,8 +8446,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               outputChannelScope.inputId,
             );
             const outputStreamingSession = outputCardProjection?.session;
-            const outputReplySourceJid =
-              outputChannelScope.scope?.sourceJid ?? replySourceImJid;
+            const outputReplySourceJid = resolveOutputChannelReplySource({
+              inputTurnId: outputChannelScope.inputId,
+              initialInputTurnId: lastProcessed.id,
+              initialSourceJid: initialReplySourceImJid,
+              scopeSourceJid: outputChannelScope.scope?.sourceJid,
+              admittedInput: admittedWarmMainInputs.get(
+                outputChannelScope.inputId,
+              ),
+            });
             if (outputReplySourceJid && !outputChannelScope.scope) {
               hadError = true;
               logger.error(
@@ -9088,64 +9029,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 }
               }
 
-              // Optional mirror mode for explicitly bound IM channels
-              const webJid = chatJid.startsWith('web:')
-                ? chatJid
-                : `web:${effectiveGroup.folder}`;
-              let mirrorDeliveryAcknowledged = true;
-              for (const [imJid, g] of Object.entries(registeredGroups)) {
-                if (
-                  g.target_main_jid !== webJid ||
-                  imJid === chatJid ||
-                  imJid === replySourceImJid
-                )
-                  continue;
-                if (g.reply_policy !== 'mirror') continue;
-                if (!getChannelType(imJid)) continue;
-                const mirrorRuntime = channelTurnRuntimes.get(
-                  outputChannelScope.inputId,
-                );
-                const mirrorAddress = parseChannelAddress(imJid);
-                const mirrorAccountId =
-                  mirrorAddress?.channelAccountId ?? g.channel_account_id;
-                if (!mirrorRuntime || !mirrorAddress || !mirrorAccountId) {
-                  mirrorDeliveryAcknowledged = false;
-                  logger.error(
-                    { chatJid, imJid, inputTurnId: outputChannelScope.inputId },
-                    'Suppressed mirror delivery without an exact durable source turn',
-                  );
-                  continue;
-                }
-                const mirrorScope = bindChannelOutboxScope(
-                  mainAdmissionKey,
-                  mirrorRuntime,
-                  {
-                    provider: mirrorAddress.provider,
-                    accountId: mirrorAccountId,
-                    sourceJid: imJid,
-                    chatId: mirrorAddress.externalChatId,
-                    rootId: mirrorAddress.rootMessageId,
-                    threadId: mirrorAddress.threadId,
-                  },
-                );
-                channelOutboxScopesByInput.set(
-                  `${outputChannelScope.inputId}:mirror:${imJid}`,
-                  mirrorScope,
-                );
-                const delivered = await sendImWithRetry(
-                  imJid,
-                  text,
-                  localImagePaths,
-                  {
-                    scopeKey: mainAdmissionKey,
-                    scopeToken: mirrorScope.token,
-                    operationKey: `main-mirror:${outputChannelScope.inputId}:${imJid}:${durableOutputIdentity}`,
-                    ordinalSlot: `mirror:${imJid}`,
-                  },
-                );
-                mirrorDeliveryAcknowledged &&= delivered;
-              }
-              replyDeliveryAcknowledged &&= mirrorDeliveryAcknowledged;
+              // Channel bindings do not subscribe to other inputs' answers.
               // An IM/card ACK proves only a channel side effect. Every
               // scheduled group occurrence must also have durably committed
               // its canonical Web result and business terminal before its
@@ -11205,11 +11089,12 @@ function startIpcWatcher(): void {
                 const webText = cardText || data.text;
 
                 // Every non-task native send, including conversation agents,
-                // resolves the sticky exact route and uses the Turn Outbox.
+                // resolves its input source and uses the Turn Outbox.
                 // DB/Web stores markdown extracted from a Feishu card; the
                 // connector receives the original JSON/text payload.
                 if (!isTaskIpcMessage) {
                   const ipcImRoute = resolveImRoute({
+                    inputTurnId: data.inputTurnId,
                     ipcAgentId,
                     isHome,
                     chatJid: data.chatJid,
@@ -11324,7 +11209,12 @@ function startIpcWatcher(): void {
                       }
                     }
                   } else if (
-                    getSessionChannelOwner(sourceGroup, ipcAgentId ?? null)
+                    resolveInputChannelReplySource(
+                      getAgentBuilderInputMessage(
+                        effectiveChatJid,
+                        data.inputTurnId,
+                      )?.source_jid,
+                    )
                   ) {
                     // The session is owned by a native channel, so a missing
                     // route means the route is unavailable — not that this is a
@@ -11803,6 +11693,7 @@ function startIpcWatcher(): void {
                   const imgImRoute = isTaskIpcImage
                     ? null
                     : resolveImRoute({
+                        inputTurnId: data.inputTurnId,
                         ipcAgentId,
                         isHome,
                         chatJid: data.chatJid,
@@ -13404,8 +13295,10 @@ async function processTaskIpc(
         // no such context, so it binds to the target conversation itself.
         const scheduleDeliveryRouteJid =
           targetFolder === sourceGroup
-            ? (getSessionChannelOwner(sourceGroup, ipcAgentId ?? null) ??
-              targetJid)
+            ? (activeChannelOutboxScopes.resolveInputScope(
+                channelTurnScope(sourceGroup, ipcAgentId),
+                data.inputTurnId ?? '',
+              )?.sourceJid ?? targetJid)
             : targetJid;
 
         createTask({
@@ -14609,6 +14502,7 @@ async function processTaskIpc(
               broadcastToWebClients(sourceGroup, warnMsg);
               // Also notify via DingTalk for conversation agents bound to IM
               const imRoute = resolveImRoute({
+                inputTurnId: data.inputTurnId,
                 ipcAgentId,
                 isHome,
                 chatJid: data.chatJid,
@@ -14659,6 +14553,7 @@ async function processTaskIpc(
           const regularFileImRoute =
             fileRoutingDecision.mode === 'none'
               ? resolveImRoute({
+                  inputTurnId: data.inputTurnId,
                   ipcAgentId,
                   isHome,
                   chatJid: data.chatJid,
@@ -15055,6 +14950,13 @@ async function processAgentConversation(
     }
     return;
   }
+  const replyBatch = selectChannelReplyBatch(missedMessages);
+  if (replyBatch.length < missedMessages.length) {
+    queue.enqueueTask(virtualChatJid, `agent-channel-next:${agentId}`, () =>
+      processAgentConversation(chatJid, agentId),
+    );
+  }
+  missedMessages = replyBatch;
   const agentAdmissionSnapshot = createIpcDeliveryTarget(
     virtualChatJid,
     missedMessages,
@@ -15099,28 +15001,13 @@ async function processAgentConversation(
         toSend.length === 0
           ? completeOutOfBandMessage
           : advanceNextPullCursorOnly;
-      // Resolve IM target so plugin replies fan out to the originating IM
-      // channel (#20 P1-1). Per-reply: prefer that message's source_jid;
-      // otherwise fall back to the agent's last_im_jid, but only if its
-      // channel is currently connected (stale jids would just retry-fail).
-      const persistedAgentImJid = (() => {
-        const agentRow = getAgent(agentId);
-        const candidate = agentRow?.last_im_jid;
-        if (
-          candidate &&
-          getChannelType(candidate) &&
-          imManager.isChannelAvailableForJid(candidate)
-        ) {
-          return candidate;
-        }
-        return null;
-      })();
+      // A Web plugin command must not inherit a prior IM recipient.
       let agentPluginRepliesAcknowledged = true;
       for (const r of replies) {
         const perMsgImJid =
           r.originalMsg.source_jid && getChannelType(r.originalMsg.source_jid)
             ? r.originalMsg.source_jid
-            : persistedAgentImJid;
+            : null;
         const delivery = await sendPluginExpanderReply(virtualChatJid, r.text, {
           originalMessageId: r.originalMsg.id,
           groupFolder: effectiveGroup.folder,
@@ -15251,38 +15138,9 @@ async function processAgentConversation(
     knownMessageIds: activeSessionReferencedMessageIds,
   });
   const imagesForAgent = images.length > 0 ? images : undefined;
-  // For agent conversations, route reply to IM based on the most recent
-  // message's source.  Unlike the main conversation (#99), agent conversations
-  // are explicitly bound to IM groups, so the user expects replies to go back
-  // to the IM channel they last messaged from — even if older messages in
-  // the batch originated from the web (e.g. after a /clear).
-  const lastSourceJid = missedMessages[missedMessages.length - 1]?.source_jid;
-  const incomingAgentOwner =
-    lastSourceJid && getChannelType(lastSourceJid) !== null
-      ? lastSourceJid
-      : null;
-  const agentRow = getAgent(agentId);
-  const persistedAgentOwner =
-    getSessionChannelOwner(effectiveGroup.folder, agentId) ??
-    agentRow?.last_im_jid ??
-    null;
-  let replySourceImJid = resolveStickyChannelOwner(
-    persistedAgentOwner,
-    incomingAgentOwner,
-  );
-
-  // Persist once so restarts and later Web/other-IM input keep the first
-  // concrete channel/account/thread identity for this logical Session.
-  if (!persistedAgentOwner && replySourceImJid) {
-    replySourceImJid = setSessionChannelOwnerOnce(
-      effectiveGroup.folder,
-      agentId,
-      replySourceImJid,
-    );
-    if (!agentRow?.last_im_jid) {
-      updateAgentLastImJid(agentId, replySourceImJid);
-    }
-  }
+  // Session bindings share context; each input retains its own reply route.
+  let replySourceImJid = resolveBatchChannelReplySource(missedMessages);
+  const initialAgentReplySourceImJid = replySourceImJid;
   if (replySourceImJid) {
     // Publish to activeImReplyRoutes so send_file/send_image IPC can route to IM.
     // Only use virtualChatJid key (per-agent) — folder-level key would collide
@@ -15610,7 +15468,9 @@ async function processAgentConversation(
     return {
       inputId,
       scope: agentChannelOutboxScopesByInput.get(inputId),
-      rejected: inputIds.some((id) => rejectedAgentInputTurns.has(id)),
+      rejected:
+        rejectedAgentInputTurns.has(inputId) ||
+        inputIds.some((id) => rejectedAgentInputTurns.has(id)),
     };
   };
   if (
@@ -15934,10 +15794,7 @@ async function processAgentConversation(
     agentAdmissionKey,
     (newSourceJid, inputTurnId, inputCursor, coveredInputs) => {
       if (admittedWarmAgentInputs.has(inputTurnId)) return false;
-      const targetSourceJid = resolveStickyChannelOwner(
-        replySourceImJid,
-        newSourceJid,
-      );
+      const targetSourceJid = resolveInputChannelReplySource(newSourceJid);
       let nextRuntime: ChannelTurnRuntime | undefined;
       let nextScope: ActiveChannelOutboxScope | undefined;
       let nextLifecycle: typeof activeAgentDurableCardLifecycle;
@@ -16074,19 +15931,9 @@ async function processAgentConversation(
     if (inputTurnId && !admittedInput) return;
     const admittedAgentLifecycle = admittedInput?.lifecycle;
     const agentInputAdmitted = !!admittedInput;
-    let targetSourceJid =
-      admittedInput?.imJid ??
-      resolveStickyChannelOwner(replySourceImJid, newSourceJid ?? null);
-    if (!replySourceImJid && targetSourceJid) {
-      targetSourceJid = setSessionChannelOwnerOnce(
-        effectiveGroup.folder,
-        agentId,
-        targetSourceJid,
-      );
-      if (!getAgent(agentId)?.last_im_jid) {
-        updateAgentLastImJid(agentId, targetSourceJid);
-      }
-    }
+    const targetSourceJid = admittedInput
+      ? admittedInput.imJid
+      : resolveInputChannelReplySource(newSourceJid);
     if (inputTurnId) {
       activeAgentInputTurnId = inputTurnId;
       bindAgentTurnOutputCoordinator(inputTurnId);
@@ -16110,7 +15957,7 @@ async function processAgentConversation(
         typingReady,
       );
     }
-    if (inputTurnId && targetSourceJid) {
+    if (inputTurnId && admittedInput) {
       agentChannelTurnRuntime = admittedInput?.runtime;
       agentChannelOutboxScope = admittedInput?.scope;
       activeAgentDurableCardLifecycle = admittedInput?.lifecycle;
@@ -16282,7 +16129,7 @@ async function processAgentConversation(
       scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
       inputTurnId,
       agentId,
-      targetJid: scope?.sourceJid ?? replySourceImJid,
+      targetJid: scope?.sourceJid ?? null,
       scope,
     });
   };
@@ -16867,8 +16714,13 @@ async function processAgentConversation(
         outputAgentScope.inputId,
       );
       const outputAgentStreamingSession = outputAgentCardProjection?.session;
-      const outputAgentReplySourceJid =
-        outputAgentScope.scope?.sourceJid ?? replySourceImJid;
+      const outputAgentReplySourceJid = resolveOutputChannelReplySource({
+        inputTurnId: outputAgentScope.inputId,
+        initialInputTurnId: lastProcessed.id,
+        initialSourceJid: initialAgentReplySourceImJid,
+        scopeSourceJid: outputAgentScope.scope?.sourceJid,
+        admittedInput: admittedWarmAgentInputs.get(outputAgentScope.inputId),
+      });
       if (outputAgentReplySourceJid && !outputAgentScope.scope) {
         hadError = true;
         logger.error(
@@ -17248,72 +17100,15 @@ async function processAgentConversation(
           );
         }
 
-        // Optional mirror mode for linked IM channels
-        let agentMirrorDeliveryAcknowledged = true;
-        for (const [imJid, g] of Object.entries(registeredGroups)) {
-          if (g.target_agent_id !== agentId || imJid === replySourceImJid)
-            continue;
-          if (g.reply_policy !== 'mirror') continue;
-          if (!getChannelType(imJid)) continue;
-          const mirrorRuntime = agentChannelTurnRuntimes.get(
-            outputAgentScope.inputId,
-          );
-          const mirrorAddress = parseChannelAddress(imJid);
-          const mirrorAccountId =
-            mirrorAddress?.channelAccountId ?? g.channel_account_id;
-          if (!mirrorRuntime || !mirrorAddress || !mirrorAccountId) {
-            agentMirrorDeliveryAcknowledged = false;
-            logger.error(
-              {
-                chatJid,
-                agentId,
-                imJid,
-                inputTurnId: outputAgentScope.inputId,
-              },
-              'Suppressed agent mirror delivery without an exact durable source turn',
-            );
-            continue;
-          }
-          const mirrorScope = bindChannelOutboxScope(
-            agentAdmissionKey,
-            mirrorRuntime,
-            {
-              provider: mirrorAddress.provider,
-              accountId: mirrorAccountId,
-              sourceJid: imJid,
-              chatId: mirrorAddress.externalChatId,
-              rootId: mirrorAddress.rootMessageId,
-              threadId: mirrorAddress.threadId,
-            },
-          );
-          agentChannelOutboxScopesByInput.set(
-            `${outputAgentScope.inputId}:mirror:${imJid}`,
-            mirrorScope,
-          );
-          const delivered = await sendImWithRetry(
-            imJid,
-            text,
-            localImagePaths,
-            {
-              scopeKey: agentAdmissionKey,
-              scopeToken: mirrorScope.token,
-              operationKey: `agent-mirror:${agentId}:${outputAgentScope.inputId}:${imJid}:${output.sdkMessageUuid || crypto.createHash('sha256').update(text).digest('hex').slice(0, 24)}`,
-              ordinalSlot: `mirror:${imJid}`,
-            },
-          );
-          agentMirrorDeliveryAcknowledged &&= delivered;
-        }
-
         const agentReplyDeliveryAcknowledged =
-          (!outputAgentReplySourceJid ||
-            agentPhysicalDeliveryAckByInput.get(outputAgentScope.inputId) ===
-              true ||
-            (streamingCardHandledIM &&
-              !agentStreamingCardDeliveryUncertain &&
-              !holdReason &&
-              agentCardAttachmentsDelivered) ||
-            agentStaticImDelivered) &&
-          agentMirrorDeliveryAcknowledged;
+          !outputAgentReplySourceJid ||
+          agentPhysicalDeliveryAckByInput.get(outputAgentScope.inputId) ===
+            true ||
+          (streamingCardHandledIM &&
+            !agentStreamingCardDeliveryUncertain &&
+            !holdReason &&
+            agentCardAttachmentsDelivered) ||
+          agentStaticImDelivered;
         if (agentReplyDeliveryAcknowledged && occupiesPrimarySlot) {
           const acknowledgedInputIds = output.ipcReceipts?.length
             ? output.ipcReceipts.map((receipt) => receipt.deliveryId)
@@ -18054,6 +17849,16 @@ async function processAgentConversation(
       agentStreamingAccText.trim()
     ) {
       try {
+        const partialInputId = activeAgentInputTurnId;
+        const partialScope =
+          agentChannelOutboxScopesByInput.get(partialInputId);
+        const partialReplySourceJid = resolveOutputChannelReplySource({
+          inputTurnId: partialInputId,
+          initialInputTurnId: lastProcessed.id,
+          initialSourceJid: initialAgentReplySourceImJid,
+          scopeSourceJid: partialScope?.sourceJid,
+          admittedInput: admittedWarmAgentInputs.get(partialInputId),
+        });
         const partialReply = buildInterruptedReply(agentStreamingAccText);
         const msgId = crypto.randomUUID();
         const timestamp = new Date().toISOString();
@@ -18068,7 +17873,7 @@ async function processAgentConversation(
           true,
           {
             meta: {
-              turnId: lastProcessed.id,
+              turnId: partialInputId,
               sessionId: currentAgentSessionId,
               sourceKind: 'interrupt_partial',
               finalizationReason: 'error',
@@ -18085,7 +17890,7 @@ async function processAgentConversation(
             content: partialReply,
             timestamp,
             is_from_me: true,
-            turn_id: lastProcessed.id,
+            turn_id: partialInputId,
             session_id: currentAgentSessionId,
             sdk_message_uuid: null,
             source_kind: 'interrupt_partial',
@@ -18098,36 +17903,34 @@ async function processAgentConversation(
         logger.info({
           chatJid,
           agentId,
-          replySourceImJid,
+          partialReplySourceJid,
           accLen: agentStreamingAccText.length,
           cursorCommitted: isCursorCommitted(),
         });
-        if (replySourceImJid) {
+        if (partialReplySourceJid) {
           const localImagePaths = extractLocalImImagePaths(
             partialReply,
             effectiveGroup.folder,
           );
           logger.info(
-            { replySourceImJid, textLen: partialReply.length },
+            { partialReplySourceJid, textLen: partialReply.length },
             'agent partial reply ready',
           );
           const imSent = await sendImWithRetry(
-            replySourceImJid,
+            partialReplySourceJid,
             partialReply,
             localImagePaths,
             {
               scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
-              scopeToken:
-                agentChannelOutboxScopesByInput.get(lastProcessed.id)?.token ??
-                `missing:${lastProcessed.id}`,
-              operationKey: `agent:${agentId}:${lastProcessed.id}:partial-fallback`,
+              scopeToken: partialScope?.token ?? `missing:${partialInputId}`,
+              operationKey: `agent:${agentId}:${partialInputId}:partial-fallback`,
             },
           );
-          logger.info({ replySourceImJid, imSent }, 'agent IM reply sent');
+          logger.info({ partialReplySourceJid, imSent }, 'agent IM reply sent');
         } else {
           logger.warn(
             { chatJid, agentId },
-            'Partial reply: no replySourceImJid found, skipping IM send',
+            'Partial reply: no partialReplySourceJid found, skipping IM send',
           );
         }
       } catch (err) {
@@ -18384,7 +18187,11 @@ async function startMessageLoop(): Promise<void> {
               liveWarmInteractionMode,
               getTaskRunById,
             );
-          messagesToSend = warmInteractionBatch.messages;
+          messagesToSend = selectChannelReplyBatch(
+            warmInteractionBatch.messages,
+          );
+          const hasDeferredReplyMessages =
+            messagesToSend.length < warmInteractionBatch.messages.length;
           const requiredInteractionMode = warmInteractionBatch.interactionMode;
           // The receipt covers the exact pre-expansion DB batch. Plugin replies
           // removed from `messagesToSend` below are already handled out-of-band,
@@ -18502,6 +18309,12 @@ async function startMessageLoop(): Promise<void> {
                 continue;
               }
               if (toSend.length === 0) {
+                if (
+                  warmInteractionBatch.hasDeferredMessages ||
+                  hasDeferredReplyMessages
+                ) {
+                  queue.enqueueMessageCheck(chatJid);
+                }
                 continue;
               }
               messagesToSend = toSend;
@@ -18612,7 +18425,10 @@ async function startMessageLoop(): Promise<void> {
             // which would cause it to be re-pulled and replayed on the next
             // poll (#18 P1-bug-1).
             advanceNextPullCursorOnly(chatJid, deliveryTarget.cursor);
-            if (warmInteractionBatch.hasDeferredMessages) {
+            if (
+              warmInteractionBatch.hasDeferredMessages ||
+              hasDeferredReplyMessages
+            ) {
               queue.enqueueMessageCheck(chatJid);
             }
           } else {
@@ -19030,20 +18846,6 @@ function buildOnNewChat(
             }
           }
         }
-        const channelType = getChannelType(chatJid);
-        const isolationConfig = getUserContextIsolationConfig(
-          userId,
-          channelType,
-          { getUserFeishuConfig },
-        );
-        if (isolationConfig.enabled) {
-          ensureAutoImConversationBinding(
-            chatJid,
-            existing,
-            userId,
-            trimmed || existing.name || chatJid,
-          );
-        }
         return;
       }
 
@@ -19164,15 +18966,6 @@ function buildOnNewChat(
       },
       'Auto-registered IM chat',
     );
-
-    const channelType = getChannelType(chatJid);
-    const isolationConfig = getUserContextIsolationConfig(userId, channelType, {
-      getUserFeishuConfig,
-    });
-    if (isolationConfig.enabled) {
-      const registered = registeredGroups[chatJid]!;
-      ensureAutoImConversationBinding(chatJid, registered, userId, chatName);
-    }
   };
 }
 
@@ -19253,56 +19046,10 @@ function createAutoImConversationAgent(input: {
   };
 }
 
-function ensureAutoImConversationBinding(
-  jid: string,
-  group: RegisteredGroup,
-  userId: string,
-  name: string,
-): boolean {
-  if (group.target_main_jid) return false;
-  if (group.target_agent_id) {
-    const existingAgent = getAgent(group.target_agent_id);
-    if (existingAgent?.source_kind === 'auto_im') {
-      ensureAgentDirectories(existingAgent.group_folder, existingAgent.id);
-      updateAgentLastImJid(existingAgent.id, jid);
-      return false;
-    }
-    return false;
-  }
-
-  const created = createAutoImConversationAgent({
-    userId,
-    sourceJid: jid,
-    groupFolder: group.folder,
-    name: name || group.name || jid,
-  });
-  if (!created) return false;
-
-  group.target_agent_id = created.agentId;
-  setRegisteredGroup(jid, group);
-  registeredGroups[jid] = group;
-  return true;
-}
-
-/**
- * Batch-apply autoIsolateContext toggle for a user's existing Feishu IM chats.
- * enable=true:  create conversation agents for unbound Feishu chats
- * enable=false: remove auto_im agent bindings (manual bindings untouched)
- */
-function applyAutoIsolateContext(userId: string, enable: boolean): number {
-  return applyAutoIsolateContextForGroups(userId, enable, {
-    groups: getAllRegisteredGroups(),
-    channelType: 'feishu',
-    getChannelType,
-    getAgent,
-    ensureBinding: ensureAutoImConversationBinding,
-    setGroup: (jid, group) => {
-      setRegisteredGroup(jid, group);
-      registeredGroups[jid] = group;
-    },
-    deleteAgent,
-    broadcastAgentRemoved,
-  });
+/** Retained for older clients; discovery never creates channel bindings. */
+function applyAutoIsolateContext(_userId: string, _enable: boolean): number {
+  // Compatibility callback for older clients. Discovery never creates bindings.
+  return 0;
 }
 
 /**
@@ -19343,82 +19090,6 @@ function buildOnBotRemovedFromGroup(): (chatJid: string) => void {
       chatJid,
       'Auto-removed IM group: bot removed or group disbanded',
     );
-  };
-}
-
-/**
- * Build Telegram-specific bot-added-to-group handler.
- * Auto-registers the group (via buildOnNewChat) then sends a welcome message
- * guiding the user to bind or create a workspace.
- */
-function buildTelegramBotAddedHandler(
-  userId: string,
-  homeFolder: string,
-): (chatJid: string, chatName: string) => void {
-  const onNewChat = buildOnNewChat(userId, homeFolder);
-  return (chatJid: string, chatName: string) => {
-    onNewChat(chatJid, chatName);
-    const welcome =
-      `已加入「${chatName}」！当前绑定到默认工作区。\n\n` +
-      `/new <名称> — 新建工作区并绑定此群\n` +
-      `/bind <工作区> — 绑定到已有工作区\n` +
-      `/list — 查看所有工作区\n\n` +
-      `也可以直接发消息，我会在默认工作区回复。`;
-    imManager
-      .sendMessage(chatJid, welcome)
-      .catch((err) =>
-        logger.warn(
-          { chatJid, err },
-          'Failed to send Telegram group welcome message',
-        ),
-      );
-  };
-}
-
-/**
- * Build the onBotAddedToGroup handler for Feishu connections.
- * Registers the new group (locked by default) and sends a one-time welcome message.
- */
-function buildFeishuBotAddedHandler(
-  userId: string,
-  homeFolder: string,
-  getOwnerOpenId?: () => string | undefined,
-): (chatJid: string, chatName: string) => void {
-  const onNewChat = buildOnNewChat(userId, homeFolder, getOwnerOpenId);
-  return (chatJid: string, chatName: string) => {
-    const isNew = !registeredGroups[chatJid] && !getRegisteredGroup(chatJid);
-    onNewChat(chatJid, chatName);
-    if (isNew) {
-      // 文案分支:仅在飞书路径(传入 getOwnerOpenId,DM 可学到 ownerOpenId 并启用 allowlist)
-      // 才提示「已启用发言者白名单」+「私信识别 owner」。通用路径(dingtalk/discord/whatsapp
-      // 不传 getOwnerOpenId)实际未启用白名单,DM 也没有 learnFeishuOwner 通道,引导用
-      // /owner_mention 在群内自我认领。
-      let welcome: string;
-      if (getOwnerOpenId) {
-        const ownerKnown = !!getOwnerOpenId();
-        welcome =
-          `已加入「${chatName}」。\n\n` +
-          `当前群聊已启用发言者白名单,仅 bot owner 可触发我。\n` +
-          (ownerKnown
-            ? `Owner 已自动从私聊中识别。\n`
-            : `请先向机器人发一条私信,系统将自动识别您的 owner 身份。\n`) +
-          `\n/allow @成员 — 将群成员加入白名单\n` +
-          `/disallow @成员 — 从白名单移除成员\n` +
-          `/allowlist — 查看白名单`;
-      } else {
-        welcome =
-          `已加入「${chatName}」。\n\n` +
-          `机器人已加入群组。请由 owner 在群内发送 /owner_mention 自我认领,命令将永久绑定该身份。\n\n` +
-          `/owner_mention — 认领工作区 owner\n` +
-          `/list — 查看所有工作区\n` +
-          `/new <名称> — 新建工作区并绑定此群`;
-      }
-      imManager
-        .sendMessage(chatJid, welcome)
-        .catch((err) =>
-          logger.warn({ chatJid, err }, 'Failed to send group welcome message'),
-        );
-    }
   };
 }
 
@@ -19736,12 +19407,8 @@ function resolveFeishuConversationPlanForMessage(
       : (group?.feishu_chat_mode ??
         (messageMeta.chatType === 'p2p' ? 'p2p' : 'group'));
   const activationMode = group?.activation_mode ?? 'auto';
-  const mentionRequired = feishuRequiresMention(
-    activationMode,
-    group?.require_mention,
-  );
   const activeContext =
-    group && (chatMode === 'topic' || mentionRequired)
+    group && chatMode === 'topic'
       ? findActiveFeishuContext(chatJid, group, messageMeta)
       : undefined;
 
@@ -19762,46 +19429,17 @@ function ensureNativeContextChannelMount(
   chatJid: string,
   group: RegisteredGroup,
 ): RegisteredGroup | null {
-  // A Feishu ordinary group in mention mode uses thread_map for isolated
-  // sessions, but it is not itself a native topic container. Do not persist a
-  // false capability marker merely because one message opened a topic.
-  const persistNativeCapability =
-    getChannelType(chatJid) !== 'feishu' ||
-    group.feishu_chat_mode === 'topic' ||
-    group.feishu_group_message_type === 'thread';
-  let routableGroup = group;
   if (
-    !persistNativeCapability &&
-    group.target_agent_id &&
-    getChannelType(chatJid) === 'feishu'
+    getChannelType(chatJid) === 'feishu' &&
+    !isNativeContextContainer(chatJid, group)
   ) {
-    // Compatibility migration for configurations created before mention mode
-    // meant "one session per activated topic". A fixed session cannot hold
-    // multiple topic sessions, so promote it to that session's workspace on
-    // the first accepted mention instead of silently dropping the message.
-    const previousSession = getAgent(group.target_agent_id);
-    const workspaceJid = previousSession?.chat_jid;
-    if (workspaceJid && getRegisteredGroup(workspaceJid)) {
-      routableGroup = buildWorkspaceMountUpdate(
-        group,
-        workspaceJid,
-        'thread_map',
-        {
-          activationMode: group.activation_mode,
-          ownerImId: group.owner_im_id ?? null,
-        },
-      );
-      setRegisteredGroup(chatJid, routableGroup);
-      registeredGroups[chatJid] = routableGroup;
-      logger.info(
-        { chatJid, previousSessionId: group.target_agent_id, workspaceJid },
-        'Promoted legacy fixed-session Feishu mention binding to workspace thread map',
-      );
-    }
+    return null;
   }
-  const detectedGroup: RegisteredGroup = persistNativeCapability
-    ? { ...routableGroup, native_context_type: 'thread' }
-    : routableGroup;
+  const persistNativeCapability = true;
+  const detectedGroup: RegisteredGroup = {
+    ...group,
+    native_context_type: 'thread',
+  };
   const upgrade = upgradeNativeContextChannelMount(chatJid, detectedGroup);
   if (upgrade.status === 'conflict') {
     // Persist capability detection for diagnostics/UI while retaining the
@@ -19853,147 +19491,27 @@ function buildOnNativeContextDetected(): (
  * workspace main conversation binding (target_main_jid).
  * Returns null if the chatJid has no binding configured.
  */
-function buildResolveEffectiveChatJid(): (
-  chatJid: string,
-  messageMeta?: ChannelMessageMeta,
-) => {
-  effectiveJid: string;
-  agentId: string | null;
-  sourceJid?: string;
-} | null {
-  return (chatJid: string, messageMeta) => {
-    let group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
-    if (!group) {
-      logger.debug({ chatJid }, 'resolveEffectiveChatJid: group not found');
-      return null;
-    }
-
-    const channelType = getChannelType(chatJid);
-    const nativeThread =
-      channelType === 'feishu' && messageMeta?.nativeContextType !== 'thread'
-        ? null
-        : resolveNativeThreadContext(messageMeta);
-    const nativeThreadDetected =
-      !!nativeThread &&
-      (messageMeta?.nativeContextType === 'thread' ||
-        (channelType === 'telegram' && !!messageMeta?.threadId));
-    if (nativeThreadDetected) {
-      const upgraded = ensureNativeContextChannelMount(chatJid, group);
-      if (!upgraded) return null;
-      group = upgraded;
-    }
-
-    const mount = getChannelMount(chatJid);
-    if (mount) {
-      const mountedTarget = resolveChannelMountTarget(mount, {
-        getAgent,
-        getRegisteredGroup: (jid) =>
-          registeredGroups[jid] ?? getRegisteredGroup(jid),
-      });
-      if (mountedTarget.status === 'stale') {
-        logger.warn(
-          {
-            chatJid,
-            reason: mountedTarget.reason,
-            sessionId: mountedTarget.sessionId,
-            workspaceJid: mountedTarget.workspaceJid,
-          },
-          'resolveEffectiveChatJid: stale channel_mounts row, message will not route',
-        );
-        return null;
-      }
-      if (mountedTarget.workspaceMismatch) {
-        logger.warn(
-          { chatJid, ...mountedTarget.workspaceMismatch },
-          'resolveEffectiveChatJid: channel_mounts workspace differs from session owner, using session owner workspace',
-        );
-      }
-      if (mountedTarget.agentId) {
-        return {
-          effectiveJid: mountedTarget.effectiveJid,
-          agentId: mountedTarget.agentId,
-        };
-      }
-
-      if (mount.routing_mode === 'thread_map' && nativeThread) {
-        return resolveOrCreateNativeThreadAgent(
-          chatJid,
-          mountedTarget.workspaceJid,
-          mountedTarget.workspace,
-          group,
-          nativeThread,
-        );
-      }
-
-      return { effectiveJid: mountedTarget.effectiveJid, agentId: null };
-    }
-
-    // Agent binding takes priority
-    if (group.target_agent_id) {
-      const agent = getAgent(group.target_agent_id);
-      if (!agent) {
-        logger.warn(
-          { chatJid, targetAgentId: group.target_agent_id },
-          'resolveEffectiveChatJid: agent not found for target_agent_id',
-        );
-        return null;
-      }
-      // Use the agent's actual chat_jid (the workspace's registered JID) as the
-      // base for the virtual JID.  Previously we constructed web:${folder} which
-      // doesn't match any registered group for non-main workspaces (folder ≠ JID).
-      const effectiveJid = `${agent.chat_jid}#agent:${group.target_agent_id}`;
-      return { effectiveJid, agentId: group.target_agent_id };
-    }
-
-    if (
-      group.binding_mode === 'thread_map' &&
-      group.target_main_jid &&
-      nativeThread
-    ) {
-      const workspaceJid = resolveWorkspaceJid(group.target_main_jid);
-      if (!workspaceJid) {
-        logger.warn(
-          { chatJid, targetMainJid: group.target_main_jid },
-          'thread_map resolveWorkspaceJid returned null — stale target_main_jid',
-        );
-        return null;
-      }
-      const workspace =
-        registeredGroups[workspaceJid] ?? getRegisteredGroup(workspaceJid);
-      if (!workspace) return null;
-
-      return resolveOrCreateNativeThreadAgent(
-        chatJid,
-        workspaceJid,
-        workspace,
-        group,
-        nativeThread,
-      );
-    }
-
-    // Main conversation binding
-    if (group.target_main_jid) {
-      const effectiveJid = resolveWorkspaceJid(group.target_main_jid);
-      if (!effectiveJid) {
-        logger.warn(
-          { chatJid, targetMainJid: group.target_main_jid },
-          'resolveWorkspaceJid returned null — target_main_jid is stale or missing, message will not route to workspace',
-        );
-        return null;
-      }
-      return { effectiveJid, agentId: null };
-    }
-
-    logger.debug(
-      {
-        chatJid,
-        targetAgentId: group.target_agent_id,
-        targetMainJid: group.target_main_jid,
-      },
-      'resolveEffectiveChatJid: no binding found',
-    );
-    return null;
+function channelInboundRoutingDeps(): ChannelInboundRoutingDeps {
+  return {
+    getRegisteredGroup: (jid) =>
+      registeredGroups[jid] ?? getRegisteredGroup(jid),
+    getAgent,
+    getChannelMount,
+    resolveWorkspaceJid,
+    ensureNativeContextChannelMount,
+    resolveOrCreateNativeThreadAgent,
   };
+}
+
+function hasExplicitChannelBinding(chatJid: string): boolean {
+  return hasExplicitChannelBindingForRoute(
+    chatJid,
+    channelInboundRoutingDeps(),
+  );
+}
+
+function buildResolveEffectiveChatJid() {
+  return createChannelInboundRouter(channelInboundRoutingDeps());
 }
 
 /**
@@ -20022,7 +19540,8 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
 
     // Fetch pending messages
     const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
-    const missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
+    const allPendingMessages = getMessagesSince(virtualChatJid, sinceCursor);
+    const missedMessages = selectChannelReplyBatch(allPendingMessages);
 
     // IM messages must force-restart the agent process so reply routing
     // (replySourceImJid) is recalculated from the latest batch.  This mirrors
@@ -20142,6 +19661,13 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
         : 'no_active';
       if (sendResult === 'sent' && deliveryTarget) {
         advanceNextPullCursorOnly(virtualChatJid, deliveryTarget.cursor);
+        if (missedMessages.length < allPendingMessages.length) {
+          queue.enqueueTask(
+            virtualChatJid,
+            `agent-channel-next:${agentId}`,
+            () => processAgentConversation(homeChatJid, agentId),
+          );
+        }
       }
       if (sendResult === 'no_active') {
         const taskId = `agent-conv:${agentId}:${Date.now()}`;
@@ -20630,6 +20156,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
         {
           ...common,
           onBotAddedToGroup: onNewChat,
+          isChatBound: hasExplicitChannelBinding,
           shouldProcessGroupMessage,
           resolveFeishuConversationPlan:
             resolveFeishuConversationPlanForMessage,
@@ -21560,12 +21087,13 @@ async function main(): Promise<void> {
               resolveEffectiveFolder(chatJid),
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
             onAgentMessage: buildOnAgentMessage(),
-            onBotAddedToGroup: buildFeishuBotAddedHandler(
+            onBotAddedToGroup: buildOnNewChat(
               userId,
               homeFolder,
               getReloadOwnerOpenId,
             ),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+            isChatBound: hasExplicitChannelBinding,
             shouldProcessGroupMessage,
             resolveFeishuConversationPlan:
               resolveFeishuConversationPlanForMessage,
@@ -21611,7 +21139,7 @@ async function main(): Promise<void> {
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
             onAgentMessage: buildOnAgentMessage(),
             onNativeContextDetected: buildOnNativeContextDetected(),
-            onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
+            onBotAddedToGroup: buildOnNewChat(userId, homeFolder),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
           },
         );
@@ -23080,30 +22608,7 @@ async function main(): Promise<void> {
   }
 
   // Run health check once on startup to clean up orphaned bindings, then periodically
-  void checkImBindingsHealth().then(() => {
-    // After health check, ensure auto_im agents exist for users with autoIsolateContext enabled
-    const groups = getAllRegisteredGroups();
-    const userIds = new Set<string>();
-    for (const [jid, group] of Object.entries(groups)) {
-      if (getChannelType(jid) === 'feishu' && group.created_by) {
-        userIds.add(group.created_by);
-      }
-    }
-    for (const uid of userIds) {
-      const isolationConfig = getUserContextIsolationConfig(uid, 'feishu', {
-        getUserFeishuConfig,
-      });
-      if (isolationConfig.enabled) {
-        const migrated = applyAutoIsolateContext(uid, true);
-        if (migrated > 0) {
-          logger.info(
-            { userId: uid, migrated },
-            'Startup: restored auto_im agents for user with autoIsolateContext enabled',
-          );
-        }
-      }
-    }
-  });
+  void checkImBindingsHealth();
   const IM_BINDING_HEALTH_CHECK_INTERVAL = 30 * 60 * 1000; // 30 min
   setInterval(() => {
     void checkImBindingsHealth();
@@ -23138,7 +22643,7 @@ async function checkImBindingsHealth(): Promise<void> {
         if (!restored) {
           logger.warn(
             { jid, targetMainJid: group.target_main_jid },
-            'Health check kept orphaned main binding because default restore was unavailable',
+            'Health check could not clear orphaned main binding',
           );
         }
         continue;
@@ -23149,38 +22654,6 @@ async function checkImBindingsHealth(): Promise<void> {
     if (group.target_agent_id) {
       const agent = getAgent(group.target_agent_id);
       if (!agent) {
-        // For auto_im agents, re-create instead of unbinding if toggle is still on
-        const userId = group.created_by;
-        const channelType = getChannelType(jid);
-        if (userId && channelType) {
-          const isolationConfig = getUserContextIsolationConfig(
-            userId,
-            channelType,
-            {
-              getUserFeishuConfig,
-            },
-          );
-          if (isolationConfig.enabled) {
-            const unbound: RegisteredGroup = {
-              ...group,
-              target_agent_id: undefined,
-            };
-            if (
-              ensureAutoImConversationBinding(
-                jid,
-                unbound,
-                userId,
-                group.name || jid,
-              )
-            ) {
-              logger.info(
-                { jid, userId },
-                'Health check: re-created auto_im agent (previous agent lost)',
-              );
-              continue;
-            }
-          }
-        }
         const restored = unbindImGroup(
           jid,
           `Orphaned agent binding: agent ${group.target_agent_id} no longer exists`,
@@ -23188,7 +22661,7 @@ async function checkImBindingsHealth(): Promise<void> {
         if (!restored) {
           logger.warn(
             { jid, agentId: group.target_agent_id },
-            'Health check kept orphaned session binding because default restore was unavailable',
+            'Health check could not clear orphaned session binding',
           );
         }
         continue;

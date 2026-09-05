@@ -149,7 +149,7 @@ import {
   hasSessionMountConflict,
   hasWorkspaceMountConflict,
   isNativeContextContainer,
-  restoreDefaultChannelMount,
+  unbindChannelMount,
   type NativeContextMetadata,
 } from '../channel-mount-service.js';
 import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
@@ -1920,12 +1920,20 @@ type ChannelChatInfo = NativeContextMetadata & {
 
 function getConversationKind(
   imJid: string,
-  group: Pick<RegisteredGroup, 'feishu_chat_mode'>,
+  group: Pick<
+    RegisteredGroup,
+    'feishu_chat_mode' | 'feishu_group_message_type' | 'native_context_type'
+  >,
   chatInfo?: ChannelChatInfo | null,
 ): ChannelConversationKind {
   return resolveChannelConversationKind(imJid, {
     feishu_chat_mode: group.feishu_chat_mode,
+    feishu_group_message_type: group.feishu_group_message_type,
+    native_context_type:
+      chatInfo?.native_context_type ?? group.native_context_type,
     chat_mode: chatInfo?.chat_mode,
+    group_message_type: chatInfo?.group_message_type,
+    thread_capable: chatInfo?.thread_capable,
   });
 }
 
@@ -1994,13 +2002,6 @@ function markNativeContextWorkspace(targetMainJid: string): void {
     conversation_source: 'native_thread',
     conversation_nav_mode: 'vertical_threads',
   });
-}
-
-function restoreDefaultChannelError(restored: { reason: string }): string {
-  if (restored.reason === 'account_mismatch') {
-    return 'Channel account does not match this chat or owner';
-  }
-  return 'Channel account has no default or owner home workspace';
 }
 
 configRoutes.get('/feishu', authMiddleware, systemConfigMiddleware, (c) => {
@@ -4480,13 +4481,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
 
   // Unbind mode
   if (body.unbind === true) {
-    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
-    // Re-read + re-authorize after the await — fetchLiveChatInfo
-    // yields the event loop on a live network call, during which ownership
-    // or binding state may have changed. restoreDefaultChannelMount commits
-    // whatever `group` it's given, so building it from the stale pre-await
-    // snapshot would silently clobber a concurrent write and could cross
-    // the original authorization boundary.
+    // JSON parsing yields; re-check ownership before committing the unbind.
     const freshImGroup = getRegisteredGroup(imJid);
     if (!freshImGroup) {
       return c.json({ error: 'IM group not found' }, 404);
@@ -4503,38 +4498,13 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     const previousTargetAgentId = freshImGroup.target_agent_id;
     const previousTargetMainJid = freshImGroup.target_main_jid;
     const wasThreadMap = freshImGroup.binding_mode === 'thread_map';
-    const restored = restoreDefaultChannelMount(
-      imJid,
-      freshImGroup,
-      user.id,
-      chatInfo ?? {},
-    );
-    if (restored.status !== 'resolved') {
-      return c.json({ error: restoreDefaultChannelError(restored) }, 409);
-    }
+    unbindChannelMount(imJid, freshImGroup);
     if (wasThreadMap) {
-      detachThreadMapWorkspaceIfLast(
-        previousTargetMainJid,
-        imJid,
-        restored.workspaceJid,
-        restored.routingMode,
-      );
+      detachThreadMapWorkspaceIfLast(previousTargetMainJid, imJid);
     }
-    if (restored.routingMode === 'thread_map') {
-      markNativeContextWorkspace(restored.workspaceJid);
-    }
-    if (previousTargetAgentId) {
-      refreshAgentLastImJid(previousTargetAgentId);
-    }
-    logger.info(
-      {
-        imJid,
-        defaultWorkspaceJid: restored.workspaceJid,
-        userId: user.id,
-      },
-      'IM group restored to channel account default workspace (bindings page)',
-    );
-    return c.json({ success: true, target_main_jid: restored.workspaceJid });
+    if (previousTargetAgentId) refreshAgentLastImJid(previousTargetAgentId);
+    logger.info({ imJid, userId: user.id }, 'IM channel unbound');
+    return c.json({ success: true, target_main_jid: null });
   }
 
   const targetSessionId =
@@ -4544,8 +4514,33 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         ? body.target_agent_id.trim()
         : '';
 
+  // Parse once for named sessions, main/workspace binds, and policy-only updates.
+  const rawActivationMode = body.activation_mode;
+  let activationMode =
+    typeof rawActivationMode === 'string' &&
+    VALID_ACTIVATION_MODES.has(rawActivationMode)
+      ? (rawActivationMode as
+          | (typeof rawActivationMode & 'auto')
+          | 'always'
+          | 'when_mentioned'
+          | 'owner_mentioned'
+          | 'disabled')
+      : undefined;
+  let audienceMode: AudienceMode | undefined =
+    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
+      ? body.audience_mode
+      : undefined;
+  if (channelType === 'feishu') {
+    const normalized = normalizeLegacyOwnerMention({
+      activationMode,
+      audienceMode,
+    });
+    activationMode = normalized.activationMode;
+    audienceMode = normalized.audienceMode;
+  }
+
   // Bind to workspace session. Stored in target_agent_id for backward compatibility.
-  if (targetSessionId) {
+  if (targetSessionId && targetSessionId !== 'main') {
     const sessionId = targetSessionId;
     const agent = getAgent(sessionId);
     if (!agent) {
@@ -4632,11 +4627,21 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
 
     const force = body.force === true;
-    const replyPolicy =
-      body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+    const replyPolicy = 'source_only' as const;
     const hasConflict = hasSessionMountConflict(freshImGroup, sessionId);
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
+    }
+
+    if (
+      getChannelType(imJid) === 'feishu' &&
+      (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
+      isMentionActivationMode(activationMode)
+    ) {
+      return c.json(
+        { error: 'Feishu private chats do not support mention activation' },
+        400,
+      );
     }
 
     const updated: RegisteredGroup = buildSessionMountUpdate(
@@ -4644,6 +4649,8 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       sessionId,
       {
         replyPolicy,
+        activationMode,
+        audienceMode,
       },
     );
     applyBindingUpdate(imJid, updated);
@@ -4655,31 +4662,6 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       'IM group bound to workspace session (bindings page)',
     );
     return c.json({ success: true });
-  }
-
-  // Parse activation_mode for activation-only update
-  const rawActivationMode = body.activation_mode;
-  let activationMode =
-    typeof rawActivationMode === 'string' &&
-    VALID_ACTIVATION_MODES.has(rawActivationMode)
-      ? (rawActivationMode as
-          | (typeof rawActivationMode & 'auto')
-          | 'always'
-          | 'when_mentioned'
-          | 'owner_mentioned'
-          | 'disabled')
-      : undefined;
-  let audienceMode: AudienceMode | undefined =
-    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
-      ? body.audience_mode
-      : undefined;
-  if (channelType === 'feishu') {
-    const normalized = normalizeLegacyOwnerMention({
-      activationMode,
-      audienceMode,
-    });
-    activationMode = normalized.activationMode;
-    audienceMode = normalized.audienceMode;
   }
 
   // Parse owner_im_id for owner_mentioned mode
@@ -4726,7 +4708,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
     const bindingPolicyError = conversationBindingPolicyError(
       getConversationKind(imJid, freshImGroup, chatInfo),
-      'workspace',
+      targetSessionId === 'main' ? 'session' : 'workspace',
     );
     if (bindingPolicyError) {
       return c.json({ error: bindingPolicyError }, 400);
@@ -4748,8 +4730,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       activation_mode: activationMode ?? freshImGroup.activation_mode,
     });
     const force = body.force === true;
-    const replyPolicy =
-      body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+    const replyPolicy = 'source_only' as const;
     const legacyMainJid = `web:${freshTargetGroup.folder}`;
     const hasConflict = hasWorkspaceMountConflict(
       freshImGroup,
@@ -4829,7 +4810,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       return c.json(
         {
           error:
-            'Mention-activated and native-topic Feishu chats must bind to a workspace, not a fixed session',
+            'Native topic groups must bind to a workspace, not a fixed session',
         },
         400,
       );

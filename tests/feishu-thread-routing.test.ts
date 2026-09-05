@@ -29,7 +29,7 @@ describe('parseFeishuRouteTarget', () => {
     });
   });
 
-  test('an ordinary-group mention becomes a reply_in_thread root target', () => {
+  test('an ordinary-group mention keeps the ordinary group reply target', () => {
     const plan = resolveFeishuConversationPlan({
       chatType: 'group',
       chatMode: 'group',
@@ -44,8 +44,7 @@ describe('parseFeishuRouteTarget', () => {
     );
     expect(target).toMatchObject({
       chatId: 'oc_ordinary',
-      rootMessageId: 'om_mention',
-      replyInThread: true,
+      replyInThread: false,
     });
   });
 });

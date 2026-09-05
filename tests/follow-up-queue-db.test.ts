@@ -94,7 +94,7 @@ describe('durable follow-up queue', () => {
     ).toBe(true);
   });
 
-  test('snapshots ordinary Web and Feishu forward messages into one turn', () => {
+  test('separates a Web turn from the subsequent Feishu forward bundle', () => {
     const jid = 'web:follow-up-forward-boundary';
     db.ensureChatExists(jid);
     for (const [index, id] of ['ordinary', 'om_root', 'om_note'].entries()) {
@@ -142,7 +142,10 @@ describe('durable follow-up queue', () => {
       db
         .claimNextQueuedFollowUpBatch(jid, 'run-ordinary')
         .map((item) => item.id),
-    ).toEqual(['ordinary', 'om_root', 'om_note']);
+    ).toEqual(['ordinary']);
+    expect(
+      db.claimNextQueuedFollowUpBatch(jid, 'run-feishu').map((item) => item.id),
+    ).toEqual(['om_root', 'om_note']);
     expect(db.claimNextQueuedFollowUpBatch(jid, 'run-empty')).toEqual([]);
   });
 

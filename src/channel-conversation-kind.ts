@@ -4,20 +4,25 @@ import { isWhatsAppDirectProviderJid } from './whatsapp-jid.js';
  * Provider-neutral classification for an external channel conversation.
  *
  * Binding policy depends on this value:
- *   - group  -> workspace binding
- *   - direct -> session binding
+ *   - topic          -> workspace binding, one session per native topic
+ *   - direct / group -> session binding
  *
  * Unknown values deliberately fail closed. In particular, Feishu uses the
  * same opaque `oc_*` identifier for P2P and group chats, so its durable/live
  * metadata is authoritative and the JID alone must never be guessed.
  */
-export type ChannelConversationKind = 'direct' | 'group' | 'unknown';
+export type ChannelConversationKind = 'direct' | 'group' | 'topic' | 'unknown';
 
 export interface ChannelConversationMetadata {
   /** Live provider value (for example Feishu `p2p`, `group`, or `topic`). */
   chat_mode?: string | null;
   /** Durable Feishu chat mode stored on registered_groups. */
   feishu_chat_mode?: string | null;
+  group_message_type?: string | null;
+  feishu_group_message_type?: string | null;
+  /** Provider-native context metadata, used by Telegram Forums. */
+  native_context_type?: string | null;
+  thread_capable?: boolean | null;
 }
 
 function baseConversationJid(jid: string): string {
@@ -35,7 +40,15 @@ export function resolveChannelConversationKind(
       ?.trim()
       .toLowerCase();
     if (mode === 'p2p') return 'direct';
-    if (mode === 'group' || mode === 'topic') return 'group';
+    const messageType = (
+      metadata.group_message_type ?? metadata.feishu_group_message_type
+    )
+      ?.trim()
+      .toLowerCase();
+    // Legacy mention routing also set generic thread flags. Only provider
+    // chat metadata identifies a Feishu topic container.
+    if (mode === 'topic' || messageType === 'thread') return 'topic';
+    if (mode === 'group') return 'group';
     return 'unknown';
   }
 
@@ -82,7 +95,11 @@ export function resolveChannelConversationKind(
   if (baseJid.startsWith('telegram:')) {
     const id = Number(baseJid.slice('telegram:'.length));
     if (!Number.isSafeInteger(id) || id === 0) return 'unknown';
-    return id > 0 ? 'direct' : 'group';
+    if (id > 0) return 'direct';
+    return metadata.native_context_type === 'thread' ||
+      metadata.thread_capable === true
+      ? 'topic'
+      : 'group';
   }
 
   return 'unknown';
@@ -93,13 +110,13 @@ export function conversationBindingPolicyError(
   target: 'workspace' | 'session',
 ): string | null {
   if (kind === 'unknown') {
-    return 'Unable to determine whether this channel chat is a direct or group conversation; sync the chat metadata and try again';
+    return 'Unable to determine whether this channel chat is a direct, group or topic conversation; sync the chat metadata and try again';
   }
-  if (target === 'workspace' && kind !== 'group') {
-    return 'Workspace bindings only accept group chats';
+  if (target === 'workspace' && kind !== 'topic') {
+    return 'Workspace bindings only accept native topic groups';
   }
-  if (target === 'session' && kind !== 'direct') {
-    return 'Session bindings only accept direct chats';
+  if (target === 'session' && kind !== 'direct' && kind !== 'group') {
+    return 'Session bindings only accept direct chats and ordinary groups';
   }
   return null;
 }

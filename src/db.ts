@@ -1,3 +1,4 @@
+import { selectChannelReplyBatch } from './channel-reply-source.js';
 import crypto from 'crypto';
 import Database from './sqlite-compat.js';
 import fs from 'fs';
@@ -3713,7 +3714,9 @@ export function claimNextQueuedFollowUpBatch(
   return db.transaction(() => {
     const rows = select.all(chatJid) as Array<Record<string, unknown>>;
     if (rows.length === 0) return [];
-    const claimed = rows.map(normalizeQueuedFollowUpRow);
+    const claimed = selectChannelReplyBatch(
+      rows.map(normalizeQueuedFollowUpRow),
+    );
     const updatedAt = new Date().toISOString();
     for (const item of claimed) {
       const result = update.run(runId, updatedAt, chatJid, item.id);

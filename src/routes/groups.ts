@@ -95,13 +95,7 @@ import {
 } from '../runtime-config.js';
 import { clearTargetAgentBindingsForDeletedAgents } from '../im-context-isolation.js';
 import { getChannelType } from '../im-channel.js';
-import {
-  buildNativeThreadWorkspaceUpdate,
-  buildUnmountUpdate,
-  ensureDirectChannelSessionMount,
-  resolveDefaultChannelMountForWorkspaceDeletion,
-} from '../channel-mount-service.js';
-import { resolveChannelConversationKind } from '../channel-conversation-kind.js';
+import { buildUnmountUpdate } from '../channel-mount-service.js';
 import {
   AdditionalMountValidationError,
   loadMountAllowlist,
@@ -1833,48 +1827,13 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
       );
     }
 
-    const excludedWorkspaceJids = new Set([jid, `web:${freshExisting.folder}`]);
-    const channelUpdates: Array<{
-      jid: string;
-      group: RegisteredGroup;
-    }> = [];
-    const nativeThreadTargets = new Set<string>();
-
+    const channelUpdates: Array<{ jid: string; group: RegisteredGroup }> = [];
     deleteGroupData(jid, freshExisting.folder, {
-      // Resolve and create any fallback direct sessions inside the same SQLite
-      // transaction as the workspace deletion. A crash must not leave a DM on
-      // a shared main mount or publish a half-created session route.
       channelUpdates: () => {
         if (!confirmedChannelUnbind) return channelUpdates;
         for (const channelJid of freshBindingSummary.mountedChannelJids) {
           const channelGroup = getRegisteredGroup(channelJid);
-          if (!channelGroup) continue;
-          const restored = resolveDefaultChannelMountForWorkspaceDeletion(
-            channelJid,
-            channelGroup,
-            channelGroup.created_by ?? authUser.id,
-            excludedWorkspaceJids,
-          );
-          if (restored.status === 'resolved') {
-            const updated =
-              resolveChannelConversationKind(channelJid) === 'direct'
-                ? ensureDirectChannelSessionMount({
-                    sourceJid: channelJid,
-                    group: restored.updated,
-                    workspaceJid: restored.workspaceJid,
-                    userId: channelGroup.created_by ?? authUser.id,
-                    force: true,
-                    mountOptions: { replyPolicy: 'source_only' },
-                  })
-                : restored.updated;
-            channelUpdates.push({ jid: channelJid, group: updated });
-            if (restored.routingMode === 'thread_map') {
-              nativeThreadTargets.add(restored.workspaceJid);
-            }
-          } else {
-            // A damaged legacy account may have no viable default workspace.
-            // Clearing its route is still safer than leaving a dangling pointer
-            // to the workspace that is about to disappear.
+          if (channelGroup) {
             channelUpdates.push({
               jid: channelJid,
               group: buildUnmountUpdate(channelGroup),
@@ -1892,15 +1851,7 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
         registeredGroups[update.jid] = update.group;
       }
     }
-    for (const targetJid of nativeThreadTargets) {
-      const target = getRegisteredGroup(targetJid);
-      if (!target || targetJid === jid) continue;
-      const updatedTarget = buildNativeThreadWorkspaceUpdate(target);
-      setRegisteredGroup(targetJid, updatedTarget);
-      if (registeredGroups[targetJid]) {
-        registeredGroups[targetJid] = updatedTarget;
-      }
-    }
+
     delete registeredGroups[jid];
     delete deps.getSessions()[freshExisting.folder];
     deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });

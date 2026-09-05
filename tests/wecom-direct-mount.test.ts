@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
-import type { ChannelProvider } from '../src/types.js';
+import type { ChannelProvider, RegisteredGroup } from '../src/types.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wecom-direct-mount-'));
 const store = path.join(tmp, 'db');
@@ -29,6 +29,8 @@ const { buildRecentConversationHistoryContext } =
   await import('../src/conversation-history.js');
 const {
   attachDefaultChannelAccountMount,
+  buildWorkspaceMountUpdate,
+  ensureDirectChannelSessionMount,
   restoreDefaultChannelMount,
   resolveChannelMountTarget,
 } = await import('../src/channel-mount-service.js');
@@ -94,6 +96,24 @@ function chatGroup(name: string, overrides: Record<string, unknown> = {}) {
   };
 }
 
+// These tests of existing session isolation opt into a concrete binding.
+// Discovery itself must never call the legacy session/repair helper.
+function bindDirectSession(
+  sourceJid: string,
+  group: RegisteredGroup,
+  targetWorkspaceJid = workspaceJid,
+) {
+  const bound = ensureDirectChannelSessionMount({
+    sourceJid,
+    group,
+    workspaceJid: targetWorkspaceJid,
+    userId: 'owner-a',
+    mountOptions: { replyPolicy: 'source_only' },
+  });
+  db.setRegisteredGroup(sourceJid, bound);
+  return bound;
+}
+
 beforeAll(() => {
   db.initDatabase();
   db.setRegisteredGroup(workspaceJid, workspaceGroup());
@@ -129,16 +149,38 @@ afterAll(() => {
 });
 
 describe.sequential('WeCom DM / group channel-account mounts', () => {
-  test('binds a new DM to a dedicated session and a group to workspace main', () => {
-    const dm = attachDefaultChannelAccountMount({
-      sourceJid: dmJid,
-      group: chatGroup('Private DM'),
-      accountId: 'bot-a',
-      fallbackWorkspaceJid: workspaceJid,
-      userId: 'owner-a',
-    });
-    expect(dm.channel_account_id).toBe('bot-a');
-    expect(dm.target_main_jid).toBeUndefined();
+  test('discovery records the account but leaves new DMs and groups unbound', () => {
+    const onCreated = vi.fn();
+    const sessionsBefore = db.listAgentsByJid(workspaceJid);
+    for (const sourceJid of [dmJid, groupJid]) {
+      const discovered = attachDefaultChannelAccountMount({
+        sourceJid,
+        // Even sharing the workspace folder does not authorize a binding.
+        group: chatGroup('Discovered WeCom chat', { folder: 'wecom-ws' }),
+        accountId: 'bot-a',
+        fallbackWorkspaceJid: workspaceJid,
+        userId: 'owner-a',
+        onCreated,
+      });
+      expect(discovered.channel_account_id).toBe('bot-a');
+      expect(discovered.target_main_jid).toBeUndefined();
+      expect(discovered.target_agent_id).toBeUndefined();
+      db.setRegisteredGroup(sourceJid, discovered);
+      expect(db.getRegisteredGroup(sourceJid)?.channel_account_id).toBe(
+        'bot-a',
+      );
+      expect(db.getChannelMount(sourceJid)).toBeUndefined();
+    }
+    expect(db.listAgentsByJid(workspaceJid)).toEqual(sessionsBefore);
+    expect(db.getSessionChannelOwner('wecom-ws')).toBeUndefined();
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  test('explicit session bindings keep DM and group main ownership separate', () => {
+    const dm = bindDirectSession(
+      dmJid,
+      chatGroup('Explicit private session', { channel_account_id: 'bot-a' }),
+    );
     expect(dm.target_agent_id).toBeTruthy();
 
     db.setRegisteredGroup(dmJid, dm);
@@ -158,13 +200,13 @@ describe.sequential('WeCom DM / group channel-account mounts', () => {
       agentId: dm.target_agent_id,
     });
 
-    const group = attachDefaultChannelAccountMount({
-      sourceJid: groupJid,
-      group: chatGroup('Team group'),
-      accountId: 'bot-a',
-      fallbackWorkspaceJid: workspaceJid,
-      userId: 'owner-a',
-    });
+    // single_session with no child ID is an explicit Main Session binding.
+    const group = buildWorkspaceMountUpdate(
+      chatGroup('Team group', { channel_account_id: 'bot-a' }),
+      workspaceJid,
+      'single_session',
+      { replyPolicy: 'source_only' },
+    );
     expect(group).toMatchObject({
       channel_account_id: 'bot-a',
       target_main_jid: workspaceJid,
@@ -196,8 +238,11 @@ describe.sequential('WeCom DM / group channel-account mounts', () => {
     ).toBe(dmJid);
   });
 
-  test('reuses the channel_direct session for the same DM conversation', () => {
-    const first = db.getRegisteredGroup(dmJid)!;
+  test('explicit binding reuses a DM session; rediscovery alone does not bind it', () => {
+    const first = bindDirectSession(
+      dmJid,
+      chatGroup('Explicit private session', { channel_account_id: 'bot-a' }),
+    );
     const again = attachDefaultChannelAccountMount({
       sourceJid: dmJid,
       group: first,
@@ -207,13 +252,16 @@ describe.sequential('WeCom DM / group channel-account mounts', () => {
     });
     expect(again).toBe(first);
 
-    const rebound = attachDefaultChannelAccountMount({
+    const discoveredAgain = attachDefaultChannelAccountMount({
       sourceJid: dmJid,
       group: chatGroup('Private DM replay'),
       accountId: 'bot-a',
       fallbackWorkspaceJid: workspaceJid,
       userId: 'owner-a',
     });
+    expect(discoveredAgain.target_agent_id).toBeUndefined();
+    expect(discoveredAgain.target_main_jid).toBeUndefined();
+    const rebound = bindDirectSession(dmJid, discoveredAgain);
     expect(rebound.target_agent_id).toBe(first.target_agent_id);
   });
 
@@ -228,14 +276,14 @@ describe.sequential('WeCom DM / group channel-account mounts', () => {
     });
     let secondAgentId: string | undefined;
     try {
-      const first = db.getRegisteredGroup(dmJid)!;
-      const second = attachDefaultChannelAccountMount({
-        sourceJid: 'wecom:c2c:user-1#account:bot-b',
-        group: chatGroup('Private DM on second bot'),
-        accountId: 'bot-b',
-        fallbackWorkspaceJid: workspaceJid,
-        userId: 'owner-a',
-      });
+      const first = bindDirectSession(
+        dmJid,
+        chatGroup('First bot session', { channel_account_id: 'bot-a' }),
+      );
+      const second = bindDirectSession(
+        'wecom:c2c:user-1#account:bot-b',
+        chatGroup('Second bot session', { channel_account_id: 'bot-b' }),
+      );
       secondAgentId = second.target_agent_id;
       expect(secondAgentId).toBeTruthy();
       expect(secondAgentId).not.toBe(first.target_agent_id);
@@ -243,12 +291,13 @@ describe.sequential('WeCom DM / group channel-account mounts', () => {
         'wecom:c2c:user-1#account:bot-b',
       );
     } finally {
+      db.deleteRegisteredGroup('wecom:c2c:user-1#account:bot-b');
       if (secondAgentId) db.deleteAgent(secondAgentId);
       db.deleteChannelAccount('bot-b', 'owner-a');
     }
   });
 
-  test('does not overwrite a manual session or workspace bind', () => {
+  test('does not overwrite an explicit Session or Main Session bind', () => {
     const sessionBound = chatGroup('Manual session', {
       channel_account_id: 'bot-a',
       target_agent_id: 'manual-session',
@@ -263,22 +312,22 @@ describe.sequential('WeCom DM / group channel-account mounts', () => {
       }),
     ).toBe(sessionBound);
 
-    const workspaceBound = chatGroup('Manual workspace', {
+    const mainSessionBound = chatGroup('Manual Main Session', {
       channel_account_id: 'bot-a',
       target_main_jid: 'web:user-selected',
     });
     expect(
       attachDefaultChannelAccountMount({
         sourceJid: 'wecom:group:chat-2#account:bot-a',
-        group: workspaceBound,
+        group: mainSessionBound,
         accountId: 'bot-a',
         fallbackWorkspaceJid: workspaceJid,
         userId: 'owner-a',
       }),
-    ).toBe(workspaceBound);
+    ).toBe(mainSessionBound);
   });
 
-  test('restore default remounts a WeCom DM onto a session, not workspace main', () => {
+  test('explicit legacy repair remounts a WeCom DM onto a dedicated session', () => {
     const restoreJid = 'wecom:c2c:user-3#account:bot-a';
     db.setRegisteredGroup(
       restoreJid,
@@ -316,16 +365,47 @@ describe.sequential(
   'QQ/Discord/WhatsApp DM / group channel-account mounts',
   () => {
     test.each(CLASSIFIABLE_ISOLATION_CASES)(
-      '$name: new attach isolates DM from group main owner',
+      '$name: discovery leaves DMs and groups unbound despite an account default workspace',
       (fixture) => {
-        const mountedDms = fixture.dms.map((sourceJid) => {
-          const dm = attachDefaultChannelAccountMount({
+        const onCreated = vi.fn();
+        const sessionsBefore = db.listAgentsByJid(fixture.workspaceJid);
+        for (const sourceJid of [...fixture.dms, fixture.groupJid]) {
+          const discovered = attachDefaultChannelAccountMount({
             sourceJid,
-            group: chatGroup(`${fixture.name} private DM`),
+            group: chatGroup(`${fixture.name} discovered chat`, {
+              folder: fixture.folder,
+            }),
             accountId: fixture.accountId,
             fallbackWorkspaceJid: fixture.workspaceJid,
             userId: 'owner-a',
+            onCreated,
           });
+          expect(discovered.channel_account_id).toBe(fixture.accountId);
+          expect(discovered.target_main_jid).toBeUndefined();
+          expect(discovered.target_agent_id).toBeUndefined();
+          db.setRegisteredGroup(sourceJid, discovered);
+          expect(db.getRegisteredGroup(sourceJid)).toBeDefined();
+          expect(db.getChannelMount(sourceJid)).toBeUndefined();
+        }
+        expect(db.listAgentsByJid(fixture.workspaceJid)).toEqual(
+          sessionsBefore,
+        );
+        expect(db.getSessionChannelOwner(fixture.folder)).toBeUndefined();
+        expect(onCreated).not.toHaveBeenCalled();
+      },
+    );
+
+    test.each(CLASSIFIABLE_ISOLATION_CASES)(
+      '$name: explicit session bindings isolate DM from group main owner',
+      (fixture) => {
+        const mountedDms = fixture.dms.map((sourceJid) => {
+          const dm = bindDirectSession(
+            sourceJid,
+            chatGroup(`${fixture.name} private DM`, {
+              channel_account_id: fixture.accountId,
+            }),
+            fixture.workspaceJid,
+          );
           expect(dm.channel_account_id).toBe(fixture.accountId);
           expect(dm.target_main_jid).toBeUndefined();
           expect(dm.target_agent_id).toBeTruthy();
@@ -353,13 +433,14 @@ describe.sequential(
           fixture.dms.length,
         );
 
-        const group = attachDefaultChannelAccountMount({
-          sourceJid: fixture.groupJid,
-          group: chatGroup(`${fixture.name} group`),
-          accountId: fixture.accountId,
-          fallbackWorkspaceJid: fixture.workspaceJid,
-          userId: 'owner-a',
-        });
+        const group = buildWorkspaceMountUpdate(
+          chatGroup(`${fixture.name} group`, {
+            channel_account_id: fixture.accountId,
+          }),
+          fixture.workspaceJid,
+          'single_session',
+          { replyPolicy: 'source_only' },
+        );
         expect(group).toMatchObject({
           channel_account_id: fixture.accountId,
           target_main_jid: fixture.workspaceJid,
@@ -394,7 +475,7 @@ describe.sequential(
     );
 
     test.each(CLASSIFIABLE_ISOLATION_CASES)(
-      '$name: /unbind restore remounts leftover DM off workspace main',
+      '$name: explicit legacy repair remounts leftover DM off workspace main',
       (fixture) => {
         db.setRegisteredGroup(
           fixture.restoreJid,
@@ -453,7 +534,25 @@ describe.sequential(
       '$name: workspace recovery does not replay isolated DM transcript',
       (fixture) => {
         const sourceJid = fixture.dms[0]!;
-        const dm = db.getRegisteredGroup(sourceJid);
+        const dm = bindDirectSession(
+          sourceJid,
+          chatGroup(`${fixture.name} isolated recovery session`, {
+            channel_account_id: fixture.accountId,
+          }),
+          fixture.workspaceJid,
+        );
+        db.setRegisteredGroup(
+          fixture.groupJid,
+          buildWorkspaceMountUpdate(
+            chatGroup(`${fixture.name} group recovery session`, {
+              channel_account_id: fixture.accountId,
+            }),
+            fixture.workspaceJid,
+            'single_session',
+            { replyPolicy: 'source_only' },
+          ),
+        );
+        db.setSessionChannelOwnerOnce(fixture.folder, null, fixture.groupJid);
         expect(dm?.target_agent_id).toBeTruthy();
         expect(dm?.target_main_jid).toBeUndefined();
         db.ensureChatExists(fixture.workspaceJid);

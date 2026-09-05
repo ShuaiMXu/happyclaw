@@ -38,7 +38,7 @@ export function workspaceDeleteDialogMessage(
     `「${state.name}」仍绑定 ${impact.channel_binding_count} 个消息渠道：`,
     ...visible,
     '',
-    '继续后，系统会先将这些渠道恢复到对应 Bot 的默认工作区；没有可用默认工作区的渠道会解除路由，然后永久删除此工作区的文件、会话和运行数据。',
+    '继续后，系统会解除这些渠道的绑定，并永久删除此工作区的文件、会话和运行数据。渠道在重新绑定前不会回复消息。',
     '此操作无法撤销。',
   ].join('\n');
 }

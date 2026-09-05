@@ -374,7 +374,7 @@ describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
     });
   });
 
-  test('confirmed delete reroutes channels and account defaults atomically', async () => {
+  test('confirmed delete clears channel bindings and updates account defaults atomically', async () => {
     const accountId = 'delete-workspace-telegram-account';
     db.createChannelAccount({
       id: accountId,
@@ -421,14 +421,14 @@ describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
         unbound_channel_count: 1,
       });
       expect(db.getRegisteredGroup(JID)).toBeUndefined();
-      expect(db.getRegisteredGroup(IM_JID)?.target_main_jid).toBe(HOME_JID);
-      expect(db.getChannelMount(IM_JID)?.workspace_jid).toBe(HOME_JID);
+      expect(db.getRegisteredGroup(IM_JID)?.target_main_jid).toBeUndefined();
+      expect(db.getChannelMount(IM_JID)).toBeUndefined();
       expect(db.getChannelAccount(accountId)?.default_workspace_jid).toBe(
         HOME_JID,
       );
       expect(
         (webDepsCache[IM_JID] as { target_main_jid?: string }).target_main_jid,
-      ).toBe(HOME_JID);
+      ).toBeUndefined();
       expect(stopGroup).toHaveBeenCalled();
       expect(discardGroupsAfterMutation).toHaveBeenCalledTimes(1);
     } finally {
@@ -436,7 +436,7 @@ describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
     }
   });
 
-  test('confirmed delete keeps a WeCom DM on an isolated fallback session', async () => {
+  test('confirmed delete leaves the former WeCom DM unbound', async () => {
     const accountId = 'delete-workspace-wecom-account';
     const dmJid = `wecom:c2c:delete-workspace-user#account:${accountId}`;
     const oldAgentId = 'delete-workspace-wecom-old-session';
@@ -501,19 +501,9 @@ describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
       const rerouted = db.getRegisteredGroup(dmJid)!;
       fallbackAgentId = rerouted.target_agent_id;
       expect(rerouted.target_main_jid).toBeUndefined();
-      expect(fallbackAgentId).toBeTruthy();
-      expect(fallbackAgentId).not.toBe(oldAgentId);
+      expect(fallbackAgentId).toBeUndefined();
       expect(db.getAgent(oldAgentId)).toBeUndefined();
-      expect(db.getAgent(fallbackAgentId!)).toMatchObject({
-        chat_jid: HOME_JID,
-        group_folder: HOME_FOLDER,
-        source_kind: 'channel_direct',
-        last_im_jid: dmJid,
-      });
-      expect(db.getChannelMount(dmJid)).toMatchObject({
-        workspace_jid: HOME_JID,
-        session_id: fallbackAgentId,
-      });
+      expect(db.getChannelMount(dmJid)).toBeUndefined();
       expect(db.getChannelAccount(accountId)?.default_workspace_jid).toBe(
         HOME_JID,
       );

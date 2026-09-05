@@ -163,7 +163,7 @@ export const CHANNEL_PROVIDER_OPTIONS: ChannelProviderOption[] = [
     setupGuide: {
       title: '创建后使用微信扫码',
       steps: [
-        '填写账号名称，并在下一步选择默认工作区。',
+        '填写账号名称，连接后再选择渠道会话的绑定目标。',
         '点击“创建并扫码”，HappyClaw 会生成微信登录二维码。',
         '用手机微信扫码确认；如微信要求验证码，直接在 HappyClaw 中输入。',
       ],
@@ -292,7 +292,7 @@ export const CHANNEL_PROVIDER_OPTIONS: ChannelProviderOption[] = [
     setupGuide: {
       title: '创建后关联 WhatsApp 设备',
       steps: [
-        '填写账号名称，并在下一步选择默认工作区。',
+        '填写账号名称，连接后再选择渠道会话的绑定目标。',
         '点击“创建并扫码”，等待 HappyClaw 生成关联设备二维码。',
         '在手机 WhatsApp 中打开“已关联设备”（iOS 在设置中，Android 在右上角菜单中），点击“关联设备”扫码。',
       ],

@@ -157,7 +157,7 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 - `PUT /api/groups/:jid/agents/:agentId/im-binding`
 - `DELETE /api/groups/:jid/agents/:agentId/im-binding/:imJid`
 
-群聊绑定到工作区：
+原生话题群绑定到工作区：
 
 - `POST /api/groups/:jid/im-groups/sync`
 - `GET /api/groups/:jid/im-groups`
@@ -166,10 +166,14 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 
 约束：
 
-- 工作区绑定只接受群聊。
-- Runtime Session 绑定只接受私聊。
-- 飞书话题群和需要 @ 激活的普通群使用 `thread_map`，每个原生上下文映射独立
-  Runtime Session。
+- 工作区绑定只接受原生话题群（飞书话题群或 Telegram Forum）。
+- Runtime Session 绑定接受私聊和普通群，`sessionId=main` 表示该 Workspace 的主会话。
+- 话题群使用 `thread_map`，每个原生话题映射独立 Session；普通群的 @ 策略不改变绑定层级。
+- `DELETE` 绑定会真正解除路由，不恢复默认工作区或自动创建会话。
+- 每条输入的回复回到实际来源渠道；Web 输入不会自动镜像到已绑定 IM。
+- 绑定管理 `PUT /api/config/user-im/bindings/:imJid` 使用
+  `{target_session_id: "main", target_main_jid: "web:..."}` 选择主会话；
+  仅指定 `target_main_jid` 表示话题群的 Workspace 绑定。
 - 请求必须携带或解析出正确的 `channel_account_id`，不能跨机器人账号绑定。
 
 ## Agent Profiles
@@ -265,8 +269,9 @@ owner 明确拒绝首次设置时可提交
 - `POST /api/channel-accounts/:id/disconnect`
 - `POST /api/channel-accounts/:id/logout`
 
-账号严格按 `owner_user_id` 隔离。同一 Provider 可以有多个账号，每个账号可以选择
-默认工作区。
+账号严格按 `owner_user_id` 隔离。同一 Provider 可以有多个账号。兼容字段
+`default_workspace_jid` 不能替代渠道会话的显式绑定；连接、发现和配对不自动选择 Session。
+层级和渠道规则见[业务模型](BUSINESS-MODEL.md)。
 
 ## Provider 与系统配置
 

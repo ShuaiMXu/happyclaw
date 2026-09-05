@@ -624,6 +624,69 @@ describe('Feishu durable Inbox and cursor integration', () => {
     expect(controls.messageReply).not.toHaveBeenCalled();
   });
 
+  test.each(['p2p', 'group'] as const)(
+    'an unbound %s stays silent before commands, reactions and routing',
+    async (chatType) => {
+      const accountId = `unbound-side-effects-${chatType}`;
+      const executed = vi.fn();
+      const onCommand = vi.fn();
+      const onNewChat = vi.fn();
+      const onP2pSender = vi.fn();
+      const resolveEffectiveChatJid = vi.fn();
+      const connected = await connect(accountId, executed, {
+        isChatBound: () => false,
+        isSenderAllowedInGroup: () => true,
+        onNewChat,
+        onP2pSender,
+        onCommand,
+        resolveEffectiveChatJid,
+      });
+      const input = event(`unbound-${chatType}`, Date.now(), '/help');
+      input.message.chat_type = chatType;
+      await connected.handler(input);
+      expect(executed).not.toHaveBeenCalled();
+      expect(onCommand).not.toHaveBeenCalled();
+      expect(resolveEffectiveChatJid).not.toHaveBeenCalled();
+      expect(controls.messageCreate).not.toHaveBeenCalled();
+      expect(controls.messageReply).not.toHaveBeenCalled();
+      expect(controls.reactionCreate).not.toHaveBeenCalled();
+      expect(onNewChat).toHaveBeenCalledTimes(chatType === 'p2p' ? 1 : 0);
+    },
+  );
+
+  test('an unbound stranger cannot claim the private-chat owner during discovery', async () => {
+    const onNewChat = vi.fn();
+    const onP2pSender = vi.fn();
+    const connected = await connect('unbound-stranger', vi.fn(), {
+      isChatBound: () => false,
+      isSenderAllowedInGroup: () => false,
+      onNewChat,
+      onP2pSender,
+    });
+    await connected.handler(
+      event('unbound-stranger-message', Date.now(), 'hello'),
+    );
+    expect(onNewChat).not.toHaveBeenCalled();
+    expect(onP2pSender).not.toHaveBeenCalled();
+    expect(controls.messageCreate).not.toHaveBeenCalled();
+    expect(controls.reactionCreate).not.toHaveBeenCalled();
+  });
+
+  test('binding and then unbinding takes effect on the next inbound message', async () => {
+    let bound = false;
+    const executed = vi.fn();
+    const connected = await connect('bind-transition', executed, {
+      isChatBound: () => bound,
+      isSenderAllowedInGroup: () => true,
+    });
+    await connected.handler(event('before-bind', Date.now(), 'hello'));
+    bound = true;
+    await connected.handler(event('after-bind', Date.now(), 'hello'));
+    bound = false;
+    await connected.handler(event('after-unbind', Date.now(), 'hello'));
+    expect(executed.mock.calls).toEqual([['after-bind']]);
+  });
+
   test('bootstraps the first P2P DM after an account-scoped route rejection', async () => {
     const accountId = `account-first-dm-${Date.now()}`;
     const executed = vi.fn();

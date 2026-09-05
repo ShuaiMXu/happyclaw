@@ -115,6 +115,8 @@ interface FeishuFileInfo {
 }
 
 export interface ConnectOptions {
+  /** Explicit binding guard, checked before commands, reactions or downloads. */
+  isChatBound?: (chatJid: string) => boolean;
   onReady: () => void;
   /** 收到消息后调用，让调用方自动注册未知的飞书聊天 */
   onNewChat?: (chatJid: string, chatName: string) => void;
@@ -2205,7 +2207,11 @@ export function createFeishuConnection(
         isSenderAllowedInGroup &&
         !isSenderAllowedInGroup(chatJid, senderOpenId)
       ) {
-        if (chatType === 'group' && mentionedBot) {
+        if (
+          chatType === 'group' &&
+          mentionedBot &&
+          (!connectOptions?.isChatBound || connectOptions.isChatBound(chatJid))
+        ) {
           addReaction(messageId, 'SILENT').catch(() => {});
         }
         logger.debug(
@@ -2214,6 +2220,19 @@ export function createFeishuConnection(
         );
         ignoreClaimedInbound(claim, payload, 'audience_rejected');
         return;
+      }
+
+      // Discovery makes a chat available in the binding UI; it does not
+      // authorize a reply. Apply this before all command/reaction side effects.
+      if (connectOptions?.isChatBound && !connectOptions.isChatBound(chatJid)) {
+        if (chatType === 'p2p') {
+          onNewChat?.(chatJid, resolvedChatName);
+          if (senderOpenId && onP2pSender) onP2pSender(senderOpenId);
+        }
+        if (!connectOptions.isChatBound(chatJid)) {
+          ignoreClaimedInbound(claim, payload, 'unbound_channel');
+          return;
+        }
       }
 
       // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──

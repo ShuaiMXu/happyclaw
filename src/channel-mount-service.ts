@@ -16,7 +16,6 @@ import { applyChannelAccountRegistrationFallback } from './channel-account-routi
 import { resolveChannelConversationKind } from './channel-conversation-kind.js';
 import { canonicalizeWhatsAppConversationJid } from './whatsapp-jid.js';
 import { isThreadMapCapableChat } from './im-channel-capabilities.js';
-import { requiresMention as feishuRequiresMention } from './feishu-conversation-policy.js';
 import {
   createAgent,
   ensureChatExists,
@@ -159,14 +158,12 @@ export function isNativeContextContainer(
     persisted.group_message_type ??
     group.feishu_group_message_type;
   if (channelType === 'feishu') {
-    if (chatMode === 'topic' || groupMessageType === 'thread') return true;
-    if (chatMode === 'p2p') return false;
-    if (chatMode === 'group') {
-      return feishuRequiresMention(
-        liveInfo.activation_mode ?? group.activation_mode,
-        group.require_mention,
-      );
-    }
+    return (
+      resolveChannelConversationKind(channelJid, {
+        chat_mode: chatMode,
+        group_message_type: groupMessageType,
+      }) === 'topic'
+    );
   }
   return isThreadMapCapableChat({
     channel_type: channelType,
@@ -433,11 +430,7 @@ export function ensureDirectChannelSessionMount(
   return buildSessionMountUpdate(params.group, agent.id, params.mountOptions);
 }
 
-/**
- * Account-aware first-registration attach. Groups and unknown chats fall
- * back to the account default workspace. Direct chats get a dedicated
- * session in that workspace so they do not share the main owner slot.
- */
+/** Record the discovering Bot account without selecting a conversation target. */
 export function attachDefaultChannelAccountMount(params: {
   sourceJid: string;
   group: RegisteredGroup;
@@ -446,35 +439,15 @@ export function attachDefaultChannelAccountMount(params: {
   userId: string;
   onCreated?: (agent: SubAgent, workspaceJid: string) => void;
 }): RegisteredGroup {
-  const conversationKind = resolveChannelConversationKind(params.sourceJid);
-  const withAccount = params.accountId
+  // Discovery/pairing proves which user and Bot own the channel. It does not
+  // authorize an Agent or select a workspace/session on the user's behalf.
+  return params.accountId
     ? applyChannelAccountRegistrationFallback(
         params.group,
         params.accountId,
         params.fallbackWorkspaceJid,
-        conversationKind,
       )
-    : conversationKind === 'direct' ||
-        params.group.target_main_jid ||
-        params.group.target_agent_id
-      ? params.group
-      : { ...params.group, target_main_jid: params.fallbackWorkspaceJid };
-
-  if (
-    conversationKind !== 'direct' ||
-    withAccount.target_main_jid ||
-    withAccount.target_agent_id
-  ) {
-    return withAccount;
-  }
-
-  return ensureDirectChannelSessionMount({
-    sourceJid: params.sourceJid,
-    group: withAccount,
-    workspaceJid: params.fallbackWorkspaceJid,
-    userId: params.userId,
-    onCreated: params.onCreated,
-  });
+    : params.group;
 }
 
 /**
@@ -626,7 +599,7 @@ export function buildSessionMountUpdate(
     target_agent_id: sessionId,
     target_main_jid: undefined,
     binding_mode: 'single_context',
-    reply_policy: options.replyPolicy ?? group.reply_policy ?? 'source_only',
+    reply_policy: 'source_only',
     ...(options.activationMode !== undefined
       ? { activation_mode: options.activationMode }
       : {}),
@@ -651,7 +624,7 @@ export function buildWorkspaceMountUpdate(
     target_main_jid: workspaceJid,
     binding_mode:
       routingMode === 'thread_map' ? 'thread_map' : 'single_context',
-    reply_policy: options.replyPolicy ?? group.reply_policy ?? 'source_only',
+    reply_policy: 'source_only',
     ...(options.activationMode !== undefined
       ? { activation_mode: options.activationMode }
       : {}),
@@ -664,6 +637,41 @@ export function buildWorkspaceMountUpdate(
   };
 }
 
+/** Reconcile legacy routing flags without changing a selected target or history. */
+export function normalizeChannelBindingPolicy(
+  channelJid: string,
+  group: RegisteredGroup,
+): RegisteredGroup {
+  const kind = resolveChannelConversationKind(channelJid, {
+    feishu_chat_mode: group.feishu_chat_mode,
+    feishu_group_message_type: group.feishu_group_message_type,
+    native_context_type: group.native_context_type,
+  });
+  const ordinary = kind === 'direct' || kind === 'group';
+  const bindingMode =
+    ordinary || (!group.target_main_jid && !group.target_agent_id)
+      ? 'single_context'
+      : kind === 'topic' && group.target_main_jid && !group.target_agent_id
+        ? 'thread_map'
+        : group.binding_mode;
+  const nativeContextType =
+    getChannelType(channelJid) === 'feishu' && ordinary
+      ? 'none'
+      : group.native_context_type;
+  if (
+    group.reply_policy === 'source_only' &&
+    group.binding_mode === bindingMode &&
+    group.native_context_type === nativeContextType
+  )
+    return group;
+  return {
+    ...group,
+    reply_policy: 'source_only',
+    binding_mode: bindingMode,
+    native_context_type: nativeContextType,
+  };
+}
+
 export function buildUnmountUpdate(
   group: RegisteredGroup,
   options: { resetActivation?: boolean } = {},
@@ -673,8 +681,19 @@ export function buildUnmountUpdate(
     target_agent_id: undefined,
     target_main_jid: undefined,
     binding_mode: 'single_context',
+    reply_policy: 'source_only',
     ...(options.resetActivation ? { activation_mode: 'auto' as const } : {}),
   };
+}
+
+/** Clear the selected target without discovering or creating another binding. */
+export function unbindChannelMount(
+  channelJid: string,
+  group: RegisteredGroup,
+): RegisteredGroup {
+  const updated = buildUnmountUpdate(group);
+  commitChannelMountUpdate(channelJid, updated);
+  return updated;
 }
 
 /**

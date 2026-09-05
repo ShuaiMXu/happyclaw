@@ -153,6 +153,7 @@ export interface WhatsAppConnectConfig {
 export type WhatsAppConnectionStateSnapshot = WhatsAppConnectionState;
 
 export interface ConnectFeishuOptions {
+  isChatBound?: (jid: string) => boolean;
   accountId?: string;
   scopeIncomingJids?: boolean;
   ignoreMessagesBefore?: number;
@@ -397,6 +398,12 @@ export class IMConnectionManager {
                 opts.onMessage!(scope(jid), text, sender);
               }
             },
+          }
+        : {}),
+      ...(opts.isChatBound
+        ? {
+            isChatBound: (jid: string) =>
+              inboundAllowed() && opts.isChatBound!(scope(jid)),
           }
         : {}),
       ...(opts.isChatAuthorized
@@ -1338,6 +1345,7 @@ export class IMConnectionManager {
           logger.info({ userId }, 'User Feishu WebSocket connected');
         },
         onNewChat,
+        isChatBound: options?.isChatBound,
         ignoreMessagesBefore: options?.ignoreMessagesBefore,
         onCommand: options?.onCommand,
         resolveGroupFolder: options?.resolveGroupFolder,

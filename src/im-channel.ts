@@ -113,6 +113,7 @@ export function appendStreamingSessionAnswer(
 // ─── Unified Interface ──────────────────────────────────────────
 
 export interface IMChannelConnectOpts {
+  isChatBound?: (jid: string) => boolean;
   onReady: () => void;
   onNewChat: (chatJid: string, chatName: string) => void;
   onMessage?: (chatJid: string, text: string, senderName: string) => void;
@@ -319,6 +320,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         await loadChannelImplementation('feishu');
       inner = createFeishuConnection(config);
       const connected = await inner.connect({
+        isChatBound: opts.isChatBound,
         onReady: opts.onReady,
         onNewChat: opts.onNewChat,
         ignoreMessagesBefore: opts.ignoreMessagesBefore,
