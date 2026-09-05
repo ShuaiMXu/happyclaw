@@ -815,18 +815,10 @@ interface PendingDelta {
 }
 const pendingDeltas = new Map<string, PendingDelta>();
 
-const STICKY_API_RETRY_STATUS_RE = /API\s*重试|retry/i;
-
-function clearStickyApiRetryStatus(
-  state: Pick<StreamingState, 'systemStatus'>,
-): void {
-  if (
-    state.systemStatus &&
-    STICKY_API_RETRY_STATUS_RE.test(state.systemStatus)
-  ) {
-    state.systemStatus = null;
-  }
-}
+// Match the runner's retry banner (including unknown SDK counters), not user
+// progress text that happens to mention a retry or a file named retry.ts.
+const API_RETRY_STATUS_RE =
+  /^API (?:重试中 \((?:\d+|\?)\/(?:\d+|\?)\)，\d+s 后重试|retry in progress \((?:\d+|\?)\/(?:\d+|\?)\))$/i;
 
 function cancelPendingDelta(key: string): void {
   const entry = pendingDeltas.get(key);
@@ -869,7 +861,6 @@ function flushPendingDelta(
         return s;
       const prev = s.agentStreaming[agentId] || { ...DEFAULT_STREAMING_STATE };
       const next = { ...prev };
-      clearStickyApiRetryStatus(next);
       if (mergedText) {
         const combined = prev.partialText + mergedText;
         next.partialText =
@@ -905,7 +896,6 @@ function flushPendingDelta(
       if (s.streaming[chatJid]?.interrupted) return s;
       const prev = s.streaming[chatJid] || { ...DEFAULT_STREAMING_STATE };
       const next = { ...prev };
-      clearStickyApiRetryStatus(next);
       if (mergedText) {
         const combined = prev.partialText + mergedText;
         next.partialText =
@@ -1398,13 +1388,6 @@ function applyStreamEvent(
   if (event.turnId) next.turnId = event.turnId;
   if (event.sessionId) next.sessionId = event.sessionId;
   next.traceEvents = pushTrace(prev.traceEvents || [], event);
-  if (
-    event.eventType === 'text_delta' ||
-    event.eventType === 'thinking_delta' ||
-    event.eventType === 'tool_use_start'
-  ) {
-    clearStickyApiRetryStatus(next);
-  }
   switch (event.eventType) {
     case 'text_delta': {
       if (event.parentToolUseId) {
@@ -2653,6 +2636,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const runtimeJid = agentId ? `${chatJid}#agent:${agentId}` : chatJid;
     if (!shouldApplyRunScopedPayload(get().activeRuns, runtimeJid, runId)) {
       return;
+    }
+
+    // Clear in receive order: an older rAF batch must not erase a newer retry.
+    // Child activity does not mean the parent request has recovered.
+    if (
+      !event.parentToolUseId &&
+      (event.eventType === 'tool_use_start' ||
+        ((event.eventType === 'text_delta' ||
+          event.eventType === 'thinking_delta') &&
+          !!event.text))
+    ) {
+      set((s) => {
+        const prev = agentId ? s.agentStreaming[agentId] : s.streaming[chatJid];
+        if (
+          !prev ||
+          prev.interrupted ||
+          !API_RETRY_STATUS_RE.test(prev.systemStatus || '')
+        ) {
+          return s;
+        }
+        const next = { ...prev, systemStatus: null };
+        if (agentId) {
+          return { agentStreaming: { ...s.agentStreaming, [agentId]: next } };
+        }
+        saveStreamingToSession(chatJid, next);
+        return { streaming: { ...s.streaming, [chatJid]: next } };
+      });
     }
 
     // ⓪ text_delta / thinking_delta — rAF batch for both agent and main conversation

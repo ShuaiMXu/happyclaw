@@ -1038,3 +1038,177 @@ describe('SDK task terminal status and sticky API retry', () => {
     );
   });
 });
+
+describe('API retry status event ordering and task isolation', () => {
+  const callbacks: FrameRequestCallback[] = [];
+  const jid = 'web:review';
+  const runId = 'review-run';
+  const retry = 'API 重试中 (2/3)，10s 后重试';
+  beforeEach(() => {
+    resetChatStore();
+    callbacks.length = 0;
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      callbacks.push(cb);
+      return callbacks.length;
+    });
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+  function flush() {
+    for (const cb of callbacks.splice(0)) cb(0);
+  }
+  function initialize(agentId?: string) {
+    const runtimeJid = agentId ? `${jid}#agent:${agentId}` : jid;
+    const streaming = {
+      partialText: '',
+      thinkingText: '',
+      isThinking: false,
+      activeTools: [],
+      activeHook: null,
+      systemStatus: null,
+      recentEvents: [],
+      traceEvents: [],
+      taskStates: {},
+    };
+    useChatStore.setState({
+      activeRuns: {
+        [runtimeJid]: {
+          chatJid: runtimeJid,
+          runId,
+          startedAt: '2026-09-06T00:00:00.000Z',
+          phase: 'running',
+        },
+      },
+      ...(agentId
+        ? {
+            agentWaiting: { [agentId]: true },
+            agentStreaming: { [agentId]: streaming },
+          }
+        : {
+            waiting: { [jid]: true },
+            streaming: { [jid]: streaming },
+          }),
+    });
+  }
+  const emit = (
+    event: Parameters<
+      ReturnType<typeof useChatStore.getState>['handleStreamEvent']
+    >[1],
+    agentId?: string,
+  ) => useChatStore.getState().handleStreamEvent(jid, event, agentId, runId);
+  for (const agentId of [undefined, 'review-agent']) {
+    it(`preserves a newer retry while flushing older text in ${agentId || 'main'}`, () => {
+      initialize(agentId);
+      emit({ eventType: 'text_delta', text: 'text before retry' }, agentId);
+      emit({ eventType: 'status', statusText: retry }, agentId);
+      const state = () =>
+        agentId
+          ? useChatStore.getState().agentStreaming[agentId]
+          : useChatStore.getState().streaming[jid];
+      expect(state().systemStatus).toBe(retry);
+      flush();
+      expect(state().partialText).toBe('text before retry');
+      expect(state().systemStatus).toBe(retry);
+    });
+
+    it(`clears retry on real recovery before rAF in ${agentId || 'main'}`, () => {
+      initialize(agentId);
+      emit({ eventType: 'status', statusText: retry }, agentId);
+      emit({ eventType: 'thinking_delta', text: 'resumed thinking' }, agentId);
+      const state = () =>
+        agentId
+          ? useChatStore.getState().agentStreaming[agentId]
+          : useChatStore.getState().streaming[jid];
+      expect(state().systemStatus).toBeNull();
+      emit({ eventType: 'status', statusText: retry }, agentId);
+      flush();
+      expect(state().thinkingText).toBe('resumed thinking');
+      expect(state().systemStatus).toBe(retry);
+      emit({ eventType: 'text_delta', text: 'recovered again' }, agentId);
+      expect(state().systemStatus).toBeNull();
+      flush();
+    });
+
+    it(`ignores empty deltas and stale runs in ${agentId || 'main'}`, () => {
+      initialize(agentId);
+      emit({ eventType: 'status', statusText: retry }, agentId);
+      emit({ eventType: 'text_delta', text: '' }, agentId);
+      emit({ eventType: 'thinking_delta' }, agentId);
+      useChatStore
+        .getState()
+        .handleStreamEvent(
+          jid,
+          { eventType: 'text_delta', text: 'previous run output' },
+          agentId,
+          'previous-run',
+        );
+      flush();
+      const state = agentId
+        ? useChatStore.getState().agentStreaming[agentId]
+        : useChatStore.getState().streaming[jid];
+      expect(state.systemStatus).toBe(retry);
+      expect(state.partialText).toBe('');
+    });
+  }
+  for (const eventType of [
+    'text_delta',
+    'thinking_delta',
+    'tool_use_start',
+  ] as const) {
+    it(`preserves the parent's retry when a child emits ${eventType}`, () => {
+      initialize();
+      useChatStore.setState({
+        sdkTasks: {
+          'review-task': {
+            chatJid: jid,
+            description: 'background task',
+            status: 'running',
+            isTeammate: true,
+          },
+        },
+      });
+      emit({ eventType: 'status', statusText: retry });
+      emit({
+        eventType,
+        parentToolUseId: 'review-task',
+        text: 'child output',
+        toolUseId: 'child-tool',
+        toolName: 'Read',
+      });
+      flush();
+      expect(useChatStore.getState().streaming[jid].systemStatus).toBe(retry);
+    });
+  }
+  it('preserves ordinary progress mentioning a retry filename', () => {
+    initialize();
+    const statusText = '正在检查 retry.ts 的并发行为';
+    emit({
+      eventType: 'status',
+      statusText,
+      agentScope: 'system',
+      isSynthetic: true,
+      displayLevel: 'primary',
+    });
+    expect(useChatStore.getState().streaming[jid].systemStatus).toBe(
+      statusText,
+    );
+    emit({
+      eventType: 'tool_use_start',
+      toolName: 'Read',
+      toolUseId: 'read-file',
+    });
+    expect(useChatStore.getState().streaming[jid].systemStatus).toBe(
+      statusText,
+    );
+  });
+
+  it('clears a runner retry banner with unavailable SDK counters', () => {
+    initialize();
+    emit({ eventType: 'status', statusText: 'API 重试中 (?/?)，0s 后重试' });
+    emit({ eventType: 'text_delta', text: 'recovered' });
+    expect(useChatStore.getState().streaming[jid].systemStatus).toBeNull();
+    flush();
+  });
+});
