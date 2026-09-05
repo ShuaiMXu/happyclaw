@@ -2708,7 +2708,12 @@ function updateSnapshotTask(
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (patch?.status === 'failed' || patch?.status === 'killed')
+    else if (
+      patch?.status === 'failed' ||
+      patch?.status === 'killed' ||
+      patch?.status === 'stopped' ||
+      patch?.status === 'aborted'
+    )
       task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
     task.latestSummary =

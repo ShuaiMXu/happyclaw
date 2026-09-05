@@ -806,7 +806,10 @@ export function feedStreamEventToCard(
           status:
             patchStatus === 'completed'
               ? 'completed'
-              : patchStatus === 'failed' || patchStatus === 'killed'
+              : patchStatus === 'failed' ||
+                  patchStatus === 'killed' ||
+                  patchStatus === 'stopped' ||
+                  patchStatus === 'aborted'
                 ? 'error'
                 : se.taskPatch?.is_backgrounded
                   ? 'backgrounded'
