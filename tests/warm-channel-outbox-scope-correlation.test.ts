@@ -247,4 +247,32 @@ describe('warm channel outbox scope wiring contract', () => {
       /logicalBaseChatJid:\s*chatJid[\s\S]*?function resolveIpcOutputRuntimeChatJid/,
     );
   });
+
+  test('WeChat physical chunks use separate outbox rows and the actual item id', () => {
+    const host = read('src/index.ts');
+    const send = section(
+      host,
+      'async function sendImWithRetry(',
+      'async function deliverChannelManualReconciliationNotice(',
+    );
+    expect(send).toContain('prepareWeChatTextChunks(text)');
+    expect(send).toMatch(
+      /childChannelOutboxRef\(outbox!, weChat \? `text:\$\{index\}`/,
+    );
+    expect(send).toContain('deliveryId: item.id');
+    expect(send).toContain('physicalOutput: weChat');
+    expect(send).toContain('ScopedChannelPartialDeliveryError');
+
+    const image = section(
+      host,
+      'async function sendTaskImageWithRetry(',
+      'async function sendTaskFileWithRetry(',
+    );
+    expect(image).toContain('prepareWeChatTextChunks(caption)');
+    expect(image).toContain(
+      'childChannelOutboxRef(outbox, `caption:${index}`)',
+    );
+    expect(image).toContain("childChannelOutboxRef(outbox, 'image')");
+    expect(image).toContain('deliveryId: item.id');
+  });
 });

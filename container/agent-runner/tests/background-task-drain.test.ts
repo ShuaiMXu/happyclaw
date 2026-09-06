@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  BackgroundProtocolDebtWatchdog,
   BackgroundTaskDrainTracker,
   DurableInputTurnCompletion,
   QuiescentResultGate,
@@ -162,6 +163,26 @@ describe('QuiescentResultGate', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('BackgroundProtocolDebtWatchdog', () => {
+  test('uses a hard first-withheld deadline which later frames cannot extend', () => {
+    const watchdog = new BackgroundProtocolDebtWatchdog();
+    expect(watchdog.arm(1_000)).toBe(1_000);
+    expect(watchdog.arm(9_000)).toBe(1_000);
+    expect(watchdog.remainingMs(10_000, 9_000)).toBe(2_000);
+    expect(watchdog.isExpired(10_000, 10_999)).toBe(false);
+    expect(watchdog.isExpired(10_000, 11_000)).toBe(true);
+  });
+
+  test('clearing a repaid debt permits a fresh later deadline', () => {
+    const watchdog = new BackgroundProtocolDebtWatchdog();
+    watchdog.arm(1_000);
+    watchdog.clear();
+    expect(watchdog.isArmed).toBe(false);
+    expect(watchdog.arm(20_000)).toBe(20_000);
+    expect(watchdog.isExpired(10_000, 25_000)).toBe(false);
   });
 });
 

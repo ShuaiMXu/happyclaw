@@ -212,6 +212,9 @@ export function TaskCard({
               {['failed', 'partial_failed'].includes(
                 task.last_run_summary?.notification_status || '',
               ) && <span className="ml-2 text-xs text-error">通知失败</span>}
+              {task.last_run_summary?.notification_status === 'uncertain' && (
+                <span className="ml-2 text-xs text-warning">送达待确认</span>
+              )}
             </div>
           </div>
         </button>

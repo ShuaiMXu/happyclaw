@@ -24,8 +24,7 @@
  *   - systemStatus
  *   - tools (Map) + purgeOldTools()
  *   - recentEvents
- *   - auxFlushTimer / lastAuxFlushTime / AUX_FLUSH_INTERVAL
- *   - buildAuxPrefix() / formatElapsed()
+ *   - auxiliary prefix rendering
  *   - setThinking() / appendThinking() / setSystemStatus()
  *   - startTool() / endTool() / updateToolSummary() / pushRecentEvent()
  *
@@ -38,6 +37,12 @@
  */
 
 import { logger } from './logger.js';
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
+import {
+  classifyImSendFailure,
+  ImDeliveryPhaseError,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -94,14 +99,14 @@ export class QQStreamingController {
   // Dependencies
   private openid: string;
   private sendStreamChunk: SendStreamChunkFn;
-  private fallbackSend: FallbackSendFn;
-  private fallbackUsed = false;
   private passiveMsgId: string | undefined;
+  private definitiveStartRejection = false;
+  private definitiveStartError: unknown;
+  private uncertainStartError: unknown;
+  private terminalDeliveryError: unknown;
+  private onDefinitiveRejection?: (error: unknown) => boolean;
 
-  // Auxiliary state (thinking, tools, status)
-  private thinking = false;
-  private thinkingText = '';
-  private systemStatus: string | null = null;
+  // Tool state remains available to the shared streaming-session interface.
   private tools = new Map<
     string,
     {
@@ -111,18 +116,7 @@ export class QQStreamingController {
       summary?: string;
     }
   >();
-  private recentEvents: string[] = [];
-
-  // Auxiliary flush throttle
-  private auxFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastAuxFlushTime = 0;
-  private static readonly AUX_FLUSH_INTERVAL = 1500; // ms
-
   // Display limits
-  private static readonly MAX_THINKING_CHARS = 500;
-  private static readonly MAX_TOOLS_DISPLAY = 5;
-  private static readonly MAX_TOOL_SUMMARY_CHARS = 60;
-  private static readonly MAX_RECENT_EVENTS = 5;
 
   constructor(opts: {
     openid: string;
@@ -131,28 +125,35 @@ export class QQStreamingController {
     fallbackSend: FallbackSendFn;
     /** Latest incoming msg_id from this openid. Required by QQ stream API. */
     passiveMsgId?: string;
+    /** Proves a failed start was rejected before any stream became visible. */
+    onDefinitiveRejection?: (error: unknown) => boolean;
   }) {
     this.openid = opts.openid;
     this.msgSeq = opts.msgSeq;
     this.sendStreamChunk = opts.sendStreamChunk;
-    this.fallbackSend = opts.fallbackSend;
     this.passiveMsgId = opts.passiveMsgId;
+    this.onDefinitiveRejection = opts.onDefinitiveRejection;
   }
 
   // ─── StreamingSession interface ─────────────────────────────
 
   isActive(): boolean {
-    // Only idle/streaming accept new content. Once complete/abort starts,
-    // late-arriving append()s are ignored to keep the QQ baseline monotonic.
-    return this.state === 'idle' || this.state === 'streaming';
+    if (this.acceptsStreamingUpdates()) return true;
+    const deliveryError =
+      this.terminalDeliveryError ?? this.uncertainStartError;
+    return (
+      deliveryError !== undefined &&
+      (this.state === 'idle' ||
+        this.state === 'streaming' ||
+        this.state === 'aborted') &&
+      classifyImSendFailure(deliveryError) === 'uncertain'
+    );
   }
 
   append(text: string): void {
-    if (!this.isActive()) return;
+    if (!this.acceptsStreamingUpdates()) return;
     const isFirst = this.accumulatedText.length === 0;
     this.accumulatedText = text;
-    this.thinkingText = '';
-    this.thinking = false;
     if (isFirst) {
       logger.info(
         { openid: this.openid, textLen: text.length },
@@ -163,6 +164,9 @@ export class QQStreamingController {
   }
 
   async complete(finalText: string): Promise<void> {
+    if (this.terminalDeliveryError !== undefined) {
+      throw this.terminalDeliveryError;
+    }
     if (
       this.state === 'completed' ||
       this.state === 'aborted' ||
@@ -181,6 +185,10 @@ export class QQStreamingController {
     // Wait for any in-flight flush to settle so we don't race the DONE chunk
     if (this.currentFlushPromise) {
       await this.currentFlushPromise.catch(() => {});
+    }
+    if (this.terminalDeliveryError !== undefined) {
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
     }
 
     // Now safe to set baseline. accumulatedText is whatever the last
@@ -217,17 +225,50 @@ export class QQStreamingController {
       return;
     }
 
+    if (this.definitiveStartRejection) {
+      logger.warn(
+        { openid: this.openid },
+        'QQ stream start was rejected; delegating static fallback to the durable host Outbox',
+      );
+      const rejected = new ImDeliveryPhaseError(
+        'rejected',
+        'QQ stream start was definitively rejected',
+        { cause: this.definitiveStartError },
+      );
+      this.terminalDeliveryError ??= rejected;
+      this.state = 'aborted';
+      throw rejected;
+    }
+    if (this.uncertainStartError) {
+      this.terminalDeliveryError ??= this.uncertainStartError;
+      this.state = 'aborted';
+      throw this.uncertainStartError;
+    }
+
     // If we never managed to start a stream, use fallback for the full text
     if (this.sentChunkCount === 0) {
       await this.tryStartStream(safeFinal);
-      if (!this.streamMsgId) {
-        logger.warn(
-          { openid: this.openid },
-          'QQ streaming never started, falling back to plain message',
+      if (this.definitiveStartRejection) {
+        const rejected = new ImDeliveryPhaseError(
+          'rejected',
+          'QQ stream start was definitively rejected',
+          { cause: this.definitiveStartError },
         );
-        await this.tryFallback(finalText);
-        this.state = 'completed';
-        return;
+        this.terminalDeliveryError ??= rejected;
+        this.state = 'aborted';
+        throw rejected;
+      }
+      if (this.uncertainStartError) {
+        this.terminalDeliveryError ??= this.uncertainStartError;
+        this.state = 'aborted';
+        throw this.uncertainStartError;
+      }
+      if (!this.streamMsgId) {
+        this.terminalDeliveryError ??= new Error(
+          'QQ streaming start returned no provider receipt; delivery outcome is uncertain',
+        );
+        this.state = 'aborted';
+        throw this.terminalDeliveryError;
       }
     }
 
@@ -245,14 +286,22 @@ export class QQStreamingController {
     } catch (err: any) {
       logger.warn(
         { err: err.message, openid: this.openid },
-        'QQ streaming finalize failed, using fallback',
+        'QQ streaming finalize failed; refusing duplicate plain fallback',
       );
-      await this.tryFallback(finalText);
-      this.state = 'completed';
+      this.terminalDeliveryError ??= new PartialChannelDeliveryError(
+        this.sentChunkCount,
+        this.sentChunkCount + 1,
+        err,
+      );
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
     }
   }
 
   async abort(reason?: string): Promise<void> {
+    if (this.terminalDeliveryError !== undefined) {
+      throw this.terminalDeliveryError;
+    }
     if (
       this.state === 'completed' ||
       this.state === 'aborted' ||
@@ -268,6 +317,25 @@ export class QQStreamingController {
     if (this.currentFlushPromise) {
       await this.currentFlushPromise.catch(() => {});
     }
+    if (this.terminalDeliveryError !== undefined) {
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
+    }
+    if (this.definitiveStartRejection) {
+      const rejected = new ImDeliveryPhaseError(
+        'rejected',
+        'QQ stream start was definitively rejected',
+        { cause: this.definitiveStartError },
+      );
+      this.terminalDeliveryError ??= rejected;
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
+    }
+    if (this.uncertainStartError !== undefined) {
+      this.terminalDeliveryError ??= this.uncertainStartError;
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
+    }
 
     if (this.streamMsgId) {
       // accumulatedText here reflects the last successfully-streamed baseline,
@@ -279,6 +347,13 @@ export class QQStreamingController {
         await this.doSendChunk(abortText, 10); // DONE
       } catch (err: any) {
         logger.debug({ err: err.message }, 'QQ streaming abort chunk failed');
+        this.terminalDeliveryError ??= new PartialChannelDeliveryError(
+          this.sentChunkCount,
+          this.sentChunkCount + 1,
+          err,
+        );
+        this.state = 'aborted';
+        throw this.terminalDeliveryError;
       }
     }
     this.state = 'aborted';
@@ -291,27 +366,15 @@ export class QQStreamingController {
   // ─── Auxiliary display methods ──────────────────────────────
 
   setThinking(): void {
-    this.thinking = true;
+    // QQ's prefix-stable stream has no auxiliary presentation surface.
   }
 
-  appendThinking(text: string): void {
-    this.thinkingText += text;
-    if (this.thinkingText.length > QQStreamingController.MAX_THINKING_CHARS) {
-      this.thinkingText =
-        '...' +
-        this.thinkingText.slice(-(QQStreamingController.MAX_THINKING_CHARS - 3));
-    }
-    this.thinking = true;
-
-    // Show thinking state via streaming if already active
-    if (this.state === 'streaming') {
-      this.scheduleAuxFlush();
-    }
+  appendThinking(_text: string): void {
+    // Intentionally hidden; emitting it would violate QQ prefix stability.
   }
 
-  setSystemStatus(status: string | null): void {
-    this.systemStatus = status;
-    if (this.state === 'streaming') this.scheduleAuxFlush();
+  setSystemStatus(_status: string | null): void {
+    // Intentionally hidden; emitting it would violate QQ prefix stability.
   }
 
   setHook(_hook: { hookName: string; hookEvent: string } | null): void {
@@ -324,13 +387,8 @@ export class QQStreamingController {
     // Too verbose for plain text
   }
 
-  pushRecentEvent(text: string): void {
-    this.recentEvents.push(text);
-    if (this.recentEvents.length > QQStreamingController.MAX_RECENT_EVENTS) {
-      this.recentEvents = this.recentEvents.slice(
-        -QQStreamingController.MAX_RECENT_EVENTS,
-      );
-    }
+  pushRecentEvent(_text: string): void {
+    // Intentionally hidden; emitting it would violate QQ prefix stability.
   }
 
   startTool(toolId: string, toolName: string): void {
@@ -375,52 +433,8 @@ export class QQStreamingController {
     return [];
   }
 
-  // ─── Internal: auxiliary prefix ─────────────────────────────
-
-  private buildAuxPrefix(): string {
-    const parts: string[] = [];
-
-    if (this.systemStatus) {
-      parts.push(`⏳ ${this.systemStatus}`);
-    }
-
-    if (this.thinkingText) {
-      const label = this.thinking ? '💭 思考中...' : '💭 思考完成';
-      const truncated =
-        this.thinkingText.length > QQStreamingController.MAX_THINKING_CHARS
-          ? '...' +
-            this.thinkingText.slice(-(QQStreamingController.MAX_THINKING_CHARS - 3))
-          : this.thinkingText;
-      parts.push(`${label}\n${truncated}`);
-    } else if (this.thinking) {
-      parts.push('💭 思考中...');
-    }
-
-    const now = Date.now();
-    const display: string[] = [];
-    for (const [, tc] of this.tools) {
-      if (display.length >= QQStreamingController.MAX_TOOLS_DISPLAY) break;
-      const elapsed = QQStreamingController.formatElapsed(now - tc.startTime);
-      const icon =
-        tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-      const summary = tc.summary
-        ? `  ${tc.summary.length > QQStreamingController.MAX_TOOL_SUMMARY_CHARS ? tc.summary.slice(0, QQStreamingController.MAX_TOOL_SUMMARY_CHARS) + '...' : tc.summary}`
-        : '';
-      display.push(`${icon} ${tc.name} (${elapsed})${summary}`);
-    }
-    if (display.length > 0) {
-      parts.push(display.join('\n'));
-    }
-
-    return parts.length > 0 ? parts.join('\n\n') + '\n\n---\n\n' : '';
-  }
-
-  private static formatElapsed(ms: number): string {
-    if (ms < 1000) return `${ms}ms`;
-    const sec = ms / 1000;
-    if (sec < 60) return `${sec.toFixed(1)}s`;
-    const min = Math.floor(sec / 60);
-    return `${min}m ${Math.floor(sec % 60)}s`;
+  getAcknowledgedProviderOutputCount(): number {
+    return this.sentChunkCount;
   }
 
   private purgeOldTools(): void {
@@ -435,6 +449,7 @@ export class QQStreamingController {
   // ─── Internal: streaming ────────────────────────────────────
 
   private scheduleFlush(): void {
+    if (!this.acceptsStreamingUpdates()) return;
     this.flushPending = true;
     // Serialize: only one flush in-flight at a time.
     // If another is running or scheduled, mark pending and let it reschedule itself.
@@ -450,7 +465,7 @@ export class QQStreamingController {
         })
         .finally(() => {
           this.currentFlushPromise = null;
-          if (this.flushPending && this.isActive()) {
+          if (this.flushPending && this.acceptsStreamingUpdates()) {
             this.scheduleFlush();
           }
         });
@@ -465,14 +480,15 @@ export class QQStreamingController {
   }
 
   private async doFlush(): Promise<void> {
+    if (!this.acceptsStreamingUpdates()) return;
     const rawText = this.accumulatedText;
     if (!rawText.trim()) return;
+    if (this.definitiveStartRejection || this.uncertainStartError) return;
 
-    // Length guard: QQ stream_messages caps content_raw (~5000 chars). Once we
-    // cross the conservative threshold, every subsequent chunk would hit the
-    // same upper-bound and fail in a tight loop. Switch to fallback once and
-    // stop streaming — fallbackUsed guard ensures only one plain message is
-    // sent even if this path is hit repeatedly before complete() fires.
+    // Length guard: QQ stream_messages caps content_raw (~5000 chars). A plain
+    // fallback is safe only before any stream mutation is visible. Once a
+    // preview exists, sending the whole body again would duplicate it; fence
+    // the partial-visible delivery for host-side manual reconciliation.
     if (rawText.length > MAX_STREAM_CONTENT) {
       logger.warn(
         {
@@ -480,14 +496,28 @@ export class QQStreamingController {
           contentLen: rawText.length,
           limit: MAX_STREAM_CONTENT,
         },
-        'QQ streaming accumulated text exceeds per-chunk cap, switching to fallback',
+        'QQ streaming accumulated text exceeds per-chunk cap',
       );
       this.clearTimers();
       this.flushPending = false;
-      // Aborted (not completed) so complete() early-returns without sending DONE.
+      if (this.sentChunkCount === 0) {
+        const fallbackRequired = preAcceptImDeliveryError(
+          `QQ streaming content exceeds ${MAX_STREAM_CONTENT} characters; use durable static delivery`,
+        );
+        this.terminalDeliveryError ??= fallbackRequired;
+        this.state = 'aborted';
+        throw fallbackRequired;
+      }
+      const overflow = new Error(
+        `QQ streaming content exceeds ${MAX_STREAM_CONTENT} characters after a visible preview`,
+      );
+      this.terminalDeliveryError ??= new PartialChannelDeliveryError(
+        this.sentChunkCount,
+        this.sentChunkCount + 1,
+        overflow,
+      );
       this.state = 'aborted';
-      await this.tryFallback(rawText);
-      return;
+      throw this.terminalDeliveryError;
     }
 
     // CRITICAL: QQ stream API requires strict prefix stability across chunks.
@@ -503,7 +533,17 @@ export class QQStreamingController {
         await this.doSendChunk(rawText, 1); // GENERATING
         this.lastUpdateTime = Date.now();
       } catch (err: any) {
-        logger.warn({ err: err.message, contentLen: rawText.length }, 'QQ streaming chunk failed');
+        logger.warn(
+          { err: err.message, contentLen: rawText.length },
+          'QQ streaming chunk failed',
+        );
+        this.terminalDeliveryError ??= new PartialChannelDeliveryError(
+          this.sentChunkCount,
+          this.sentChunkCount + 1,
+          err,
+        );
+        this.state = 'aborted';
+        throw this.terminalDeliveryError;
       }
     }
   }
@@ -540,15 +580,32 @@ export class QQStreamingController {
       } else {
         logger.warn(
           { openid: this.openid, resp },
-          'QQ stream API returned no id',
+          'QQ stream API returned no id; delivery outcome is uncertain',
+        );
+        this.uncertainStartError = new Error(
+          'QQ stream API returned no provider receipt',
         );
       }
     } catch (err: any) {
+      const definitivelyRejected = this.onDefinitiveRejection?.(err) === true;
       logger.warn(
-        { err: err.message, openid: this.openid },
-        'QQ streaming start failed',
+        {
+          err: err.message,
+          openid: this.openid,
+          outcome: definitivelyRejected ? 'rejected' : 'uncertain',
+        },
+        definitivelyRejected
+          ? 'QQ streaming start was definitively rejected'
+          : 'QQ streaming start failed with an uncertain outcome',
       );
-      // Stay in idle, will retry or fallback
+      if (definitivelyRejected) {
+        this.definitiveStartRejection = true;
+        this.definitiveStartError = err;
+      } else {
+        // Reusing the same (msg_id,msg_seq) or sending a plain fallback could
+        // duplicate a stream the provider accepted before its ACK was lost.
+        this.uncertainStartError = err;
+      }
     }
   }
 
@@ -570,24 +627,19 @@ export class QQStreamingController {
     this.sentChunkCount++;
   }
 
-  private async tryFallback(text: string): Promise<void> {
-    if (this.fallbackUsed) return;
-    this.fallbackUsed = true;
-    try {
-      await this.fallbackSend(text);
-    } catch (err: any) {
-      logger.warn({ err: err.message }, 'QQ streaming fallback send also failed');
-    }
-  }
-
   private clearTimers(): void {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
-    if (this.auxFlushTimer) {
-      clearTimeout(this.auxFlushTimer);
-      this.auxFlushTimer = null;
-    }
+  }
+
+  private acceptsStreamingUpdates(): boolean {
+    return (
+      (this.state === 'idle' || this.state === 'streaming') &&
+      !this.definitiveStartRejection &&
+      this.uncertainStartError === undefined &&
+      this.terminalDeliveryError === undefined
+    );
   }
 }

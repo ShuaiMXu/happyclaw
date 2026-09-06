@@ -3,6 +3,24 @@ import type { MessageCursor } from './types.js';
 export interface CursorOrderedMessage {
   timestamp: string;
   id: string;
+  ingest_sequence?: number;
+  sequence?: number;
+}
+
+function compareCursorOrder(
+  message: CursorOrderedMessage,
+  cursor: MessageCursor,
+): number {
+  if (
+    (message.ingest_sequence !== undefined || message.sequence !== undefined) &&
+    cursor.sequence !== undefined
+  ) {
+    return (message.ingest_sequence ?? message.sequence!) - cursor.sequence;
+  }
+  if (message.timestamp !== cursor.timestamp) {
+    return message.timestamp < cursor.timestamp ? -1 : 1;
+  }
+  return message.id.localeCompare(cursor.id);
 }
 
 /** True when DB recovery still contains work ordered before an out-of-band
@@ -12,15 +30,14 @@ export function hasEarlierCursorMessage(
   pending: CursorOrderedMessage[],
   candidate: MessageCursor,
 ): boolean {
-  return pending.some((message) => {
-    if (message.timestamp < candidate.timestamp) return true;
-    return (
-      message.timestamp === candidate.timestamp && message.id < candidate.id
-    );
-  });
+  return pending.some((message) => compareCursorOrder(message, candidate) < 0);
 }
 
 function cursorKey(cursor: CursorOrderedMessage): string {
+  const sequence = cursor.ingest_sequence ?? cursor.sequence;
+  if (sequence !== undefined) {
+    return `sequence:${sequence}`;
+  }
   return `${cursor.timestamp}\u0000${cursor.id}`;
 }
 
@@ -35,9 +52,7 @@ export function hasUncoveredCursorMessageThrough(
 ): boolean {
   const coveredKeys = new Set(covered.map(cursorKey));
   return pending.some((message) => {
-    const isThroughTerminal =
-      message.timestamp < terminal.timestamp ||
-      (message.timestamp === terminal.timestamp && message.id <= terminal.id);
+    const isThroughTerminal = compareCursorOrder(message, terminal) <= 0;
     return isThroughTerminal && !coveredKeys.has(cursorKey(message));
   });
 }
@@ -48,16 +63,21 @@ export class DeferredOutOfBandCursorLedger {
   defer(jid: string, cursor: MessageCursor): void {
     const cursors = this.entries.get(jid) ?? [];
     if (
-      !cursors.some(
-        (item) => item.timestamp === cursor.timestamp && item.id === cursor.id,
+      !cursors.some((item) =>
+        item.sequence !== undefined && cursor.sequence !== undefined
+          ? item.sequence === cursor.sequence
+          : item.timestamp === cursor.timestamp && item.id === cursor.id,
       )
     ) {
       cursors.push(cursor);
-      cursors.sort((a, b) =>
-        a.timestamp === b.timestamp
+      cursors.sort((a, b) => {
+        if (a.sequence !== undefined && b.sequence !== undefined) {
+          return a.sequence - b.sequence;
+        }
+        return a.timestamp === b.timestamp
           ? a.id.localeCompare(b.id)
-          : a.timestamp.localeCompare(b.timestamp),
-      );
+          : a.timestamp.localeCompare(b.timestamp);
+      });
       this.entries.set(jid, cursors);
     }
   }

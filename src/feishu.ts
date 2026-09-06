@@ -1,9 +1,14 @@
-import fs from 'fs';
 import { randomUUID } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import {
+  cancelAwaitingForwardBundleRoot,
+  findForwardBundleCommentTail,
+  findForwardBundleCoveringComment,
+  getForwardBundleRootMaterial,
+  releaseAwaitingForwardBundleRoot,
+  sequenceInboundTimestampAfterChatTail,
   storeChatMetadata,
   storeMessageDirect,
   updateChatName,
@@ -17,17 +22,12 @@ import {
   FileTooLargeError,
 } from './im-downloader.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastFollowUpUpdate, broadcastNewMessage } from './web.js';
 import { detectImageMimeType } from './image-detector.js';
-import {
-  resolveJidByMessageId,
-  getStreamingSession,
-} from './feishu-streaming-card.js';
+import { resolveJidByMessageId } from './feishu-streaming-card.js';
 import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 import {
   buildAgentReplyCard,
   buildFollowUpActionResultCard,
-  buildQueuedFollowUpCard,
 } from './feishu-cards/builder.js';
 import {
   evaluateMentionGate,
@@ -35,19 +35,35 @@ import {
   stripLeadingBotMention,
   type MentionGateMention,
 } from './feishu-mention-gate.js';
-import { resolveAdmittedChannelRoute } from './channel-admission.js';
 import {
-  extractProviderTarget,
-  parseChannelAddress,
-  scopeChannelJid,
-} from './channel-address.js';
+  resolveAdmittedChannelRoute,
+  ChannelRouteRejectedError,
+} from './channel-admission.js';
+import { parseChannelAddress, scopeChannelJid } from './channel-address.js';
 import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import {
+  isRuntimeControlLike,
+  parseRuntimeControl,
+} from './follow-up-policy.js';
+import {
+  definitiveFeishuHttpRejection,
+  DefinitiveFeishuCapabilityError,
   executeFeishuCapability,
+  withFeishuPreAcceptanceRetry,
   type FeishuCapabilityRequest,
   type FeishuCapabilityResult,
 } from './feishu-capability.js';
+import { DefinitiveChannelDeliveryError } from './channel-outbox-delivery.js';
+import {
+  PartialChannelDeliveryError,
+  PhysicalDeliveryTracker,
+} from './im-delivery-progress.js';
+import { preAcceptImDeliveryError } from './im-send-retry-policy.js';
 import { enrichFeishuInboundContent } from './feishu-rich-content.js';
+import {
+  FeishuForwardBundleResolver,
+  type FeishuForwardCandidate,
+} from './feishu-forward-bundle.js';
 import {
   advanceChannelCursor,
   claimChannelInboxById,
@@ -55,6 +71,7 @@ import {
   completeChannelInbox,
   failChannelInbox,
   getChannelCursor,
+  ignoreDeferredChannelInbox,
   ignoreChannelInbox,
   listChannelCursors,
   recordChannelInbox,
@@ -67,6 +84,7 @@ import {
   processingIndicatorKey,
 } from './processing-indicator.js';
 import type {
+  ChannelContentLink,
   ChannelReferencedMessage,
   ChannelTurnContext,
   FeishuMessageMeta,
@@ -75,6 +93,11 @@ import type {
   FollowUpDisposition,
   FollowUpMode,
 } from './types.js';
+
+// All live/recovery connections in this process share the same per-account,
+// per-chat intake lane. This closes the common HA/reconnect race where one
+// connection handles the root while another handles its authored note.
+const feishuInboundTailByRoute = new Map<string, Promise<void>>();
 
 // ─── FeishuConnection Interface ────────────────────────────────
 
@@ -92,6 +115,8 @@ interface FeishuFileInfo {
 }
 
 export interface ConnectOptions {
+  /** Explicit binding guard, checked before commands, reactions or downloads. */
+  isChatBound?: (chatJid: string) => boolean;
   onReady: () => void;
   /** 收到消息后调用，让调用方自动注册未知的飞书聊天 */
   onNewChat?: (chatJid: string, chatName: string) => void;
@@ -121,6 +146,8 @@ export interface ConnectOptions {
   } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onMessagePersisted?: import('./channel-contracts.js').OnChannelMessagePersisted;
+  onFollowUpsChanged?: import('./channel-contracts.js').OnChannelFollowUpsChanged;
   /** Decide whether an inbound message starts now, queues, or steers. */
   onFollowUpMessage?: (input: {
     targetJid: string;
@@ -128,9 +155,20 @@ export interface ConnectOptions {
     messageId: string;
     senderImId: string;
     requestedMode?: FollowUpMode;
-    repliedToActiveCard: boolean;
+    coalesceBundleId?: string;
   }) => FollowUpDisposition;
-  /** Handle buttons on the compact queued-message card. */
+  /** Execute an exact, structurally authorized Feishu `/break` command. */
+  onSessionBreak?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
+  onSessionClear?: (input: {
+    sourceJid: string;
+    targetJid?: string;
+    senderImId: string;
+  }) => Promise<string>;
+  /** Handle buttons from legacy queued-message cards sent by older versions. */
   onFollowUpCardAction?: (input: {
     sourceJid: string;
     targetJid: string;
@@ -161,7 +199,7 @@ export interface ConnectOptions {
   ) => FollowUpActionResult;
   /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
   onP2pSender?: (senderOpenId: string) => void;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
   /** Recovery gate: durable Inbox remains replayable instead of ignored. */
   shouldDeferInbound?: () => boolean;
 }
@@ -192,6 +230,8 @@ export interface FeishuConnection {
     fileName?: string,
   ): Promise<void>;
   sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
+  /** Add the "OnIt" reaction for the one message that owns an active batch. */
+  beginAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   /** Clear the "OnIt" ack reaction owned by one exact inbound input. */
   clearAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
@@ -215,12 +255,25 @@ const FEISHU_WS_READY_STATE_OPEN = 1;
 const WS_HEALTH_CHECK_INTERVAL_MS = 15_000;
 const WS_RECONNECT_CHECK_THRESHOLD = 4;
 const WS_RECONNECT_MIN_INTERVAL_MS = 30_000;
+// Enable the lark SDK's ping/pong liveness watchdog. After the SDK sends a
+// keepalive ping it waits this many seconds for a pong (or any inbound frame);
+// if none arrives the socket is terminated so the normal reconnect flow runs.
+// Without it, a silently half-dead connection keeps readyState === OPEN forever
+// and the readyState-based health check never reconnects — the bot goes quiet
+// with no error until the process is restarted. Any inbound frame clears the
+// watchdog, so healthy idle connections are never terminated.
+const FEISHU_WS_PING_TIMEOUT_SEC = 10;
 const BACKFILL_LOOKBACK_MS = 5 * 60 * 1000;
 const BACKFILL_PAGE_SIZE = 50;
 const BACKFILL_MAX_PAGES_PER_CHAT = 5;
 const FEISHU_INBOX_LEASE_MS = 5 * 60 * 1000;
 const FEISHU_INBOX_HEARTBEAT_MS = 60 * 1000;
 const FEISHU_INBOX_RETRY_DELAY_MS = 5_000;
+const FEISHU_FORWARD_COMPANION_GRACE_MS = 3_000;
+const FEISHU_FORWARD_CONTENT_REQUEST_TIMEOUT_MS = 3_000;
+const FEISHU_FORWARD_CONTENT_TOTAL_TIMEOUT_MS = 5_000;
+const FEISHU_FORWARD_MATERIAL_RETRY_DELAY_MS = 2_000;
+const FEISHU_FORWARD_MATERIAL_MAX_ATTEMPTS = 4;
 const FEISHU_INBOX_GATE_RETRY_DELAY_MS = 250;
 const FEISHU_INBOX_RECOVERY_LIMIT = 500;
 const FEISHU_RESOURCE_REQUEST_TIMEOUT_MS = 15_000;
@@ -237,6 +290,7 @@ const FEISHU_RESOURCE_STREAM_TIMEOUT_MS = 30_000;
 // the promise and the outbox claim hanging past it.
 const FEISHU_CLIENT_HTTP_TIMEOUT_MS = 60_000;
 let feishuClientHttpTimeoutApplied = false;
+const FEISHU_ACK_REACTION_TIMEOUT_MS = 10_000;
 const FEISHU_CURSOR_SCOPE = 'chat_messages';
 // 启动期 bot info 拉取的最大重试次数（指数退避 1s/2s/4s）
 const BOT_INFO_FETCH_MAX_ATTEMPTS = 4;
@@ -274,6 +328,34 @@ class FeishuApiRejectedError extends Error {
     super(message);
     this.name = 'FeishuApiRejectedError';
   }
+}
+
+/**
+ * Convert an authoritative Feishu rejection into the durable Outbox's
+ * definitive-failure signal. The Lark SDK rejects HTTP 4xx responses as
+ * Axios errors before the normal response-envelope assertion can inspect
+ * their code/message, so both shapes must be recognized here.
+ */
+function definitiveFeishuChannelDeliveryError(
+  error: unknown,
+): DefinitiveChannelDeliveryError | null {
+  if (error instanceof DefinitiveChannelDeliveryError) return error;
+  const rejection =
+    error instanceof FeishuApiRejectedError
+      ? error
+      : definitiveFeishuHttpRejection(error);
+  if (!rejection) return null;
+
+  const retryAfterMs =
+    rejection instanceof DefinitiveFeishuCapabilityError
+      ? rejection.retryAfterMs
+      : undefined;
+  return new DefinitiveChannelDeliveryError(rejection.message, {
+    cause: rejection,
+    ...(retryAfterMs === undefined
+      ? {}
+      : { retryAt: new Date(Date.now() + retryAfterMs).toISOString() }),
+  });
 }
 
 type FeishuSlashCommandCheckpoint =
@@ -448,6 +530,7 @@ export function buildFeishuChannelTurnContext(input: {
     parentId?: string;
     threadId?: string;
     type?: string;
+    contentLink?: ChannelContentLink;
     referencedMessages?: ChannelReferencedMessage[];
   };
   sender?: {
@@ -506,6 +589,9 @@ export function buildFeishuChannelTurnContext(input: {
       ...(input.message.parentId ? { parentId: input.message.parentId } : {}),
       ...(input.message.threadId ? { threadId: input.message.threadId } : {}),
       ...(input.message.type ? { type: input.message.type } : {}),
+      ...(input.message.contentLink
+        ? { contentLink: input.message.contentLink }
+        : {}),
       ...(input.message.referencedMessages?.length
         ? { referencedMessages: input.message.referencedMessages }
         : {}),
@@ -615,9 +701,22 @@ function assertFeishuApiSuccess(operation: string, response: unknown): void {
     throw new Error(`${operation} returned no acknowledgement`);
   }
   const result = response as { code?: number; msg?: string };
+  // Message create/reply use the regular Feishu response envelope. Require an
+  // explicit success code so malformed or partial acknowledgements can never
+  // make the durable outbox believe an unsent message was delivered. Upload
+  // endpoints have a separate unwrapped-payload contract below.
+  if (typeof result.code !== 'number') {
+    throw new Error(
+      `${operation} acknowledgement is missing an explicit success code (code=${String(result.code)})`,
+    );
+  }
   if (result.code !== 0) {
+    logger.error(
+      { operation, response },
+      'Feishu API acknowledgement did not contain an explicit success code',
+    );
     throw new FeishuApiRejectedError(
-      `${operation} failed (code=${result.code ?? 'unknown'}, msg=${result.msg || 'unknown'})`,
+      `${operation} failed (code=${result.code}, msg=${result.msg || 'unknown'})`,
     );
   }
 }
@@ -666,7 +765,7 @@ function requireFeishuUploadKey(
     data?: { image_key?: string; file_key?: string };
   };
   if (typeof result.code === 'number' && result.code !== 0) {
-    throw new Error(
+    throw new FeishuApiRejectedError(
       `${operation} failed (code=${result.code}, msg=${result.msg || 'unknown'})`,
     );
   }
@@ -675,6 +774,26 @@ function requireFeishuUploadKey(
     throw new Error(`${operation} returned no ${key}`);
   }
   return uploadKey;
+}
+
+/**
+ * Uploads and local file reads happen before their corresponding visible
+ * message mutation. A lost upload ACK can waste an upload when retried, but it
+ * cannot duplicate a user-visible message. Preserve authoritative provider
+ * rejections; classify every other failure at this stage as pre-acceptance.
+ */
+function preVisibleFeishuDeliveryError(
+  operation: string,
+  error: unknown,
+): Error {
+  const detail = error instanceof Error ? `: ${error.message}` : '';
+  return (
+    definitiveFeishuChannelDeliveryError(error) ??
+    preAcceptImDeliveryError(
+      `${operation} failed before a visible Feishu message was sent${detail}`,
+      error,
+    )
+  );
 }
 
 export function buildFeishuRouteTarget(
@@ -716,6 +835,16 @@ function feishuRouteToJid(
  * Extract message content from Feishu message.
  * Returns text content, optional image keys, and optional file infos for download.
  */
+function unwrapFeishuParagraphText(text: string): string {
+  const trimmed = text.trim();
+  if (!/^<p>[\s\S]*<\/p>$/i.test(trimmed)) return text;
+  return trimmed
+    .replace(/^<p>/i, '')
+    .replace(/<\/p>\s*<p>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>$/i, '');
+}
+
 function extractMessageContent(
   messageType: string,
   content: string,
@@ -1164,6 +1293,13 @@ export function createFeishuConnection(
   let disconnectedChecks = 0;
   let healthTimer: NodeJS.Timeout | null = null;
   let inboxRecoveryTimer: NodeJS.Timeout | null = null;
+  const forwardBundles = new FeishuForwardBundleResolver(async (messageId) => {
+    if (!client) return undefined;
+    return client.im.v1.message.get({
+      path: { message_id: messageId },
+      params: { card_msg_content_type: 'user_card_content' },
+    });
+  });
   // botOpenId 自愈状态：lastBotInfoFetchAt 防止 lazy refetch 高频骚扰 OAPI；
   // botInfoRefetchInFlight 防止并发拉取
   let lastBotInfoFetchAt = 0;
@@ -1171,6 +1307,38 @@ export function createFeishuConnection(
   // mention gate fail-closed 的 warn 节流：避免 botOpenId 长时间缺失时日志洪水
   let lastBotInfoMissingWarnAt = 0;
   let botInfoMissingDroppedSinceLastWarn = 0;
+
+  async function serializeInboundForChat(
+    chatId: string,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const routeKey = `${reliabilityAccountId}\u0000${chatId}`;
+    const previous =
+      feishuInboundTailByRoute.get(routeKey) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    feishuInboundTailByRoute.set(routeKey, current);
+    try {
+      await current;
+    } finally {
+      if (feishuInboundTailByRoute.get(routeKey) === current) {
+        feishuInboundTailByRoute.delete(routeKey);
+      }
+    }
+  }
+
+  async function processClaimedInboundSerialized(
+    payload: IncomingMessagePayload,
+    source: 'ws' | 'backfill',
+    claim: ClaimedChannelInboxItem,
+  ): Promise<void> {
+    // Claims may wait behind rich-content work from an earlier physical event.
+    // Begin renewal before entering that shared lane so the DB lease remains
+    // fenced for the whole wait.
+    startInboxHeartbeat(claim);
+    await serializeInboundForChat(payload.chatId, () =>
+      processClaimedIncomingMessage(payload, source, claim),
+    );
+  }
 
   function rememberChatProgress(
     chatId: string,
@@ -1625,17 +1793,41 @@ export function createFeishuConnection(
     return senderNameCache.get(openId) || openId;
   }
 
+  function withAckReactionTimeout<T>(
+    operation: 'add' | 'remove',
+    request: Promise<T>,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`Feishu ${operation} reaction timed out`)),
+        FEISHU_ACK_REACTION_TIMEOUT_MS,
+      );
+      timer.unref();
+      request.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
   async function addReaction(
     messageId: string,
     emojiType: string,
   ): Promise<string | null> {
     try {
-      const res = (await client!.im.messageReaction.create({
+      const request = client!.im.messageReaction.create({
         path: { message_id: messageId },
-        data: {
-          reaction_type: { emoji_type: emojiType },
-        },
-      })) as { data?: { reaction_id?: string } };
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+      const res = (await withAckReactionTimeout('add', request)) as {
+        data?: { reaction_id?: string };
+      };
       return res.data?.reaction_id || null;
     } catch (err) {
       logger.debug({ err, messageId, emojiType }, 'Failed to add reaction');
@@ -1647,9 +1839,10 @@ export function createFeishuConnection(
     messageId: string,
     reactionId: string,
   ): Promise<void> {
-    await client!.im.messageReaction.delete({
+    const request = client!.im.messageReaction.delete({
       path: { message_id: messageId, reaction_id: reactionId },
     });
+    await withAckReactionTimeout('remove', request);
   }
 
   function clearAckForInput(
@@ -1659,6 +1852,22 @@ export function createFeishuConnection(
     const target = parseFeishuRouteTarget(rawTarget);
     return ackReactions.clear(
       processingIndicatorKey(target.raw, inputMessageId),
+    );
+  }
+
+  function beginAckForInput(
+    rawTarget: string,
+    inputMessageId: string,
+  ): Promise<void> {
+    const target = parseFeishuRouteTarget(rawTarget);
+    return ackReactions.attach(
+      processingIndicatorKey(target.raw, inputMessageId),
+      async () => {
+        const reactionId = await addReaction(inputMessageId, 'OnIt');
+        return reactionId ? { messageId: inputMessageId, reactionId } : null;
+      },
+      ({ messageId, reactionId }) =>
+        removeReactionStrict(messageId, reactionId),
     );
   }
 
@@ -1719,30 +1928,44 @@ export function createFeishuConnection(
     msgType: string,
     content: string,
   ): Promise<void> {
-    if (!client) throw new Error('Feishu client is not initialized');
-    const target = requireFeishuRouteTarget(chatId);
-    const receiveIdType = target.chatId.startsWith('oc_')
-      ? 'chat_id'
-      : 'open_id';
-    const replyMsgId = target.rootMessageId || p2pLastMessageId(target);
-    if (replyMsgId) {
-      await replyToFeishuMessage(
-        replyMsgId,
-        msgType,
-        content,
-        target.replyInThread,
-      );
-    } else {
-      const response = await client.im.v1.message.create({
-        params: { receive_id_type: receiveIdType },
-        data: {
-          receive_id: target.chatId,
-          msg_type: msgType,
-          content,
+    await withFeishuPreAcceptanceRetry(
+      async () => {
+        if (!client) {
+          throw preAcceptImDeliveryError('Feishu client is not initialized');
+        }
+        const target = requireFeishuRouteTarget(chatId);
+        const receiveIdType = target.chatId.startsWith('oc_')
+          ? 'chat_id'
+          : 'open_id';
+        const replyMsgId = target.rootMessageId || p2pLastMessageId(target);
+        if (replyMsgId) {
+          await replyToFeishuMessage(
+            replyMsgId,
+            msgType,
+            content,
+            target.replyInThread,
+          );
+        } else {
+          const response = await client.im.v1.message.create({
+            params: { receive_id_type: receiveIdType },
+            data: {
+              receive_id: target.chatId,
+              msg_type: msgType,
+              content,
+            },
+          });
+          assertFeishuApiSuccess('Feishu message.create', response);
+        }
+      },
+      {
+        onRetry: ({ attempt, nextAttempt, delayMs, error }) => {
+          logger.warn(
+            { chatId, msgType, attempt, nextAttempt, delayMs, err: error },
+            'Feishu request failed before send; retrying safely',
+          );
         },
-      });
-      assertFeishuApiSuccess('Feishu message.create', response);
-    }
+      },
+    );
   }
 
   async function sendTextToChat(chatId: string, text: string): Promise<void> {
@@ -1760,12 +1983,13 @@ export function createFeishuConnection(
       );
     } catch (err) {
       logger.error({ chatId, err }, 'Failed to send Feishu text reply');
+      const rejected = definitiveFeishuChannelDeliveryError(err);
       throw new FeishuTextDeliveryError(
         `Feishu text reply was not acknowledged: ${
           err instanceof Error ? err.message : String(err)
         }`,
-        err instanceof FeishuApiRejectedError ? 'rejected' : 'uncertain',
-        err,
+        rejected ? 'rejected' : 'uncertain',
+        rejected ?? err,
       );
     }
   }
@@ -1827,7 +2051,7 @@ export function createFeishuConnection(
       );
       return;
     }
-    await processClaimedIncomingMessage(payload, source, claim);
+    await processClaimedInboundSerialized(payload, source, claim);
   }
 
   async function processClaimedIncomingMessage(
@@ -1835,7 +2059,6 @@ export function createFeishuConnection(
     source: 'ws' | 'backfill',
     claim: ClaimedChannelInboxItem,
   ): Promise<void> {
-    startInboxHeartbeat(claim);
     if (connectOptions?.shouldDeferInbound?.()) {
       failClaimedInbound(
         claim,
@@ -1856,7 +2079,11 @@ export function createFeishuConnection(
       resolveGroupFolder,
       resolveEffectiveChatJid,
       onAgentMessage,
+      onMessagePersisted,
+      onFollowUpsChanged,
       onFollowUpMessage,
+      onSessionBreak,
+      onSessionClear,
       shouldProcessGroupMessage,
       resolveFeishuConversationPlan,
       isGroupOwnerMessage,
@@ -1881,6 +2108,22 @@ export function createFeishuConnection(
       senderTenantKey,
       senderType,
     } = payload;
+    const forwardCandidate: FeishuForwardCandidate = {
+      messageId,
+      messageType,
+      content: rawContent,
+      rootId,
+      parentId,
+      threadId,
+      senderOpenId,
+      createTimeMs,
+      chatType:
+        chatType === 'p2p' || chatType === 'group' ? chatType : undefined,
+    };
+    // Register roots before any rich-content lookup. A concurrently delivered
+    // note may otherwise finish normalization first and miss the structural
+    // fact even though both provider events are already in this process.
+    let contentLink = forwardBundles.observeRoot(forwardCandidate);
     if (!chatId || !messageId) {
       failClaimedInbound(
         claim,
@@ -1942,6 +2185,16 @@ export function createFeishuConnection(
         chatJid,
         rawMessageMeta,
       );
+      const routedMessageMeta: FeishuMessageMeta = {
+        ...rawMessageMeta,
+        nativeContextType:
+          conversationPlan?.independentContext ||
+          (!conversationPlan && !!threadId)
+            ? 'thread'
+            : undefined,
+        contextId: conversationPlan?.contextId || threadId,
+        rootId: conversationPlan?.rootMessageId || rootId,
+      };
       const rootMessageId =
         conversationPlan?.rootMessageId || rootId || messageId;
       const deliveryRootMessageId = conversationPlan?.independentContext
@@ -1966,7 +2219,11 @@ export function createFeishuConnection(
         isSenderAllowedInGroup &&
         !isSenderAllowedInGroup(chatJid, senderOpenId)
       ) {
-        if (chatType === 'group' && mentionedBot) {
+        if (
+          chatType === 'group' &&
+          mentionedBot &&
+          (!connectOptions?.isChatBound || connectOptions.isChatBound(chatJid))
+        ) {
           addReaction(messageId, 'SILENT').catch(() => {});
         }
         logger.debug(
@@ -1977,31 +2234,64 @@ export function createFeishuConnection(
         return;
       }
 
-      // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
-      // 群聊中 @机器人 后跟斜杠命令，mention 替换后文本为 "@botname /cmd"，
-      // 需要先 strip 掉开头的 @mention 前缀再匹配
-      let textForSlash = text?.trim().replace(/^@\S+\s+/, '') ?? '';
-      let requestedFollowUpMode: FollowUpMode | undefined;
-      const followUpModeMatch = textForSlash.match(
-        /^\/(queue|steer)(?:\s+([\s\S]+))?$/i,
-      );
-      if (followUpModeMatch) {
-        const modeContent = followUpModeMatch[2]?.trim();
-        if (!modeContent) {
-          await sendTextToChat(
-            messageRouteTarget.raw,
-            `请在 /${followUpModeMatch[1].toLowerCase()} 后输入消息内容。`,
-          );
-          completeClaimedInbound(claim, payload);
+      // Discovery makes a chat available in the binding UI; it does not
+      // authorize a reply. Apply this before all command/reaction side effects.
+      if (connectOptions?.isChatBound && !connectOptions.isChatBound(chatJid)) {
+        if (chatType === 'p2p') {
+          onNewChat?.(chatJid, resolvedChatName);
+          if (senderOpenId && onP2pSender) onP2pSender(senderOpenId);
+        }
+        if (!connectOptions.isChatBound(chatJid)) {
+          ignoreClaimedInbound(claim, payload, 'unbound_channel');
           return;
         }
-        requestedFollowUpMode =
-          followUpModeMatch[1].toLowerCase() === 'steer' ? 'steer' : 'queue';
-        text = modeContent;
-        textForSlash = modeContent;
+      }
+
+      // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
+      // 只有飞书结构化 mentions 证明了真实 Bot 点名，才移除开头的展示名。
+      // 用户手写的同名字面 `@Bot` 不能获得 /steer 或 /break 控制能力。
+      let textForSlash =
+        chatType === 'group'
+          ? stripLeadingBotMention(
+              text ?? '',
+              botOpenId,
+              mentions as MentionGateMention[] | undefined,
+            ).trim()
+          : (text?.trim() ?? '');
+      let requestedFollowUpMode: FollowUpMode | undefined;
+      const runtimeControlGate = evaluateMentionGate({
+        chatType: normalizedChatType,
+        botOpenId,
+        mentions: mentions as MentionGateMention[] | undefined,
+        chatJid,
+        senderOpenId,
+        shouldProcessGroupMessage,
+        isGroupOwnerMessage,
+        conversationPlan,
+      });
+      const runtimeControl = parseRuntimeControl({
+        commandText: textForSlash,
+        eligible:
+          chatType !== 'group' || (mentionedBot && runtimeControlGate.allow),
+        hasAttachments:
+          Boolean(extracted.imageKeys?.length) ||
+          Boolean(extracted.fileInfos?.length) ||
+          (messageType !== 'text' && messageType !== 'post'),
+      });
+      if (runtimeControl?.kind === 'steer') {
+        requestedFollowUpMode = 'steer';
+        text = runtimeControl.text;
+        textForSlash = runtimeControl.text;
       }
       const slashMatch = textForSlash.match(/^\/(\S+)(.*)$/);
-      if (slashMatch && onCommand && !requestedFollowUpMode) {
+      const runtimeControlLike = isRuntimeControlLike(textForSlash);
+      if (
+        slashMatch &&
+        !requestedFollowUpMode &&
+        (runtimeControl?.kind === 'break' ||
+          runtimeControl?.kind === 'clear' ||
+          (onCommand && !runtimeControlLike))
+      ) {
         const cmdBody = (slashMatch[1] + slashMatch[2]).trim();
         const persistedCommand = parseFeishuSlashCommandCheckpoint(
           claim.normalizedPayload,
@@ -2092,7 +2382,51 @@ export function createFeishuConnection(
               );
               return;
             }
-            reply = await onCommand(chatJid, cmdBody, senderOpenId, mentions);
+            if (
+              runtimeControl?.kind === 'break' ||
+              runtimeControl?.kind === 'clear'
+            ) {
+              let targetJid: string | undefined;
+              // Group routes are already registered and may carry a native
+              // thread/topic target. A first-contact P2P route is deliberately
+              // left for the host fallback so command handling never bypasses
+              // the normal P2P bootstrap below.
+              if (chatType === 'group' && resolveEffectiveChatJid) {
+                try {
+                  targetJid = resolveEffectiveChatJid(
+                    chatJid,
+                    routedMessageMeta,
+                  )?.effectiveJid;
+                } catch (error) {
+                  if (!(error instanceof ChannelRouteRejectedError))
+                    throw error;
+                }
+              }
+              if (runtimeControl?.kind === 'break') {
+                reply = onSessionBreak
+                  ? await onSessionBreak({
+                      sourceJid: chatJid,
+                      targetJid,
+                      senderImId: senderOpenId,
+                    })
+                  : '当前运行环境不支持 /break。';
+              } else {
+                reply = onSessionClear
+                  ? await onSessionClear({
+                      sourceJid: chatJid,
+                      targetJid,
+                      senderImId: senderOpenId,
+                    })
+                  : '当前运行环境不支持 /clear。';
+              }
+            } else {
+              reply = await onCommand!(
+                chatJid,
+                cmdBody,
+                senderOpenId,
+                mentions,
+              );
+            }
             replyTarget = messageRouteTarget.raw;
             if (reply) {
               const pendingReply: FeishuSlashCommandCheckpoint = {
@@ -2344,69 +2678,155 @@ export function createFeishuConnection(
       // onNewChat/onP2pSender are idempotent no-ops once already
       // registered, so calling them again in their normal position below
       // is safe and keeps this bootstrap narrowly scoped to P2P.
-      if (
-        chatType === 'p2p' &&
-        resolveEffectiveChatJid &&
-        !resolveEffectiveChatJid(chatJid)
-      ) {
-        onNewChat?.(chatJid, resolvedChatName);
-        if (senderOpenId && onP2pSender) {
-          onP2pSender(senderOpenId);
+      //
+      // resolveEffectiveChatJid is wrapped per-account by im-manager, which
+      // throws ChannelRouteRejectedError instead of returning null for an
+      // unbound chat (see im-manager.ts). A bare `!resolveEffectiveChatJid(...)`
+      // check never observes that falsy case — the throw unwinds straight to
+      // the outer catch below, onNewChat never runs, and the chat can never
+      // register. Treat that specific rejection the same as a null return.
+      if (chatType === 'p2p' && resolveEffectiveChatJid) {
+        let alreadyBound = false;
+        try {
+          alreadyBound = !!resolveEffectiveChatJid(chatJid);
+        } catch (err) {
+          if (!(err instanceof ChannelRouteRejectedError)) throw err;
+        }
+        if (!alreadyBound) {
+          onNewChat?.(chatJid, resolvedChatName);
+          if (senderOpenId && onP2pSender) {
+            onP2pSender(senderOpenId);
+          }
         }
       }
 
-      const admittedRoute = resolveAdmittedChannelRoute<FeishuMessageMeta>(
-        chatJid,
-        resolveEffectiveChatJid,
-        {
-          provider: 'feishu',
-          chatType: normalizedChatType,
-          mentionedBot,
-          nativeContextType:
-            conversationPlan?.independentContext ||
-            (!conversationPlan && !!threadId)
-              ? 'thread'
-              : undefined,
-          contextId: conversationPlan?.contextId || threadId,
-          threadId,
-          rootId: conversationPlan?.rootMessageId || rootId,
-          parentId,
-          messageId,
-          text,
-        },
-      );
+      const admittedRoute = (() => {
+        try {
+          return resolveAdmittedChannelRoute<FeishuMessageMeta>(
+            chatJid,
+            resolveEffectiveChatJid,
+            { ...routedMessageMeta, text },
+          );
+        } catch (err) {
+          if (err instanceof ChannelRouteRejectedError) return null;
+          throw err;
+        }
+      })();
       if (!admittedRoute) {
         logger.warn(
           { chatJid, messageId, source },
-          'Feishu binding resolver rejected route; dropping message',
+          'Feishu binding resolver rejected route; ignoring without retry',
         );
         ignoreClaimedInbound(claim, payload, 'binding_rejected');
         return;
       }
       const agentRouting = admittedRoute.routing;
 
+      // Known commands and rejected messages returned above. Only an admitted
+      // textual direct child may spend a message.get lookup to prove that its
+      // root is a merge_forward from the same sender.
+      if (!contentLink) {
+        contentLink = await forwardBundles.resolveCompanion(forwardCandidate);
+      }
+
+      const cachedForwardRootMaterial =
+        contentLink?.kind === 'forward_bundle'
+          ? getForwardBundleRootMaterial(
+              admittedRoute.targetJid,
+              contentLink.bundleId,
+              senderOpenId,
+            )
+          : null;
+      const reuseCurrentForwardRoot =
+        contentLink?.role === 'forwarded_content' &&
+        claim.attempt > 1 &&
+        cachedForwardRootMaterial !== null;
+      if (cachedForwardRootMaterial) {
+        logger.info(
+          {
+            messageId,
+            bundleId: contentLink?.bundleId,
+            role: contentLink?.role,
+            source: 'database',
+          },
+          'Reused durable merged-forward material',
+        );
+      }
+
       // Event payloads intentionally contain only a lossy placeholder for
       // cards and merged forwards. Resolve their complete user-facing content
       // and bounded quoted context only after audience, mention and binding
       // admission, so rejected messages cannot consume tenant API quota.
-      const enriched = await enrichFeishuInboundContent({
-        client: client as unknown as Parameters<
-          typeof enrichFeishuInboundContent
-        >[0]['client'],
-        messageId,
-        messageType,
-        fallbackText: text,
-        fallbackImageKeys: extracted.imageKeys,
-        parentId,
-        nativeRootId: rootId,
-        threadId,
-        // A native thread already has durable SDK history, so one explicit
-        // parent is enough to preserve reply semantics. Ordinary reply chains
-        // may start a new logical session and need bounded ancestor metadata.
-        limits: threadId ? { maxReferenceDepth: 1 } : undefined,
-        parseContent: (type, content) => extractMessageContent(type, content),
-      });
+      let enriched: Awaited<ReturnType<typeof enrichFeishuInboundContent>>;
+      if (reuseCurrentForwardRoot) {
+        enriched = {
+          text: cachedForwardRootMaterial.content,
+          richMessageResolved: true,
+          referencedMessages: 0,
+          currentMaterialResolved: true,
+        };
+      } else {
+        enriched = await enrichFeishuInboundContent({
+          client: client as unknown as Parameters<
+            typeof enrichFeishuInboundContent
+          >[0]['client'],
+          messageId,
+          messageType,
+          fallbackText: text,
+          fallbackImageKeys: extracted.imageKeys,
+          parentId,
+          nativeRootId: rootId,
+          threadId,
+          // A cached root is already a complete durable reference. Avoid a
+          // second provider read whose timeout used to split one forward.
+          limits: {
+            ...(contentLink?.role === 'forwarder_comment' &&
+            cachedForwardRootMaterial
+              ? { maxReferenceDepth: 0 }
+              : threadId
+                ? { maxReferenceDepth: 1 }
+                : {}),
+            ...(messageType === 'merge_forward' ||
+            (contentLink?.kind === 'forward_bundle' &&
+              contentLink.role === 'forwarder_comment' &&
+              !cachedForwardRootMaterial)
+              ? {
+                  requestTimeoutMs: FEISHU_FORWARD_CONTENT_REQUEST_TIMEOUT_MS,
+                  totalTimeoutMs: FEISHU_FORWARD_CONTENT_TOTAL_TIMEOUT_MS,
+                }
+              : {}),
+          },
+          parseContent: (type, content) => extractMessageContent(type, content),
+        });
+      }
+      if (
+        contentLink?.role === 'forwarder_comment' &&
+        cachedForwardRootMaterial &&
+        !enriched.references?.some(
+          (reference) => reference.id === contentLink!.bundleId,
+        )
+      ) {
+        enriched = {
+          ...enriched,
+          references: [
+            ...(enriched.references ?? []),
+            {
+              id: cachedForwardRootMaterial.id,
+              sender: cachedForwardRootMaterial.senderName,
+              text: cachedForwardRootMaterial.content,
+              materialResolved: true,
+            },
+          ],
+          referencedMessages: enriched.referencedMessages + 1,
+        };
+      }
       text = enriched.text;
+      if (contentLink?.kind === 'rapid_topic_bundle') {
+        // This Feishu composer shape wraps its plain-text companion in a
+        // literal <p>...</p>. Keep that transport artifact out of Agent prompts
+        // and queue cards without changing ordinary text-message semantics.
+        text = unwrapFeishuParagraphText(text);
+      }
       extracted = {
         ...extracted,
         text,
@@ -2430,9 +2850,16 @@ export function createFeishuConnection(
       }
       lastMessageIdByChat.set(chatId, messageId);
       const resolvedCreateTimeMs = createTimeMs > 0 ? createTimeMs : Date.now();
-      const timestamp = new Date(resolvedCreateTimeMs).toISOString();
+      let timestamp = new Date(resolvedCreateTimeMs).toISOString();
 
-      let attachmentsJson: string | undefined;
+      let attachmentsJson: string | undefined =
+        cachedForwardRootMaterial &&
+        (reuseCurrentForwardRoot || contentLink?.role === 'forwarder_comment')
+          ? (cachedForwardRootMaterial.attachments ?? undefined)
+          : undefined;
+      let currentForwardMaterialResolved =
+        contentLink?.role === 'forwarded_content' &&
+        enriched.currentMaterialResolved === true;
 
       // ── 附件下载（已通过白名单 + mention 门控后才执行）──
       // 安全：未授权发送者 / 未 @bot 的群消息已在上面 return，绝不会触发图片/
@@ -2444,7 +2871,20 @@ export function createFeishuConnection(
       const referencedImageRefs = enriched.referencedImageRefs ?? [];
       const referencedMessages: ChannelReferencedMessage[] = (
         enriched.references ?? []
-      ).map((reference) => ({ ...reference }));
+      ).map((reference) => ({
+        ...reference,
+        ...(contentLink?.role === 'forwarder_comment' &&
+        reference.id === contentLink.bundleId
+          ? {
+              contentLink: {
+                kind: contentLink.kind,
+                bundleId: contentLink.bundleId,
+                role: 'forwarded_content' as const,
+                relatedMessageId: messageId,
+              },
+            }
+          : {}),
+      }));
       const replaceReferenceMarker = (
         referenceMessageId: string,
         marker: string,
@@ -2532,6 +2972,10 @@ export function createFeishuConnection(
             ref.imageKey,
           );
           if (!imageData) {
+            const failedReference = referencedMessages.find(
+              (item) => item.id === ref.referenceMessageId,
+            );
+            if (failedReference) failedReference.materialResolved = false;
             replaceReferenceMarker(
               ref.referenceMessageId,
               ref.marker,
@@ -2583,6 +3027,15 @@ export function createFeishuConnection(
         // 拼接图片标记：成功下载的用路径，失败的用占位符，确保 text 不为空。
         // 否则长图/超大图片下载失败时会落入 agent 的空消息分支，回复"消息是空的"。
         const failedCount = currentImageRefs.length - downloadedCurrentImages;
+        if (
+          messageType === 'image' &&
+          contentLink?.role === 'forwarded_content' &&
+          currentImageRefs.length > 0 &&
+          failedCount === 0
+        ) {
+          currentForwardMaterialResolved = true;
+        }
+        if (failedCount > 0) currentForwardMaterialResolved = false;
         const markers: string[] = [];
         if (attachments.length > 0) {
           attachmentsJson = JSON.stringify(attachments);
@@ -2661,31 +3114,31 @@ export function createFeishuConnection(
           ? feishuRouteToJid(messageRouteTarget, chatJid)
           : chatJid);
 
-      // ── Ack Reaction：确认已收到消息（在 mention 过滤之后，避免对未处理的消息加表情） ──
-      if (source === 'ws') {
-        // The registry is owned by one channel-account instance. Keep its key
-        // provider-native on both attach and clear; account scoping belongs to
-        // ImManager's instance lookup, not to the provider target.
-        const ackTarget = parseFeishuRouteTarget(
-          extractProviderTarget(routeSourceJid),
-        );
-        ackReactions
-          .attach(
-            processingIndicatorKey(ackTarget.raw, messageId),
-            async () => {
-              const reactionId = await addReaction(messageId, 'OnIt');
-              return reactionId ? { messageId, reactionId } : null;
-            },
-            ({ messageId: ackMessageId, reactionId }) =>
-              removeReactionStrict(ackMessageId, reactionId),
-          )
-          .catch(() => {});
-      }
-
       // Store message and broadcast to WebSocket clients
       const targetJid = admittedRoute.targetJid;
 
       const targetAgentId = agentRouting?.agentId;
+      if (
+        contentLink?.kind === 'forward_bundle' &&
+        contentLink.role === 'forwarded_content' &&
+        !currentForwardMaterialResolved
+      ) {
+        logger.warn(
+          {
+            messageId,
+            bundleId: contentLink.bundleId,
+            claimAttempt: claim.attempt,
+          },
+          'Merged-forward material remained incomplete after enrichment',
+        );
+      }
+      if (contentLink?.role === 'forwarded_content') {
+        contentLink = {
+          ...contentLink,
+          ...(currentForwardMaterialResolved ? { materialResolved: true } : {}),
+          ...(claim.attempt > 1 ? { defaultAction: 'summarize' as const } : {}),
+        };
+      }
       const channelContext = buildFeishuChannelTurnContext({
         appId: config.appId,
         configuredChannelAccountId: config.channelAccountId,
@@ -2703,6 +3156,7 @@ export function createFeishuConnection(
           parentId,
           threadId,
           type: messageType,
+          contentLink,
           referencedMessages,
         },
         sender: {
@@ -2718,6 +3172,18 @@ export function createFeishuConnection(
         targetJid,
         sessionAgentId: targetAgentId,
       });
+      const bundleCommentCarriesCompleteMaterial =
+        contentLink?.role === 'forwarder_comment' &&
+        referencedMessages.some(
+          (reference) =>
+            reference.id === contentLink!.bundleId &&
+            (contentLink!.kind === 'rapid_topic_bundle'
+              ? Boolean(reference.text.trim())
+              : reference.materialResolved === true) &&
+            reference.contentLink?.kind === contentLink!.kind &&
+            reference.contentLink.bundleId === contentLink!.bundleId &&
+            reference.contentLink.role === 'forwarded_content',
+        );
       updateClaimedChannelInbox(claim, {
         normalizedPayload: {
           version: 1,
@@ -2727,7 +3193,96 @@ export function createFeishuConnection(
           channelContext,
         },
       });
+      const incompleteForwardLink =
+        contentLink?.kind === 'forward_bundle' ? contentLink : null;
+      const incompleteForwardMaterial =
+        incompleteForwardLink !== null &&
+        ((incompleteForwardLink.role === 'forwarded_content' &&
+          !currentForwardMaterialResolved &&
+          claim.attempt > 1) ||
+          (incompleteForwardLink.role === 'forwarder_comment' &&
+            !bundleCommentCarriesCompleteMaterial));
+      if (incompleteForwardMaterial) {
+        if (claim.attempt < FEISHU_FORWARD_MATERIAL_MAX_ATTEMPTS) {
+          failClaimedInbound(
+            claim,
+            payload,
+            new Error('Waiting for complete forwarded material'),
+            true,
+            FEISHU_FORWARD_MATERIAL_RETRY_DELAY_MS,
+          );
+          logger.warn(
+            {
+              messageId,
+              bundleId: incompleteForwardLink.bundleId,
+              role: incompleteForwardLink.role,
+              claimAttempt: claim.attempt,
+            },
+            'Deferred Agent execution until forwarded material is complete',
+          );
+          return;
+        }
+        cancelAwaitingForwardBundleRoot({
+          chatJid: targetJid,
+          bundleId: incompleteForwardLink.bundleId,
+          sender: senderOpenId,
+        });
+        ignoreClaimedInbound(claim, payload, 'forward_material_unavailable');
+        try {
+          await replyToFeishuMessage(
+            messageId,
+            'text',
+            JSON.stringify({
+              text: '⚠️ 暂时无法读取这条转发的完整内容，请稍后重新转发一次。',
+            }),
+            true,
+          );
+        } catch (feedbackError) {
+          logger.warn(
+            {
+              feedbackError,
+              messageId,
+              bundleId: incompleteForwardLink.bundleId,
+            },
+            'Failed to send terminal forwarded-material feedback',
+          );
+        }
+        return;
+      }
 
+      const earlierBundleComment =
+        contentLink?.role === 'forwarded_content'
+          ? findForwardBundleCommentTail(
+              targetJid,
+              contentLink.bundleId,
+              senderOpenId,
+              timestamp,
+            )
+          : null;
+      const coveringCommentMessageId =
+        contentLink?.role === 'forwarded_content'
+          ? findForwardBundleCoveringComment(
+              targetJid,
+              contentLink.bundleId,
+              senderOpenId,
+            )
+          : null;
+      const subsumedByMessageId =
+        coveringCommentMessageId ??
+        (claim.attempt > 1 ? (earlierBundleComment?.id ?? null) : null);
+      const awaitingForwardCompanion =
+        contentLink?.kind === 'forward_bundle' &&
+        contentLink.role === 'forwarded_content' &&
+        claim.attempt === 1 &&
+        !earlierBundleComment &&
+        !subsumedByMessageId;
+      if (earlierBundleComment && !subsumedByMessageId) {
+        // The note was admitted first but could not carry a complete copy of
+        // the root. Keep the late root independently runnable by placing it
+        // after the durable chat tail; its original provider time remains in
+        // the rendered forwarded material/context rather than cursor order.
+        timestamp = sequenceInboundTimestampAfterChatTail(targetJid, timestamp);
+      }
       storeChatMetadata(targetJid, timestamp);
       storeMessageDirect(
         messageId,
@@ -2741,18 +3296,119 @@ export function createFeishuConnection(
           attachments: attachmentsJson,
           sourceJid: routeSourceJid,
           channelContext,
+          ...(awaitingForwardCompanion
+            ? {
+                meta: {
+                  deliveryStatus: 'awaiting_companion' as const,
+                  deliveryUpdatedAt: new Date().toISOString(),
+                },
+              }
+            : subsumedByMessageId
+              ? {
+                  meta: {
+                    deliveryStatus: 'subsumed' as const,
+                    deliveryRunId: subsumedByMessageId,
+                    deliveryUpdatedAt: new Date().toISOString(),
+                  },
+                }
+              : {}),
         },
       );
-      const followUp = onFollowUpMessage?.({
-        targetJid,
-        sourceJid: routeSourceJid,
-        messageId,
-        senderImId: senderOpenId,
-        requestedMode: requestedFollowUpMode,
-        repliedToActiveCard: !!parentId && !!resolveJidByMessageId(parentId),
-      }) ?? { disposition: 'started' as const };
-      const deliveryFields =
-        followUp.disposition === 'queued'
+      if (awaitingForwardCompanion) {
+        onMessagePersisted?.(
+          targetJid,
+          {
+            id: messageId,
+            chat_jid: targetJid,
+            source_jid: routeSourceJid,
+            sender: senderOpenId,
+            sender_name: resolvedSenderName,
+            content: text,
+            timestamp,
+            attachments: attachmentsJson,
+            channel_context: channelContext,
+            delivery_status: 'awaiting_companion',
+            delivery_updated_at: new Date().toISOString(),
+          },
+          targetAgentId ?? undefined,
+        );
+        failClaimedInbound(
+          claim,
+          payload,
+          new Error('Waiting briefly for a merged-forward companion note'),
+          true,
+          FEISHU_FORWARD_COMPANION_GRACE_MS,
+        );
+        logger.info(
+          {
+            chatJid,
+            targetJid,
+            messageId,
+            waitMs: FEISHU_FORWARD_COMPANION_GRACE_MS,
+          },
+          'Merged-forward root held for an authored companion',
+        );
+        return;
+      }
+      const followUp = subsumedByMessageId
+        ? ({ disposition: 'started' } as const)
+        : (onFollowUpMessage?.({
+            targetJid,
+            sourceJid: routeSourceJid,
+            messageId,
+            senderImId: senderOpenId,
+            // Explicit composer commands remain authoritative. Structural
+            // coalescing is decided by the scheduler, which can prove whether
+            // the active query actually owns this bundle root before
+            // interrupting it.
+            requestedMode: requestedFollowUpMode,
+            coalesceBundleId:
+              !requestedFollowUpMode &&
+              !slashMatch &&
+              bundleCommentCarriesCompleteMaterial &&
+              contentLink
+                ? contentLink.bundleId
+                : undefined,
+          }) ?? { disposition: 'started' as const });
+      if (
+        contentLink?.kind === 'forward_bundle' &&
+        contentLink.role === 'forwarder_comment'
+      ) {
+        const rootReleased = releaseAwaitingForwardBundleRoot({
+          chatJid: targetJid,
+          bundleId: contentLink.bundleId,
+          sender: senderOpenId,
+          queuedRunId:
+            followUp.disposition === 'queued' ? followUp.runId : null,
+          subsumedByMessageId:
+            followUp.disposition === 'steered' ? messageId : null,
+        });
+        const rootInboxIgnored = ignoreDeferredChannelInbox({
+          provider: 'feishu',
+          accountId: reliabilityAccountId,
+          externalMessageId: contentLink.bundleId,
+          reason: `covered_by_forwarder_comment:${messageId}`,
+        });
+        logger.info(
+          {
+            chatJid,
+            targetJid,
+            messageId,
+            bundleId: contentLink.bundleId,
+            rootReleased,
+            rootInboxIgnored,
+            disposition: followUp.disposition,
+          },
+          'Merged-forward companion activated its durable root material',
+        );
+      }
+      const deliveryFields = subsumedByMessageId
+        ? {
+            delivery_status: 'subsumed' as const,
+            delivery_run_id: subsumedByMessageId,
+            delivery_updated_at: new Date().toISOString(),
+          }
+        : followUp.disposition === 'queued'
           ? {
               delivery_mode: 'queue' as const,
               delivery_status: 'queued' as const,
@@ -2770,7 +3426,7 @@ export function createFeishuConnection(
                 delivery_updated_at: timestamp,
               }
             : {};
-      broadcastNewMessage(
+      onMessagePersisted?.(
         targetJid,
         {
           id: messageId,
@@ -2786,34 +3442,29 @@ export function createFeishuConnection(
         },
         targetAgentId ?? undefined,
       );
-      if (followUp.disposition === 'queued') {
-        broadcastFollowUpUpdate(targetJid);
-        const position = followUp.position ?? 1;
-        if (followUp.runId) {
-          // Strip the prefix through the shared helper, which also drops the
-          // account fragment. Slicing by hand left `#account:` in place, and
-          // requireFeishuRouteTarget only accepts thread/root fragments — so
-          // every account-scoped route threw here instead of sending the card.
-          const queuedReplyTarget = routeSourceJid
-            ? extractProviderTarget(routeSourceJid)
-            : messageRouteTarget.raw;
-          await sendToFeishu(
-            queuedReplyTarget,
-            'interactive',
-            JSON.stringify(
-              buildQueuedFollowUpCard({
-                content: text,
-                position,
-                sourceJid: chatJid,
-                targetJid,
-                messageId,
-                expectedRunId: followUp.runId,
-              }),
-            ),
-          );
-        }
+      if (subsumedByMessageId) {
+        await clearAckForInput(routeSourceJid, messageId).catch((err) =>
+          logger.debug(
+            { err, messageId, subsumedByMessageId },
+            'Failed to clear acknowledgement for covered forward root',
+          ),
+        );
         logger.info(
-          { chatJid, targetJid, messageId, position },
+          { chatJid, targetJid, messageId, subsumedByMessageId },
+          'Late merged-forward root preserved without redundant Agent turn',
+        );
+        completeClaimedInbound(claim, payload);
+        return;
+      }
+      if (followUp.disposition === 'queued') {
+        onFollowUpsChanged?.(targetJid);
+        logger.info(
+          {
+            chatJid,
+            targetJid,
+            messageId,
+            position: followUp.position ?? 1,
+          },
           'Feishu message queued behind active query',
         );
         completeClaimedInbound(claim, payload);
@@ -3049,7 +3700,7 @@ export function createFeishuConnection(
         );
         continue;
       }
-      await processClaimedIncomingMessage(
+      await processClaimedInboundSerialized(
         envelope.payload,
         envelope.source,
         claim,
@@ -3125,6 +3776,9 @@ export function createFeishuConnection(
         appId: config.appId,
         appSecret: config.appSecret,
         loggerLevel: lark.LoggerLevel.info,
+        // Detect silently-dead long connections instead of hanging on a
+        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
+        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
       });
       await wsClient.start({ eventDispatcher });
 
@@ -3273,6 +3927,11 @@ export function createFeishuConnection(
             logger.error({ err }, 'Error handling Feishu message');
           }
         },
+        // The Bot's own create/delete calls are echoed as events. Registering
+        // no-op handlers prevents the Lark SDK from logging one warning per
+        // processing indicator mutation.
+        'im.message.reaction.created_v1': () => undefined,
+        'im.message.reaction.deleted_v1': () => undefined,
         'im.chat.member.bot.added_v1': async (data) => {
           try {
             const chatId = data.chat_id;
@@ -3394,6 +4053,9 @@ export function createFeishuConnection(
         appId: config.appId,
         appSecret: config.appSecret,
         loggerLevel: lark.LoggerLevel.info,
+        // Detect silently-dead long connections instead of hanging on a
+        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
+        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
       });
 
       try {
@@ -3456,29 +4118,43 @@ export function createFeishuConnection(
       options?: { presentation?: 'default' | 'native' },
     ): Promise<void> {
       if (!client) {
-        throw new Error('Feishu client is not initialized');
+        throw preAcceptImDeliveryError('Feishu client is not initialized');
       }
 
-      requireFeishuRouteTarget(chatId);
+      try {
+        requireFeishuRouteTarget(chatId);
+      } catch (error) {
+        throw preVisibleFeishuDeliveryError('Feishu route validation', error);
+      }
+      const imagePaths = localImagePaths ?? [];
+      const tracker = new PhysicalDeliveryTracker(1 + imagePaths.length);
 
       try {
-        // Proactive-mode workspace Agents speak as ordinary native rich-text
-        // messages. They never enter the interactive-card presentation lane.
-        if (options?.presentation === 'native') {
-          await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
-        } else {
+        await tracker.send(async () => {
+          // Proactive-mode workspace Agents speak as ordinary native rich-text
+          // messages. They never enter the interactive-card presentation lane.
+          if (options?.presentation === 'native') {
+            await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
+            return;
+          }
+
+          let prebuiltCard: string | undefined;
           if (text.startsWith('{"type":"interactive"')) {
-            // Detect pre-built Feishu interactive card JSON — send directly
-            // without wrapping.
+            // Parse independently from delivery. A send rejection must never be
+            // swallowed as if the JSON itself were malformed.
             try {
               const parsed = JSON.parse(text);
               if (parsed.type === 'interactive' && parsed.card) {
-                await sendToFeishu(chatId, 'interactive', text);
-                return;
+                prebuiltCard = text;
               }
             } catch {
-              // Not valid card JSON, fall through to normal handling
+              // Not valid card JSON, fall through to normal handling.
             }
+          }
+
+          if (prebuiltCard) {
+            await sendToFeishu(chatId, 'interactive', prebuiltCard);
+            return;
           }
 
           // Count markdown tables to decide format upfront — Feishu cards have
@@ -3488,46 +4164,62 @@ export function createFeishuConnection(
 
           if (usePostMd) {
             await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
-          } else {
-            const card = buildInteractiveCard(text);
-            const content = JSON.stringify(card);
-            try {
-              await sendToFeishu(chatId, 'interactive', content);
-            } catch (err) {
-              logger.warn(
-                { err, chatId },
-                'Feishu interactive send failed, fallback to post+md',
-              );
-              await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
-            }
+            return;
           }
-        }
+
+          const card = buildInteractiveCard(text);
+          const content = JSON.stringify(card);
+          try {
+            await sendToFeishu(chatId, 'interactive', content);
+          } catch (err) {
+            // A format fallback is a second provider mutation. It is safe only
+            // when the first mutation was authoritatively rejected (including a
+            // transport failure proven to precede TLS/request acceptance).
+            if (!definitiveFeishuChannelDeliveryError(err)) throw err;
+            logger.warn(
+              { err, chatId },
+              'Feishu interactive send was rejected, fallback to post+md',
+            );
+            await sendToFeishu(chatId, 'post', buildPostMdFallback(text));
+          }
+        });
         logger.debug(
           { chatId, presentation: options?.presentation ?? 'default' },
           'Sent Feishu message',
         );
 
-        for (const localImagePath of localImagePaths || []) {
+        for (const localImagePath of imagePaths) {
           try {
-            const uploadRes = (await client.im.v1.image.create({
-              data: {
-                image_type: 'message',
-                image: fs.createReadStream(localImagePath),
-              },
-            })) as
-              | { image_key?: string; data?: { image_key?: string } }
-              | null
-              | undefined;
-            const imageKey = requireFeishuUploadKey(
-              'Feishu image.create',
-              uploadRes,
-              'image_key',
-            );
-            await sendToFeishu(
-              chatId,
-              'image',
-              JSON.stringify({ image_key: imageKey }),
-            );
+            await tracker.send(async () => {
+              let imageKey: string;
+              try {
+                const image = await fsPromises.readFile(localImagePath);
+                const uploadRes = (await client!.im.v1.image.create({
+                  data: {
+                    image_type: 'message',
+                    image,
+                  },
+                })) as
+                  | { image_key?: string; data?: { image_key?: string } }
+                  | null
+                  | undefined;
+                imageKey = requireFeishuUploadKey(
+                  'Feishu image.create',
+                  uploadRes,
+                  'image_key',
+                );
+              } catch (error) {
+                throw preVisibleFeishuDeliveryError(
+                  'Feishu image attachment upload',
+                  error,
+                );
+              }
+              await sendToFeishu(
+                chatId,
+                'image',
+                JSON.stringify({ image_key: imageKey }),
+              );
+            });
           } catch (imageErr) {
             logger.error(
               { chatId, localImagePath, err: imageErr },
@@ -3538,7 +4230,8 @@ export function createFeishuConnection(
         }
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send Feishu message');
-        throw err;
+        if (err instanceof PartialChannelDeliveryError) throw err;
+        throw definitiveFeishuChannelDeliveryError(err) ?? err;
       }
     },
 
@@ -3550,39 +4243,52 @@ export function createFeishuConnection(
       _fileName?: string /* Feishu image API has no filename field, intentionally unused */,
     ): Promise<void> {
       if (!client) {
-        throw new Error('Feishu client is not initialized');
+        throw preAcceptImDeliveryError('Feishu client is not initialized');
       }
 
-      requireFeishuRouteTarget(chatId);
+      try {
+        requireFeishuRouteTarget(chatId);
+      } catch (error) {
+        throw preVisibleFeishuDeliveryError('Feishu route validation', error);
+      }
 
       try {
-        // Step 1: Upload image to Feishu to get image_key
-        const uploadResult = (await client.im.v1.image.create({
-          data: {
-            image_type: 'message',
-            image: imageBuffer,
-          },
-        })) as
-          | { image_key?: string; data?: { image_key?: string } }
-          | null
-          | undefined;
+        const tracker = new PhysicalDeliveryTracker(caption ? 2 : 1);
+        let imageKey: string | undefined;
 
-        const imageKey = requireFeishuUploadKey(
-          'Feishu image.create',
-          uploadResult,
-          'image_key',
-        );
-
-        // Step 2: Send image message
-        await sendToFeishu(
-          chatId,
-          'image',
-          JSON.stringify({ image_key: imageKey }),
-        );
+        // Uploading is pre-visible. Keep it inside the first tracked operation
+        // so only the subsequent message ACK advances physical progress.
+        await tracker.send(async () => {
+          try {
+            const uploadResult = (await client!.im.v1.image.create({
+              data: {
+                image_type: 'message',
+                image: imageBuffer,
+              },
+            })) as
+              | { image_key?: string; data?: { image_key?: string } }
+              | null
+              | undefined;
+            imageKey = requireFeishuUploadKey(
+              'Feishu image.create',
+              uploadResult,
+              'image_key',
+            );
+          } catch (error) {
+            throw preVisibleFeishuDeliveryError('Feishu image upload', error);
+          }
+          await sendToFeishu(
+            chatId,
+            'image',
+            JSON.stringify({ image_key: imageKey }),
+          );
+        });
 
         // Step 3: If caption provided, send it as a follow-up text message
         if (caption) {
-          await sendToFeishu(chatId, 'text', JSON.stringify({ text: caption }));
+          await tracker.send(() =>
+            sendToFeishu(chatId, 'text', JSON.stringify({ text: caption })),
+          );
         }
         logger.info(
           { chatId, imageKey, mimeType, size: imageBuffer.length },
@@ -3590,7 +4296,8 @@ export function createFeishuConnection(
         );
       } catch (err) {
         logger.error({ err, chatId, mimeType }, 'Failed to send Feishu image');
-        throw err;
+        if (err instanceof PartialChannelDeliveryError) throw err;
+        throw definitiveFeishuChannelDeliveryError(err) ?? err;
       }
     },
 
@@ -3600,19 +4307,28 @@ export function createFeishuConnection(
       fileName: string,
     ): Promise<void> {
       if (!client) {
-        throw new Error('Feishu client is not initialized');
+        throw preAcceptImDeliveryError('Feishu client is not initialized');
       }
 
-      requireFeishuRouteTarget(chatId);
+      try {
+        requireFeishuRouteTarget(chatId);
+      } catch (error) {
+        throw preVisibleFeishuDeliveryError('Feishu route validation', error);
+      }
 
       try {
-        const buffer = await fsPromises.readFile(filePath);
+        let buffer: Buffer;
+        try {
+          buffer = await fsPromises.readFile(filePath);
+        } catch (error) {
+          throw preVisibleFeishuDeliveryError('Feishu file read', error);
+        }
 
         // Check file size limit (30MB)
         const MAX_FILE_SIZE = 30 * 1024 * 1024;
         if (buffer.length > MAX_FILE_SIZE) {
-          throw new Error(
-            `文件大小超过 30MB 限制 (${(buffer.length / 1024 / 1024).toFixed(2)}MB)`,
+          throw preAcceptImDeliveryError(
+            `Feishu file exceeds the 30MB limit (${(buffer.length / 1024 / 1024).toFixed(2)}MB)`,
           );
         }
 
@@ -3620,22 +4336,27 @@ export function createFeishuConnection(
         const fileType = getFileType(ext);
 
         // Upload file
-        const uploadResult = (await client.im.v1.file.create({
-          data: {
-            file_type: fileType,
-            file_name: fileName,
-            file: buffer,
-          },
-        })) as
-          | { file_key?: string; data?: { file_key?: string } }
-          | null
-          | undefined;
+        let fileKey: string;
+        try {
+          const uploadResult = (await client.im.v1.file.create({
+            data: {
+              file_type: fileType,
+              file_name: fileName,
+              file: buffer,
+            },
+          })) as
+            | { file_key?: string; data?: { file_key?: string } }
+            | null
+            | undefined;
 
-        const fileKey = requireFeishuUploadKey(
-          'Feishu file.create',
-          uploadResult,
-          'file_key',
-        );
+          fileKey = requireFeishuUploadKey(
+            'Feishu file.create',
+            uploadResult,
+            'file_key',
+          );
+        } catch (error) {
+          throw preVisibleFeishuDeliveryError('Feishu file upload', error);
+        }
 
         // Determine msg_type: Feishu requires upload file_type and send msg_type to match.
         // mp4 → media (video message), opus → audio (audio message), others → file.
@@ -3643,10 +4364,9 @@ export function createFeishuConnection(
           fileType === 'mp4' ? 'media' : fileType === 'opus' ? 'audio' : 'file';
 
         // Send file message
-        await sendToFeishu(
-          chatId,
-          msgType,
-          JSON.stringify({ file_key: fileKey }),
+        const tracker = new PhysicalDeliveryTracker(1);
+        await tracker.send(() =>
+          sendToFeishu(chatId, msgType, JSON.stringify({ file_key: fileKey })),
         );
         logger.info(
           { chatId, fileName, fileSize: buffer.length },
@@ -3657,8 +4377,13 @@ export function createFeishuConnection(
           { err, chatId, filePath },
           'Failed to send file to Feishu',
         );
-        throw err;
+        if (err instanceof PartialChannelDeliveryError) throw err;
+        throw definitiveFeishuChannelDeliveryError(err) ?? err;
       }
+    },
+
+    beginAckReaction(chatId: string, inputMessageId: string): Promise<void> {
+      return beginAckForInput(chatId, inputMessageId);
     },
 
     clearAckReaction(chatId: string, inputMessageId: string): Promise<void> {
@@ -3775,90 +4500,4 @@ export function createFeishuConnection(
   };
 
   return connection;
-}
-
-// ─── Backward-compatible global singleton ──────────────────────
-// @deprecated — 旧的顶层导出函数，内部使用一个默认全局实例。
-// 后续由 imManager 替代。
-
-let _defaultInstance: FeishuConnection | null = null;
-
-export interface ConnectFeishuOptions {
-  onReady: () => void;
-  /** 收到消息后调用，让主模块自动注册未知的飞书聊天到主容器 */
-  onNewChat?: (chatJid: string, chatName: string) => void;
-  /** 热重连时设置：丢弃 create_time 早于此时间戳（epoch ms）的消息，避免处理渠道关闭期间的堆积消息 */
-  ignoreMessagesBefore?: number;
-}
-
-/**
- * @deprecated Use createFeishuConnection() factory instead. Will be replaced by imManager.
- * Connect to Feishu via WebSocket and start receiving messages.
- */
-export async function connectFeishu(
-  opts: ConnectFeishuOptions,
-): Promise<boolean> {
-  const { getFeishuProviderConfigWithSource } =
-    await import('./runtime-config.js');
-  const { config, source } = getFeishuProviderConfigWithSource();
-  if (!config.appId || !config.appSecret) {
-    logger.warn(
-      { source },
-      'Feishu config is empty, running in Web-only mode (set it in Settings -> Feishu config)',
-    );
-    return false;
-  }
-
-  _defaultInstance = createFeishuConnection({
-    appId: config.appId,
-    appSecret: config.appSecret,
-  });
-
-  return _defaultInstance.connect(opts);
-}
-
-/**
- * @deprecated Use FeishuConnection.sendMessage() instead.
- */
-export async function sendFeishuMessage(
-  chatId: string,
-  text: string,
-  localImagePaths?: string[],
-): Promise<void> {
-  if (!_defaultInstance) {
-    logger.warn(
-      { chatId },
-      'Feishu client not initialized, skip sending message',
-    );
-    return;
-  }
-  return _defaultInstance.sendMessage(chatId, text, localImagePaths);
-}
-
-/**
- * @deprecated Use FeishuConnection.syncGroups() instead.
- */
-export async function syncFeishuGroups(): Promise<void> {
-  if (!_defaultInstance) {
-    logger.debug('Feishu client not initialized, skip group sync');
-    return;
-  }
-  return _defaultInstance.syncGroups();
-}
-
-/**
- * @deprecated Use FeishuConnection.isConnected() instead.
- */
-export function isFeishuConnected(): boolean {
-  return _defaultInstance?.isConnected() ?? false;
-}
-
-/**
- * @deprecated Use FeishuConnection.stop() instead.
- */
-export async function stopFeishu(): Promise<void> {
-  if (_defaultInstance) {
-    await _defaultInstance.stop();
-    _defaultInstance = null;
-  }
 }

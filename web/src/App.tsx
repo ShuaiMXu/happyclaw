@@ -6,14 +6,8 @@ import {
   createHashRouter,
   createRoutesFromElements,
 } from 'react-router-dom';
-import { lazy, Suspense } from 'react';
-import { LoginPage } from './pages/LoginPage';
-import { RegisterPage } from './pages/RegisterPage';
-import { SetupPage } from './pages/SetupPage';
-import { SetupProvidersPage } from './pages/SetupProvidersPage';
-import { SetupChannelsPage } from './pages/SetupChannelsPage';
+import { lazy, Suspense, type ReactNode } from 'react';
 import { AuthGuard } from './components/auth/AuthGuard';
-import { AppLayout } from './components/layout/AppLayout';
 import { APP_BASE, shouldUseHashRouter } from './utils/url';
 import { shouldPreloadChatRoute } from './utils/chat-route-preload';
 import { Toaster } from '@/components/ui/sonner';
@@ -26,6 +20,30 @@ const loadChatPage = () =>
     default: m.ChatPage,
   })));
 const ChatPage = lazy(loadChatPage);
+const LoginPage = lazy(() =>
+  import('./pages/LoginPage').then((m) => ({ default: m.LoginPage })),
+);
+const RegisterPage = lazy(() =>
+  import('./pages/RegisterPage').then((m) => ({ default: m.RegisterPage })),
+);
+const SetupPage = lazy(() =>
+  import('./pages/SetupPage').then((m) => ({ default: m.SetupPage })),
+);
+const SetupProvidersPage = lazy(() =>
+  import('./pages/SetupProvidersPage').then((m) => ({
+    default: m.SetupProvidersPage,
+  })),
+);
+const SetupChannelsPage = lazy(() =>
+  import('./pages/SetupChannelsPage').then((m) => ({
+    default: m.SetupChannelsPage,
+  })),
+);
+const AppLayout = lazy(() =>
+  import('./components/layout/AppLayout').then((m) => ({
+    default: m.AppLayout,
+  })),
+);
 
 // Start the expensive chat split as soon as the entry executes, but only for
 // the default/chat routes. Static HTML modulepreloads made login, setup, tasks,
@@ -102,37 +120,39 @@ function AgentProfilesRouteFallback() {
   );
 }
 
+function ShellFallback() {
+  return (
+    <div
+      className="flex min-h-screen items-center justify-center text-sm text-muted-foreground motion-safe:animate-pulse"
+      role="status"
+      aria-live="polite"
+    >
+      正在加载…
+    </div>
+  );
+}
+
+function lazyShell(element: ReactNode) {
+  return <Suspense fallback={<ShellFallback />}>{element}</Suspense>;
+}
+
 const appRoutes = createRoutesFromElements(
   <>
     {/* Public Routes */}
-    <Route path="/login" element={<LoginPage />} />
-    <Route path="/register" element={<RegisterPage />} />
-    <Route path="/setup" element={<SetupPage />} />
+    <Route path="/login" element={lazyShell(<LoginPage />)} />
+    <Route path="/register" element={lazyShell(<RegisterPage />)} />
+    <Route path="/setup" element={lazyShell(<SetupPage />)} />
     <Route
       path="/setup/providers"
-      element={
-        <AuthGuard>
-          <SetupProvidersPage />
-        </AuthGuard>
-      }
+      element={<AuthGuard>{lazyShell(<SetupProvidersPage />)}</AuthGuard>}
     />
     <Route
       path="/setup/channels"
-      element={
-        <AuthGuard>
-          <SetupChannelsPage />
-        </AuthGuard>
-      }
+      element={<AuthGuard>{lazyShell(<SetupChannelsPage />)}</AuthGuard>}
     />
 
     {/* Protected Routes with Layout */}
-    <Route
-      element={
-        <AuthGuard>
-          <AppLayout />
-        </AuthGuard>
-      }
-    >
+    <Route element={<AuthGuard>{lazyShell(<AppLayout />)}</AuthGuard>}>
       <Route
         path="/chat/:groupFolder?"
         element={

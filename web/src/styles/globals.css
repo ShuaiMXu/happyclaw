@@ -28,33 +28,15 @@
     U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 
-/* Alibaba PuHuiTi 3.0 — Chinese text fallback */
+/* Alibaba PuHuiTi 3.0 — last-resort Chinese fallback.
+   Keep one regular face and let browsers synthesize occasional 500/600 text;
+   shipping three full CJK fonts added more than 15MB to every deployment. */
 @font-face {
   font-family: 'Alibaba PuHuiTi 3';
   font-style: normal;
   font-weight: 400;
   font-display: swap;
   src: url('/fonts/AlibabaPuHuiTi-3-55-Regular.woff2') format('woff2');
-  unicode-range:
-    U+4E00-9FFF, U+3400-4DBF, U+3000-303F, U+FF00-FFEF, U+2E80-2EFF,
-    U+3100-312F, U+FE30-FE4F, U+F900-FAFF, U+2F800-2FA1F;
-}
-@font-face {
-  font-family: 'Alibaba PuHuiTi 3';
-  font-style: normal;
-  font-weight: 500;
-  font-display: swap;
-  src: url('/fonts/AlibabaPuHuiTi-3-65-Medium.woff2') format('woff2');
-  unicode-range:
-    U+4E00-9FFF, U+3400-4DBF, U+3000-303F, U+FF00-FFEF, U+2E80-2EFF,
-    U+3100-312F, U+FE30-FE4F, U+F900-FAFF, U+2F800-2FA1F;
-}
-@font-face {
-  font-family: 'Alibaba PuHuiTi 3';
-  font-style: normal;
-  font-weight: 600;
-  font-display: swap;
-  src: url('/fonts/AlibabaPuHuiTi-3-75-SemiBold.woff2') format('woff2');
   unicode-range:
     U+4E00-9FFF, U+3400-4DBF, U+3000-303F, U+FF00-FFEF, U+2E80-2EFF,
     U+3100-312F, U+FE30-FE4F, U+F900-FAFF, U+2F800-2FA1F;
@@ -124,7 +106,7 @@
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
-  /* CJK order matters: the self-hosted PuHuiTi trio is 16.2MB total, so
+  /* CJK order matters: the self-hosted PuHuiTi fallback is still large, so
      system CJK fonts (PingFang/YaHei) must win on platforms that have them.
      PuHuiTi stays as the last resort for devices with no CJK font at all —
      @font-face only downloads when a glyph actually falls through to it. */

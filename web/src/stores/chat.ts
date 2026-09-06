@@ -45,6 +45,8 @@ export type { GroupInfo, AgentInfo };
 export interface Message {
   id: string;
   chat_jid: string;
+  /** Stable host arrival order used by history and polling cursors. */
+  ingest_sequence?: number;
   source_jid?: string;
   sender: string;
   sender_name: string;
@@ -71,7 +73,14 @@ export interface Message {
     | 'error'
     | null;
   delivery_mode?: FollowUpMode | null;
-  delivery_status?: 'queued' | 'promoting' | 'released' | 'cancelled' | null;
+  delivery_status?:
+    | 'queued'
+    | 'promoting'
+    | 'released'
+    | 'cancelled'
+    | 'awaiting_companion'
+    | 'subsumed'
+    | null;
   delivery_run_id?: string | null;
   delivery_updated_at?: string | null;
 }
@@ -223,7 +232,7 @@ export interface StreamingState {
   interrupted?: boolean;
 }
 
-function mergeMessagesChronologically(
+export function mergeMessagesChronologically(
   existing: Message[],
   incoming: Message[],
 ): Message[] {
@@ -232,24 +241,33 @@ function mergeMessagesChronologically(
   // Incoming messages are authoritative, but preserve reference if content unchanged
   for (const m of incoming) {
     const old = byId.get(m.id);
+    // WebSocket/stream projections can update a canonical row before their
+    // payload has been enriched with the REST-only ingest cursor. Never erase
+    // an already-authoritative sequence or pagination can silently fall back
+    // to the provider timestamp boundary.
+    const next =
+      old?.ingest_sequence !== undefined && m.ingest_sequence === undefined
+        ? { ...m, ingest_sequence: old.ingest_sequence }
+        : m;
     if (
       !old ||
-      old.content !== m.content ||
-      old.timestamp !== m.timestamp ||
-      old.token_usage !== m.token_usage ||
+      old.content !== next.content ||
+      old.timestamp !== next.timestamp ||
+      old.ingest_sequence !== next.ingest_sequence ||
+      old.token_usage !== next.token_usage ||
       JSON.stringify(old.workflow_runs ?? []) !==
-        JSON.stringify(m.workflow_runs ?? []) ||
-      old.turn_id !== m.turn_id ||
-      old.session_id !== m.session_id ||
-      old.sdk_message_uuid !== m.sdk_message_uuid ||
-      old.source_kind !== m.source_kind ||
-      old.finalization_reason !== m.finalization_reason ||
-      old.delivery_mode !== m.delivery_mode ||
-      old.delivery_status !== m.delivery_status ||
-      old.delivery_run_id !== m.delivery_run_id ||
-      old.delivery_updated_at !== m.delivery_updated_at
+        JSON.stringify(next.workflow_runs ?? []) ||
+      old.turn_id !== next.turn_id ||
+      old.session_id !== next.session_id ||
+      old.sdk_message_uuid !== next.sdk_message_uuid ||
+      old.source_kind !== next.source_kind ||
+      old.finalization_reason !== next.finalization_reason ||
+      old.delivery_mode !== next.delivery_mode ||
+      old.delivery_status !== next.delivery_status ||
+      old.delivery_run_id !== next.delivery_run_id ||
+      old.delivery_updated_at !== next.delivery_updated_at
     ) {
-      byId.set(m.id, m);
+      byId.set(next.id, next);
     }
   }
   const result = Array.from(byId.values()).sort((a, b) => {
@@ -267,6 +285,24 @@ function mergeMessagesChronologically(
     });
   }
   return result;
+}
+
+function messageSequenceBoundary(
+  messages: Message[],
+  direction: 'min' | 'max',
+): number | undefined {
+  let boundary: number | undefined;
+  for (const message of messages) {
+    const sequence = message.ingest_sequence;
+    if (!Number.isSafeInteger(sequence) || sequence === undefined) continue;
+    boundary =
+      boundary === undefined
+        ? sequence
+        : direction === 'min'
+          ? Math.min(boundary, sequence)
+          : Math.max(boundary, sequence);
+  }
+  return boundary;
 }
 
 const MAX_THINKING_CACHE_SIZE = 500;
@@ -391,6 +427,10 @@ interface ChatState {
   resetSession: (jid: string, agentId?: string) => Promise<boolean>;
   clearHistory: (jid: string) => Promise<boolean>;
   deleteMessage: (jid: string, messageId: string) => Promise<boolean>;
+  handleMessageDeleted: (
+    messageChatJid: string,
+    messageId: string,
+  ) => Promise<void>;
   createFlow: (
     name: string,
     options?: CreateWorkspaceOptions,
@@ -774,6 +814,11 @@ interface PendingDelta {
   runId?: string;
 }
 const pendingDeltas = new Map<string, PendingDelta>();
+
+// Match the runner's retry banner (including unknown SDK counters), not user
+// progress text that happens to mention a retry or a file named retry.ts.
+const API_RETRY_STATUS_RE =
+  /^API (?:重试中 \((?:\d+|\?)\/(?:\d+|\?)\)，\d+s 后重试|retry in progress \((?:\d+|\?)\/(?:\d+|\?)\))$/i;
 
 function cancelPendingDelta(key: string): void {
   const entry = pendingDeltas.get(key);
@@ -1259,7 +1304,12 @@ function updateTaskRuntime(
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (patch?.status === 'failed' || patch?.status === 'killed')
+    else if (
+      patch?.status === 'failed' ||
+      patch?.status === 'killed' ||
+      patch?.status === 'stopped' ||
+      patch?.status === 'aborted'
+    )
       task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
     else if (patch?.status === 'running' || patch?.status === 'pending')
@@ -1714,19 +1764,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadMessages: async (jid: string, loadMore = false) => {
     const state = get();
     const existing = state.messages[jid] || [];
+    const beforeSequence = loadMore
+      ? messageSequenceBoundary(existing, 'min')
+      : undefined;
     const before =
-      loadMore && existing.length > 0 ? existing[0].timestamp : undefined;
+      loadMore && beforeSequence === undefined && existing.length > 0
+        ? existing[0].timestamp
+        : undefined;
 
     // 首屏有两个入口（ChatPage 路由解析 + ChatView 挂载）会各发一次同参请求；
     // 同一目标的首页加载在途时直接复用，避免重复拉 50 条。
-    const inFlightKey = `${jid}\0${before ?? 'first'}`;
+    const inFlightKey = `${jid}\0${beforeSequence ?? before ?? 'first'}`;
     const inFlight = loadMessagesInFlight.get(inFlightKey);
     if (inFlight) return inFlight;
     const request = (async () => {
       try {
         const data = await api.get<{ messages: Message[]; hasMore: boolean }>(
           `/api/groups/${encodeURIComponent(jid)}/messages?${new URLSearchParams(
-            before ? { before: String(before), limit: '50' } : { limit: '50' },
+            beforeSequence !== undefined
+              ? { beforeSequence: String(beforeSequence), limit: '50' }
+              : before
+                ? { before: String(before), limit: '50' }
+                : { limit: '50' },
           )}`,
         );
         // Messages come in DESC order from API, reverse to chronological for display
@@ -1769,13 +1828,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const state = get();
     const existing = state.messages[jid] || [];
+    const lastSequence = messageSequenceBoundary(existing, 'max');
     const lastTs =
-      existing.length > 0 ? existing[existing.length - 1].timestamp : undefined;
+      lastSequence === undefined && existing.length > 0
+        ? existing[existing.length - 1].timestamp
+        : undefined;
 
     try {
       // Fetch messages newer than the last one we have
       const params = new URLSearchParams({ limit: '50' });
-      if (lastTs) params.set('after', lastTs);
+      if (lastSequence !== undefined) {
+        params.set('afterSequence', String(lastSequence));
+      } else if (lastTs) {
+        params.set('after', lastTs);
+      }
 
       const data = await api.get<{ messages: Message[] }>(
         `/api/groups/${encodeURIComponent(jid)}/messages?${params}`,
@@ -1899,6 +1965,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             success: true;
             messageId: string;
             timestamp: string;
+            ingestSequence?: number;
             disposition: 'started' | 'queued' | 'steered';
             runId?: string;
           }
@@ -1935,6 +2002,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         content,
         // Use server timestamp so incremental polling cursor stays monotonic with backend data.
         timestamp: data.timestamp,
+        ingest_sequence: data.ingestSequence,
         // is_from_me is from the bot's perspective: true = bot sent it, false = human sent it
         is_from_me: false,
         attachments: body.attachments
@@ -2269,20 +2337,77 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  handleMessageDeleted: async (messageChatJid, messageId) => {
+    const agentMarker = '#agent:';
+    const agentSep = messageChatJid.indexOf(agentMarker);
+    const workspaceJid =
+      agentSep >= 0 ? messageChatJid.slice(0, agentSep) : null;
+    const agentId =
+      agentSep >= 0
+        ? messageChatJid.slice(agentSep + agentMarker.length)
+        : null;
+
+    set((s) => {
+      const matchesDeletedRow = (message: Message) =>
+        message.id === messageId && message.chat_jid === messageChatJid;
+      const messages = { ...s.messages };
+      for (const [key, list] of Object.entries(messages)) {
+        if (list.some(matchesDeletedRow)) {
+          messages[key] = list.filter((message) => !matchesDeletedRow(message));
+        }
+      }
+
+      const agentMessages = { ...s.agentMessages };
+      for (const [key, list] of Object.entries(agentMessages)) {
+        if (list.some(matchesDeletedRow)) {
+          agentMessages[key] = list.filter(
+            (message) => !matchesDeletedRow(message),
+          );
+        }
+      }
+
+      if (!workspaceJid || !agentId) return { messages, agentMessages };
+
+      // The Session sidebar has its own latest-message projection. Update it
+      // immediately from the loaded page, then force an authoritative refresh
+      // below in case the previous message is outside that page.
+      const loaded = agentMessages[agentId];
+      const latest = loaded?.[loaded.length - 1];
+      const agents = { ...s.agents };
+      if (agents[workspaceJid]) {
+        agents[workspaceJid] = agents[workspaceJid].map((agent) =>
+          agent.id === agentId
+            ? {
+                ...agent,
+                latest_message: latest
+                  ? { content: latest.content, timestamp: latest.timestamp }
+                  : null,
+              }
+            : agent,
+        );
+      }
+      return { messages, agentMessages, agents };
+    });
+
+    if (workspaceJid && agentId) {
+      // A deleted sensitive message must not survive in the PWA's persisted
+      // hydrate cache. Await invalidation so an immediate reload cannot race it.
+      await deleteAgentMessageSnapshot(workspaceJid, agentId);
+      await get().loadAgents(workspaceJid, { force: true });
+    }
+  },
+
   deleteMessage: async (jid: string, messageId: string) => {
     try {
       await api.delete(
         `/api/groups/${encodeURIComponent(jid)}/messages/${encodeURIComponent(messageId)}`,
       );
-      set((s) => ({
-        messages: {
-          ...s.messages,
-          [jid]: (s.messages[jid] || []).filter((m) => m.id !== messageId),
-        },
-      }));
+      await get().handleMessageDeleted(jid, messageId);
       return true;
     } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+      const message = extractErrorMessage(err) || '删除聊天记录失败';
+      set({ error: message });
+      showToast('删除失败', message);
       return false;
     }
   },
@@ -2511,6 +2636,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const runtimeJid = agentId ? `${chatJid}#agent:${agentId}` : chatJid;
     if (!shouldApplyRunScopedPayload(get().activeRuns, runtimeJid, runId)) {
       return;
+    }
+
+    // Clear in receive order: an older rAF batch must not erase a newer retry.
+    // Child activity does not mean the parent request has recovered.
+    if (
+      !event.parentToolUseId &&
+      (event.eventType === 'tool_use_start' ||
+        ((event.eventType === 'text_delta' ||
+          event.eventType === 'thinking_delta') &&
+          !!event.text))
+    ) {
+      set((s) => {
+        const prev = agentId ? s.agentStreaming[agentId] : s.streaming[chatJid];
+        if (
+          !prev ||
+          prev.interrupted ||
+          !API_RETRY_STATUS_RE.test(prev.systemStatus || '')
+        ) {
+          return s;
+        }
+        const next = { ...prev, systemStatus: null };
+        if (agentId) {
+          return { agentStreaming: { ...s.agentStreaming, [agentId]: next } };
+        }
+        saveStreamingToSession(chatJid, next);
+        return { streaming: { ...s.streaming, [chatJid]: next } };
+      });
     }
 
     // ⓪ text_delta / thinking_delta — rAF batch for both agent and main conversation
@@ -2797,7 +2949,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (
         patchStatus === 'completed' ||
         patchStatus === 'failed' ||
-        patchStatus === 'killed'
+        patchStatus === 'killed' ||
+        patchStatus === 'stopped' ||
+        patchStatus === 'aborted'
       ) {
         finalizeSdkTask(
           resolvedTaskId,
@@ -3294,7 +3448,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         !msg.is_from_me &&
         msg.delivery_status !== 'queued' &&
         msg.delivery_status !== 'promoting' &&
-        msg.delivery_status !== 'cancelled';
+        msg.delivery_status !== 'cancelled' &&
+        msg.delivery_status !== 'subsumed';
       const isHidden = typeof document !== 'undefined' && document.hidden;
       const isOtherChat =
         s.currentGroup !== chatJid || !!s.activeAgentTab[chatJid];
@@ -3714,14 +3869,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadAgentMessages: async (jid, agentId, loadMore = false) => {
     const existing = get().agentMessages[agentId] || [];
+    const beforeSequence = loadMore
+      ? messageSequenceBoundary(existing, 'min')
+      : undefined;
     const before =
-      loadMore && existing.length > 0 ? existing[0].timestamp : undefined;
+      loadMore && beforeSequence === undefined && existing.length > 0
+        ? existing[0].timestamp
+        : undefined;
 
     try {
       const params = new URLSearchParams(
-        before
-          ? { before: String(before), limit: '50', agentId }
-          : { limit: '50', agentId },
+        beforeSequence !== undefined
+          ? {
+              beforeSequence: String(beforeSequence),
+              limit: '50',
+              agentId,
+            }
+          : before
+            ? { before: String(before), limit: '50', agentId }
+            : { limit: '50', agentId },
       );
       const data = await api.get<{ messages: Message[]; hasMore: boolean }>(
         `/api/groups/${encodeURIComponent(jid)}/messages?${params}`,
@@ -3822,12 +3988,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   refreshAgentMessages: async (jid, agentId) => {
     const existing = get().agentMessages[agentId] || [];
+    const lastSequence = messageSequenceBoundary(existing, 'max');
     const lastTs =
-      existing.length > 0 ? existing[existing.length - 1].timestamp : undefined;
+      lastSequence === undefined && existing.length > 0
+        ? existing[existing.length - 1].timestamp
+        : undefined;
 
     try {
       const params = new URLSearchParams({ limit: '50', agentId });
-      if (lastTs) params.set('after', lastTs);
+      if (lastSequence !== undefined) {
+        params.set('afterSequence', String(lastSequence));
+      } else if (lastTs) {
+        params.set('after', lastTs);
+      }
 
       const data = await api.get<{ messages: Message[] }>(
         `/api/groups/${encodeURIComponent(jid)}/messages?${params}`,

@@ -1,5 +1,6 @@
 import path from 'path';
-import { defineConfig } from 'vite';
+import fs from 'node:fs';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
@@ -17,9 +18,69 @@ const APP_BASE = (() => {
   return base;
 })();
 
+function katexWoff2Only(): Plugin {
+  return {
+    name: 'happyclaw-katex-woff2-only',
+    enforce: 'pre',
+    transform(source, id) {
+      if (!id.includes('/katex/dist/katex.min.css')) return null;
+      return source.replace(
+        /,url\([^)]*\.woff\) format\("woff"\),url\([^)]*\.ttf\) format\("truetype"\)/g,
+        '',
+      );
+    },
+  };
+}
+
+function lucideDirectImports(): Plugin {
+  const iconIndex = fs.readFileSync(
+    path.resolve(
+      __dirname,
+      'node_modules/lucide-react/dist/esm/lucide-react.js',
+    ),
+    'utf8',
+  );
+  const iconPaths = new Map<string, string>();
+  for (const match of iconIndex.matchAll(
+    /export \{([^}]+)\} from '\.\/icons\/([^']+)'/g,
+  )) {
+    for (const alias of match[1].matchAll(/default as (\w+)/g)) {
+      iconPaths.set(alias[1], match[2]);
+    }
+  }
+
+  return {
+    name: 'happyclaw-lucide-direct-imports',
+    enforce: 'pre',
+    transform(source, id) {
+      if (!id.includes('/src/') || !/\.[jt]sx?(?:\?|$)/.test(id)) return null;
+      const rewritten = source.replace(
+        /import\s*\{([^}]*)\}\s*from\s*['"]lucide-react['"]\s*;?/g,
+        (_statement, rawSpecifiers: string) =>
+          rawSpecifiers
+            .split(',')
+            .map((specifier) => specifier.trim())
+            .filter(Boolean)
+            .map((specifier) => {
+              const [imported, local = imported] = specifier.split(/\s+as\s+/);
+              const iconPath = iconPaths.get(imported);
+              if (!iconPath) {
+                throw new Error(
+                  `Unknown lucide-react icon export: ${imported}`,
+                );
+              }
+              return `import ${local} from 'lucide-react/dist/esm/icons/${iconPath}';`;
+            })
+            .join('\n'),
+      );
+      return rewritten === source ? null : rewritten;
+    },
+  };
+}
+
 export default defineConfig({
   base: APP_BASE,
-  plugins: [react(), tailwindcss()],
+  plugins: [katexWoff2Only(), lucideDirectImports(), react(), tailwindcss()],
   server: {
     port: 5173,
     host: '0.0.0.0',

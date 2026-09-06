@@ -1,13 +1,12 @@
-import { Bot, InputFile } from 'grammy';
+import { Bot, InputFile, type Context } from 'grammy';
 import crypto from 'crypto';
 import fsPromises from 'node:fs/promises';
-import https from 'node:https';
+import { downloadHttpsBuffer } from './im-media-download.js';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { createDedupCache } from './im-utils.js';
 import { notifyNewImMessage } from './message-notifier.js';
-import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import {
   saveDownloadedFile,
@@ -25,7 +24,8 @@ import {
   extractProviderTarget,
 } from './channel-address.js';
 import { resolveAdmittedChannelRoute } from './channel-admission.js';
-import type { ChannelMessageMeta } from './types.js';
+import { PhysicalDeliveryTracker } from './im-delivery-progress.js';
+import type { ChannelMessageMeta, NewMessage } from './types.js';
 import {
   ExactAsyncIndicatorRegistry,
   processingIndicatorKey,
@@ -73,6 +73,12 @@ export interface TelegramConnectOpts {
   } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  /** Project a message that has already committed to the host-owned store. */
+  onMessagePersisted?: (
+    chatJid: string,
+    message: NewMessage & { is_from_me?: boolean },
+    agentId?: string,
+  ) => void;
   /** Bot 被添加到群聊时调用（仅 group/supergroup） */
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   /** Bot 被移出群聊或群被解散时调用 */
@@ -82,7 +88,7 @@ export interface TelegramConnectOpts {
     chatJid: string,
     contextType: 'thread',
   ) => boolean | void | Promise<boolean | void>;
-  normalizeIncomingJid?: (jid: string) => string;
+  normalizeIncomingJid?: (jid: string) => string | null;
 }
 
 /**
@@ -98,6 +104,183 @@ export function buildTelegramRouteJid(
   return Number.isSafeInteger(messageThreadId) && messageThreadId! > 0
     ? `${base}#thread:${messageThreadId}`
     : base;
+}
+
+export type TelegramNativeMediaKind = 'video' | 'voice' | 'audio' | 'animation';
+
+export interface TelegramNativeFile {
+  fileId: string;
+  fileName: string;
+  fileSize?: number;
+  kind: TelegramNativeMediaKind;
+}
+
+/**
+ * Native Telegram media that is NOT message:photo / message:document.
+ * Video-button MP4, voice notes, audio files, and GIF/animation never
+ * carry `document` unless the user picked "Send as file".
+ */
+export function telegramNativeFileFromMessage(message: {
+  video?: { file_id: string; file_name?: string; file_size?: number };
+  voice?: { file_id: string; file_size?: number };
+  audio?: { file_id: string; file_name?: string; file_size?: number };
+  animation?: { file_id: string; file_name?: string; file_size?: number };
+}): TelegramNativeFile | null {
+  if (message.video) {
+    return {
+      fileId: message.video.file_id,
+      fileName: message.video.file_name || 'video.mp4',
+      fileSize: message.video.file_size,
+      kind: 'video',
+    };
+  }
+  if (message.voice) {
+    return {
+      fileId: message.voice.file_id,
+      fileName: 'voice.ogg',
+      fileSize: message.voice.file_size,
+      kind: 'voice',
+    };
+  }
+  if (message.audio) {
+    return {
+      fileId: message.audio.file_id,
+      fileName: message.audio.file_name || 'audio.mp3',
+      fileSize: message.audio.file_size,
+      kind: 'audio',
+    };
+  }
+  if (message.animation) {
+    return {
+      fileId: message.animation.file_id,
+      fileName: message.animation.file_name || 'animation.mp4',
+      fileSize: message.animation.file_size,
+      kind: 'animation',
+    };
+  }
+  return null;
+}
+
+export function persistTelegramNativeMediaMessage(input: {
+  id?: string;
+  targetJid: string;
+  sourceJid: string;
+  senderId: string;
+  senderName: string;
+  text: string;
+  timestamp: string;
+  agentId?: string;
+  storeMessageDirect: (
+    id: string,
+    chatJid: string,
+    sender: string,
+    senderName: string,
+    content: string,
+    timestamp: string,
+    isFromMe: boolean,
+    extra?: { sourceJid?: string },
+  ) => void;
+  notifyNewImMessage: () => void;
+  onMessagePersisted?: (
+    chatJid: string,
+    message: {
+      id: string;
+      chat_jid: string;
+      source_jid: string;
+      sender: string;
+      sender_name: string;
+      content: string;
+      timestamp: string;
+      is_from_me: boolean;
+    },
+    agentId?: string,
+  ) => void;
+}): string {
+  const id = input.id ?? crypto.randomUUID();
+  input.storeMessageDirect(
+    id,
+    input.targetJid,
+    input.senderId,
+    input.senderName,
+    input.text,
+    input.timestamp,
+    false,
+    { sourceJid: input.sourceJid },
+  );
+  input.onMessagePersisted?.(
+    input.targetJid,
+    {
+      id,
+      chat_jid: input.targetJid,
+      source_jid: input.sourceJid,
+      sender: input.senderId,
+      sender_name: input.senderName,
+      content: input.text,
+      timestamp: input.timestamp,
+      is_from_me: false,
+    },
+    input.agentId,
+  );
+  input.notifyNewImMessage();
+  return id;
+}
+
+/**
+ * Caption or text `/pair CODE` (optionally addressed to this bot).
+ * Telegram puts media commands on `caption`, not `text`.
+ */
+export function matchTelegramPairCode(
+  text: string | undefined,
+  expectedBotUsername?: string,
+): string | null {
+  if (!text) return null;
+  const match = text.trim().match(/^\/pair(?:@([A-Z0-9_]+))?\s+(\S+)/i);
+  if (!match) return null;
+  const addressedUsername = match[1];
+  const normalizedExpected = expectedBotUsername?.replace(/^@/, '');
+  if (
+    addressedUsername &&
+    (!normalizedExpected ||
+      addressedUsername.toLowerCase() !== normalizedExpected.toLowerCase())
+  ) {
+    return null;
+  }
+  return match[2] ?? null;
+}
+
+export function telegramMediaMessageText(
+  fileText: string,
+  caption: string | undefined,
+): string {
+  const normalizedCaption = caption?.trim();
+  return normalizedCaption ? `${fileText}\n${normalizedCaption}` : fileText;
+}
+
+/**
+ * Bot API animation updates also carry a compatibility `document` object.
+ * grammY middleware stops unless `next()` is called, so the document handler
+ * must explicitly yield or the later `message:animation` handler is unreachable.
+ */
+export async function yieldTelegramAnimationDocument(
+  message: { animation?: unknown },
+  next: () => Promise<unknown>,
+): Promise<boolean> {
+  if (!message.animation) return false;
+  await next();
+  return true;
+}
+
+export type TelegramOutboundFileKind = 'video' | 'audio' | 'voice' | 'document';
+
+/** Telegram's native APIs accept a narrower set than generic MIME viewers. */
+export function telegramOutboundFileKind(
+  fileName: string,
+): TelegramOutboundFileKind {
+  const ext = (fileName.split('.').pop() || '').toLowerCase();
+  if (ext === 'mp4') return 'video';
+  if (ext === 'mp3' || ext === 'm4a') return 'audio';
+  if (ext === 'ogg' || ext === 'opus') return 'voice';
+  return 'document';
 }
 
 export interface TelegramProviderTarget {
@@ -226,6 +409,33 @@ export interface TelegramConnection {
 
 // ─── Shared Helpers (pure functions, no instance state) ────────
 
+/**
+ * Only real HTML parse failures should fall back to a second plain send.
+ * Timeout / 5xx / 429 / other transport errors are wrapped by grammy as
+ * HttpError (inner error on `.error`, not `.cause`) and must be rethrown so
+ * the already-attempted chunk is not duplicated.
+ */
+function isTelegramHtmlParseError(err: unknown): boolean {
+  let current: unknown = err;
+  const seen = new Set<unknown>();
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const rec = current as Record<string, unknown>;
+    const code = Number(rec.error_code);
+    const description = String(rec.description ?? rec.message ?? '');
+    if (
+      code === 400 &&
+      /parse entities|unclosed|unsupported start tag|can't find end tag/i.test(
+        description,
+      )
+    ) {
+      return true;
+    }
+    current = rec.cause ?? rec.error;
+  }
+  return false;
+}
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -344,6 +554,7 @@ export function createTelegramConnection(
   let stopping = false;
   let readyFired = false;
   let connected = false;
+  let botUsername: string | undefined;
   const telegramApiAgent =
     config.proxyUrl && config.proxyUrl.trim()
       ? new ProxyAgent({
@@ -387,25 +598,10 @@ export function createTelegramConnection(
       }
 
       const url = `https://api.telegram.org/file/bot${config.botToken}/${filePath}`;
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        https
-          .get(url, { agent: telegramApiAgent }, (res) => {
-            const chunks: Buffer[] = [];
-            let total = 0;
-            res.on('data', (chunk: Buffer) => {
-              total += chunk.length;
-              if (total > MAX_FILE_SIZE) {
-                res.destroy(
-                  new Error('File exceeds MAX_FILE_SIZE during download'),
-                );
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-          })
-          .on('error', reject);
+      const buffer = await downloadHttpsBuffer(url, {
+        agentForUrl: () => telegramApiAgent,
+        followRedirects: true,
+        oversizedMessage: 'File exceeds MAX_FILE_SIZE during download',
       });
 
       // 使用 file_path 中的最后一段作为文件名（若无则用 originalFilename）
@@ -463,25 +659,10 @@ export function createTelegramConnection(
         return null;
       }
       const url = `https://api.telegram.org/file/bot${config.botToken}/${filePath}`;
-      const buffer = await new Promise<Buffer>((resolve, reject) => {
-        https
-          .get(url, { agent: telegramApiAgent }, (res) => {
-            const chunks: Buffer[] = [];
-            let total = 0;
-            res.on('data', (chunk: Buffer) => {
-              total += chunk.length;
-              if (total > MAX_FILE_SIZE) {
-                res.destroy(
-                  new Error('Photo exceeds MAX_FILE_SIZE during download'),
-                );
-                return;
-              }
-              chunks.push(chunk);
-            });
-            res.on('end', () => resolve(Buffer.concat(chunks)));
-            res.on('error', reject);
-          })
-          .on('error', reject);
+      const buffer = await downloadHttpsBuffer(url, {
+        agentForUrl: () => telegramApiAgent,
+        followRedirects: true,
+        oversizedMessage: 'Photo exceeds MAX_FILE_SIZE during download',
       });
       if (buffer.length === 0) {
         logger.warn({ fileId }, 'Empty response from Telegram photo download');
@@ -525,6 +706,93 @@ export function createTelegramConnection(
       );
       return false;
     }
+  }
+
+  /**
+   * One admission path for every caption-capable Telegram media update.
+   * Pairing is completed before any download/registration side effect, and the
+   * asynchronous pair attempt itself lives inside this try/catch so failures
+   * reliably produce user-visible feedback.
+   */
+  async function admitTelegramMedia(input: {
+    opts: TelegramConnectOpts;
+    jid: string;
+    chatName: string;
+    chat: TelegramChatDescriptor;
+    caption?: string;
+    kind: TelegramNativeMediaKind | 'photo' | 'document';
+    reply: (text: string) => Promise<unknown>;
+  }): Promise<boolean> {
+    if (input.opts.isChatAuthorized(input.jid)) return true;
+
+    const pairCode = matchTelegramPairCode(input.caption, botUsername);
+    if (pairCode && input.opts.onPairAttempt) {
+      try {
+        const success = await input.opts.onPairAttempt(
+          input.jid,
+          input.chatName,
+          pairCode,
+        );
+        if (success) {
+          const forumState = await prepareTelegramForumPairing(
+            input.jid,
+            input.chat,
+            (id) => bot!.api.getChat(id),
+            input.opts.onNativeContextDetected,
+          );
+          if (forumState === 'thread_ready') {
+            nativeContextReported.add(input.jid);
+          }
+          await input.reply(
+            forumState === 'thread_unavailable'
+              ? 'Pairing succeeded, but Telegram Forum routing could not be initialized. In Web settings, bind this channel to a default workspace before sending topic messages; do not bind it to a fixed session.'
+              : 'Pairing successful! This chat is now connected.',
+          );
+        } else {
+          await input.reply(
+            'Invalid or expired pairing code. Please generate a new code from the web settings page.',
+          );
+        }
+      } catch (err) {
+        logger.error(
+          { err, jid: input.jid, kind: input.kind },
+          'Error during Telegram media pair attempt',
+        );
+        try {
+          await input.reply(
+            'Pairing failed due to an internal error. Please try again.',
+          );
+        } catch (replyErr) {
+          logger.debug(
+            { err: replyErr, jid: input.jid },
+            'Failed to send Telegram pairing error feedback',
+          );
+        }
+      }
+      return false;
+    }
+
+    const now = Date.now();
+    const lastReject = rejectTimestamps.get(input.jid) ?? 0;
+    if (now - lastReject >= REJECT_COOLDOWN_MS) {
+      rejectTimestamps.set(input.jid, now);
+      try {
+        await input.reply(
+          'This chat is not yet paired. Please send /pair <code> to connect.\n' +
+            'You can generate a pairing code from the web settings page.',
+        );
+      } catch (err) {
+        logger.debug(
+          { err, jid: input.jid },
+          'Failed to send Telegram unauthorized feedback',
+        );
+      }
+    }
+    logger.debug(
+      { jid: input.jid, kind: input.kind },
+      'Unauthorized Telegram media ignored',
+    );
+    return false;
   }
 
   function isExpectedStopError(err: unknown): boolean {
@@ -639,9 +907,9 @@ export function createTelegramConnection(
             const text = ctx.message.text;
 
             // ── /pair <code> command ──
-            const pairMatch = text.match(/^\/pair\s+(\S+)/i);
-            if (pairMatch && opts.onPairAttempt) {
-              const code = pairMatch[1];
+            const pairCode = matchTelegramPairCode(text, botUsername);
+            if (pairCode && opts.onPairAttempt) {
+              const code = pairCode;
               try {
                 const success = await opts.onPairAttempt(jid, chatName, code);
                 if (success) {
@@ -824,8 +1092,8 @@ export function createTelegramConnection(
               { sourceJid },
             );
 
-            // 广播到 Web 客户端
-            broadcastNewMessage(
+            // The connector owns persistence; the host decides how to project it.
+            opts.onMessagePersisted?.(
               targetJid,
               {
                 id,
@@ -899,11 +1167,17 @@ export function createTelegramConnection(
                 .filter(Boolean)
                 .join(' ') || 'Unknown';
 
-            if (!opts.isChatAuthorized(jid)) {
-              logger.debug(
-                { jid },
-                'Unauthorized Telegram chat (photo), ignoring',
-              );
+            if (
+              !(await admitTelegramMedia({
+                opts,
+                jid,
+                chatName,
+                chat: ctx.chat as TelegramChatDescriptor,
+                caption: ctx.message.caption,
+                kind: 'photo',
+                reply: (text) => ctx.reply(text),
+              }))
+            ) {
               return;
             }
 
@@ -979,8 +1253,10 @@ export function createTelegramConnection(
               }
             }
 
-            const caption = ctx.message.caption;
-            const text = caption ? `${imgMarker}\n${caption}` : imgMarker;
+            const text = telegramMediaMessageText(
+              imgMarker,
+              ctx.message.caption,
+            );
 
             const id = crypto.randomUUID();
             ackReactions
@@ -1025,7 +1301,7 @@ export function createTelegramConnection(
               { attachments: attachmentsJson, sourceJid },
             );
 
-            broadcastNewMessage(
+            opts.onMessagePersisted?.(
               targetJid,
               {
                 id,
@@ -1059,8 +1335,12 @@ export function createTelegramConnection(
       });
 
       // ── message:document 处理器 ──
-      bot.on('message:document', async (ctx) => {
+      bot.on('message:document', async (ctx, next) => {
         try {
+          // Telegram exposes animations through both `animation` and the
+          // backwards-compatible `document` field. Let the native animation
+          // handler own it so one update cannot race two persistence paths.
+          if (await yieldTelegramAnimationDocument(ctx.message, next)) return;
           const msgId =
             String(ctx.message.message_id) + ':' + String(ctx.chat.id);
           if (isGloballyStale(ctx.message.date * 1000)) return;
@@ -1089,11 +1369,17 @@ export function createTelegramConnection(
                 .filter(Boolean)
                 .join(' ') || 'Unknown';
 
-            if (!opts.isChatAuthorized(jid)) {
-              logger.debug(
-                { jid },
-                'Unauthorized Telegram chat (document), ignoring',
-              );
+            if (
+              !(await admitTelegramMedia({
+                opts,
+                jid,
+                chatName,
+                chat: ctx.chat as TelegramChatDescriptor,
+                caption: ctx.message.caption,
+                kind: 'document',
+                reply: (text) => ctx.reply(text),
+              }))
+            ) {
               return;
             }
 
@@ -1124,7 +1410,10 @@ export function createTelegramConnection(
 
             // file_size 超过上限时跳过下载
             if (doc.file_size !== undefined && doc.file_size > MAX_FILE_SIZE) {
-              const text = `[文件过大，未下载: ${safeFilename}]`;
+              const text = telegramMediaMessageText(
+                `[文件过大，未下载: ${safeFilename}]`,
+                ctx.message.caption,
+              );
               const id = crypto.randomUUID();
               const timestamp = new Date(ctx.message.date * 1000).toISOString();
               const senderId = ctx.from?.id
@@ -1140,7 +1429,7 @@ export function createTelegramConnection(
                 false,
                 { sourceJid },
               );
-              broadcastNewMessage(
+              opts.onMessagePersisted?.(
                 targetJid,
                 {
                   id,
@@ -1175,8 +1464,10 @@ export function createTelegramConnection(
                 : `[文件下载失败: ${safeFilename}]`;
             }
 
-            const caption = ctx.message.caption;
-            const text = caption ? `${fileText}\n${caption}` : fileText;
+            const text = telegramMediaMessageText(
+              fileText,
+              ctx.message.caption,
+            );
 
             const id = crypto.randomUUID();
             ackReactions
@@ -1221,7 +1512,7 @@ export function createTelegramConnection(
               { sourceJid },
             );
 
-            broadcastNewMessage(
+            opts.onMessagePersisted?.(
               targetJid,
               {
                 id,
@@ -1252,6 +1543,171 @@ export function createTelegramConnection(
           logger.error({ err }, 'Error handling Telegram document');
         }
       });
+
+      // ── message:video|voice|audio|animation（原生媒体，不是 "Send as file"）──
+      const handleNativeTelegramMedia = async (ctx: Context): Promise<void> => {
+        try {
+          const tgMessage = ctx.message;
+          const tgChat = ctx.chat;
+          if (!tgMessage || !tgChat) return;
+          const file = telegramNativeFileFromMessage(tgMessage);
+          if (!file) return;
+          const msgId = String(tgMessage.message_id) + ':' + String(tgChat.id);
+          if (isGloballyStale(tgMessage.date * 1000)) return;
+          if (dedup.isDuplicate(msgId)) return;
+          if (!processingLock.acquire(msgId)) return;
+          dedup.markSeen(msgId);
+          try {
+            if (isStaleMessage(tgMessage.date, opts.ignoreMessagesBefore))
+              return;
+
+            const chatId = String(tgChat.id);
+            const routeJid =
+              opts.normalizeIncomingJid?.(
+                buildTelegramRouteJid(chatId, tgMessage.message_thread_id),
+              ) ?? buildTelegramRouteJid(chatId, tgMessage.message_thread_id);
+            const jid = channelConversationJid(routeJid);
+            const messageMeta = telegramMessageMeta(tgMessage);
+            const chatName =
+              tgChat.title ||
+              [tgChat.first_name, tgChat.last_name].filter(Boolean).join(' ') ||
+              `Telegram ${chatId}`;
+            const senderName =
+              [ctx.from?.first_name, ctx.from?.last_name]
+                .filter(Boolean)
+                .join(' ') || 'Unknown';
+
+            if (
+              !(await admitTelegramMedia({
+                opts,
+                jid,
+                chatName,
+                chat: tgChat as TelegramChatDescriptor,
+                caption: tgMessage.caption,
+                kind: file.kind,
+                reply: (text) => ctx.reply(text),
+              }))
+            ) {
+              return;
+            }
+
+            const resolvedRoute = resolveAdmittedChannelRoute(
+              routeJid,
+              opts.resolveEffectiveChatJid
+                ? () => opts.resolveEffectiveChatJid!(jid, messageMeta)
+                : undefined,
+            );
+            if (!resolvedRoute) {
+              logger.warn(
+                { jid, routeJid, kind: file.kind },
+                'Telegram native media dropped: binding resolver rejected route',
+              );
+              return;
+            }
+            const { targetJid, routing: agentRouting } = resolvedRoute;
+            const sourceJid = agentRouting?.sourceJid ?? routeJid;
+
+            await reportNativeContext(opts, jid, tgMessage.message_thread_id);
+            storeChatMetadata(jid, new Date().toISOString());
+            updateChatName(jid, chatName);
+            opts.onNewChat(jid, chatName);
+
+            const originalFilename = file.fileName;
+            const safeFilename = sanitizeImFilename(originalFilename);
+
+            let fileText: string;
+            const groupFolder = opts.resolveGroupFolder?.(jid);
+            if (file.fileSize !== undefined && file.fileSize > MAX_FILE_SIZE) {
+              fileText = `[文件过大，未下载: ${safeFilename}]`;
+            } else if (!groupFolder) {
+              fileText = `[文件下载失败: 无法确定工作目录]`;
+            } else {
+              const relPath = await downloadTelegramFile(
+                file.fileId,
+                originalFilename,
+                groupFolder,
+                file.fileSize,
+              );
+              fileText = relPath
+                ? `[文件: ${relPath}]`
+                : `[文件下载失败: ${safeFilename}]`;
+            }
+
+            // One UUID owns both the exact-input reaction and the durable row.
+            // Passing the already-final marker avoids rebuilding a fake path in
+            // a second helper and preserves download/oversize failure details.
+            const id = crypto.randomUUID();
+            ackReactions
+              .attach(
+                processingIndicatorKey(extractProviderTarget(sourceJid), id),
+                async () => {
+                  try {
+                    await ctx.react('👀');
+                    return {
+                      chatId: tgChat.id,
+                      messageId: tgMessage.message_id,
+                    };
+                  } catch (err) {
+                    logger.debug(
+                      { err, msgId },
+                      'Failed to add Telegram reaction',
+                    );
+                    return null;
+                  }
+                },
+                async (handle) => {
+                  if (!bot) throw new Error('Telegram bot is not initialized');
+                  await bot.api.setMessageReaction(
+                    handle.chatId,
+                    handle.messageId,
+                    [],
+                  );
+                },
+              )
+              .catch(() => {});
+            const timestamp = new Date(tgMessage.date * 1000).toISOString();
+            const senderId = ctx.from?.id ? `tg:${ctx.from.id}` : 'tg:unknown';
+            const text = telegramMediaMessageText(fileText, tgMessage.caption);
+            storeChatMetadata(targetJid, timestamp);
+            persistTelegramNativeMediaMessage({
+              id,
+              targetJid,
+              sourceJid,
+              senderId,
+              senderName,
+              text,
+              timestamp,
+              agentId: agentRouting?.agentId ?? undefined,
+              storeMessageDirect,
+              notifyNewImMessage,
+              onMessagePersisted: opts.onMessagePersisted,
+            });
+
+            if (agentRouting?.agentId) {
+              opts.onAgentMessage?.(jid, agentRouting.agentId);
+            }
+
+            logger.info(
+              {
+                jid,
+                sender: senderName,
+                msgId,
+                kind: file.kind,
+                routed: !!agentRouting,
+              },
+              'Telegram native media stored',
+            );
+          } finally {
+            processingLock.release(msgId);
+          }
+        } catch (err) {
+          logger.error({ err }, 'Error handling Telegram native media');
+        }
+      };
+      bot.on('message:video', handleNativeTelegramMedia);
+      bot.on('message:voice', handleNativeTelegramMedia);
+      bot.on('message:audio', handleNativeTelegramMedia);
+      bot.on('message:animation', handleNativeTelegramMedia);
 
       // ── my_chat_member: Bot 加入/离开群聊检测 ──
       bot.on('my_chat_member', async (ctx) => {
@@ -1314,7 +1770,8 @@ export function createTelegramConnection(
       });
 
       // Validate credentials/network before reporting transport readiness.
-      await bot.api.getMe();
+      const me = await bot.api.getMe();
+      botUsername = me.username;
 
       let settleInitialReady: ((ready: boolean) => void) | null = null;
       const initialReady = new Promise<boolean>((resolve) => {
@@ -1434,6 +1891,7 @@ export function createTelegramConnection(
       }
       processingLock.dispose();
       nativeContextReported.clear();
+      botUsername = undefined;
     },
 
     async sendMessage(
@@ -1444,6 +1902,7 @@ export function createTelegramConnection(
       if (!bot) {
         throw new Error('Telegram bot is not initialized');
       }
+      const activeBot = bot;
 
       const target = parseTelegramProviderTarget(chatId);
       if (!target) {
@@ -1456,30 +1915,46 @@ export function createTelegramConnection(
       try {
         // Split original markdown into chunks (leave room for HTML tag overhead)
         const mdChunks = splitMarkdownChunks(text, 3800);
+        const tracker = new PhysicalDeliveryTracker(
+          mdChunks.length + (localImagePaths?.length ?? 0),
+        );
 
         for (const mdChunk of mdChunks) {
-          const html = markdownToTelegramHtml(mdChunk);
-          try {
-            await bot.api.sendMessage(target.chatId, html, {
-              parse_mode: 'HTML',
-              ...threadOptions,
-            });
-          } catch (err) {
-            // HTML parse failed (e.g. unclosed tags), fallback to plain text
-            logger.debug(
-              { err, chatId },
-              'HTML parse failed, fallback to plain',
-            );
-            await bot.api.sendMessage(target.chatId, mdChunk, threadOptions);
-          }
+          await tracker.send(async () => {
+            const html = markdownToTelegramHtml(mdChunk);
+            try {
+              await activeBot.api.sendMessage(target.chatId, html, {
+                parse_mode: 'HTML',
+                ...threadOptions,
+              });
+            } catch (err) {
+              if (!isTelegramHtmlParseError(err)) {
+                throw err;
+              }
+              // HTML parse failed (e.g. unclosed tags), fallback to plain text
+              logger.debug(
+                { err, chatId },
+                'HTML parse failed, fallback to plain',
+              );
+              await activeBot.api.sendMessage(
+                target.chatId,
+                mdChunk,
+                threadOptions,
+              );
+            }
+          });
         }
 
         for (const localImagePath of localImagePaths || []) {
           try {
-            await bot.api.sendPhoto(
-              target.chatId,
-              new InputFile(localImagePath),
-              threadOptions,
+            await tracker.send(() =>
+              activeBot.api
+                .sendPhoto(
+                  target.chatId,
+                  new InputFile(localImagePath),
+                  threadOptions,
+                )
+                .then(() => undefined),
             );
           } catch (imageErr) {
             logger.error(
@@ -1611,13 +2086,20 @@ export function createTelegramConnection(
           );
         }
 
-        await bot.api.sendDocument(
-          target.chatId,
-          new InputFile(filePath, fileName),
-          target.messageThreadId
-            ? { message_thread_id: target.messageThreadId }
-            : {},
-        );
+        const inputFile = new InputFile(filePath, fileName);
+        const threadOptions = target.messageThreadId
+          ? { message_thread_id: target.messageThreadId }
+          : {};
+        const fileKind = telegramOutboundFileKind(fileName);
+        if (fileKind === 'video') {
+          await bot.api.sendVideo(target.chatId, inputFile, threadOptions);
+        } else if (fileKind === 'audio') {
+          await bot.api.sendAudio(target.chatId, inputFile, threadOptions);
+        } else if (fileKind === 'voice') {
+          await bot.api.sendVoice(target.chatId, inputFile, threadOptions);
+        } else {
+          await bot.api.sendDocument(target.chatId, inputFile, threadOptions);
+        }
 
         logger.info(
           { chatId, filePath, fileName, size: stat.size },
@@ -1653,66 +2135,4 @@ export function createTelegramConnection(
   };
 
   return connection;
-}
-
-// ─── Backward-compatible global singleton ──────────────────────
-// @deprecated — 旧的顶层导出函数，内部使用一个默认全局实例。
-// 后续由 imManager 替代。
-
-let _defaultInstance: TelegramConnection | null = null;
-
-/**
- * @deprecated Use createTelegramConnection() factory instead. Will be replaced by imManager.
- */
-export async function connectTelegram(
-  opts: TelegramConnectOpts,
-): Promise<void> {
-  const { getTelegramProviderConfig } = await import('./runtime-config.js');
-  const config = getTelegramProviderConfig();
-  if (!config.botToken) {
-    logger.info('Telegram bot token not configured, skipping');
-    return;
-  }
-
-  _defaultInstance = createTelegramConnection({
-    botToken: config.botToken,
-    proxyUrl: config.proxyUrl,
-  });
-
-  await _defaultInstance.connect(opts);
-}
-
-/**
- * @deprecated Use TelegramConnection.sendMessage() instead.
- */
-export async function sendTelegramMessage(
-  chatId: string,
-  text: string,
-  localImagePaths?: string[],
-): Promise<void> {
-  if (!_defaultInstance) {
-    logger.warn(
-      { chatId },
-      'Telegram bot not initialized, skip sending message',
-    );
-    return;
-  }
-  return _defaultInstance.sendMessage(chatId, text, localImagePaths);
-}
-
-/**
- * @deprecated Use TelegramConnection.disconnect() instead.
- */
-export async function disconnectTelegram(): Promise<void> {
-  if (_defaultInstance) {
-    await _defaultInstance.disconnect();
-    _defaultInstance = null;
-  }
-}
-
-/**
- * @deprecated Use TelegramConnection.isConnected() instead.
- */
-export function isTelegramConnected(): boolean {
-  return _defaultInstance?.isConnected() ?? false;
 }

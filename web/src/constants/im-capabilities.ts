@@ -15,6 +15,7 @@ export const IM_CHANNEL_ORDER = [
   'telegram',
   'qq',
   'wechat',
+  'wecom',
   'dingtalk',
   'discord',
   'whatsapp',
@@ -40,7 +41,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<
   dingtalk: {
     channel_type: 'dingtalk',
     label: '钉钉',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -62,7 +63,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<
   qq: {
     channel_type: 'qq',
     label: 'QQ',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: false,
@@ -73,7 +74,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<
   wechat: {
     channel_type: 'wechat',
     label: '微信',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: false,
@@ -81,10 +82,21 @@ export const IM_CHANNEL_CAPABILITIES: Record<
     supports_streaming_updates: false,
     supports_file_send: false,
   },
+  wecom: {
+    channel_type: 'wecom',
+    label: '企业微信',
+    can_bind_workspace: false,
+    can_bind_session: true,
+    supports_thread_map: false,
+    supports_activation_modes: true,
+    supports_owner_mention: true,
+    supports_streaming_updates: true,
+    supports_file_send: false,
+  },
   discord: {
     channel_type: 'discord',
     label: 'Discord',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -95,7 +107,7 @@ export const IM_CHANNEL_CAPABILITIES: Record<
   whatsapp: {
     channel_type: 'whatsapp',
     label: 'WhatsApp',
-    can_bind_workspace: true,
+    can_bind_workspace: false,
     can_bind_session: true,
     supports_thread_map: false,
     supports_activation_modes: true,
@@ -123,6 +135,11 @@ export function isThreadMapCapableChat(info?: {
   if (!info?.channel_type) return false;
   const caps = getImChannelCapabilities(info.channel_type);
   if (!caps?.supports_thread_map) return false;
+  if (info.channel_type === 'feishu') {
+    // Generic thread flags may come from legacy mention routing.
+    if (info.chat_mode === 'p2p') return false;
+    return info.chat_mode === 'topic' || info.group_message_type === 'thread';
+  }
   return (
     info.thread_capable === true ||
     info.native_context_type === 'thread' ||

@@ -32,9 +32,25 @@ export interface ResolveTurnOutcomeInput {
   status: 'success' | 'error' | 'stream' | 'closed';
   healthyInputTurnCompleted: boolean;
   cursorCommitted: boolean;
+  /** Terminal/final user-answer acknowledgement only. */
   replyDelivered: boolean;
+  /** Observability only: progress can never settle or commit the turn. */
+  progressDelivered?: boolean;
   stopRequested?: boolean;
   deterministicFailure?: boolean;
+}
+
+/** Progress/separate output creates an obligation to produce a terminal final. */
+export function hasUnfinishedProactiveOutput(input: {
+  interactionMode: 'assistant' | 'proactive';
+  nonTerminalDelivered: boolean;
+  finalDelivered: boolean;
+}): boolean {
+  return (
+    input.interactionMode === 'proactive' &&
+    input.nonTerminalDelivered &&
+    !input.finalDelivered
+  );
 }
 
 export function resolveTurnOutcome(

@@ -102,18 +102,17 @@ interface PendingWeChatQr {
 
 const pendingWeChatQr = new Map<string, PendingWeChatQr>();
 
-export const PAIRING_CHANNEL_PROVIDERS = new Set<ChannelProvider>([
+const PAIRING_CHANNEL_PROVIDERS = new Set<ChannelProvider>([
   'telegram',
   'qq',
   'wechat',
+  'wecom',
   'dingtalk',
   'discord',
   'whatsapp',
 ]);
 
-export function channelProviderSupportsPairing(
-  provider: ChannelProvider,
-): boolean {
+function channelProviderSupportsPairing(provider: ChannelProvider): boolean {
   return PAIRING_CHANNEL_PROVIDERS.has(provider);
 }
 
@@ -178,6 +177,7 @@ const PROVIDER_NAMES: Record<ChannelProvider, string> = {
   telegram: 'Telegram',
   qq: 'QQ',
   wechat: '微信',
+  wecom: '企业微信',
   dingtalk: '钉钉',
   discord: 'Discord',
   whatsapp: 'WhatsApp',
@@ -231,6 +231,7 @@ function credentialsError(
     telegram: ['botToken'],
     qq: ['appId', 'appSecret'],
     wechat: [],
+    wecom: ['botId', 'secret'],
     dingtalk: ['clientId', 'clientSecret'],
     discord: ['botToken'],
     whatsapp: [],
@@ -249,6 +250,7 @@ function credentialsError(
         ? ['botToken', 'ilinkBotId', 'baseUrl', 'cdnBaseUrl', 'getUpdatesBuf']
         : []),
     ],
+    wecom: ['botId', 'secret', 'corpId'],
     dingtalk: ['clientId', 'clientSecret', 'streamingMode'],
     discord: ['botToken', 'streamingMode'],
     whatsapp: ['phoneNumber'],
@@ -374,7 +376,7 @@ function syncLegacyUserImFacade(
       streamingMode: secret.streamingMode === 'edit' ? 'edit' : 'off',
       enabled,
     });
-  } else {
+  } else if (account.provider === 'whatsapp') {
     saveUserWhatsAppConfig(account.owner_user_id, {
       accountId: account.id,
       phoneNumber: secret.phoneNumber || '',
@@ -479,17 +481,25 @@ function legacyCredentialsFor(
         }
       : null;
   }
-  const value = getUserWhatsAppConfig(userId);
-  return value
-    ? {
-        secret: { accountId: value.accountId, phoneNumber: value.phoneNumber },
-        enabled: value.enabled !== false,
-      }
-    : null;
+  if (provider === 'whatsapp') {
+    const value = getUserWhatsAppConfig(userId);
+    return value
+      ? {
+          secret: {
+            accountId: value.accountId,
+            phoneNumber: value.phoneNumber,
+          },
+          enabled: value.enabled !== false,
+        }
+      : null;
+  }
+  // WeCom has never had a legacy /user-im singleton. It must not inherit the
+  // WhatsApp facade or auth directory through a catch-all branch.
+  return null;
 }
 
 /** Lazy, idempotent projection of legacy per-user/provider singleton configs. */
-export function ensureLegacyDefaultChannelAccounts(userId: string): void {
+function ensureLegacyDefaultChannelAccounts(userId: string): void {
   const providers = Object.keys(PROVIDER_NAMES) as ChannelProvider[];
   for (const provider of providers) {
     const legacy = legacyCredentialsFor(userId, provider);
@@ -510,6 +520,24 @@ routes.get('/', authMiddleware, (c) => {
   return c.json({
     accounts: listChannelAccountsForUser(user.id).map(publicAccount),
   });
+});
+
+routes.get('/status', authMiddleware, (c) => {
+  const user = c.get('user') as AuthUser;
+  ensureLegacyDefaultChannelAccounts(user.id);
+  const connected = new Set(
+    listChannelAccountsForUser(user.id)
+      .filter((account) => account.enabled && account.status === 'connected')
+      .map((account) => account.provider),
+  );
+  return c.json(
+    Object.fromEntries(
+      (Object.keys(PROVIDER_NAMES) as ChannelProvider[]).map((provider) => [
+        provider,
+        connected.has(provider),
+      ]),
+    ),
+  );
 });
 
 routes.post('/', authMiddleware, async (c) => {

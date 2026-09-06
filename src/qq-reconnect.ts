@@ -38,12 +38,7 @@ export function isTransientError(err: unknown): boolean {
 }
 
 export const RECONNECT_DELAYS: readonly number[] = [
-  1_000,
-  2_000,
-  5_000,
-  10_000,
-  30_000,
-  60_000,
+  1_000, 2_000, 5_000, 10_000, 30_000, 60_000,
 ];
 
 export function getReconnectDelay(
@@ -58,7 +53,8 @@ export type CloseCodeAction =
   | { kind: 'normal' }
   | { kind: 'refresh-token' }
   | { kind: 'rate-limit' }
-  | { kind: 'reset-session' };
+  | { kind: 'reset-session' }
+  | { kind: 'intents-rejected' };
 
 /**
  * Map a WebSocket close code to a reconnect strategy.
@@ -66,6 +62,9 @@ export type CloseCodeAction =
  * - 4004: invalid token → drop cached token, IDENTIFY fresh
  * - 4008: rate limited → wait `RATE_LIMIT_DELAY_MS` before retry
  * - 4900-4913: server internal error → drop session, IDENTIFY fresh
+ * - 4914/4915: the gateway refused the requested intents → reconnecting with
+ *   the same IDENTIFY can only fail the same way, so the caller has to drop
+ *   an optional intent before retrying
  * - anything else: normal reconnect (RESUME if session is still valid)
  */
 export function classifyCloseCode(
@@ -73,6 +72,9 @@ export function classifyCloseCode(
 ): CloseCodeAction {
   if (code === 4004) return { kind: 'refresh-token' };
   if (code === 4008) return { kind: 'rate-limit' };
+  // 4914 INSUFFICIENT_INTENTS / 4915 DISALLOWED_INTENTS. Checked before the
+  // 4900-4913 server-error range so the ranges stay disjoint and readable.
+  if (code === 4914 || code === 4915) return { kind: 'intents-rejected' };
   if (typeof code === 'number' && code >= 4900 && code <= 4913) {
     return { kind: 'reset-session' };
   }

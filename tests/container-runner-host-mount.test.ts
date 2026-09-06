@@ -47,7 +47,11 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 const db = await import('../src/db.js');
-const { buildVolumeMounts } = await import('../src/container-runner.js');
+const {
+  buildVolumeMounts,
+  clearSessionClaudeOAuthFiles,
+  workspaceRuntimeCredentialOwnerId,
+} = await import('../src/container-runner.js');
 
 const OWNER_ID = 'host-mount-admin';
 const ALLOWED_ROOT = path.join(SHARED_TMP, 'allowed');
@@ -320,6 +324,85 @@ describe.sequential(
           { hostPath: missing, containerPath: 'missing-half', readonly: true },
         ]),
       ).toThrow();
+    });
+
+    it('clears stale Docker session OAuth when a workspace API key is explicit', () => {
+      const folder = 'runtime-mount-workspace';
+      const envDir = path.join(SHARED_TMP, 'data', 'config', 'container-env');
+      const sessionDir = path.join(
+        SHARED_TMP,
+        'data',
+        'sessions',
+        folder,
+        '.claude',
+      );
+      fs.mkdirSync(envDir, { recursive: true });
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(envDir, `${folder}.json`),
+        JSON.stringify({ anthropicApiKey: 'workspace-key' }),
+      );
+      fs.writeFileSync(
+        path.join(sessionDir, '.claude.json'),
+        JSON.stringify({
+          userID: 'stable-device',
+          oauthAccount: { id: 'old' },
+        }),
+      );
+      fs.writeFileSync(
+        path.join(sessionDir, '.credentials.json'),
+        JSON.stringify({ claudeAiOauth: { accessToken: 'old' } }),
+      );
+
+      buildVolumeMounts(group([]) as any, false, false);
+
+      expect(
+        JSON.parse(
+          fs.readFileSync(path.join(sessionDir, '.claude.json'), 'utf8'),
+        ),
+      ).toEqual({ userID: 'stable-device' });
+      expect(fs.existsSync(path.join(sessionDir, '.credentials.json'))).toBe(
+        false,
+      );
+      fs.unlinkSync(path.join(envDir, `${folder}.json`));
+    });
+
+    it('materializes a host session without mutating global OAuth and uses a stable Keychain owner', () => {
+      const hostRoot = path.join(SHARED_TMP, 'host-auth-test');
+      const sessionDir = path.join(hostRoot, 'session');
+      const globalClaudeJson = path.join(hostRoot, '.claude.json');
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        globalClaudeJson,
+        JSON.stringify({ userID: 'host-device', oauthAccount: { id: 'old' } }),
+      );
+      fs.symlinkSync(globalClaudeJson, path.join(sessionDir, '.claude.json'));
+      fs.writeFileSync(path.join(sessionDir, '.credentials.json'), '{}');
+
+      clearSessionClaudeOAuthFiles(sessionDir, globalClaudeJson);
+
+      expect(
+        JSON.parse(fs.readFileSync(globalClaudeJson, 'utf8')).oauthAccount,
+      ).toEqual({ id: 'old' });
+      expect(
+        JSON.parse(
+          fs.readFileSync(path.join(sessionDir, '.claude.json'), 'utf8'),
+        ),
+      ).toEqual({ userID: 'host-device' });
+      expect(fs.lstatSync(path.join(sessionDir, '.claude.json')).isFile()).toBe(
+        true,
+      );
+      expect(workspaceRuntimeCredentialOwnerId('runtime-mount-workspace')).toBe(
+        'runtime-workspace-auth:runtime-mount-workspace',
+      );
+
+      const runnerSource = fs.readFileSync(
+        new URL('../src/container-runner.ts', import.meta.url),
+        'utf8',
+      );
+      expect(runnerSource).toMatch(
+        /removeClaudeKeychainOAuth\([\s\S]*workspaceRuntimeCredentialOwnerId\(group\.folder\)/,
+      );
     });
   },
 );

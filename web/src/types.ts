@@ -66,7 +66,7 @@ export interface AgentProfile {
   avatar_emoji: string | null;
   avatar_color: string | null;
   avatar_url: string | null;
-  /** Null means inherit the system default model configuration. */
+  /** Null means select automatically from enabled model configurations. */
   model_config_id: string | null;
   runtime_policy: AgentProfileRuntimePolicy;
   /** Policy after applying system defaults and current authorization. */
@@ -85,7 +85,6 @@ export interface ModelConfigOption {
   type: 'official' | 'third_party';
   enabled: boolean;
   anthropic_model: string;
-  is_default: boolean;
 }
 
 export type AgentProfilePromptMode = 'append' | 'replace';
@@ -353,7 +352,13 @@ export interface AgentInfo {
   completed_at?: string;
   result_summary?: string;
   linked_im_groups?: Array<{ jid: string; name: string }>;
-  source_kind?: 'manual' | 'native_thread' | 'feishu_thread' | 'auto_im' | null;
+  source_kind?:
+    | 'manual'
+    | 'native_thread'
+    | 'feishu_thread'
+    | 'auto_im'
+    | 'channel_direct'
+    | null;
   thread_id?: string | null;
   root_message_id?: string | null;
   title_source?:
@@ -398,7 +403,7 @@ export interface AvailableImGroup {
   chat_mode?: string;
   group_message_type?: string;
   is_thread_capable?: boolean;
-  conversation_kind?: 'direct' | 'group' | 'unknown';
+  conversation_kind?: 'direct' | 'group' | 'topic' | 'unknown';
   sender_allowlist_locked?: boolean;
 }
 

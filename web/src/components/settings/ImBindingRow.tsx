@@ -14,6 +14,10 @@ import {
   ACTIVATION_MODE_OPTIONS,
   AUDIENCE_MODE_OPTIONS,
 } from '../../constants/im';
+import {
+  hasBindingPolicyMismatch,
+  resolveBindingTargetType,
+} from '../../utils/im-binding-policy';
 import { getImChannelCapabilities } from '../../constants/im-capabilities';
 
 interface ImBindingRowProps {
@@ -40,11 +44,11 @@ export function ImBindingRow({
   const boundSessionId = group.bound_session_id ?? group.bound_agent_id;
   const boundWorkspaceJid = group.bound_workspace_jid ?? group.bound_main_jid;
   const hasBound = !!boundSessionId || !!boundWorkspaceJid;
-  const isLegacyGroupSessionBinding =
-    !!boundSessionId && group.conversation_kind !== 'direct';
+  const policyMismatch = hasBindingPolicyMismatch(group);
   const supportsActivation =
-    group.conversation_kind === 'group' &&
-    !isLegacyGroupSessionBinding &&
+    (group.conversation_kind === 'group' ||
+      group.conversation_kind === 'topic') &&
+    !policyMismatch &&
     getImChannelCapabilities(group.channel_type)?.supports_activation_modes ===
       true;
   const supportsOwnerMention =
@@ -68,12 +72,10 @@ export function ImBindingRow({
         group.bound_workspace_name !== group.bound_target_name
           ? `${group.bound_workspace_name} / ${group.bound_target_name}`
           : group.bound_target_name;
-      return group.conversation_kind === 'direct'
-        ? `会话 · ${target}`
-        : `异常会话绑定 · ${target}`;
+      return !policyMismatch ? `会话 · ${target}` : `异常会话绑定 · ${target}`;
     }
     if (boundWorkspaceJid && group.bound_target_name) {
-      return group.conversation_kind === 'direct'
+      return resolveBindingTargetType(group) === 'session'
         ? `主会话 · ${group.bound_target_name}`
         : `工作区 · ${group.bound_target_name}`;
     }
@@ -119,8 +121,10 @@ export function ImBindingRow({
               {group.conversation_kind === 'direct'
                 ? '私聊'
                 : group.conversation_kind === 'group'
-                  ? '群聊'
-                  : '类型待确认'}
+                  ? '普通群'
+                  : group.conversation_kind === 'topic'
+                    ? '话题群'
+                    : '类型待确认'}
             </span>
             {group.member_count != null && (
               <span className="flex items-center gap-0.5">
@@ -147,10 +151,12 @@ export function ImBindingRow({
               </span>
             </div>
           )}
-          {isLegacyGroupSessionBinding && (
+          {policyMismatch && (
             <div className="mt-1 flex items-start gap-1 text-xs text-amber-700 dark:text-amber-400">
               <AlertTriangle className="mt-0.5 size-3 shrink-0" />
-              <span>历史绑定需要迁移：群聊只能绑定工作区。</span>
+              <span>
+                此绑定与渠道类型不符：私聊和普通群绑定会话，话题群绑定工作区。
+              </span>
             </div>
           )}
         </div>
@@ -202,8 +208,9 @@ export function ImBindingRow({
           </div>
         )}
         {group.channel_type === 'feishu' &&
-          group.conversation_kind === 'group' &&
-          !isLegacyGroupSessionBinding && (
+          (group.conversation_kind === 'group' ||
+            group.conversation_kind === 'topic') &&
+          !policyMismatch && (
             <select
               value={
                 group.audience_mode === 'owner_only' ||
@@ -236,14 +243,14 @@ export function ImBindingRow({
             onClick={() => onUnbind(group)}
             disabled={isActioning}
             className="text-muted-foreground hover:text-foreground"
-            title="恢复账号默认工作区"
+            title="解除渠道绑定"
           >
             {isActioning ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
             ) : (
               <RotateCcw className="w-3.5 h-3.5" />
             )}
-            <span className="sr-only">恢复账号默认工作区</span>
+            <span className="sr-only">解除渠道绑定</span>
           </Button>
         )}
         <Button

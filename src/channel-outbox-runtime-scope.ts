@@ -94,6 +94,34 @@ export class ActiveChannelOutboxScopeRegistry {
     return null;
   }
 
+  /** Resolve the route captured for the input, without consulting a later turn. */
+  resolveInputScope(
+    key: string,
+    inputTurnId: string,
+  ): ActiveChannelOutboxScope | null {
+    const bucket = this.scopes.get(key);
+    if (!bucket || !inputTurnId) return null;
+    const matches = [...bucket.values()].filter(
+      (scope) => scope.inputTurnId === inputTurnId,
+    );
+    const latest = matches[matches.length - 1];
+    if (!latest) return null;
+    // A legacy mirror scope must never become an input's reply recipient.
+    if (
+      matches.some(
+        (scope) =>
+          scope.provider !== latest.provider ||
+          scope.accountId !== latest.accountId ||
+          scope.sourceJid !== latest.sourceJid ||
+          scope.chatId !== latest.chatId ||
+          scope.rootId !== latest.rootId ||
+          scope.threadId !== latest.threadId,
+      )
+    )
+      return null;
+    return latest;
+  }
+
   unbind(key: string, expected: ActiveChannelOutboxScope | undefined): boolean {
     if (!expected) return false;
     const bucket = this.scopes.get(key);

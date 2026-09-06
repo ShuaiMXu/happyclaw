@@ -163,12 +163,54 @@ export const CHANNEL_PROVIDER_OPTIONS: ChannelProviderOption[] = [
     setupGuide: {
       title: '创建后使用微信扫码',
       steps: [
-        '填写账号名称，并在下一步选择默认工作区。',
+        '填写账号名称，连接后再选择渠道会话的绑定目标。',
         '点击“创建并扫码”，HappyClaw 会生成微信登录二维码。',
         '用手机微信扫码确认；如微信要求验证码，直接在 HappyClaw 中输入。',
       ],
       nextStep:
         '扫码授权只建立渠道账号；连接后还需要生成配对码，授权具体微信会话。',
+    },
+    supportsTest: true,
+    supportsPairing: true,
+  },
+  {
+    value: 'wecom',
+    label: '企业微信',
+    description: '使用企业微信智能机器人的 Bot ID 和 Secret 建立长连接。',
+    authMode: 'credentials',
+    credentials: [
+      {
+        key: 'botId',
+        label: '智能机器人 Bot ID',
+        required: true,
+        help: '在企业微信管理后台的智能机器人详情中复制。',
+      },
+      {
+        key: 'secret',
+        label: '智能机器人 Secret',
+        required: true,
+        secret: true,
+        help: '仅用于长连接鉴权，请勿填写企业应用 Secret。',
+      },
+      {
+        key: 'corpId',
+        label: '企业 ID（可选）',
+        help: '可在企业微信“我的企业”页面底部找到。',
+      },
+    ],
+    setupGuide: {
+      title: '先创建企业微信智能机器人',
+      steps: [
+        '在企业微信管理后台创建智能机器人并启用 API 模式。',
+        '选择长连接接收消息，复制 Bot ID 和 Secret。',
+        '保存后等待连接成功，再用配对码授权具体单聊或群聊。',
+      ],
+      action: {
+        label: '查看企业微信开发文档',
+        url: 'https://developer.work.weixin.qq.com/document/path/101039',
+      },
+      nextStep:
+        '连接成功后生成配对码，在目标会话中发送 /pair <配对码> 完成授权。',
     },
     supportsTest: true,
     supportsPairing: true,
@@ -250,7 +292,7 @@ export const CHANNEL_PROVIDER_OPTIONS: ChannelProviderOption[] = [
     setupGuide: {
       title: '创建后关联 WhatsApp 设备',
       steps: [
-        '填写账号名称，并在下一步选择默认工作区。',
+        '填写账号名称，连接后再选择渠道会话的绑定目标。',
         '点击“创建并扫码”，等待 HappyClaw 生成关联设备二维码。',
         '在手机 WhatsApp 中打开“已关联设备”（iOS 在设置中，Android 在右上角菜单中），点击“关联设备”扫码。',
       ],

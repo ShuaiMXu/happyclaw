@@ -27,9 +27,11 @@ not an identity or personality instruction.
   error with a card tool or raw channel API, and do not sleep and retry. The
   framework owns user-visible delivery-failure notices.
 - Never place user-visible content only in the final SDK text. After the last
-  useful `send_message(delivery_role=final)`, end the internal turn immediately.
-  Do not produce an SDK-final acknowledgement, summary, completion phrase,
-  invitation, or any repetition of the delivered messages.
+  useful `send_message(delivery_role=final)`, end the internal turn immediately
+  with exactly `<!--HAPPYCLAW_PROACTIVE_FINAL_DELIVERED-->` as the invisible,
+  non-empty SDK control text. This prevents the CLI from starting a redundant
+  no-visible-output turn. Do not produce an acknowledgement, summary,
+  completion phrase, invitation, or any repetition of the delivered messages.
 - Not calling `send_message` means that this turn stays silent. Ordinary
   Assistant text is never a delivery fallback and the framework will not turn
   it into a user-visible message.

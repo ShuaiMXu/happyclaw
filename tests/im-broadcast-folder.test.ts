@@ -263,6 +263,49 @@ describe('broadcastToOwnerIMChannels — folder-precise routing (fix F regressio
 
     expect(sendFn).not.toHaveBeenCalled();
   });
+
+  test('reports an explicitly requested channel that has no usable binding', () => {
+    const sendFn = vi.fn<(jid: string) => void>();
+    const deps: BroadcastToOwnerIMChannelsDeps = {
+      getConnectedChannelTypes: () => ['wechat'],
+      getGroupsByOwner: () => [],
+      getChannelType: (jid) => (jid.startsWith('wechat:') ? 'wechat' : null),
+      resolveJidFolder: () => null,
+    };
+
+    const unavailable = broadcastToOwnerIMChannels(
+      'user-1',
+      'ws-x',
+      new Set<string>(),
+      sendFn,
+      ['wechat'],
+      deps,
+    );
+
+    expect(sendFn).not.toHaveBeenCalled();
+    expect(unavailable).toEqual(['wechat']);
+  });
+
+  test('does not report a requested channel already strictly delivered', () => {
+    const sendFn = vi.fn<(jid: string) => void>();
+    const deps: BroadcastToOwnerIMChannelsDeps = {
+      getConnectedChannelTypes: () => ['wechat'],
+      getGroupsByOwner: () => [],
+      getChannelType: (jid) => (jid.startsWith('wechat:') ? 'wechat' : null),
+      resolveJidFolder: () => null,
+    };
+
+    const unavailable = broadcastToOwnerIMChannels(
+      'user-1',
+      'ws-x',
+      new Set(['wechat:account:peer']),
+      sendFn,
+      ['wechat'],
+      deps,
+    );
+
+    expect(unavailable).toEqual([]);
+  });
 });
 
 /**

@@ -6,7 +6,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: docker-publish-main
+  # A manually verified branch build must not cancel an in-flight main
+  # publication (or vice versa). Each ref owns its own build lane.
+  group: docker-publish-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -14,10 +16,13 @@ permissions:
 
 env:
   IMAGE_NAME: riba2534/happyclaw-agent
+  # Official multi-platform OCI index for the BuildKit buildx-stable-1 channel,
+  # resolved from registry-1.docker.io on 2026-08-15.
+  BUILDKIT_IMAGE: moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
 
 jobs:
   build-and-smoke:
-    name: Build and smoke (${{ matrix.platform }})
+    name: Build and smoke (${{ matrix.profile }}, ${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -27,38 +32,69 @@ jobs:
           - platform: linux/amd64
             arch: amd64
             runner: ubuntu-24.04
+            profile: core
+            target: runtime-core
           - platform: linux/arm64
             arch: arm64
             runner: ubuntu-24.04-arm
+            profile: core
+            target: runtime-core
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+            profile: headroom
+            target: runtime-headroom
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            profile: headroom
+            target: runtime-headroom
     steps:
       - name: Check out source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull BuildKit image
+        run: |
+          set -euo pipefail
+          for attempt in {1..5}; do
+            if docker pull "$BUILDKIT_IMAGE"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "Failed to pull BuildKit after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
 
       # docker/github-builder finalizes image tags in its reusable workflow.
       # Build by digest here so no user-facing tag can move before both native
       # runners have started their image and passed the real CDP HTTP probe.
       - name: Build and push untagged candidate
         id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: ./container
           file: ./container/Dockerfile
+          target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
           pull: true
           build-args: |
             TOOL_REFRESH=${{ github.sha }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=happyclaw-agent-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=happyclaw-agent-${{ matrix.arch }}
+          cache-from: type=gha,scope=happyclaw-agent-${{ matrix.profile }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=happyclaw-agent-${{ matrix.profile }}-${{ matrix.arch }}
           sbom: true
           provenance: mode=max
           labels: |
@@ -66,25 +102,44 @@ jobs:
             org.opencontainers.image.description=Isolated multi-platform agent runtime for HappyClaw
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.profile=${{ matrix.profile }}
 
-      - name: Start candidate and probe Chromium over HTTP
+      - name: Smoke immutable runner and lazy Chromium
         env:
           IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
         run: ./scripts/smoke-agent-image.sh "$IMAGE_REF" "${{ matrix.arch }}"
 
+      - name: Set up Node for image contract tests
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install image contract test dependencies
+        run: npm ci
+
+      - name: Verify container permission contract against candidate
+        env:
+          HAPPYCLAW_CONTAINER_PERMISSION_TEST_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: npx vitest run tests/container-session-permissions.test.ts
+
       - name: Record verified digest
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_PROFILE: ${{ matrix.profile }}
+          IMAGE_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
           mkdir -p /tmp/happyclaw-digests
-          touch "/tmp/happyclaw-digests/${IMAGE_DIGEST#sha256:}"
+          printf '%s\n' "$IMAGE_DIGEST" \
+            > "/tmp/happyclaw-digests/${IMAGE_PROFILE}-${IMAGE_ARCH}.txt"
 
       - name: Upload verified digest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digests-${{ matrix.arch }}
+          name: digests-${{ matrix.profile }}-${{ matrix.arch }}
           path: /tmp/happyclaw-digests/*
           if-no-files-found: error
           retention-days: 1
@@ -98,17 +153,33 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
       - name: Log in to Docker Hub
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Pull BuildKit image
+        run: |
+          set -euo pipefail
+          for attempt in {1..5}; do
+            if docker pull "$BUILDKIT_IMAGE"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "Failed to pull BuildKit after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep "$((attempt * 5))"
+          done
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
       - name: Download verified digests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: digests-*
           path: /tmp/happyclaw-digests
@@ -121,78 +192,88 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
-          mapfile -t digest_files < <(find /tmp/happyclaw-digests -maxdepth 1 -type f -printf '%f\n' | sort)
-          if [ "${#digest_files[@]}" -ne 2 ]; then
-            echo "Expected two verified platform digests, found ${#digest_files[@]}" >&2
-            exit 1
-          fi
-
-          sources=()
-          for digest in "${digest_files[@]}"; do
-            if [[ ! "$digest" =~ ^[a-f0-9]{64}$ ]]; then
-              echo "Invalid digest artifact: $digest" >&2
-              exit 1
-            fi
-            sources+=("${IMAGE_NAME}@sha256:${digest}")
-          done
-
-          commit_tag="${IMAGE_NAME}:git-${GITHUB_SHA}"
-          docker buildx imagetools create --tag "$commit_tag" "${sources[@]}"
-          inspection="$(docker buildx imagetools inspect "$commit_tag")"
-          printf '%s\n' "$inspection"
-
-          raw_manifest="$(docker buildx imagetools inspect --raw "$commit_tag")"
-          jq -e '
-            [
-              .manifests[] |
-              select(
-                (.platform.os // "unknown") != "unknown" and
-                (.platform.architecture // "unknown") != "unknown"
-              ) |
-              "\(.platform.os)/\(.platform.architecture)"
-            ] as $platforms |
-            ($platforms | length) == 2 and
-            (($platforms | sort) == ["linux/amd64", "linux/arm64"])
-          ' <<<"$raw_manifest" >/dev/null
-
-          manifest_digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"
-          [[ "$manifest_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
-          cosign sign --yes "${IMAGE_NAME}@${manifest_digest}"
           certificate_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker-publish.yml@${GITHUB_REF}"
-          cosign verify \
-            --certificate-identity "$certificate_identity" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "${IMAGE_NAME}@${manifest_digest}" >/dev/null
-          echo "digest=$manifest_digest" >>"$GITHUB_OUTPUT"
+          create_and_sign_manifest() {
+            profile="$1"
+            suffix="$2"
+            sources=()
+            for arch in amd64 arm64; do
+              digest_file="/tmp/happyclaw-digests/${profile}-${arch}.txt"
+              test -f "$digest_file"
+              digest="$(cat "$digest_file")"
+              [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+              sources+=("${IMAGE_NAME}@${digest}")
+            done
+
+            commit_tag="${IMAGE_NAME}:git-${GITHUB_SHA}${suffix}"
+            docker buildx imagetools create --tag "$commit_tag" "${sources[@]}"
+            inspection="$(docker buildx imagetools inspect "$commit_tag")"
+            printf '%s\n' "$inspection"
+            raw_manifest="$(docker buildx imagetools inspect --raw "$commit_tag")"
+            jq -e '
+              [
+                .manifests[] |
+                select(
+                  (.platform.os // "unknown") != "unknown" and
+                  (.platform.architecture // "unknown") != "unknown"
+                ) |
+                "\(.platform.os)/\(.platform.architecture)"
+              ] as $platforms |
+              ($platforms | length) == 2 and
+              (($platforms | sort) == ["linux/amd64", "linux/arm64"])
+            ' <<<"$raw_manifest" >/dev/null
+            manifest_digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"
+            [[ "$manifest_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            cosign sign --yes "${IMAGE_NAME}@${manifest_digest}"
+            cosign verify \
+              --certificate-identity "$certificate_identity" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${IMAGE_NAME}@${manifest_digest}" >/dev/null
+            CREATED_MANIFEST_DIGEST="$manifest_digest"
+          }
+
+          create_and_sign_manifest core ''
+          core_digest="$CREATED_MANIFEST_DIGEST"
+          create_and_sign_manifest headroom '-headroom'
+          headroom_digest="$CREATED_MANIFEST_DIGEST"
+          echo "core_digest=$core_digest" >>"$GITHUB_OUTPUT"
+          echo "headroom_digest=$headroom_digest" >>"$GITHUB_OUTPUT"
 
       - name: Promote signed manifest to latest
+        # workflow_dispatch is also used to publish an immutable git-<sha> tag
+        # for pre-merge production verification. Only a push to main may move
+        # the shared latest tag.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
-          MANIFEST_DIGEST: ${{ steps.manifest.outputs.digest }}
+          CORE_MANIFEST_DIGEST: ${{ steps.manifest.outputs.core_digest }}
+          HEADROOM_MANIFEST_DIGEST: ${{ steps.manifest.outputs.headroom_digest }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create \
-            --tag "${IMAGE_NAME}:latest" \
-            "${IMAGE_NAME}@${MANIFEST_DIGEST}"
-
-          # Docker Hub can acknowledge the tag mutation before every registry
-          # read path can resolve it. Retry the read-after-write verification
-          # instead of marking an already-published image as failed.
-          latest_digest=""
-          for attempt in {1..12}; do
-            if inspection="$(
-              docker buildx imagetools inspect "${IMAGE_NAME}:latest" 2>&1
-            )"; then
-              latest_digest="$(
-                awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection"
-              )"
-              if [ "$latest_digest" = "$MANIFEST_DIGEST" ]; then
-                break
+          promote_and_verify() {
+            tag="$1"
+            manifest_digest="$2"
+            docker buildx imagetools create \
+              --tag "${IMAGE_NAME}:${tag}" \
+              "${IMAGE_NAME}@${manifest_digest}"
+            latest_digest=""
+            for attempt in {1..12}; do
+              if inspection="$(
+                docker buildx imagetools inspect "${IMAGE_NAME}:${tag}" 2>&1
+              )"; then
+                latest_digest="$(
+                  awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection"
+                )"
+                if [ "$latest_digest" = "$manifest_digest" ]; then
+                  break
+                fi
+                echo "${tag} resolved to ${latest_digest:-no digest}; waiting for ${manifest_digest}" >&2
+              else
+                echo "${tag} is not readable yet (attempt ${attempt}/12): ${inspection}" >&2
               fi
-              echo "latest resolved to ${latest_digest:-no digest}; waiting for ${MANIFEST_DIGEST}" >&2
-            else
-              echo "latest is not readable yet (attempt ${attempt}/12): ${inspection}" >&2
-            fi
-            sleep 5
-          done
-          test "$latest_digest" = "$MANIFEST_DIGEST"
-          echo "Published ${IMAGE_NAME}:latest at ${MANIFEST_DIGEST}"
+              sleep 5
+            done
+            test "$latest_digest" = "$manifest_digest"
+            echo "Published ${IMAGE_NAME}:${tag} at ${manifest_digest}"
+          }
+          promote_and_verify latest "$CORE_MANIFEST_DIGEST"
+          promote_and_verify latest-headroom "$HEADROOM_MANIFEST_DIGEST"

@@ -164,6 +164,10 @@ describe('prompts/ files', () => {
     );
     expect(proactiveOutput).toContain('在第一个可能明显耗时的工具调用前');
     expect(proactive).not.toContain('minimal internal acknowledgement');
+    expect(proactive).toContain('<!--HAPPYCLAW_PROACTIVE_FINAL_DELIVERED-->');
+    expect(proactiveOutput).toContain(
+      '<!--HAPPYCLAW_PROACTIVE_FINAL_DELIVERED-->',
+    );
     expect(proactiveOutput).not.toContain('最终回复必须自包含');
     expect(taskOutput).toContain(
       '最终 SDK Assistant 文本会自动作为正式任务结果归档',

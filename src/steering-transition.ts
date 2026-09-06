@@ -60,4 +60,16 @@ export class SteeringTransitionRegistry {
     if (state.pending) return true;
     return !!turnId && state.interruptedTurnIds.has(turnId);
   }
+
+  /**
+   * Some SDK/runner combinations acknowledge a clean interrupt by closing the
+   * query instead of emitting status=interrupted. Treat that close as the same
+   * steer terminal while preserving the old-turn suppression fence.
+   */
+  consumeRunnerClose(chatJid: string, turnId?: string): boolean {
+    if (!this.shouldSuppressOutput(chatJid, turnId)) return false;
+    const state = this.states.get(chatJid);
+    if (state?.pending) this.resolveInterrupted(chatJid, turnId);
+    return true;
+  }
 }

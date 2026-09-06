@@ -286,7 +286,14 @@ export class TurnOutputCoordinator {
 export interface ActiveTurnOutputCallbacks {
   onProgress: (text: string) => boolean;
   onFinalCandidate: (text: string) => boolean;
+  /**
+   * Called only for an acknowledged terminal/user-answer utterance. Progress
+   * is still counted by the reply fuse, but must never settle the input turn.
+   */
   onUtteranceDelivered?: () => void;
+  /** Optional observability hook for progress/separate utterances. Unlike
+   * onUtteranceDelivered this never settles or advances a durable input. */
+  onNonTerminalDelivered?: () => void;
 }
 
 interface ActiveTurnOutputBinding {
@@ -407,7 +414,14 @@ export class ActiveTurnOutputRegistry {
     );
     if (!binding) return false;
     if (!this.recordProjectedUtterance(input)) return false;
-    binding.callbacks.onUtteranceDelivered?.();
+    if (input.role === 'final' || input.role === undefined) {
+      // Legacy messages and non-text artifacts omit a role. Preserve their
+      // historical terminal semantics; explicit progress/separate utterances
+      // are never completion signals.
+      binding.callbacks.onUtteranceDelivered?.();
+    } else {
+      binding.callbacks.onNonTerminalDelivered?.();
+    }
     return true;
   }
 

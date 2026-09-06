@@ -164,8 +164,7 @@ export function BindingTargetDialog({
                         {items[0].groupName}
                       </div>
                       {items.map((target) => {
-                        const key =
-                          target.sessionId || `main:${target.groupJid}`;
+                        const key = `${target.groupJid}:${target.type}:${target.sessionId ?? ''}`;
                         const isSelecting = selecting === key;
                         return (
                           <button
@@ -203,7 +202,7 @@ export function BindingTargetDialog({
               className="text-muted-foreground hover:text-foreground w-full"
             >
               <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
-              恢复账号默认工作区
+              解除渠道绑定
             </Button>
           </div>
         )}

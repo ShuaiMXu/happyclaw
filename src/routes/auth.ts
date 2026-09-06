@@ -36,7 +36,6 @@ import {
 } from '../db.js';
 import {
   getRegistrationConfig,
-  getClaudeProviderConfig,
   getEnabledProviders,
   getFeishuProviderConfigWithSource,
   getAppearanceConfig,
@@ -56,7 +55,6 @@ import {
 import type { AuthUser, User, UserPublic } from '../types.js';
 import { logger } from '../logger.js';
 import {
-  lastActiveCache,
   invalidateSessionCache,
   invalidateUserSessions,
 } from '../web-context.js';

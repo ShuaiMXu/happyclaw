@@ -2,7 +2,14 @@ export interface TimelineMessageLike {
   id: string;
   timestamp: string;
   is_from_me: boolean;
-  delivery_status?: 'queued' | 'promoting' | 'released' | 'cancelled' | null;
+  delivery_status?:
+    | 'queued'
+    | 'promoting'
+    | 'released'
+    | 'cancelled'
+    | 'awaiting_companion'
+    | 'subsumed'
+    | null;
   delivery_updated_at?: string | null;
   delivery_run_id?: string | null;
 }
@@ -14,7 +21,12 @@ export interface FollowUpTransitionLike {
   delivery_updated_at: string;
 }
 
-const HIDDEN_FOLLOW_UP_STATUSES = new Set(['queued', 'promoting', 'cancelled']);
+const HIDDEN_FOLLOW_UP_STATUSES = new Set([
+  'queued',
+  'promoting',
+  'cancelled',
+  'subsumed',
+]);
 
 /**
  * Queued user inputs belong beside the composer until they actually start.

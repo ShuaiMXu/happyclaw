@@ -60,4 +60,25 @@ describe('channel card physical finalization', () => {
     expect(card.complete).not.toHaveBeenCalled();
     expect(card.abort).toHaveBeenCalledWith('attachment retry');
   });
+
+  test('preserves abort delivery evidence when prerequisites are missing', async () => {
+    const abortError = new Error('abort provider ACK was lost');
+    const card = {
+      complete: vi.fn(async () => {}),
+      abort: vi.fn(async () => {
+        throw abortError;
+      }),
+    };
+
+    const result = await finalizeChannelCardAfterDelivery(
+      card,
+      'final answer',
+      false,
+      'attachment retry',
+    );
+
+    expect(result).toEqual({ acknowledged: false, error: abortError });
+    expect(card.complete).not.toHaveBeenCalled();
+    expect(card.abort).toHaveBeenCalledOnce();
+  });
 });

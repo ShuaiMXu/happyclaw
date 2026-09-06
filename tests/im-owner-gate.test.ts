@@ -112,6 +112,14 @@ describe('isDirectMessageJid', () => {
     expect(isDirectMessageJid('whatsapp:15551234567@s.whatsapp.net')).toBe(
       true,
     );
+    expect(isDirectMessageJid('whatsapp:123456789012345@lid')).toBe(true);
+    expect(
+      isDirectMessageJid('whatsapp:123456789012345@lid#account:bot-a'),
+    ).toBe(true);
+    expect(isDirectMessageJid('whatsapp:15551234567@c.us')).toBe(true);
+    expect(isDirectMessageJid('whatsapp:16505361212@c.us#account:bot-a')).toBe(
+      true,
+    );
     expect(isDirectMessageJid('wechat:wxid_abc123')).toBe(true);
     // Telegram private chats have positive ids
     expect(isDirectMessageJid('telegram:123456789')).toBe(true);

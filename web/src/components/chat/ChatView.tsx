@@ -260,7 +260,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     let active = true;
     const fetchStatus = () => {
       api
-        .get<Record<string, boolean>>('/api/config/user-im/status')
+        .get<Record<string, boolean>>('/api/channel-accounts/status')
         .then((data) => {
           if (active) setImStatus(data);
         })
@@ -1063,8 +1063,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               type="button"
               onClick={() => setBindingAgentId(WORKSPACE_BINDING)}
               className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
-              title="管理工作区群聊绑定"
-              aria-label="管理工作区群聊绑定"
+              title="管理工作区话题群绑定"
+              aria-label="管理工作区话题群绑定"
             >
               <Link className="h-4 w-4" />
               <span className="hidden sm:inline">渠道绑定</span>

@@ -20,6 +20,11 @@ import {
   channelAccountKey,
 } from '../../utils/channel-accounts';
 
+import {
+  hasBindingPolicyMismatch,
+  resolveBindingTargetType,
+} from '../../utils/im-binding-policy';
+
 type ChannelFilter = 'all' | ImChannelType;
 
 export function BindingsSection() {
@@ -33,6 +38,7 @@ export function BindingsSection() {
     targetsLoading,
     reload,
     rebind,
+    bindTarget,
     resetAllowlist,
     error: hookError,
     clearError: clearHookError,
@@ -105,24 +111,15 @@ export function BindingsSection() {
         key: 'needs-migration',
         title: '需要迁移',
         description: '历史绑定与当前规则不一致，请换绑到正确目标',
-        items: filtered.filter(
-          (item) =>
-            (!!(item.bound_session_id ?? item.bound_agent_id) &&
-              item.conversation_kind !== 'direct') ||
-            (item.conversation_kind === 'unknown' &&
-              !!(
-                (item.bound_workspace_jid ?? item.bound_main_jid) ||
-                (item.bound_session_id ?? item.bound_agent_id)
-              )),
-        ),
+        items: filtered.filter(hasBindingPolicyMismatch),
       },
       {
         key: 'workspace',
         title: '工作区绑定',
-        description: '群聊绑定工作区；话题群中的每个话题使用独立会话',
+        description: '话题群绑定工作区，每个话题使用独立会话',
         items: filtered.filter(
           (item) =>
-            item.conversation_kind === 'group' &&
+            resolveBindingTargetType(item) === 'workspace' &&
             !(item.bound_session_id ?? item.bound_agent_id) &&
             !!(item.bound_workspace_jid ?? item.bound_main_jid),
         ),
@@ -130,10 +127,11 @@ export function BindingsSection() {
       {
         key: 'main-session',
         title: '主会话绑定',
-        description: '私聊继续使用目标工作区的主会话上下文',
+        description: '私聊和普通群使用目标工作区的主会话',
         items: filtered.filter(
           (item) =>
-            item.conversation_kind === 'direct' &&
+            resolveBindingTargetType(item) === 'session' &&
+            !hasBindingPolicyMismatch(item) &&
             !(item.bound_session_id ?? item.bound_agent_id) &&
             !!(item.bound_workspace_jid ?? item.bound_main_jid),
         ),
@@ -141,17 +139,18 @@ export function BindingsSection() {
       {
         key: 'session',
         title: '会话绑定',
-        description: '私聊继续使用指定会话上下文',
+        description: '私聊和普通群使用指定会话',
         items: filtered.filter(
           (item) =>
-            item.conversation_kind === 'direct' &&
+            resolveBindingTargetType(item) === 'session' &&
+            !hasBindingPolicyMismatch(item) &&
             Boolean(item.bound_session_id ?? item.bound_agent_id),
         ),
       },
       {
         key: 'unbound',
         title: '未绑定',
-        description: '尚未指定工作区或会话',
+        description: '未绑定的渠道不会响应消息',
         items: filtered.filter(
           (item) =>
             !(item.bound_session_id ?? item.bound_agent_id) &&
@@ -169,11 +168,8 @@ export function BindingsSection() {
 
   const selectableTargets = useMemo(() => {
     if (!rebindGroup) return [];
-    if (rebindGroup.conversation_kind === 'group') {
-      return targets.filter((target) => target.type === 'main');
-    }
-    if (rebindGroup.conversation_kind === 'direct') return targets;
-    return [];
+    const targetType = resolveBindingTargetType(rebindGroup);
+    return targets.filter((target) => target.type === targetType);
   }, [rebindGroup, targets]);
 
   const handleRebind = useCallback((group: AvailableImGroup) => {
@@ -262,33 +258,19 @@ export function BindingsSection() {
   const handleSelectTarget = useCallback(
     async (target: BindingTarget) => {
       if (!rebindGroup) return;
-      const imJid = rebindGroup.jid;
-      const key = target.sessionId || `main:${target.groupJid}`;
+      const key = `${target.groupJid}:${target.type}:${target.sessionId ?? ''}`;
       setSelectingKey(key);
       setLocalError(null);
 
       const hasBound =
         !!(rebindGroup.bound_session_id ?? rebindGroup.bound_agent_id) ||
         !!(rebindGroup.bound_workspace_jid ?? rebindGroup.bound_main_jid);
-      const payload: {
-        target_session_id?: string;
-        target_main_jid?: string;
-        force?: boolean;
-      } = {};
-
-      if (target.type === 'session' && target.sessionId) {
-        payload.target_session_id = target.sessionId;
-      } else {
-        payload.target_main_jid = target.groupJid;
-      }
-      if (hasBound) payload.force = true;
-
-      const err = await rebind(imJid, payload);
+      const err = await bindTarget(rebindGroup, target, hasBound);
       setSelectingKey(null);
       if (!err) setRebindGroup(null);
       else setLocalError(err);
     },
-    [rebindGroup, rebind],
+    [rebindGroup, bindTarget],
   );
 
   const [restoreConfirmGroup, setRestoreConfirmGroup] =
@@ -322,7 +304,7 @@ export function BindingsSection() {
               渠道绑定
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              群聊绑定工作区，私聊绑定主会话或指定会话。两类绑定互不混用。
+              私聊和普通群绑定会话，话题群绑定工作区。回复返回当前消息所在渠道或话题；未绑定时不响应。
             </p>
           </div>
           <Button
@@ -501,7 +483,9 @@ export function BindingsSection() {
         targets={selectableTargets}
         targetsLoading={targetsLoading}
         targetType={
-          rebindGroup?.conversation_kind === 'group' ? 'workspace' : 'both'
+          rebindGroup
+            ? (resolveBindingTargetType(rebindGroup) ?? 'session')
+            : 'session'
         }
         canUnbind={
           !!(
@@ -515,32 +499,32 @@ export function BindingsSection() {
         selecting={selectingKey}
       />
 
-      {/* Restore account default confirm dialog */}
+      {/* Unbind confirm dialog */}
       <ConfirmDialog
         open={!!unbindGroup}
         onClose={() => setUnbindGroup(null)}
         onConfirm={confirmUnbind}
-        title="恢复账号默认工作区"
+        title="解除渠道绑定"
         message={
           unbindGroup
-            ? `「${unbindGroup.name}」将改为路由到该 Bot 账号的默认工作区；如账号未指定，则回到账号所有者的主工作区。已有会话和历史不会被删除。`
+            ? `「${unbindGroup.name}」解除绑定后不再响应消息。已有会话和历史不会被删除。`
             : ''
         }
-        confirmText="恢复默认"
+        confirmText="解除绑定"
       />
 
-      {/* Restore default confirm dialog */}
+      {/* Unbind target confirm dialog */}
       <ConfirmDialog
         open={!!restoreConfirmGroup}
         onClose={() => setRestoreConfirmGroup(null)}
         onConfirm={confirmRestoreDefault}
-        title="恢复账号默认工作区"
+        title="解除渠道绑定"
         message={
           restoreConfirmGroup
-            ? `「${restoreConfirmGroup.name}」将改为路由到该 Bot 账号的默认工作区；如账号未指定，则回到账号所有者的主工作区。已有会话和历史不会被删除。`
+            ? `「${restoreConfirmGroup.name}」解除绑定后不再响应消息。已有会话和历史不会被删除。`
             : ''
         }
-        confirmText="恢复默认"
+        confirmText="解除绑定"
       />
 
       {/* Release sender restriction confirm dialog */}
@@ -565,7 +549,7 @@ export function BindingsSection() {
         title="删除接入记录与本地历史"
         message={
           deleteGroup
-            ? `确认删除「${deleteGroup.name}」的接入记录？此操作会删除它在 HappyClaw 中的渠道绑定、本地消息、关联会话及运行数据，且不可撤销；不会删除 IM 平台上的群聊。如果机器人之后再次收到该群消息，它可能会重新注册。若只是更换路由，请使用“换绑”或“恢复默认”。`
+            ? `确认删除「${deleteGroup.name}」的接入记录？此操作会删除它在 HappyClaw 中的渠道绑定、本地消息、关联会话及运行数据，且不可撤销；不会删除 IM 平台上的群聊。如果机器人之后再次收到该群消息，它可能会重新注册。若只是更换路由，请使用“换绑”或“解除绑定”。`
             : ''
         }
         confirmText="删除接入记录"

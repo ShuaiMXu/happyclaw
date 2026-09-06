@@ -12,7 +12,14 @@ interface MessageContextMenuProps {
   onShareImage?: () => void;
 }
 
-export function MessageContextMenu({ content, position, onClose, chatJid, messageId, onShareImage }: MessageContextMenuProps) {
+export function MessageContextMenu({
+  content,
+  position,
+  onClose,
+  chatJid,
+  messageId,
+  onShareImage,
+}: MessageContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
@@ -46,7 +53,9 @@ export function MessageContextMenu({ content, position, onClose, chatJid, messag
 
   const handleCopyText = () => {
     const plain = content
-      .replace(/```[\s\S]*?```/g, (m) => m.replace(/```\w*\n?/, '').replace(/\n?```$/, ''))
+      .replace(/```[\s\S]*?```/g, (m) =>
+        m.replace(/```\w*\n?/, '').replace(/\n?```$/, ''),
+      )
       .replace(/`([^`]+)`/g, '$1')
       .replace(/\*\*([^*]+)\*\*/g, '$1')
       .replace(/\*([^*]+)\*/g, '$1')
@@ -99,7 +108,10 @@ export function MessageContextMenu({ content, position, onClose, chatJid, messag
           <>
             <div className="mx-3 my-0.5 border-t border-border" />
             <button
-              onClick={() => { onShareImage(); onClose(); }}
+              onClick={() => {
+                onShareImage();
+                onClose();
+              }}
               className="group/item w-full flex items-center gap-3 mx-1 px-3 py-2.5 text-sm text-foreground rounded-lg hover:bg-foreground/10 active:bg-foreground/15 transition-colors"
             >
               <ImageDown className="w-4 h-4 text-muted-foreground group-hover/item:text-primary transition-colors" />
@@ -110,6 +122,11 @@ export function MessageContextMenu({ content, position, onClose, chatJid, messag
         {chatJid && messageId && (
           <>
             <div className="mx-3 my-0.5 border-t border-border" />
+            {confirmDelete && (
+              <p className="max-w-[240px] px-4 py-1.5 text-xs leading-relaxed text-muted-foreground">
+                仅删除持久聊天记录，不会撤回正在处理的模型输入。
+              </p>
+            )}
             <button
               onClick={handleDelete}
               className={`group/item w-full flex items-center gap-3 mx-1 px-3 py-2.5 text-sm rounded-lg transition-colors ${
@@ -118,13 +135,15 @@ export function MessageContextMenu({ content, position, onClose, chatJid, messag
                   : 'text-red-400 hover:bg-foreground/10 hover:text-red-500 active:bg-foreground/15'
               }`}
             >
-              <Trash2 className={`w-4 h-4 transition-colors ${confirmDelete ? '' : 'group-hover/item:text-red-500'}`} />
-              {confirmDelete ? '确认删除' : '删除消息'}
+              <Trash2
+                className={`w-4 h-4 transition-colors ${confirmDelete ? '' : 'group-hover/item:text-red-500'}`}
+              />
+              {confirmDelete ? '确认删除记录' : '删除聊天记录'}
             </button>
           </>
         )}
       </div>
     </div>,
-    document.body
+    document.body,
   );
 }

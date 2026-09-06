@@ -32,7 +32,7 @@ afterAll(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe('default model configuration', () => {
+describe('independent model configurations', () => {
   test('strips root-side permission controls from saved Workspace env', () => {
     runtimeConfig.saveContainerEnvConfig('permission-env-workspace', {
       customEnv: {
@@ -48,7 +48,23 @@ describe('default model configuration', () => {
     ).toEqual({ PROJECT_ENV: 'kept' });
   });
 
-  test('selects one complete Provider environment as the default', () => {
+  test('honors creation, toggle, and deletion without a default-model lock', () => {
+    const initiallyDisabled = runtimeConfig.createProvider({
+      name: 'Initially disabled',
+      type: 'official',
+      anthropicApiKey: 'disabled-key',
+      enabled: false,
+    });
+    expect(initiallyDisabled.enabled).toBe(false);
+    runtimeConfig.setProviderEnabled(initiallyDisabled.id, true);
+    runtimeConfig.setProviderEnabled(initiallyDisabled.id, false);
+    runtimeConfig.deleteProvider(initiallyDisabled.id);
+    expect(
+      runtimeConfig
+        .getProviders()
+        .some((provider) => provider.id === initiallyDisabled.id),
+    ).toBe(false);
+
     const first = runtimeConfig.createProvider({
       name: 'Official subscription',
       type: 'official',
@@ -66,9 +82,12 @@ describe('default model configuration', () => {
       enabled: true,
     });
 
-    expect(runtimeConfig.getDefaultProviderId()).toBe(first.id);
-    runtimeConfig.setDefaultProvider(second.id);
-    expect(runtimeConfig.getDefaultProviderId()).toBe(second.id);
+    expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
+      anthropicApiKey: 'official-key',
+      anthropicModel: 'sonnet',
+    });
+
+    runtimeConfig.setProviderEnabled(first.id, false);
     expect(runtimeConfig.getClaudeProviderConfig()).toMatchObject({
       anthropicBaseUrl: 'https://gateway.example.test',
       anthropicAuthToken: 'gateway-token',
@@ -77,12 +96,13 @@ describe('default model configuration', () => {
     expect(runtimeConfig.getActiveProfileCustomEnv()).toEqual({
       ANTHROPIC_CUSTOM_HEADERS: 'x-tenant: model-b',
     });
-    expect(() => runtimeConfig.setProviderEnabled(second.id, false)).toThrow(
-      '默认模型配置不能禁用',
+    runtimeConfig.setProviderEnabled(second.id, false);
+    expect(runtimeConfig.getEnabledProviders()).toEqual([]);
+    expect(() => runtimeConfig.getClaudeProviderConfig()).toThrow(
+      '没有启用的模型配置',
     );
-    expect(() => runtimeConfig.deleteProvider(second.id)).toThrow(
-      '默认模型配置不能删除',
-    );
+    runtimeConfig.setProviderEnabled(second.id, true);
+    runtimeConfig.deleteProvider(first.id);
   });
 
   test('Agent selection overrides a legacy Workspace Provider environment', () => {
@@ -116,7 +136,7 @@ describe('default model configuration', () => {
     expect(db.getSessionProviderId('model-workspace')).toBe(selected.id);
   });
 
-  test('migrates V4 by choosing the first enabled configuration', () => {
+  test('migrates V4 without creating a default-model pointer', () => {
     const stored = JSON.parse(fs.readFileSync(configFile, 'utf8')) as Record<
       string,
       unknown
@@ -125,50 +145,90 @@ describe('default model configuration', () => {
     delete stored.defaultProviderId;
     fs.writeFileSync(configFile, `${JSON.stringify(stored, null, 2)}\n`);
 
-    const firstEnabledId = runtimeConfig
-      .getProviders()
-      .find((provider) => provider.enabled)!.id;
-    expect(runtimeConfig.getDefaultProviderId()).toBe(firstEnabledId);
+    runtimeConfig.getProviders();
 
-    const migrated = JSON.parse(fs.readFileSync(configFile, 'utf8')) as {
-      version: number;
-      defaultProviderId: string;
-    };
-    expect(migrated).toMatchObject({
-      version: 5,
-      defaultProviderId: firstEnabledId,
-    });
+    const migrated = JSON.parse(fs.readFileSync(configFile, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(migrated.version).toBe(5);
+    expect(migrated).not.toHaveProperty('defaultProviderId');
   });
 
-  test('promoting a disabled provider to default auto-enables it', () => {
-    const primary = runtimeConfig.createProvider({
-      name: 'Auto-enable primary',
-      type: 'third_party',
-      anthropicBaseUrl: 'https://ae-primary.example.test',
-      anthropicAuthToken: 'ae-primary-token',
-      anthropicModel: 'ae-primary-model',
+  test('normalizes an existing V5 default pointer without changing switches', () => {
+    const before = runtimeConfig
+      .getProviders()
+      .map((provider) => ({ id: provider.id, enabled: provider.enabled }));
+    const stored = JSON.parse(fs.readFileSync(configFile, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    stored.defaultProviderId = before[0]?.id ?? 'legacy-default';
+    fs.writeFileSync(configFile, `${JSON.stringify(stored, null, 2)}\n`);
+
+    expect(
+      runtimeConfig
+        .getProviders()
+        .map((provider) => ({ id: provider.id, enabled: provider.enabled })),
+    ).toEqual(before);
+    expect(JSON.parse(fs.readFileSync(configFile, 'utf8'))).not.toHaveProperty(
+      'defaultProviderId',
+    );
+  });
+
+  test('persists refreshed OAuth credentials with full compare-and-swap semantics', () => {
+    const original = {
+      accessToken: 'oauth-access-original',
+      refreshToken: 'oauth-refresh-original',
+      expiresAt: 1_800_000_000_000,
+      // Imported legacy credentials can lack scopes; reconciliation sees the
+      // default scopes emitted by buildClaudeAiOauthPayload.
+      scopes: [],
+      subscriptionType: 'max',
+    };
+    const effectiveOriginal = {
+      ...original,
+      scopes: ['user:inference', 'user:profile', 'user:sessions:claude_code'],
+    };
+    const refreshed = {
+      accessToken: 'oauth-access-refreshed',
+      refreshToken: 'oauth-refresh-refreshed',
+      expiresAt: 1_800_003_600_000,
+      scopes: ['user:inference', 'user:profile'],
+      subscriptionType: 'max',
+    };
+    const provider = runtimeConfig.createProvider({
+      name: 'OAuth CAS provider',
+      type: 'official',
+      claudeOAuthCredentials: original,
       enabled: true,
     });
-    runtimeConfig.setDefaultProvider(primary.id);
-    expect(runtimeConfig.getDefaultProviderId()).toBe(primary.id);
 
-    const alt = runtimeConfig.createProvider({
-      name: 'Auto-enable alt',
-      type: 'third_party',
-      anthropicBaseUrl: 'https://ae-alt.example.test',
-      anthropicAuthToken: 'ae-alt-token',
-      anthropicModel: 'ae-alt-model',
-      enabled: false,
-    });
-    expect(alt.enabled).toBe(false);
+    expect(
+      runtimeConfig.updateProviderOAuthCredentialsIfCurrent(
+        provider.id,
+        {
+          ...effectiveOriginal,
+          scopes: [...effectiveOriginal.scopes].reverse(),
+        },
+        refreshed,
+      ),
+    ).toBe(true);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.claudeOAuthCredentials,
+    ).toEqual(refreshed);
 
-    // 旧行为是抛错「默认模型配置必须处于启用状态」；现在应自动启用并设为默认，
-    // 从而把原默认释放出来去禁用或删除，避免死结。
-    const promoted = runtimeConfig.setDefaultProvider(alt.id);
-    expect(promoted.enabled).toBe(true);
-    expect(runtimeConfig.getDefaultProviderId()).toBe(alt.id);
-    expect(() =>
-      runtimeConfig.setProviderEnabled(primary.id, false),
-    ).not.toThrow();
+    expect(
+      runtimeConfig.updateProviderOAuthCredentialsIfCurrent(
+        provider.id,
+        original,
+        { ...refreshed, accessToken: 'must-not-win' },
+      ),
+    ).toBe(false);
+    expect(
+      runtimeConfig.getProviders().find((item) => item.id === provider.id)
+        ?.claudeOAuthCredentials,
+    ).toEqual(refreshed);
   });
 });

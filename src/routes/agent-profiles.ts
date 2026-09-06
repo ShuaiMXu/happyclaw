@@ -69,7 +69,7 @@ import {
   getRunContextSnapshot,
   hashRuntimePolicy,
 } from '../run-context-snapshot.js';
-import { getDefaultProviderId, getProviders } from '../runtime-config.js';
+import { getProviders } from '../runtime-config.js';
 
 const agentProfileRoutes = new Hono<{ Variables: Variables }>();
 const AVATARS_DIR = path.join(DATA_DIR, 'avatars');
@@ -108,7 +108,6 @@ function usesFourPartPromptPayload(input: {
 agentProfileRoutes.get('/', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const profiles = listAgentProfilesForUser(user.id);
-  const defaultModelConfigId = getDefaultProviderId();
   return c.json({
     profiles: profiles.map((profile) => ({
       ...profile,
@@ -124,9 +123,7 @@ agentProfileRoutes.get('/', authMiddleware, (c) => {
       type: provider.type,
       enabled: provider.enabled,
       anthropic_model: provider.anthropicModel,
-      is_default: provider.id === defaultModelConfigId,
     })),
-    default_model_config_id: defaultModelConfigId,
   });
 });
 

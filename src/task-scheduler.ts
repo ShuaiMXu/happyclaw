@@ -21,8 +21,8 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
+import { isProviderQuotaControlOutput } from './provider-quota-observation.js';
 import {
-  advanceSkippedTask,
   cancelDeliveredGroupTaskRunWithWorkspaceIntent,
   cancelTaskRun,
   claimNextTaskRunNotification,
@@ -39,10 +39,8 @@ import {
   getAllTasks,
   cleanupOldTaskRunLogs,
   cleanupStaleRunningLogs,
-  clearStaleTaskLeases,
   claimTaskForRun,
   deleteGroupData,
-  getDueTasks,
   getDueTaskDefinitionsV2,
   getNextScheduledTaskWakeAt,
   getNextTaskRunWakeAt,
@@ -54,6 +52,7 @@ import {
   getUserById,
   getUserHomeGroup,
   getAgentProfileForWorkspace,
+  getWorkspaceInteractionMode,
   getSessionAgentIdentity,
   logTaskRun,
   logTaskRunStart,
@@ -84,6 +83,7 @@ import {
   AgentProfile,
   ClaimedTaskRun,
   ExecutionMode,
+  InteractionMode,
   MessageSourceKind,
   RegisteredGroup,
   ScheduledTask,
@@ -108,6 +108,9 @@ import {
   tryCleanupCompletedIsolatedTaskRunIpc,
 } from './isolated-task-ipc.js';
 import { getScriptTaskHostExecutionError } from './script-task-policy.js';
+import { resolveScheduledGroupDeliveryContract } from './reply-delivery.js';
+import { resolveRuntimeInteractionMode } from './workspace-interaction-runtime.js';
+import { explicitImDeliveryPhase } from './im-send-retry-policy.js';
 
 export function shouldFinalizeScheduledRunOutput(
   output: Pick<
@@ -471,6 +474,7 @@ export interface SchedulerDependencies {
     text: string;
     taskId: string;
     queuedResult: string;
+    interactionMode: InteractionMode;
   }) => string;
   /** Store task result in workspace chat and push to owner's IM channels */
   storeResultAndNotify?: (
@@ -1305,6 +1309,11 @@ async function runTaskInner(
           selectedProviderId,
         ),
       async (streamedOutput: ContainerOutput) => {
+        if (isProviderQuotaControlOutput(streamedOutput)) {
+          lastOutputTime = Date.now();
+          resetIdleTimer();
+          return;
+        }
         // Broadcast stream events to WebSocket clients viewing the task workspace
         if (streamedOutput.status === 'stream' && streamedOutput.streamEvent) {
           deps.broadcastStreamEvent?.(effectiveJid, streamedOutput.streamEvent);
@@ -1871,14 +1880,35 @@ async function runScriptTaskInner(
  * 这段框定，明确「这是已有定时任务到点自动执行、不是用户新指令，不要再 schedule_task」，
  * 否则当 prompt 含「每隔/每天/提醒」等措辞时，agent 会按 CLAUDE.md 的定时任务规则再建一个
  * 任务而递归增殖（#564）。标记串 [定时任务自动触发] 与 global CLAUDE.md 的兜底 guard 一致。
+ *
+ * 投递契约措辞必须与消息管线的真实行为一致，且两种 interaction mode 行为不同：
+ * assistant 模式下框架会把最终 SDK 文本作为正式结果自动发送到任务绑定的渠道并归档，
+ * 若措辞误称「只归档」，agent 会再用 send_message 自行发送一份，用户就会收到两条相同
+ * 内容（group 定时任务双投递的根因）；proactive 模式下框架只归档、渠道投递仍由 agent
+ * 自己负责。因此按目标工作区当前的 interaction mode 生成对应措辞，判定方式与
+ * index.ts 消费该消息时的 resolveRuntimeInteractionMode({ agentKind: 'main' }) 一致。
  */
-const SCHEDULED_GROUP_TRIGGER_FRAMING = [
-  '[定时任务自动触发] 以下内容是你此前创建的定时任务到点自动执行的触发，不是用户新发来的指令。',
-  '请直接执行该任务对应的动作。',
-  '你的最终 SDK Assistant 文本会作为正式任务结果归档到所属 Web 工作区，因此必须包含一份完整、可独立阅读的业务结果；所有结论、报告和数据都要写在最终文本中，不得只回复“已完成”“已发送”、消息 ID、文件路径或简短摘要。',
-  '如果任务要求调用 feishu-cli 或其他外部发送工具，请照常调用；但工具投递不能替代上述完整最终文本，工具报错时也不要声称发送成功。',
-  '重要：这条只是触发信号，对应的定时任务已在调度中。即使下面内容里出现「每隔/每天/定期/提醒我」等字样，也不要再调用 schedule_task 创建或重复该定时任务（除非内容明确要求你另外新建一个不同的任务）。',
-].join('\n');
+export function buildScheduledGroupTriggerFraming(
+  interactionMode: InteractionMode,
+): string {
+  const { frameworkDeliversFinalText } =
+    resolveScheduledGroupDeliveryContract(interactionMode);
+  const deliveryContract = frameworkDeliversFinalText
+    ? [
+        '你的最终 SDK Assistant 文本会由框架作为正式任务结果统一投递：归档到所属 Web 工作区，任务绑定 IM 渠道时同一份内容也会自动发送到该渠道。因此必须包含一份完整、可独立阅读的业务结果；所有结论、报告和数据都要写在最终文本中，不得只回复“已完成”“已发送”、消息 ID、文件路径或简短摘要。',
+        '正因为框架会自动投递最终文本，不要再用 send_message 等消息工具把同样的内容重复发送一遍，否则用户会收到两份。',
+      ]
+    : [
+        '你的最终 SDK Assistant 文本只会作为正式任务结果归档到所属 Web 工作区，不会自动发送到 IM 渠道；需要送达用户的内容请照常通过 send_message 主动发送。归档文本仍必须包含一份完整、可独立阅读的业务结果；所有结论、报告和数据都要写在最终文本中，不得只回复“已完成”“已发送”、消息 ID、文件路径或简短摘要。',
+      ];
+  return [
+    '[定时任务自动触发] 以下内容是你此前创建的定时任务到点自动执行的触发，不是用户新发来的指令。',
+    '请直接执行该任务对应的动作。',
+    ...deliveryContract,
+    '如果任务要求调用 feishu-cli 或其他外部发送工具，请照常调用；但工具投递不能替代上述完整最终文本，工具报错时也不要声称发送成功。',
+    '重要：这条只是触发信号，对应的定时任务已在调度中。即使下面内容里出现「每隔/每天/定期/提醒我」等字样，也不要再调用 schedule_task 创建或重复该定时任务（除非内容明确要求你另外新建一个不同的任务）。',
+  ].join('\n');
+}
 
 const SCHEDULED_GROUP_PROMPT_ID_PREFIX = 'scheduled-task-prompt:';
 
@@ -1896,12 +1926,170 @@ export function scheduledGroupRunIdFromPromptMessageId(
   return runId && /^[a-zA-Z0-9-]+$/.test(runId) ? runId : null;
 }
 
+/**
+ * Resolve the durable occurrence owned by a scheduled-task IPC side effect.
+ *
+ * Isolated runs carry the durable id in their private IPC namespace. Group
+ * runs share the workspace IPC root, so they must instead correlate through
+ * the immutable scheduler prompt id stamped as inputTurnId. The task id and
+ * source folder checks prevent a forged/stale workspace message from writing
+ * a delivery receipt onto another occurrence.
+ */
+export function resolveScheduledTaskIpcRunId(
+  data: {
+    inputTurnId?: unknown;
+    taskId?: unknown;
+    scheduledTaskRunId?: unknown;
+  },
+  isolatedRunId: string | null,
+  sourceGroup: string,
+  getRun: (runId: string) => TaskRun | undefined,
+): string | null {
+  if (isolatedRunId) {
+    const run = getRun(isolatedRunId);
+    if (
+      !run ||
+      run.definition_snapshot.context_mode !== 'isolated' ||
+      run.definition_snapshot.group_folder !== sourceGroup ||
+      (typeof data.taskId === 'string' &&
+        data.taskId.length > 0 &&
+        data.taskId !== run.task_id) ||
+      (typeof data.scheduledTaskRunId === 'string' &&
+        data.scheduledTaskRunId.length > 0 &&
+        data.scheduledTaskRunId !== isolatedRunId)
+    ) {
+      return null;
+    }
+    return isolatedRunId;
+  }
+  if (
+    typeof data.inputTurnId !== 'string' ||
+    typeof data.taskId !== 'string' ||
+    !data.taskId
+  ) {
+    return null;
+  }
+  const runId =
+    typeof data.scheduledTaskRunId === 'string' &&
+    /^[a-zA-Z0-9-]+$/.test(data.scheduledTaskRunId)
+      ? data.scheduledTaskRunId
+      : scheduledGroupRunIdFromPromptMessageId(data.inputTurnId);
+  if (!runId) return null;
+  const run = getRun(runId);
+  if (
+    !run ||
+    run.task_id !== data.taskId ||
+    run.definition_snapshot.context_mode !== 'group' ||
+    run.definition_snapshot.group_folder !== sourceGroup
+  ) {
+    return null;
+  }
+  return runId;
+}
+
 interface ScheduledGroupPromptMessage {
   id: string;
   chat_jid: string;
   timestamp?: string;
   source_kind?: string | null;
   task_id?: string | null;
+}
+
+/**
+ * Resolve the immutable native delivery route represented by scheduler-owned
+ * group prompt rows. A scheduled turn is allowed to override a workspace's
+ * sticky interactive owner, but only with the route frozen in its exact
+ * durable definition snapshot.
+ */
+export function resolveScheduledGroupDeliveryRoute(
+  messages: readonly ScheduledGroupPromptMessage[],
+  sourceFolder: string,
+  getRun: (runId: string) => TaskRun | undefined,
+  getChannelType: (jid: string) => string | null,
+): string | null {
+  const routes = new Set<string>();
+  for (const message of messages) {
+    if (message.source_kind !== 'scheduled_task_prompt' || !message.task_id) {
+      continue;
+    }
+    const runId = scheduledGroupRunIdFromPromptMessageId(message.id);
+    if (!runId) continue;
+    const run = getRun(runId);
+    if (
+      !run ||
+      run.task_id !== message.task_id ||
+      run.definition_snapshot.context_mode !== 'group' ||
+      run.definition_snapshot.group_folder !== sourceFolder ||
+      !['delivered', 'success'].includes(run.status)
+    ) {
+      continue;
+    }
+    const route =
+      run.definition_snapshot.delivery_route_jid ||
+      run.definition_snapshot.chat_jid;
+    if (route && getChannelType(route)) routes.add(route);
+  }
+  return routes.size === 1 ? [...routes][0]! : null;
+}
+
+/**
+ * Resolve the immutable interaction contract carried by one scheduler prompt.
+ * Historical delivered rows predate the snapshot field and deliberately
+ * return null so the caller can retain the legacy live-workspace fallback.
+ */
+export function resolveScheduledGroupPromptInteractionMode(
+  message: ScheduledGroupPromptMessage,
+  getRun: (runId: string) => TaskRun | undefined,
+): InteractionMode | null {
+  if (message.source_kind !== 'scheduled_task_prompt' || !message.task_id) {
+    return null;
+  }
+  const runId = scheduledGroupRunIdFromPromptMessageId(message.id);
+  if (!runId) return null;
+  const run = getRun(runId);
+  if (
+    !run ||
+    run.task_id !== message.task_id ||
+    run.definition_snapshot.context_mode !== 'group'
+  ) {
+    return null;
+  }
+  const mode = run.definition_snapshot.interaction_mode;
+  return mode === 'assistant' || mode === 'proactive' ? mode : null;
+}
+
+/**
+ * One SDK query has exactly one interaction contract. Keep only the
+ * contiguous prefix compatible with its first input; the caller schedules the
+ * remainder for a fresh/warm-compatible runner. This prevents two scheduled
+ * prompts frozen under different modes from being coalesced into one answer.
+ */
+export function selectInteractionModeCompatibleMessagePrefix<
+  T extends ScheduledGroupPromptMessage,
+>(
+  messages: readonly T[],
+  liveInteractionMode: InteractionMode,
+  getRun: (runId: string) => TaskRun | undefined,
+): {
+  messages: T[];
+  interactionMode: InteractionMode;
+  hasDeferredMessages: boolean;
+} {
+  const modeFor = (message: T): InteractionMode =>
+    resolveScheduledGroupPromptInteractionMode(message, getRun) ??
+    liveInteractionMode;
+  const interactionMode = messages[0]
+    ? modeFor(messages[0])
+    : liveInteractionMode;
+  const boundary = messages.findIndex(
+    (message) => modeFor(message) !== interactionMode,
+  );
+  const end = boundary < 0 ? messages.length : boundary;
+  return {
+    messages: messages.slice(0, end),
+    interactionMode,
+    hasDeferredMessages: end < messages.length,
+  };
 }
 
 /**
@@ -2047,7 +2235,11 @@ async function runGroupModeTask(
     const owner = task.created_by ? getUserById(task.created_by) : null;
     const senderName = owner?.display_name || owner?.username || '定时任务';
 
-    const promptText = `${SCHEDULED_GROUP_TRIGGER_FRAMING}\n\n${task.prompt}`;
+    const interactionMode = resolveRuntimeInteractionMode(
+      getWorkspaceInteractionMode(task.group_folder),
+      { agentKind: 'main' },
+    );
+    const promptText = `${buildScheduledGroupTriggerFraming(interactionMode)}\n\n${task.prompt}`;
     if (durableRun) {
       if (!deps.storeGroupPromptAndDeliverRun) {
         throw new Error(
@@ -2063,6 +2255,7 @@ async function runGroupModeTask(
         text: promptText,
         taskId: task.id,
         queuedResult: resultSummary,
+        interactionMode,
       });
     } else {
       if (!deps.storePromptMessage) {
@@ -2319,20 +2512,33 @@ function mergeNotificationReceipts(
       ...next.summary.failed_channels,
     ]),
   ];
+  const uncertain =
+    (current.summary.uncertain ?? 0) + (next.summary.uncertain ?? 0);
+  const uncertainChannels = [
+    ...new Set([
+      ...(current.summary.uncertain_channels ?? []),
+      ...(next.summary.uncertain_channels ?? []),
+    ]),
+  ];
   const summary: TaskRunNotificationSummary = {
     attempted: current.summary.attempted + next.summary.attempted,
     succeeded: current.summary.succeeded + next.summary.succeeded,
     failed: current.summary.failed + next.summary.failed,
     failed_channels: failedChannels,
+    ...(uncertain > 0
+      ? { uncertain, uncertain_channels: uncertainChannels }
+      : {}),
   };
   const status =
-    summary.failed === 0
-      ? summary.attempted === 0
-        ? 'skipped'
-        : 'success'
-      : summary.succeeded > 0
-        ? 'partial_failed'
-        : 'failed';
+    uncertain > 0
+      ? 'uncertain'
+      : summary.failed === 0
+        ? summary.attempted === 0
+          ? 'skipped'
+          : 'success'
+        : summary.succeeded > 0
+          ? 'partial_failed'
+          : 'failed';
   return {
     status,
     summary,
@@ -2344,13 +2550,16 @@ function failedNotificationReceipt(
   channel: string,
   error: unknown,
 ): TaskRunNotificationReceipt {
+  const deliveryPhase = explicitImDeliveryPhase(error);
+  const uncertain = deliveryPhase === 'uncertain';
   return {
-    status: 'failed',
+    status: uncertain ? 'uncertain' : 'failed',
     summary: {
       attempted: 1,
       succeeded: 0,
       failed: 1,
       failed_channels: [channel],
+      ...(uncertain ? { uncertain: 1, uncertain_channels: [channel] } : {}),
     },
     error: error instanceof Error ? error.message : String(error),
   };
@@ -2381,10 +2590,16 @@ function trackTaskRunNotifications(
     payload?: TaskRunNotificationPayload,
   ) => {
     aggregate = mergeNotificationReceipts(aggregate, receipt);
-    if (receipt.status === 'failed' || receipt.status === 'partial_failed') {
+    if (
+      receipt.status === 'failed' ||
+      receipt.status === 'partial_failed' ||
+      receipt.status === 'uncertain'
+    ) {
       const retryPayload = payload
         ? payload.kind === 'batch'
-          ? payload
+          ? receipt.status === 'uncertain'
+            ? undefined
+            : payload
           : retryPayloadForReceipt(payload, receipt)
         : undefined;
       // Failure recovery must survive a process crash before the execution
@@ -2425,14 +2640,17 @@ function trackTaskRunNotifications(
       } catch (err) {
         directlyDeliveredJids.delete(jid);
         const receipt = failedNotificationReceipt(jid, err);
+        const retryPayload = retryPayloadForReceipt(payload, receipt);
         // Persist before returning to Agent/script work: the process may crash
         // or continue running for a long time before the owner fallback/finish.
-        recordTaskRunNotificationReceipt(claim.id, receipt, payload);
-        pendingDirectFailure = {
-          jid,
-          receipt,
-          payload,
-        };
+        recordTaskRunNotificationReceipt(claim.id, receipt, retryPayload);
+        if (retryPayload) {
+          pendingDirectFailure = { jid, receipt, payload: retryPayload };
+        } else {
+          // Uncertain delivery is historical evidence, not provisional retry
+          // work that a later fallback may replace or erase.
+          trackPersistedReceipt(receipt);
+        }
         // Notification transport is independent of execution. The durable
         // retry payload above owns recovery; do not turn successful script or
         // Agent work into an execution failure.
@@ -2515,7 +2733,8 @@ function trackTaskRunNotifications(
                   directFailure.payload,
                   receipt,
                   receipt.status === 'failed' ||
-                    receipt.status === 'partial_failed'
+                    receipt.status === 'partial_failed' ||
+                    receipt.status === 'uncertain'
                     ? retryPayloadForReceipt(payload, receipt)
                     : undefined,
                 );
@@ -2966,7 +3185,11 @@ function materializeDueOccurrences(): void {
 function retryPayloadForReceipt(
   payload: TaskRunAtomicNotificationPayload,
   receipt: TaskRunNotificationReceipt,
-): TaskRunAtomicNotificationPayload {
+): TaskRunAtomicNotificationPayload | undefined {
+  const uncertainChannels = new Set(receipt.summary.uncertain_channels ?? []);
+  const retryableFailures =
+    receipt.summary.failed - (receipt.summary.uncertain ?? 0);
+  if (retryableFailures <= 0) return undefined;
   if (
     payload.kind !== 'store_result_and_notify' ||
     !payload.options ||
@@ -2979,12 +3202,14 @@ function retryPayloadForReceipt(
     'telegram',
     'qq',
     'wechat',
+    'wecom',
     'dingtalk',
     'discord',
     'whatsapp',
   ]);
-  let failedChannels = receipt.summary.failed_channels.filter((channel) =>
-    knownChannelTypes.has(channel),
+  let failedChannels = receipt.summary.failed_channels.filter(
+    (channel) =>
+      knownChannelTypes.has(channel) && !uncertainChannels.has(channel),
   );
   const originalChannels = payload.options.notifyChannels;
   if (Array.isArray(originalChannels)) {
@@ -3114,9 +3339,13 @@ export async function deliverPersistedNotificationPayload(
       receipt = failedNotificationReceipt(channel, err);
     }
     aggregate = mergeNotificationReceipts(aggregate, receipt);
-    if (receipt.status === 'failed' || receipt.status === 'partial_failed') {
+    if (
+      receipt.status === 'failed' ||
+      receipt.status === 'partial_failed' ||
+      receipt.status === 'uncertain'
+    ) {
       const retry = retryPayloadForReceipt(item, receipt);
-      failedItems.push(retry);
+      if (retry) failedItems.push(retry);
     }
   }
 

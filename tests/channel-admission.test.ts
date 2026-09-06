@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from 'vitest';
 import { ChannelType } from 'discord.js';
 import {
+  ChannelRouteRejectedError,
   evaluateChannelAdmission,
   matchesChannelAccountAuthorization,
   matchesChannelPairTarget,
@@ -81,6 +82,30 @@ describe('channel admission', () => {
         agentId: 'session',
       },
     });
+  });
+
+  // Regression (2026-08-04): im-manager wraps a channel's resolveEffectiveChatJid
+  // per-account and throws ChannelRouteRejectedError instead of returning null
+  // for an unbound/unauthorized chat. Every channel calls this function
+  // directly with that wrapped resolver and branches on `!resolvedRoute` —
+  // if the throw isn't translated to null here, it escapes past that branch
+  // entirely and falls into whatever generic outer catch happens to wrap the
+  // caller (misleading "intake failed" logs, and in Feishu's P2P bootstrap
+  // path, skipped registration side effects — see feishu.ts commit fc828b4).
+  test('translates a wrapped resolver rejection into the same null contract as a direct null return', () => {
+    expect(
+      resolveAdmittedChannelRoute('discord:source', () => {
+        throw new ChannelRouteRejectedError('discord:source');
+      }),
+    ).toBeNull();
+  });
+
+  test('does not swallow errors unrelated to route rejection', () => {
+    expect(() =>
+      resolveAdmittedChannelRoute('discord:source', () => {
+        throw new Error('database unavailable');
+      }),
+    ).toThrow('database unavailable');
   });
 
   test('passes native context metadata to an authoritative resolver', () => {

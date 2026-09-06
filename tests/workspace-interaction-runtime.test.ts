@@ -376,4 +376,18 @@ describe('workspace interaction runtime policy', () => {
       'healthyAgentCompletedInputTurns.has(inputTurnId)',
     );
   });
+
+  test('keeps definitive native rejection notices out of canonical Web history', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    expect(source).toContain('projectToWeb?: boolean');
+    expect(source).toContain('if (input.projectToWeb === false) return true;');
+    expect(source).toContain("noticeKey: 'native-delivery-rejected'");
+    expect(source).toContain('projectToWeb: false');
+    expect(source).toContain(
+      'IPC final completed in Web after native rejection',
+    );
+  });
 });

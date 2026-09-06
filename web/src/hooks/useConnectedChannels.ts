@@ -11,7 +11,7 @@ export function useConnectedChannels(): Record<string, boolean> {
 
   useEffect(() => {
     api
-      .get<Record<string, boolean>>('/api/config/user-im/status')
+      .get<Record<string, boolean>>('/api/channel-accounts/status')
       .then((data) => {
         const result: Record<string, boolean> = {};
         for (const ch of CHANNEL_OPTIONS) {

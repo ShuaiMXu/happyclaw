@@ -26,11 +26,12 @@ function message(
 }
 
 describe('Codex-style message timeline', () => {
-  test('keeps queued inputs beside the composer until they start', () => {
+  test('hides queued, cancelled, and subsumed inputs from the transcript', () => {
     for (const deliveryStatus of [
       'queued',
       'promoting',
       'cancelled',
+      'subsumed',
     ] as const) {
       expect(
         isMessageVisibleInTimeline(

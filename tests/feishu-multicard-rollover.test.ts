@@ -15,10 +15,12 @@ import { StreamingCardController } from '../src/feishu-streaming-card.js';
 function buildMockClient() {
   let cardSeq = 0;
   let msgSeq = 0;
-  const cardUpdate = vi.fn().mockResolvedValue({});
-  const messageCreate = vi.fn().mockImplementation(() =>
-    Promise.resolve({ data: { message_id: `om_${++msgSeq}` } }),
-  );
+  const cardUpdate = vi.fn().mockResolvedValue({ code: 0 });
+  const messageCreate = vi
+    .fn()
+    .mockImplementation(() =>
+      Promise.resolve({ data: { message_id: `om_${++msgSeq}` } }),
+    );
   const cardCreate = vi.fn().mockImplementation(() => {
     cardSeq++;
     // 第一次 create 是 Level 0（streaming mode）尝试 —— 拒绝，强制走 v1 路径
@@ -61,9 +63,7 @@ describe('MultiCardManager rollover (v1 degraded mode)', () => {
     // 触发创建：Level 0 失败 → Level 1 (v1 multi-card) 成功
     controller.append('# 标题\n正文开始');
     await vi.waitFor(() => expect(messageCreate).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() =>
-      expect((controller as any).state).toBe('streaming'),
-    );
+    await vi.waitFor(() => expect((controller as any).state).toBe('streaming'));
 
     vi.useFakeTimers();
 
@@ -107,13 +107,10 @@ describe('MultiCardManager rollover (v1 degraded mode)', () => {
 
     controller.append('# 标题\n正文开始');
     await vi.waitFor(() => expect(messageCreate).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() =>
-      expect((controller as any).state).toBe('streaming'),
-    );
+    await vi.waitFor(() => expect((controller as any).state).toBe('streaming'));
 
     vi.useFakeTimers();
-    const bigText =
-      '# 标题\n' + 'B'.repeat(30000) + '\n尾部独立行内容\n结束语';
+    const bigText = '# 标题\n' + 'B'.repeat(30000) + '\n尾部独立行内容\n结束语';
     controller.append(bigText);
     await vi.advanceTimersByTimeAsync(1200);
     await vi.waitFor(() => expect(messageCreate).toHaveBeenCalledTimes(2), {
@@ -168,4 +165,3 @@ describe('MultiCardManager rollover (v1 degraded mode)', () => {
     expect(cardCreate.mock.calls.length).toBeGreaterThan(2);
   });
 });
-

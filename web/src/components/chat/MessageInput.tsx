@@ -27,7 +27,7 @@ import {
   Check,
   Trash2,
 } from 'lucide-react';
-import { useFileStore } from '../../stores/files';
+import { formatUploadRetryStatus, useFileStore } from '../../stores/files';
 import {
   useChatStore,
   type FollowUpMode,
@@ -42,6 +42,7 @@ import {
   FOLLOW_UP_MODE_CHANGED_EVENT,
   getDefaultFollowUpMode,
 } from '../../lib/follow-up-preferences';
+import { planImageClipboardPaste } from '../../lib/mixed-paste';
 
 interface PendingFile {
   /** Display name: relative path for folder uploads, file name otherwise */
@@ -131,6 +132,7 @@ export function MessageInput({
   // 窄 selector：这是 1200+ 行常驻组件，无 selector 的整 store 订阅会让它在
   // 流式输出的每一帧（rAF 级 set()）都重渲染一次。actions 引用稳定。
   const uploadFiles = useFileStore((s) => s.uploadFiles);
+  const cancelUpload = useFileStore((s) => s.cancelUpload);
   const uploading = useFileStore((s) => s.uploading);
   const uploadProgress = useFileStore((s) => s.uploadProgress);
   const drafts = useChatStore((s) => s.drafts);
@@ -524,27 +526,46 @@ export function MessageInput({
       }
     }
 
-    if (imageItems.length > 0) {
-      e.preventDefault();
-      const newImages: PendingImage[] = [];
+    if (imageItems.length === 0) return;
 
-      for (const item of imageItems) {
-        const file = item.getAsFile();
-        if (file) {
-          try {
-            const base64 = await readFileAsBase64(file);
-            newImages.push({
-              name: file.name || `pasted-${Date.now()}.png`,
-              data: base64,
-              mimeType: file.type,
-              preview: URL.createObjectURL(file),
-            });
-          } catch {
-            // Skip failed images
-          }
-        }
+    const textarea = e.currentTarget;
+    const pastePlan = planImageClipboardPaste({
+      value: textarea.value,
+      selectionStart: textarea.selectionStart,
+      selectionEnd: textarea.selectionEnd,
+      text: e.clipboardData.getData('text/plain'),
+      imageItemCount: imageItems.length,
+    });
+    e.preventDefault();
+
+    if (pastePlan.value !== textarea.value) {
+      setContent(pastePlan.value);
+      debouncedSaveDraft(pastePlan.value);
+    }
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.setSelectionRange(pastePlan.selectionStart, pastePlan.selectionEnd);
+    });
+
+    const newImages: PendingImage[] = [];
+    for (const item of imageItems) {
+      const file = item.getAsFile();
+      if (!file) continue;
+      try {
+        const base64 = await readFileAsBase64(file);
+        newImages.push({
+          name: file.name || `pasted-${Date.now()}.png`,
+          data: base64,
+          mimeType: file.type,
+          preview: URL.createObjectURL(file),
+        });
+      } catch {
+        // Skip failed images
       }
+    }
 
+    if (newImages.length > 0) {
       setPendingImages((prev) => [...prev, ...newImages]);
     }
   };
@@ -787,6 +808,9 @@ export function MessageInput({
           (uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100,
         )
       : 0;
+  const uploadRetryStatus = uploadProgress
+    ? formatUploadRetryStatus(uploadProgress)
+    : null;
 
   return (
     <div
@@ -822,10 +846,22 @@ export function MessageInput({
             <div className="flex items-center justify-between mb-1.5">
               <span className="text-xs text-foreground/70 truncate max-w-[65%]">
                 {uploadProgress.currentFile || '完成'}
+                {uploadRetryStatus ? (
+                  <span data-upload-retry-status>（{uploadRetryStatus}）</span>
+                ) : null}
               </span>
-              <span className="text-xs text-muted-foreground">
+              <span className="flex items-center gap-2 text-xs text-muted-foreground">
                 {uploadProgress.completed}/{uploadProgress.total} ·{' '}
                 {progressPercent}%
+                <button
+                  type="button"
+                  data-upload-cancel
+                  onClick={cancelUpload}
+                  className="inline-flex items-center gap-0.5 hover:text-foreground"
+                >
+                  <X className="h-3 w-3" />
+                  取消
+                </button>
               </span>
             </div>
             <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
@@ -844,7 +880,9 @@ export function MessageInput({
               <span>
                 {queuedFollowUps.some((item) => item.delivery_mode === 'steer')
                   ? '正在停止当前回复，随后发送引导消息'
-                  : `${queuedFollowUps.length} 条消息已排队`}
+                  : queuedFollowUps.length > 1
+                    ? `${queuedFollowUps.length} 条消息已排队，将合并为下一轮`
+                    : '1 条消息已排队'}
               </span>
             </div>
             <div className="max-h-56 divide-y divide-border/70 overflow-y-auto">

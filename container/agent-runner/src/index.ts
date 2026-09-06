@@ -63,6 +63,7 @@ import {
   extractSessionHistory as extractSessionHistoryImpl,
   parseTranscript,
 } from './session-history.js';
+import { trimSessionJsonl } from './session-trim.js';
 import { StreamEventProcessor } from './stream-processor.js';
 import {
   acknowledgeHappyClawOwnerProfileFirstWake,
@@ -85,6 +86,7 @@ import {
 } from './runtime-mcp-policy.js';
 import {
   IpcTurnDeliveryTracker,
+  ipcReceiptInputIdentity,
   IpcTurnOutputCorrelation,
   isHealthyInputTurnCompletion,
   latestIpcDeliveryId,
@@ -94,6 +96,7 @@ import {
   partitionIpcMessagesForLogicalTurn,
   requeueIpcInputMessages,
   resolveLogicalQueryInputTurnId,
+  scheduledGroupRunIdFromIpcMessages,
   shouldAcceptIpcMessagesDuringQuery,
   type IpcDeliveryReceipt,
   type IpcInputMessage,
@@ -110,12 +113,17 @@ import {
 } from './provider-runtime.js';
 import { resolveAgentSdkEffort } from './agent-effort.js';
 import {
+  classifyProviderAssistantError,
   decideProviderLimitAction,
-  isAccountProviderAssistantError,
   ProviderFallbackModelState,
   ProviderFallbackTurnLedger,
+  type ProviderFailureClass,
   type ProviderFallbackRetryTurn,
 } from './provider-fallback.js';
+import {
+  isTerminalSdkRateLimitRejection,
+  normalizeSdkRateLimitObservation,
+} from './provider-quota-observation.js';
 import {
   runSdkControlWithTimeout,
   SdkFirstResponseWatchdog,
@@ -132,6 +140,11 @@ import {
 } from './assistant-usage.js';
 import { buildHappyClawPromptPlan, type PromptPlan } from './prompt-plan.js';
 import { withHappyClawSubagentContract } from './sdk-compat.js';
+import {
+  isCliNoVisibleOutputCompanion,
+  isProactiveFinalDeliveredSentinel,
+  proactiveFinalWasDeliveredForInput,
+} from './proactive-turn-protocol.js';
 import { assessContextBudget } from './context-budget.js';
 import {
   findClaudeMdExcludeLeaks,
@@ -144,10 +157,12 @@ import {
 } from './agent-turn-contract.js';
 import { prepareMessageStreamText } from './message-stream-text.js';
 import {
+  BackgroundProtocolDebtWatchdog,
   DurableInputTurnCompletion,
   QuiescentResultGate,
   shouldFailIncompleteQueryExit,
 } from './background-task-drain.js';
+import { IpcInputClaimStore } from './ipc-input-claims.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -175,6 +190,7 @@ const MODEL_LIMIT_EXHAUSTED_NOTICE =
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事件丢失）
+const ipcInputClaims = new IpcInputClaimStore(IPC_INPUT_DIR);
 
 let hadCompaction = false;
 // Module-level session ID so SIGTERM handler can emit it before exit.
@@ -234,8 +250,9 @@ function loadPrompt(...segments: string[]): string {
 
 // 解析本地依赖 @anthropic-ai/claude-code 的真实 CLI binary 路径。
 // 该包 postinstall 会把平台对应的 native binary 落地到其 `bin` 字段指向的位置
-// （Windows / macOS / Linux 一致），作为 SDK 的 pathToClaudeCodeExecutable 最可靠来源——
-// 它不依赖 PATH，也不会命中 SDK optionalDependencies 里那些空的 native binary 占位包。
+// （Windows / macOS / Linux 一致），作为 SDK 的 pathToClaudeCodeExecutable 最可靠来源。
+// The image deliberately removes the SDK's duplicate platform packages after
+// verifying this binary, so every runtime must prefer it before PATH fallbacks.
 function resolveBundledClaudeCli(): string | undefined {
   try {
     const require = createRequire(import.meta.url);
@@ -815,6 +832,8 @@ const SDK_CONTEXT_USAGE_TIMEOUT_MS = 5_000;
 const SDK_FIRST_RESPONSE_TIMEOUT_MS = 60_000;
 const SDK_COMPACTION_RESPONSE_TIMEOUT_MS = 10 * 60_000;
 const SDK_PROVIDER_FAILURE_EXIT_GRACE_MS = 250;
+const BACKGROUND_PROTOCOL_DEBT_TIMEOUT_MS = 15_000;
+const BACKGROUND_PROTOCOL_FAILURE_EXIT_GRACE_MS = 1_000;
 
 function writeOutput(output: ContainerOutput): void {
   const correlatedOutput: ContainerOutput = activeOutputInputTurnId
@@ -939,100 +958,6 @@ function getSessionSummary(
 }
 
 /**
- * Trim session JSONL file by removing all entries before the last compact_boundary.
- * After compaction, entries before the boundary are already summarized and no longer
- * needed for session reconstruction. This prevents unbounded file growth.
- *
- * Safety: uses atomic write (tmp + rename) to avoid data loss on crash.
- */
-function trimSessionJsonl(jsonlPath: string): void {
-  try {
-    const content = fs.readFileSync(jsonlPath, 'utf-8');
-    const lines = content.split('\n');
-    const nonEmptyLines: { index: number; line: string }[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].trim()) nonEmptyLines.push({ index: i, line: lines[i] });
-    }
-
-    // Find the last compact_boundary entry (and any preserved segment it references)
-    let lastBoundaryPos = -1;
-    let preservedHeadUuid: string | undefined;
-    let parseSkipped = 0;
-    for (let i = nonEmptyLines.length - 1; i >= 0; i--) {
-      try {
-        const entry = JSON.parse(nonEmptyLines[i].line);
-        if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-          lastBoundaryPos = i;
-          preservedHeadUuid =
-            entry.compact_metadata?.preserved_segment?.head_uuid;
-          break;
-        }
-      } catch {
-        parseSkipped++;
-      }
-    }
-    if (parseSkipped > 0) {
-      log(`Session trim: skipped ${parseSkipped} unparseable JSONL lines`);
-    }
-
-    if (lastBoundaryPos <= 0) {
-      // No boundary found or it's already the first entry — nothing to trim
-      log('Session trim: no compact_boundary found or already minimal');
-      return;
-    }
-
-    // partial compaction 时 boundary 带 preserved_segment{head_uuid, anchor_uuid, tail_uuid}：
-    // 保留段内容是 head_uuid..tail_uuid，SDK 的 resume loader 会在 anchor_uuid 处把它拼回。
-    // 若裁切越过 head_uuid，会连同这些消息及其 uuid 一起删掉，导致 loader 找不到锚点、resume
-    // 丢上下文。因此把裁切起点回退到 head_uuid 所在行，保住整段保留消息。
-    let trimStartPos = lastBoundaryPos;
-    if (preservedHeadUuid) {
-      const preservedPos = nonEmptyLines.findIndex((e) => {
-        try {
-          return JSON.parse(e.line).uuid === preservedHeadUuid;
-        } catch {
-          return false;
-        }
-      });
-      if (preservedPos >= 0 && preservedPos < trimStartPos) {
-        trimStartPos = preservedPos;
-        log(
-          `Session trim: preserving segment from head_uuid=${preservedHeadUuid.slice(0, 8)} (pos ${preservedPos} < boundary ${lastBoundaryPos})`,
-        );
-      }
-    }
-
-    // Keep entries from trimStartPos onwards
-    const trimmedLines = nonEmptyLines.slice(trimStartPos).map((e) => e.line);
-    const removedCount = trimStartPos;
-
-    const TRIM_MIN_ENTRIES = 50; // Skip trimming if fewer entries before boundary (not worth the I/O)
-    if (removedCount < TRIM_MIN_ENTRIES) {
-      log(
-        `Session trim: only ${removedCount} entries before boundary, skipping`,
-      );
-      return;
-    }
-
-    // Atomic write: temp file + rename
-    const tmpPath = jsonlPath + '.trim-tmp';
-    fs.writeFileSync(tmpPath, trimmedLines.join('\n') + '\n');
-    fs.renameSync(tmpPath, jsonlPath);
-
-    const sizeBefore = Buffer.byteLength(content, 'utf-8');
-    const sizeAfter = fs.statSync(jsonlPath).size;
-    log(
-      `Session trim: ${nonEmptyLines.length} → ${trimmedLines.length} entries (removed ${removedCount}), ` +
-        `${(sizeBefore / 1024 / 1024).toFixed(1)}MB → ${(sizeAfter / 1024 / 1024).toFixed(1)}MB`,
-    );
-  } catch (err) {
-    log(
-      `Session trim failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
-/**
  * Archive the full transcript to conversations/ before compaction.
  * Also flush any accumulated streaming text as a compact_partial message
  * so users don't lose the response that was being generated.
@@ -1117,7 +1042,7 @@ function createPreCompactHook(deps: {
     // ── Trim session JSONL to prevent unbounded growth ──
     // Remove entries before the last compact_boundary (already summarized).
     // Must run AFTER archiving (archive needs full transcript).
-    trimSessionJsonl(transcriptPath);
+    trimSessionJsonl(transcriptPath, log);
 
     // Flag compaction so the query loop auto-continues instead of
     // waiting for user input (non-blocking compaction #229).
@@ -1309,6 +1234,7 @@ const IPC_INPUT_DRAIN_SENTINEL = path.join(IPC_INPUT_DIR, '_drain');
 const IPC_INPUT_INTERRUPT_SENTINEL = path.join(IPC_INPUT_DIR, '_interrupt');
 const INTERRUPT_GRACE_WINDOW_MS = 10_000;
 let lastInterruptRequestedAt = 0;
+let activeInterruptQueryRunId: string | undefined;
 
 function markInterruptRequested(): void {
   lastInterruptRequestedAt = Date.now();
@@ -1327,10 +1253,10 @@ function isWithinInterruptGraceWindow(): boolean {
 
 function isInterruptRelatedError(err: unknown): boolean {
   const errno = err as NodeJS.ErrnoException;
-  const message = err instanceof Error ? err.message : String(err ?? '');
   return (
     errno?.code === 'ABORT_ERR' ||
-    /abort|aborted|interrupt|interrupted|cancelled|canceled/i.test(message)
+    (err instanceof Error &&
+      (err.name === 'AbortError' || err.name === 'CanceledError'))
   );
 }
 
@@ -1339,34 +1265,29 @@ function isInterruptRelatedError(err: unknown): boolean {
  */
 function shouldInterrupt(): boolean {
   if (fs.existsSync(IPC_INPUT_INTERRUPT_SENTINEL)) {
+    let sentinelQueryRunId = '';
     try {
+      sentinelQueryRunId = fs
+        .readFileSync(IPC_INPUT_INTERRUPT_SENTINEL, 'utf8')
+        .trim();
       fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
     } catch {
       /* ignore */
+    }
+    if (
+      sentinelQueryRunId &&
+      activeInterruptQueryRunId &&
+      sentinelQueryRunId !== activeInterruptQueryRunId
+    ) {
+      log(
+        `Ignoring interrupt for stale query ${sentinelQueryRunId} (active ${activeInterruptQueryRunId})`,
+      );
+      return false;
     }
     markInterruptRequested();
     return true;
   }
   return false;
-}
-
-function cleanupStartupInterruptSentinel(): void {
-  try {
-    const stat = fs.statSync(IPC_INPUT_INTERRUPT_SENTINEL);
-    const ageMs = Date.now() - stat.mtimeMs;
-    if (ageMs <= INTERRUPT_GRACE_WINDOW_MS) {
-      log(
-        `Preserving recent interrupt sentinel at startup (${Math.round(ageMs)}ms old)`,
-      );
-      return;
-    }
-    fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-    log(
-      `Removed stale interrupt sentinel at startup (${Math.round(ageMs)}ms old)`,
-    );
-  } catch {
-    /* ignore */
-  }
 }
 
 /**
@@ -1397,16 +1318,11 @@ interface IpcDrainResult {
 function drainIpcInput(): IpcDrainResult {
   const result: IpcDrainResult = { messages: [] };
   try {
-    const files = fs
-      .readdirSync(IPC_INPUT_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .sort();
+    const claimPaths = ipcInputClaims.claimAvailable();
 
-    for (const file of files) {
-      const filePath = path.join(IPC_INPUT_DIR, file);
+    for (const claimPath of claimPaths) {
       try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        fs.unlinkSync(filePath);
+        const data = JSON.parse(fs.readFileSync(claimPath, 'utf-8'));
         if (data.type === 'message' && data.text) {
           result.messages.push({
             text: data.text,
@@ -1421,24 +1337,65 @@ function drainIpcInput(): IpcDrainResult {
               typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
             ),
             receipt: parseIpcReceipt(data.receipt),
+            ipcClaimPath: claimPath,
           });
+        } else {
+          ipcInputClaims.discard(claimPath);
         }
       } catch (err) {
         log(
-          `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to process input claim ${path.basename(claimPath)}: ${err instanceof Error ? err.message : String(err)}`,
         );
-        try {
-          fs.unlinkSync(filePath);
-        } catch {
-          /* ignore */
-        }
+        ipcInputClaims.discard(claimPath);
       }
     }
-    result.messages = orderIpcInputMessages(result.messages);
+    const seenInputIdentities = new Set<string>();
+    const duplicateClaims: string[] = [];
+    result.messages = orderIpcInputMessages(
+      result.messages.filter((message) => {
+        const receipt = message.receipt;
+        if (!receipt) return true;
+        const identity = ipcReceiptInputIdentity(receipt);
+        if (!seenInputIdentities.has(identity)) {
+          seenInputIdentities.add(identity);
+          return true;
+        }
+        if (message.ipcClaimPath) duplicateClaims.push(message.ipcClaimPath);
+        return false;
+      }),
+    );
+    // A crash claim and a Host re-emission can coexist briefly. Keep exactly
+    // one durable copy and remove the duplicate claim before prompt assembly.
+    const duplicateClaimFailures = ipcInputClaims.acknowledge(duplicateClaims);
+    if (duplicateClaimFailures.length > 0) {
+      logWarn(
+        `Failed to remove ${duplicateClaimFailures.length} duplicate IPC claim(s); delivery-id deduplication remains active`,
+      );
+    }
   } catch (err) {
     log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
   }
   return result;
+}
+
+/**
+ * Transfer durable file ownership to the in-memory delivery tracker. Failed
+ * unlinks stay claimed and are ignored by this process; a replacement Runner
+ * can recover them after a crash.
+ */
+function acknowledgeRegisteredIpcInputs(
+  messages: readonly IpcInputMessage[],
+): void {
+  const failed = ipcInputClaims.acknowledge(
+    messages
+      .map((message) => message.ipcClaimPath)
+      .filter((claimPath): claimPath is string => !!claimPath),
+  );
+  if (failed.length > 0) {
+    logWarn(
+      `Failed to acknowledge ${failed.length} registered IPC input claim(s); keeping them recoverable on disk`,
+    );
+  }
 }
 
 /**
@@ -1534,11 +1491,6 @@ function waitForIpcMessage(): Promise<
         return;
       }
 
-      if (shouldInterrupt()) {
-        log('Interrupt sentinel received while idle, ignoring');
-        clearInterruptRequested();
-      }
-
       const { messages } = drainIpcInput();
 
       if (messages.length > 0) {
@@ -1581,6 +1533,12 @@ function waitForIpcMessage(): Promise<
         });
         return;
       }
+
+      // Do not consume _interrupt while idle, even when no IPC file is present
+      // yet. The host can reserve a durable query and publish its query-bound
+      // interrupt while asynchronous prompt preparation is still in progress.
+      // Once that input arrives, the outer loop binds queryRunId and runQuery's
+      // pre-start check consumes or rejects the sentinel exactly.
     };
 
     const ipcWatcher = createIpcWatcher(tryDrain);
@@ -1720,6 +1678,9 @@ async function runQueryAttempt(
   // name in the return type, this includes the initial startup/idle-drain batch
   // as well as messages piped while the query is active.
   const ipcDeliveryTracker = new IpcTurnDeliveryTracker(initialIpcMessages);
+  // Registration is synchronous and precedes every await in this query. Only
+  // now may the crash-recoverable disk claims be removed.
+  acknowledgeRegisteredIpcInputs(initialIpcMessages);
   const coldInputTurnId =
     resolveLogicalQueryInputTurnId(
       containerInput.turnId,
@@ -1743,11 +1704,17 @@ async function runQueryAttempt(
       mcpToolsContext.currentInputTurnId = currentInputTurnId;
       if (currentMessage) {
         mcpToolsContext.currentTaskId = currentMessage.taskId ?? null;
+        mcpToolsContext.currentScheduledTaskRunId =
+          scheduledGroupRunIdFromIpcMessages(
+            currentMessages,
+            currentMessage.taskId,
+          );
       }
     }
     if (currentMessage) {
       if (currentMessage.queryRunId) {
         containerInput.queryRunId = currentMessage.queryRunId;
+        activeInterruptQueryRunId = currentMessage.queryRunId;
       }
       setCurrentChannelTurn(
         containerInput,
@@ -1878,13 +1845,45 @@ async function runQueryAttempt(
     }
     if (emitOutput) writeOutput(output);
   };
+  const publishProviderQuotaObservation = (info: SDKRateLimitInfo): void => {
+    // Passive provider observations are host control-plane state, including
+    // internal maintenance queries whose user-visible output is suppressed.
+    writeOutput(
+      outputCorrelation.correlate({
+        status: 'stream',
+        result: null,
+        providerQuotaObservation: normalizeSdkRateLimitObservation(info),
+        turnId: containerInput.turnId,
+        sessionId: newSessionId || sessionId,
+      }),
+    );
+  };
   let providerFailurePublished = false;
-  const publishProviderAccountFailure = (
-    error: SDKAssistantMessageError,
-    rateLimitResetsAt?: number,
-    failureNotice?: string,
-    rateLimitScope: 'account' | 'model' = 'account',
-  ): void => {
+  /**
+   * Publish one provider failure control signal.
+   *
+   * `failureClass` — not the SDK error name — is what the host reads to decide
+   * whether the account is quarantined, whether the input is replayed, and
+   * which notice the user eventually sees. It is required so that no future
+   * call site can silently inherit the account-verdict disposition the way the
+   * liveness watchdog once did by borrowing the `server_error` label.
+   */
+  const publishProviderFailure = (options: {
+    error: SDKAssistantMessageError;
+    failureClass: ProviderFailureClass;
+    rateLimitResetsAt?: number;
+    failureNotice?: string;
+    rateLimitScope?: 'account' | 'model';
+    livenessTimeout?: boolean;
+  }): void => {
+    const {
+      error,
+      failureClass,
+      rateLimitResetsAt,
+      failureNotice,
+      rateLimitScope = 'account',
+      livenessTimeout = false,
+    } = options;
     if (providerFailurePublished) return;
     providerFailurePublished = true;
     // Produce the exact receipt candidates for a terminal host projection.
@@ -1896,6 +1895,7 @@ async function runQueryAttempt(
       result: null,
       newSessionId,
       providerFailure: true,
+      providerFailureClass: failureClass,
       ...(typeof rateLimitResetsAt === 'number' &&
       Number.isFinite(rateLimitResetsAt)
         ? { providerRateLimitResetsAt: rateLimitResetsAt }
@@ -1907,16 +1907,45 @@ async function runQueryAttempt(
         PROVIDER_FALLBACK_MODELS.activeModelOverride,
       ),
       ...(!emitOutput ? { providerFailureMaintenance: true } : {}),
+      ...(livenessTimeout ? { providerLivenessTimeout: true } : {}),
       finalizationReason: 'error',
       ...(emitOutput && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
       ...(sourceKindOverride ? { sourceKind: sourceKindOverride } : {}),
     };
-    log(`Publishing provider failure control signal (${error})`);
+    log(
+      `Publishing provider failure control signal (${error}, class=${failureClass})`,
+    );
     if (emitOutput) {
       emit(output);
     } else {
       writeOutput(outputCorrelation.correlate(output));
     }
+  };
+  /**
+   * Tell the user, once, that the answer they are about to read came from the
+   * fallback model rather than the one they configured.
+   *
+   * Without this the downgrade is invisible: the turn is silently re-run on a
+   * weaker tier and the reply is indistinguishable from a primary-model reply,
+   * so a user reading it has no way to know the quality bar moved or that their
+   * primary model needs attention. It is a standalone out-of-band notice, never
+   * the answer — `provider_fallback_notice` keeps it out of the primary reply
+   * slot so it cannot be mistaken for a delivered result.
+   *
+   * `ProviderFallbackModelState` latches on activation, so this fires at most
+   * once per runner process even across warm IPC turns.
+   */
+  const emitModelFallbackNotice = (): void => {
+    if (!emitOutput) return;
+    emit({
+      status: 'success',
+      result:
+        `⚠️ 主模型 ${PROVIDER_FALLBACK_MODELS.primaryModel} 已达用量上限，` +
+        `本轮起改用备用模型 ${PROVIDER_FALLBACK_MODELS.fallbackModel} 回复。` +
+        `回答质量可能与平时不同；如需恢复，请等待用量重置或在「模型配置」中调整。`,
+      newSessionId: undefined,
+      sourceKind: 'provider_fallback_notice',
+    });
   };
   let firstResponseWatchdog: SdkFirstResponseWatchdog | undefined;
 
@@ -1941,6 +1970,7 @@ async function runQueryAttempt(
   // before force-closing the stream.
   let resultReceivedAt: number | null = null;
   let cancelBackgroundResultCompletion: () => void = () => {};
+  let clearBackgroundProtocolDebtWatchdog: () => void = () => {};
   const POST_RESULT_TIMEOUT_MS = 5_000;
   // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
   let queryRef: Pick<Query, 'interrupt'> | null = null;
@@ -2069,6 +2099,7 @@ async function runQueryAttempt(
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
       cancelBackgroundResultCompletion();
+      clearBackgroundProtocolDebtWatchdog();
       closedDuringQuery = true;
       emitResultUsage({}, containerInput.turnId || generateTurnId());
       interruptQueryForShutdown('Close sentinel detected during query');
@@ -2080,6 +2111,7 @@ async function runQueryAttempt(
     if (shouldInterrupt()) {
       log('Interrupt sentinel detected, interrupting current query');
       cancelBackgroundResultCompletion();
+      clearBackgroundProtocolDebtWatchdog();
       interruptedDuringQuery = true;
       const cancelledInputs = ipcDeliveryTracker.cancelCurrentTurn();
       cancelledIpcReceipts = cancelledInputs
@@ -2114,6 +2146,7 @@ async function runQueryAttempt(
     if (resultCount > 0 && shouldDrain()) {
       log('Drain sentinel detected after query result, ending stream');
       cancelBackgroundResultCompletion();
+      clearBackgroundProtocolDebtWatchdog();
       closedDuringQuery = true;
       interruptQueryForShutdown('Drain sentinel detected after query result');
       stream.end();
@@ -2173,12 +2206,16 @@ async function runQueryAttempt(
     }
 
     const { messages } = drainIpcInput();
+    // Claim the entire drained batch in the delivery tracker before the first
+    // Memory/Profile await. Previously each file was deleted by drainIpcInput()
+    // and registered one at a time, so a close/interrupt during the first await
+    // could permanently lose every later file in the batch.
+    const acceptedMessages: IpcInputMessage[] = [];
     for (const msg of messages) {
-      log(
-        `Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`,
-      );
       const becomesCurrentTurn = !ipcDeliveryTracker.hasPendingTurns;
-      ipcDeliveryTracker.acceptTurn([msg]);
+      const accepted = ipcDeliveryTracker.acceptTurn([msg]);
+      if (accepted.length === 0) continue;
+      acceptedMessages.push(...accepted);
       if (becomesCurrentTurn) {
         durableInputCompletion.activateInput();
         providerFallbackTurns.acceptCurrentTurn([msg]);
@@ -2186,6 +2223,13 @@ async function runQueryAttempt(
           msg.receipt?.deliveryId || containerInput.turnId || generateTurnId(),
         );
       }
+    }
+    acknowledgeRegisteredIpcInputs(messages);
+
+    for (const msg of acceptedMessages) {
+      log(
+        `Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`,
+      );
       // A new user turn arrived after a prior result. Cancel that result's
       // post-timeout so the stream cannot close before this turn completes.
       resultReceivedAt = null;
@@ -2206,7 +2250,7 @@ async function runQueryAttempt(
             loadHappyClawOwnerProfileTurnContext(() =>
               fetchHappyClawOwnerProfileTurn(
                 mcpToolsContext,
-                5_000,
+                8_000,
                 msg.receipt?.deliveryId,
               ),
             ),
@@ -2279,8 +2323,69 @@ async function runQueryAttempt(
   scheduleIpcPoll();
 
   const processor = new StreamEventProcessor(emit, log);
+  const backgroundProtocolDebtWatchdog = new BackgroundProtocolDebtWatchdog();
+  let backgroundProtocolDebtTimer: ReturnType<typeof setTimeout> | undefined;
+  let backgroundProtocolFailureExitTimer:
+    | ReturnType<typeof setTimeout>
+    | undefined;
+  let backgroundProtocolFailure: Error | undefined;
 
-  const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
+  clearBackgroundProtocolDebtWatchdog = () => {
+    backgroundProtocolDebtWatchdog.clear();
+    if (backgroundProtocolDebtTimer) {
+      clearTimeout(backgroundProtocolDebtTimer);
+      backgroundProtocolDebtTimer = undefined;
+    }
+    if (backgroundProtocolFailureExitTimer) {
+      clearTimeout(backgroundProtocolFailureExitTimer);
+      backgroundProtocolFailureExitTimer = undefined;
+    }
+  };
+
+  const armBackgroundProtocolDebtWatchdog = (
+    blockingDebtCount: number,
+  ): void => {
+    if (blockingDebtCount <= 0 || backgroundProtocolFailure) return;
+    backgroundProtocolDebtWatchdog.arm();
+    if (backgroundProtocolDebtTimer) return;
+    backgroundProtocolDebtTimer = setTimeout(() => {
+      backgroundProtocolDebtTimer = undefined;
+      const unresolved = processor.getBlockingBackgroundProtocolCount();
+      const liveTasks = processor.getBlockingPendingSdkTaskCount();
+      if (unresolved <= 0 || liveTasks > 0) {
+        clearBackgroundProtocolDebtWatchdog();
+        return;
+      }
+      const message =
+        `background_protocol_timeout: ${unresolved} completion obligation(s) ` +
+        `remained unresolved for ${BACKGROUND_PROTOCOL_DEBT_TIMEOUT_MS}ms`;
+      backgroundProtocolFailure = new Error(message);
+      logWarn(
+        `${message}; interrupting the SDK stream so the durable input can recover`,
+      );
+      emitResultUsage({}, containerInput.turnId || generateTurnId());
+      processor.discardPendingTextOutput();
+      interruptQueryForShutdown('Background protocol debt watchdog expired');
+      stream.end();
+      ipcPolling = false;
+      ipcQueryWatcher.close();
+      // query.interrupt() normally unwinds the iterator immediately. Keep a
+      // bounded escape hatch for a wedged transport so this path can never fall
+      // back to the outer 30-minute idle timeout.
+      backgroundProtocolFailureExitTimer = setTimeout(() => {
+        emit({
+          status: 'error',
+          result: null,
+          error: message,
+          newSessionId,
+          finalizationReason: 'error',
+        });
+        forceExitWithSafetyNet(1);
+      }, BACKGROUND_PROTOCOL_FAILURE_EXIT_GRACE_MS);
+    }, backgroundProtocolDebtWatchdog.remainingMs(BACKGROUND_PROTOCOL_DEBT_TIMEOUT_MS));
+  };
+
+  const { isHome } = normalizeHomeFlags(containerInput);
   const agentBuilderEnabled = resolveAgentBuilderEnabled(
     containerInput,
     isHome,
@@ -2327,10 +2432,17 @@ async function runQueryAttempt(
     candidate: BackgroundResultCandidate,
     inputTurnCompleted: boolean,
   ): void => {
+    if (inputTurnCompleted) {
+      clearBackgroundProtocolDebtWatchdog();
+    }
     const ipcReceipts = inputTurnCompleted
       ? ipcDeliveryTracker.completeNextTurn()
       : undefined;
     const queryIdle = inputTurnCompleted && !ipcDeliveryTracker.hasPendingTurns;
+    const activeIpcReceipts =
+      inputTurnCompleted && ipcDeliveryTracker.hasPendingTurns
+        ? ipcDeliveryTracker.currentTurnReceipts
+        : undefined;
     durableInputCompletion.publishResult(
       inputTurnCompleted,
       ipcDeliveryTracker.hasPendingTurns,
@@ -2358,6 +2470,9 @@ async function runQueryAttempt(
       inputTurnCompleted,
       queryIdle,
       ...(ipcReceipts && ipcReceipts.length > 0 ? { ipcReceipts } : {}),
+      ...(activeIpcReceipts && activeIpcReceipts.length > 0
+        ? { activeIpcReceipts }
+        : {}),
     });
 
     containerInput.turnId = generateTurnId();
@@ -2560,14 +2675,16 @@ async function runQueryAttempt(
     }
   }
   // Resolve the actual claude CLI path for the SDK.
-  // SDK 的 optionalDependencies（@anthropic-ai/claude-agent-sdk-{platform} 等）不保证被安装，
-  // pathToClaudeCodeExecutable 留空、且 SDK 自带平台包缺失时会报
-  // "Claude Code native binary not found at .../claude-agent-sdk-win32-x64/claude"（Windows 宿主机模式）。
-  // 仅在 Windows 上优先解析本地依赖 @anthropic-ai/claude-code 里 postinstall 落地的真实 binary
-  // （Windows 没有 which、SDK 平台包又常缺失，故需此兜底）；Linux 容器 / macOS 宿主机
-  // 保持原有 which 解析逻辑不变，避免改变既有 claude 解析来源。
+  // Container builds remove the SDK's duplicate native optionalDependencies,
+  // so the image requires its verified @anthropic-ai/claude-code binary.
+  // Windows keeps the same bundled-first fallback it has always needed. Other
+  // host runtimes retain their existing PATH resolution contract.
+  const requireBundledClaude =
+    process.env.HAPPYCLAW_REQUIRE_BUNDLED_CLAUDE === '1';
   let pathToClaudeCodeExecutable: string | undefined =
-    process.platform === 'win32' ? resolveBundledClaudeCli() : undefined;
+    requireBundledClaude || process.platform === 'win32'
+      ? resolveBundledClaudeCli()
+      : undefined;
   if (!pathToClaudeCodeExecutable) {
     try {
       // `which` 在 Windows 上不存在，改用 `where`；其多行输出取第一行。
@@ -2708,10 +2825,16 @@ async function runQueryAttempt(
     firstResponseWatchdog = new SdkFirstResponseWatchdog(
       SDK_FIRST_RESPONSE_TIMEOUT_MS,
       (phase, timeoutMs) => {
-        log(
-          `No model response event within ${timeoutMs}ms (${phase}); marking provider unhealthy`,
+        // WARN, not info: the host only forwards warn-and-above from the runner,
+        // and this line is the sole diagnostic for a liveness stall.
+        logWarn(
+          `No model response event within ${timeoutMs}ms (${phase}); reporting a transient liveness timeout (account health untouched)`,
         );
-        publishProviderAccountFailure('server_error');
+        publishProviderFailure({
+          error: 'server_error',
+          failureClass: 'transient',
+          livenessTimeout: true,
+        });
         processor.discardPendingTextOutput();
         processor.cleanup();
         stream.end();
@@ -2774,7 +2897,8 @@ async function runQueryAttempt(
       // the original indefinite "thinking" state.
       if (message.type === 'rate_limit_event') {
         const info: SDKRateLimitInfo = message.rate_limit_info;
-        if (info.status === 'rejected') {
+        publishProviderQuotaObservation(info);
+        if (isTerminalSdkRateLimitRejection(info)) {
           const limitDecision = decideProviderLimitAction({
             structuredRejection: { rateLimitType: info.rateLimitType },
             result: null,
@@ -2786,7 +2910,11 @@ async function runQueryAttempt(
                 info.resetsAt ?? 'none'
               }); marking provider unhealthy immediately`,
             );
-            publishProviderAccountFailure('rate_limit', info.resetsAt);
+            publishProviderFailure({
+              error: 'rate_limit',
+              failureClass: 'account',
+              rateLimitResetsAt: info.resetsAt,
+            });
             processor.discardPendingTextOutput();
             processor.cleanup();
             assistantTextTracker.reset();
@@ -2818,6 +2946,7 @@ async function runQueryAttempt(
             log(
               `Model-specific rate limit rejected; retrying current turn with fallback model ${PROVIDER_FALLBACK_MODELS.fallbackModel}`,
             );
+            emitModelFallbackNotice();
             writeOutput({
               status: 'stream',
               result: null,
@@ -2857,12 +2986,13 @@ async function runQueryAttempt(
               info.resetsAt ?? 'none'
             }); quarantining profile for failover`,
           );
-          publishProviderAccountFailure(
-            'rate_limit',
-            info.resetsAt,
-            MODEL_LIMIT_EXHAUSTED_NOTICE,
-            'model',
-          );
+          publishProviderFailure({
+            error: 'rate_limit',
+            failureClass: 'account',
+            rateLimitResetsAt: info.resetsAt,
+            failureNotice: MODEL_LIMIT_EXHAUSTED_NOTICE,
+            rateLimitScope: 'model',
+          });
           processor.discardPendingTextOutput();
           processor.cleanup();
           assistantTextTracker.reset();
@@ -2907,6 +3037,11 @@ async function runQueryAttempt(
           // user.origin=task-notification. Never apply it while B is already
           // accepted, or B's assistant activity could repay A's debt.
           processor.observeBackgroundNotificationActivity();
+          // The hard watchdog only bounds arrival of the completion-driven
+          // continuation. Once that continuation has started, normal SDK
+          // response/tool watchdogs own its execution time; a legitimate long
+          // synthesis must not inherit the notification-arrival deadline.
+          clearBackgroundProtocolDebtWatchdog();
         }
         processor.processStreamEvent(message as any);
         continue;
@@ -3008,6 +3143,61 @@ async function runQueryAttempt(
           continue;
         }
       }
+      if (
+        proactiveInteractiveContract &&
+        isCliNoVisibleOutputCompanion(message) &&
+        proactiveFinalWasDeliveredForInput(
+          mcpToolsContext?.proactiveFinalDeliveredInputTurnId,
+          outputCorrelation.currentInputTurnId,
+        )
+      ) {
+        // Older CLIs inject this synthetic user turn after a tool-only response
+        // and immediately start another model call. The native final is already
+        // physically ACKed, so seal the exact input now and interrupt that
+        // redundant companion before it can produce a second final.
+        log(
+          `Suppressing CLI no-visible-output companion after Proactive final ACK for ${outputCorrelation.currentInputTurnId}`,
+        );
+        // resumeSessionAt accepts any chain UUID. Anchor after the synthetic
+        // companion (rather than the earlier assistant tool_use) so the next
+        // warm turn cannot revive a dangling send_message call or replay the
+        // just-completed user input.
+        const companionUuid = (message as { uuid?: string }).uuid;
+        const completionUuid = companionUuid || lastAssistantUuid;
+        if (completionUuid) lastAssistantUuid = completionUuid;
+        cancelBackgroundResultCompletion();
+        emitResultUsage({}, containerInput.turnId || generateTurnId());
+        assistantBatchFlushedSinceLastResult = false;
+        processor.cleanup();
+        assistantTextTracker.reset();
+        canonicalAssistantUuid = undefined;
+        publishResultCandidate(
+          {
+            finalText: null,
+            suspectTruncated: false,
+            pendingBgTasks: 0,
+            sdkMessageUuid: completionUuid,
+            completedAssistantUuid: completionUuid,
+          },
+          true,
+        );
+        stream.end();
+        ipcPolling = false;
+        ipcQueryWatcher.close();
+        q.interrupt().catch((err: unknown) =>
+          log(`No-visible companion interrupt failed: ${err}`),
+        );
+        return {
+          newSessionId,
+          lastAssistantUuid,
+          closedDuringQuery,
+          interruptedDuringQuery,
+          cancelledIpcReceipts,
+          pipedMessagesDuringQuery,
+          durableInputTurnCompleted: true,
+          providerAccountFailure: false,
+        };
+      }
       if (message.type === 'assistant') {
         sawLiveTurnActivity = true;
       } else if (message.type === 'user') {
@@ -3028,9 +3218,11 @@ async function runQueryAttempt(
         if (um.origin?.kind === 'task-notification') {
           if ((message as { shouldQuery?: boolean }).shouldQuery === false) {
             processor.observeBackgroundNotificationWithoutQuery();
+            clearBackgroundProtocolDebtWatchdog();
             scheduleBackgroundResultCompletion();
           } else {
             processor.observeBackgroundNotificationActivity();
+            clearBackgroundProtocolDebtWatchdog();
           }
         }
       }
@@ -3078,11 +3270,20 @@ async function runQueryAttempt(
       if (message.type === 'assistant' && 'uuid' in message) {
         const assistantError = (message as { error?: SDKAssistantMessageError })
           .error;
-        if (isAccountProviderAssistantError(assistantError)) {
+        if (assistantError) {
+          // Assistant.error is itself a terminal SDK-attempt boundary. The
+          // classifier only selects the host disposition; it must never decide
+          // whether we keep waiting for a Result which compatible endpoints may
+          // never emit.
+          const assistantErrorClass =
+            classifyProviderAssistantError(assistantError) ?? 'transient';
           log(
-            `Assistant provider error (${assistantError}); marking provider unhealthy`,
+            `Assistant provider error (${assistantError}); classified as ${assistantErrorClass}`,
           );
-          publishProviderAccountFailure(assistantError);
+          publishProviderFailure({
+            error: assistantError,
+            failureClass: assistantErrorClass,
+          });
           processor.discardPendingTextOutput();
           processor.cleanup();
           assistantTextTracker.reset();
@@ -3123,6 +3324,7 @@ async function runQueryAttempt(
             ipcDeliveryTracker.pendingTurnCount <= 1
           ) {
             processor.observeBackgroundNotificationActivity();
+            clearBackgroundProtocolDebtWatchdog();
           }
           const msgContent = (
             assistantMsg.message as Record<string, unknown> | undefined
@@ -3269,7 +3471,10 @@ async function runQueryAttempt(
           log(
             'Account rate limit recognized from compatibility text; marking provider unhealthy',
           );
-          publishProviderAccountFailure('rate_limit');
+          publishProviderFailure({
+            error: 'rate_limit',
+            failureClass: 'account',
+          });
           emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
           assistantBatchFlushedSinceLastResult = false;
           processor.discardPendingTextOutput();
@@ -3305,6 +3510,7 @@ async function runQueryAttempt(
           log(
             `Primary model hit a model-specific limit; retrying current turn with fallback model ${PROVIDER_FALLBACK_MODELS.fallbackModel}`,
           );
+          emitModelFallbackNotice();
           writeOutput({
             status: 'stream',
             result: null,
@@ -3332,12 +3538,12 @@ async function runQueryAttempt(
           log(
             'Model tiers exhausted on this account; quarantining profile for failover',
           );
-          publishProviderAccountFailure(
-            'rate_limit',
-            undefined,
-            textResult?.trim() || MODEL_LIMIT_EXHAUSTED_NOTICE,
-            'model',
-          );
+          publishProviderFailure({
+            error: 'rate_limit',
+            failureClass: 'account',
+            failureNotice: textResult?.trim() || MODEL_LIMIT_EXHAUSTED_NOTICE,
+            rateLimitScope: 'model',
+          });
           emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
           assistantBatchFlushedSinceLastResult = false;
           processor.discardPendingTextOutput();
@@ -3434,7 +3640,16 @@ async function runQueryAttempt(
         // 过程旁白混进最终回复。选择链固定为：非空 SDK Result → 最近一条
         // 完全不含 top-level tool_use 的 AssistantMessage；旁白绝不兜底。
         processor.processResult(textResult);
-        const finalText = assistantTextTracker.pickFinalText(textResult);
+        const pickedFinalText = assistantTextTracker.pickFinalText(textResult);
+        const finalText =
+          proactiveInteractiveContract &&
+          isProactiveFinalDeliveredSentinel(pickedFinalText) &&
+          proactiveFinalWasDeliveredForInput(
+            mcpToolsContext?.proactiveFinalDeliveredInputTurnId,
+            outputCorrelation.currentInputTurnId,
+          )
+            ? null
+            : pickedFinalText;
         // ── emit 前置计算：截断指纹 + 后台任务数 ──
         // finalizationReason / pendingBgTasks 必须随本条 result 一起送达主进程，
         // 主进程据此决定流式卡片是定稿「已完成」还是保持「后台任务运行中/自动续写中」。
@@ -3562,6 +3777,7 @@ async function runQueryAttempt(
               ? candidate
               : undefined;
           resultReceivedAt = null;
+          armBackgroundProtocolDebtWatchdog(blockingBackgroundProtocol);
           log(
             `Result #${resultCount} withheld: ${blockingBackgroundProtocol} background protocol obligation(s) remain`,
           );
@@ -3579,6 +3795,7 @@ async function runQueryAttempt(
         }
 
         if (pendingBgTasks > 0) {
+          clearBackgroundProtocolDebtWatchdog();
           resultReceivedAt = null;
           log(
             `Result #${resultCount} emitted; holding stream open for ${pendingBgTasks} background task(s): ${processor.describePendingSdkTasks().join(' | ')}`,
@@ -3596,6 +3813,10 @@ async function runQueryAttempt(
           });
         }
       }
+    }
+
+    if (backgroundProtocolFailure) {
+      throw backgroundProtocolFailure;
     }
 
     if (
@@ -3632,6 +3853,15 @@ async function runQueryAttempt(
     };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
+
+    // The dedicated protocol watchdog owns this terminal even though it used
+    // query.interrupt() to unwind a stuck SDK iterator. Do not let the generic
+    // post-result interrupt branch downgrade it to a successful warm return.
+    if (backgroundProtocolFailure) {
+      processor.discardPendingTextOutput();
+      processor.cleanup();
+      throw backgroundProtocolFailure;
+    }
 
     // Ending the spent primary stream after a quota notice can make the SDK
     // throw while it tears down. The retry payload is already authoritative;
@@ -3768,6 +3998,7 @@ async function runQueryAttempt(
     throw err;
   } finally {
     firstResponseWatchdog?.clear();
+    clearBackgroundProtocolDebtWatchdog();
     backgroundResultGate.dispose();
     pendingBackgroundResult = undefined;
     // IPC watcher 清理：覆盖 try 块内的正常出口、catch 抛出，以及 try 内所有 early-return
@@ -3886,6 +4117,7 @@ async function main(): Promise<void> {
   try {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
+    activeInterruptQueryRunId = containerInput.queryRunId;
     // A cold turn without a durable IPC receipt is correlated by the original
     // host turn ID. Keep that fallback stable for every frame in this run.
     containerInput.turnId ||= generateTurnId();
@@ -3898,6 +4130,21 @@ async function main(): Promise<void> {
       error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
     });
     process.exit(1);
+  }
+
+  if (process.env.HAPPYCLAW_IMAGE_PREFLIGHT === '1') {
+    const cli = resolveBundledClaudeCli();
+    if (!cli || typeof query !== 'function' || SECURITY_RULES.length === 0) {
+      writeOutput({
+        status: 'error',
+        result: null,
+        error: 'Immutable image preflight failed',
+      });
+      forceExitWithSafetyNet(1);
+    }
+    execFileSync(cli, ['--version'], { stdio: 'ignore' });
+    writeOutput({ status: 'closed', result: 'IMAGE_RUNNER_PREFLIGHT_OK' });
+    forceExitWithSafetyNet(0);
   }
 
   setCurrentChannelTurn(
@@ -3956,6 +4203,7 @@ async function main(): Promise<void> {
     interactionMode: containerInput.interactionMode ?? 'assistant',
     isScheduledTask: containerInput.isScheduledTask || false,
     currentTaskId: containerInput.messageTaskId ?? null,
+    currentScheduledTaskRunId: null,
     currentInputTurnId: containerInput.turnId,
     workspaceMemoryMutationAuth:
       containerInput.workspaceMemoryMutationSigningSecret &&
@@ -4000,7 +4248,11 @@ async function main(): Promise<void> {
   } catch {
     /* ignore */
   }
-  cleanupStartupInterruptSentinel();
+  // `_interrupt` is deliberately not age-pruned here. The host cleans stale
+  // sentinels before every runner attempt, then may publish this file as soon
+  // as the child process is registered. A cold image can take well over ten
+  // seconds to reach this point, so wall-clock age cannot distinguish that
+  // current query-bound interrupt from stale state.
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -4019,6 +4271,27 @@ async function main(): Promise<void> {
     prompt = scheduledTaskPrefix + '\n\n' + prompt;
   }
   const pendingDrain = drainIpcInput();
+  const coldBatchMessageIds = new Set(
+    containerInput.currentBatchMessageIds ?? [],
+  );
+  const coldDuplicates = pendingDrain.messages.filter((message) => {
+    const receipt = message.receipt;
+    if (!receipt || coldBatchMessageIds.size === 0) return false;
+    const represented = receipt.coveredCursors ?? [receipt.cursor];
+    return (
+      represented.length > 0 &&
+      represented.every((cursor) => coldBatchMessageIds.has(cursor.id))
+    );
+  });
+  if (coldDuplicates.length > 0) {
+    acknowledgeRegisteredIpcInputs(coldDuplicates);
+    pendingDrain.messages = pendingDrain.messages.filter(
+      (message) => !coldDuplicates.includes(message),
+    );
+    log(
+      `Suppressed ${coldDuplicates.length} stale IPC claim(s) already owned by the cold Host turn`,
+    );
+  }
   // Files replayed after a runner failure may still carry the previous
   // attempt's ID. Startup belongs to the host's newly allocated exact query,
   // so normalize the entire initial batch to ContainerInput.queryRunId.
@@ -4059,6 +4332,8 @@ async function main(): Promise<void> {
       const tid = pendingDrain.messages[i].taskId;
       if (tid) {
         mcpToolsConfig.currentTaskId = tid;
+        mcpToolsConfig.currentScheduledTaskRunId =
+          scheduledGroupRunIdFromIpcMessages(pendingDrain.messages, tid);
         containerInput.messageTaskId = tid;
         break;
       }
@@ -4079,15 +4354,12 @@ async function main(): Promise<void> {
     while (true) {
       pruneProcessedHistoryImagesInTranscript(sessionId);
 
-      // 清理残留的 _interrupt sentinel（空闲期间写入的中断信号不应影响下一次 query）。
-      // 注意：_drain 不在此处清理 — 如果 _drain 存在，说明有待处理的消息，
-      // pollIpcDuringQuery 会在查询结果后检测到并正确退出容器。
-      try {
-        fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-      } catch {
-        /* ignore */
-      }
-      clearInterruptRequested();
+      // At cold startup the host can register the process, then write a
+      // query-bound interrupt before this loop begins. Preserve that signal
+      // for runQuery()'s pre-start check. Later loop iterations are entered
+      // only after the previous query produced a terminal result, whose
+      // interrupt path already consumes/clears its sentinel.
+      if (resumeAt !== undefined) clearInterruptRequested();
 
       // 消费 auto-continue 阶段暂存的 history context（如果存在）。
       // 对应 sessionResumeFailed 在 auto-continue 路径上的镜像处理：
@@ -4129,7 +4401,7 @@ async function main(): Promise<void> {
         resumeAt = queryResult.lastAssistantUuid;
       }
       if (queryResult.providerAccountFailure) {
-        log('Account provider failure emitted; exiting runner');
+        log('Provider failure control signal emitted; exiting runner');
         forceExitWithSafetyNet(0);
         return;
       }
@@ -4237,6 +4509,49 @@ async function main(): Promise<void> {
         // 中断后清除 resumeAt：被中断的 assistant 消息可能未完整提交到 session 历史。
         // 使用 undefined 让 SDK 自行选择恢复点，避免因指向不完整消息的 UUID 导致 resume 失败。
         resumeAt = undefined;
+        // Finish consuming the old interrupt before acknowledging it. The
+        // host may synchronously publish a new interrupt for the next current
+        // turn as soon as it receives the status below; cleaning afterwards
+        // would erase that newer, query-valid sentinel.
+        try {
+          fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
+        } catch {
+          /* ignore */
+        }
+        // Do not delete _drain here. It is an independent runner-lifecycle
+        // request (for example, an incompatible queued replacement), not part
+        // of the query-bound interrupt being acknowledged. The subsequent
+        // wait consumes it and exits, leaving requeued inputs for a new runner.
+        clearInterruptRequested();
+        consecutiveCompactions = 0;
+
+        // The current turn was removed by cancelCurrentTurn(). Requeue only
+        // later accepted turns, and do so before the acknowledgement so a
+        // replacement interrupt always observes a runnable next turn.
+        if (queryResult.pipedMessagesDuringQuery.length > 0) {
+          const piped = queryResult.pipedMessagesDuringQuery;
+          log(
+            `Query interrupted; re-enqueueing ${piped.length} later accepted message(s) to IPC`,
+          );
+          requeueIpcInputMessages(IPC_INPUT_DIR, piped);
+        }
+
+        // A drain combines every file currently present into the next SDK
+        // input. When accepted later turns already exist, perform that drain
+        // before acknowledging the interrupt so the host receives the exact
+        // next-batch ownership—including any IPC that landed during teardown.
+        // Otherwise it could mistake a mixed batch for an exclusive forward
+        // root and destructively steer unrelated work.
+        let nextMessage:
+          | Awaited<ReturnType<typeof waitForIpcMessage>>
+          | undefined;
+        if (queryResult.pipedMessagesDuringQuery.length > 0) {
+          log('Draining requeued turns before acknowledging interrupt');
+          nextMessage = await waitForIpcMessage();
+        }
+        const activeIpcReceipts = (nextMessage?.messages ?? [])
+          .map((message) => message.receipt)
+          .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
         writeOutput({
           status: 'stream',
           result: null,
@@ -4253,35 +4568,15 @@ async function main(): Promise<void> {
           ...(queryResult.cancelledIpcReceipts?.length
             ? { ipcReceipts: queryResult.cancelledIpcReceipts }
             : {}),
+          queryIdle: !nextMessage,
+          ...(activeIpcReceipts.length > 0 ? { activeIpcReceipts } : {}),
         });
-        // 清理可能残留的 _interrupt / _drain 文件
-        try {
-          fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-        } catch {
-          /* ignore */
-        }
-        try {
-          fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL);
-        } catch {
-          /* ignore */
-        }
-        clearInterruptRequested();
-        consecutiveCompactions = 0;
-
-        // 当前 turn 已由 cancelCurrentTurn() 从未确认列表移除，不能重放；否则热
-        // runner 的旧用户输入会抢在 steer 后再次执行。这里只回放当前 turn 之后
-        // 已经被 SDK 接受、但尚未获得结果的后续 turn（若有）。
-        if (queryResult.pipedMessagesDuringQuery.length > 0) {
-          const piped = queryResult.pipedMessagesDuringQuery;
-          log(
-            `Query interrupted; re-enqueueing ${piped.length} later accepted message(s) to IPC`,
-          );
-          requeueIpcInputMessages(IPC_INPUT_DIR, piped);
-        }
 
         // 等待下一条消息（包括刚重新入队的 piped 消息）
-        log('Query interrupted by user, waiting for next message');
-        const nextMessage = await waitForIpcMessage();
+        if (nextMessage === undefined) {
+          log('Query interrupted by user, waiting for next message');
+          nextMessage = await waitForIpcMessage();
+        }
         if (nextMessage === null) {
           log('Close sentinel received after interrupt, exiting');
           // 退出前发送 session 更新，确保主进程持久化最新 session ID
@@ -4295,11 +4590,20 @@ async function main(): Promise<void> {
         prompt = nextMessage.text;
         promptImages = nextMessage.images;
         currentIpcMessages = nextMessage.messages;
+        containerInput.queryRunId =
+          latestIpcInputMessage(nextMessage.messages)?.queryRunId ??
+          containerInput.queryRunId;
+        activeInterruptQueryRunId = containerInput.queryRunId;
         containerInput.turnId = generateTurnId();
         mcpToolsConfig.currentInputTurnId =
           latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
+        mcpToolsConfig.currentScheduledTaskRunId =
+          scheduledGroupRunIdFromIpcMessages(
+            nextMessage.messages,
+            nextMessage.taskId,
+          );
         containerInput.messageTaskId =
           mcpToolsConfig.currentTaskId ?? undefined;
         setCurrentChannelTurn(
@@ -4425,12 +4729,41 @@ async function main(): Promise<void> {
             } catch {
               /* ignore */
             }
+            clearInterruptRequested();
+            if (autoContResult.pipedMessagesDuringQuery.length > 0) {
+              requeueIpcInputMessages(
+                IPC_INPUT_DIR,
+                autoContResult.pipedMessagesDuringQuery,
+              );
+            }
+            writeOutput({
+              status: 'stream',
+              result: null,
+              sourceKind: 'auto_continue',
+              streamEvent: {
+                eventType: 'status',
+                statusText: 'interrupted',
+                queryRunId: containerInput.queryRunId,
+                turnId: containerInput.turnId,
+                sessionId,
+              },
+              newSessionId: sessionId,
+              turnId: containerInput.turnId,
+              sessionId,
+              ...(autoContResult.cancelledIpcReceipts?.length
+                ? { ipcReceipts: autoContResult.cancelledIpcReceipts }
+                : {}),
+              queryIdle: autoContResult.pipedMessagesDuringQuery.length === 0,
+            });
           }
           // Auto-continue can consume user IPC while it is running. A query
           // that ends without a healthy result leaves those messages in the
           // delivery tracker; requeue them now so they become the next turn
           // instead of remaining invisible until host-side exit recovery.
-          if (autoContResult.pipedMessagesDuringQuery.length > 0) {
+          if (
+            !autoContResult.interruptedDuringQuery &&
+            autoContResult.pipedMessagesDuringQuery.length > 0
+          ) {
             const pending = autoContResult.pipedMessagesDuringQuery;
             log(
               `Auto-continue ended with ${pending.length} unacknowledged IPC message(s); re-enqueueing`,
@@ -4566,6 +4899,32 @@ async function main(): Promise<void> {
           } catch {
             /* ignore */
           }
+          clearInterruptRequested();
+          if (contResult.pipedMessagesDuringQuery.length > 0) {
+            requeueIpcInputMessages(
+              IPC_INPUT_DIR,
+              contResult.pipedMessagesDuringQuery,
+            );
+          }
+          writeOutput({
+            status: 'stream',
+            result: null,
+            sourceKind: 'truncation_continue',
+            streamEvent: {
+              eventType: 'status',
+              statusText: 'interrupted',
+              queryRunId: containerInput.queryRunId,
+              turnId: containerInput.turnId,
+              sessionId,
+            },
+            newSessionId: sessionId,
+            turnId: containerInput.turnId,
+            sessionId,
+            ...(contResult.cancelledIpcReceipts?.length
+              ? { ipcReceipts: contResult.cancelledIpcReceipts }
+              : {}),
+            queryIdle: contResult.pipedMessagesDuringQuery.length === 0,
+          });
           break;
         }
         // 续写本身又被截断 → 带新结尾再续，直到写完或触顶
@@ -4613,6 +4972,7 @@ async function main(): Promise<void> {
       containerInput.queryRunId =
         latestIpcInputMessage(nextMessage.messages)?.queryRunId ??
         containerInput.queryRunId;
+      activeInterruptQueryRunId = containerInput.queryRunId;
       containerInput.turnId = generateTurnId();
       mcpToolsConfig.currentInputTurnId =
         latestIpcDeliveryId(nextMessage.messages) ?? containerInput.turnId;
@@ -4622,6 +4982,11 @@ async function main(): Promise<void> {
       // Forgetting to clear would cause regular user replies to be broadcast
       // to the task's notify channels, hijacking later conversation.
       mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
+      mcpToolsConfig.currentScheduledTaskRunId =
+        scheduledGroupRunIdFromIpcMessages(
+          nextMessage.messages,
+          nextMessage.taskId,
+        );
       containerInput.messageTaskId = mcpToolsConfig.currentTaskId ?? undefined;
       setCurrentChannelTurn(
         containerInput,
@@ -4736,7 +5101,7 @@ process.on('unhandledRejection', (reason: unknown) => {
   if (errno?.code === 'EPIPE') {
     process.exit(0);
   }
-  if (isWithinInterruptGraceWindow()) {
+  if (isWithinInterruptGraceWindow() && isInterruptRelatedError(reason)) {
     console.error('Unhandled rejection during interrupt (non-fatal):', reason);
     return;
   }

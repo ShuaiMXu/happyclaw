@@ -49,10 +49,7 @@ import {
   PLUGIN_EXPANSION_ATTACHMENT_TYPE,
   readPluginExpansionFromAttachments,
 } from './plugin-expander-sentinel.js';
-import type {
-  PluginExpansionSentinel,
-  PersistExpansionFn,
-} from './plugin-expander-sentinel.js';
+import type { PersistExpansionFn } from './plugin-expander-sentinel.js';
 
 export type ExpansionResult =
   | { kind: 'miss' }

@@ -9,7 +9,6 @@
 
 import { Hono } from 'hono';
 import fs from 'fs/promises';
-import path from 'path';
 
 import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';

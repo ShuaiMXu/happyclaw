@@ -13,12 +13,13 @@ import {
   AVATAR_MAX_FILE_BYTES,
 } from '../http-upload-policy.js';
 import type { Variables } from '../web-context.js';
-import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
+import { getWebDeps } from '../web-context.js';
+import { canAccessGroup, canModifyGroup } from '../group-acl.js';
+import { recordLegacyUserImRoute } from '../legacy-route-telemetry.js';
 import { extractChatId, getChannelType } from '../im-channel.js';
 import {
   deleteRegisteredGroup,
   deleteChatHistory,
-  deleteAgent,
   getRegisteredGroup,
   getAllRegisteredGroups,
   forceActiveAdminRuntimesToHost,
@@ -84,8 +85,6 @@ import {
   appendClaudeConfigAudit,
   getProviders,
   getEnabledProviders,
-  getDefaultProviderId,
-  setDefaultProvider,
   getBalancingConfig,
   saveBalancingConfig,
   createProvider,
@@ -111,6 +110,8 @@ import {
   getEffectiveExternalDir,
   getContainerEnvConfig,
   saveSystemSettings,
+  buildClaudeAiOauthPayload,
+  updateProviderOAuthCredentialsIfCurrent,
   getUserFeishuConfig,
   saveUserFeishuConfig,
   getUserTelegramConfig,
@@ -125,19 +126,19 @@ import {
   saveUserDiscordConfig,
   getUserWhatsAppConfig,
   saveUserWhatsAppConfig,
-  updateAllSessionCredentials,
   appendImConfigAudit,
 } from '../runtime-config.js';
 import type {
   ClaudeOAuthCredentials,
   CachedOAuthUsage,
-  OAuthUsageResponse,
-  OAuthUsageBucket,
 } from '../runtime-config.js';
-import { parseOAuthUsageBucket } from '../runtime-config.js';
+import {
+  hasOAuthUsageSignals,
+  parseOAuthUsageResponse,
+} from '../runtime-config.js';
 import type { AudienceMode, AuthUser, RegisteredGroup } from '../types.js';
-import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
+import brandAssetRoutes from './brand-assets.js';
 import { testFeishuCredentials } from '../feishu-connectivity.js';
 import {
   buildSessionMountUpdate,
@@ -148,11 +149,13 @@ import {
   hasSessionMountConflict,
   hasWorkspaceMountConflict,
   isNativeContextContainer,
-  restoreDefaultChannelMount,
+  unbindChannelMount,
   type NativeContextMetadata,
 } from '../channel-mount-service.js';
 import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
 import { providerPool } from '../provider-pool.js';
+import { getProviderQuotaObservation } from '../provider-quota-observation.js';
+import { updateProviderSessionCredentials } from '../provider-session-credentials.js';
 import { getClientIp } from '../utils.js';
 import {
   getWorkspaceRuntimeJids,
@@ -174,6 +177,11 @@ import {
   restorePendingAdminHostOnlyRuntimeSafetyBlocks,
 } from '../admin-host-only-runtime.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
+
+configRoutes.use('/user-im/*', async (c, next) => {
+  recordLegacyUserImRoute(c.req.method, new URL(c.req.url).pathname);
+  await next();
+});
 
 /**
  * Count how many IM channels are currently enabled for a user, excluding the given channel.
@@ -766,23 +774,210 @@ setInterval(() => {
 
 const OAUTH_USAGE_API = 'https://api.anthropic.com/api/oauth/usage';
 const USAGE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
+const OAUTH_USAGE_TIMEOUT_MS = 5_000;
+const OAUTH_TOKEN_REFRESH_TIMEOUT_MS = 30_000;
 const usageCache = new Map<string, CachedOAuthUsage>();
 const inFlightUsageRequests = new Map<string, Promise<CachedOAuthUsage>>();
+const usageCacheEpochs = new Map<string, number>();
+const MAX_USAGE_CACHE_EPOCHS = 256;
+let nextUsageCacheEpoch = 1;
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of usageCache) {
-    if (now - entry.fetchedAt >= USAGE_CACHE_TTL_MS) {
-      usageCache.delete(key);
+function enforceUsageEpochCapacity(): void {
+  while (usageCacheEpochs.size > MAX_USAGE_CACHE_EPOCHS) {
+    const oldestProviderId = usageCacheEpochs.keys().next().value as
+      | string
+      | undefined;
+    if (oldestProviderId === undefined) break;
+    usageCacheEpochs.delete(oldestProviderId);
+  }
+}
+
+function getProviderUsageEpoch(providerId: string): number {
+  const existing = usageCacheEpochs.get(providerId);
+  if (existing !== undefined) return existing;
+  const epoch = nextUsageCacheEpoch++;
+  usageCacheEpochs.set(providerId, epoch);
+  enforceUsageEpochCapacity();
+  return epoch;
+}
+
+function advanceProviderUsageEpoch(providerId: string): number {
+  const epoch = nextUsageCacheEpoch++;
+  usageCacheEpochs.delete(providerId);
+  usageCacheEpochs.set(providerId, epoch);
+  enforceUsageEpochCapacity();
+  return epoch;
+}
+
+function invalidateProviderUsageCache(providerId: string): void {
+  usageCache.delete(providerId);
+  inFlightUsageRequests.delete(providerId);
+  advanceProviderUsageEpoch(providerId);
+}
+
+async function fetchOAuthEndpoint(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<{ response: Response; release: () => void }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    clearTimeout(timeout);
+  };
+  try {
+    const response = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+    // Keep the abort timer alive until the caller finishes consuming the
+    // response body. Receiving headers alone is not a completed request.
+    return { response, release };
+  } catch (err) {
+    release();
+    throw err;
+  }
+}
+
+function usageFailureFallback(
+  providerId: string,
+  cached: CachedOAuthUsage | undefined,
+  error: string,
+): CachedOAuthUsage | null {
+  const observation = getProviderQuotaObservation(providerId);
+  if (cached) return { ...cached, error, observation };
+  if (!observation) return null;
+  return {
+    data: parseOAuthUsageResponse({}),
+    fetchedAt: observation.observedAt,
+    error,
+    observation,
+  };
+}
+
+class ProviderOAuthCredentialsChangedError extends Error {
+  constructor() {
+    super('Provider OAuth credentials changed during refresh');
+    this.name = 'ProviderOAuthCredentialsChangedError';
+  }
+}
+
+async function refreshProviderOAuthCredentials(
+  providerId: string,
+  expected: ClaudeOAuthCredentials,
+): Promise<void> {
+  const endpoint = await fetchOAuthEndpoint(
+    OAUTH_TOKEN_URL,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        refresh_token: expected.refreshToken,
+        client_id: OAUTH_CLIENT_ID,
+        scope: expected.scopes.join(' '),
+      }),
+    },
+    OAUTH_TOKEN_REFRESH_TIMEOUT_MS,
+  );
+  let raw: Record<string, unknown>;
+  try {
+    if (!endpoint.response.ok) {
+      throw new Error(
+        `OAuth token refresh returned ${endpoint.response.status}`,
+      );
+    }
+    raw = (await endpoint.response.json()) as Record<string, unknown>;
+  } finally {
+    endpoint.release();
+  }
+  const accessToken =
+    typeof raw.access_token === 'string' ? raw.access_token.trim() : '';
+  if (!accessToken) {
+    throw new Error('OAuth token refresh returned no access_token');
+  }
+  const refreshToken =
+    typeof raw.refresh_token === 'string' && raw.refresh_token.trim()
+      ? raw.refresh_token.trim()
+      : expected.refreshToken;
+  const expiresIn =
+    typeof raw.expires_in === 'number' &&
+    Number.isFinite(raw.expires_in) &&
+    raw.expires_in > 0
+      ? raw.expires_in
+      : 8 * 60 * 60;
+  const responseScopes =
+    typeof raw.scope === 'string'
+      ? raw.scope.split(/\s+/).filter(Boolean)
+      : expected.scopes;
+  const refreshed: ClaudeOAuthCredentials = {
+    ...expected,
+    accessToken,
+    refreshToken,
+    expiresAt: Date.now() + expiresIn * 1000,
+    scopes: responseScopes,
+  };
+
+  let persisted = false;
+  try {
+    persisted = updateProviderOAuthCredentialsIfCurrent(
+      providerId,
+      expected,
+      refreshed,
+    );
+  } catch {
+    throw new ProviderOAuthCredentialsChangedError();
+  }
+  if (!persisted) {
+    throw new ProviderOAuthCredentialsChangedError();
+  }
+  invalidateProviderUsageCache(providerId);
+  const updated = getProviders().find((provider) => provider.id === providerId);
+  if (updated) {
+    try {
+      updateProviderSessionCredentials(providerId, providerToConfig(updated));
+    } catch (err) {
+      logger.warn(
+        { err, providerId },
+        'Failed to project refreshed OAuth credentials into sessions',
+      );
+    }
+    // A rotated refresh token may invalidate a credential cached inside a
+    // running SDK process. Drain only this Provider's runners after their
+    // current query; a settings-page GET must never interrupt active work.
+    try {
+      deps?.queue?.drainProviderRunnersForCredentialRefresh?.(providerId);
+    } catch (err) {
+      logger.warn(
+        { err, providerId },
+        'Failed to drain runners after OAuth credential refresh',
+      );
     }
   }
-}, 5 * 60_000);
+}
 
-async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
-  const cached = usageCache.get(providerId);
-  if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) {
-    return cached;
+async function fetchOAuthUsage(
+  providerId: string,
+  refreshAttempted = false,
+  inheritedFallback?: CachedOAuthUsage,
+): Promise<CachedOAuthUsage> {
+  const storedCached = usageCache.get(providerId);
+  if (
+    storedCached &&
+    Date.now() - storedCached.fetchedAt < USAGE_CACHE_TTL_MS
+  ) {
+    return {
+      ...storedCached,
+      observation: getProviderQuotaObservation(providerId),
+    };
   }
+  const cached = storedCached ?? inheritedFallback;
 
   // Deduplicate concurrent requests for the same provider
   const inFlight = inFlightUsageRequests.get(providerId);
@@ -793,45 +988,102 @@ async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
   if (!provider) {
     throw new Error('Provider not found');
   }
-  if (!provider.claudeOAuthCredentials) {
-    throw new Error('Provider has no OAuth credentials');
+  const oauthCredentials = buildClaudeAiOauthPayload(
+    providerToConfig(provider),
+  );
+  if (!oauthCredentials) {
+    const observation = getProviderQuotaObservation(providerId);
+    return {
+      data: parseOAuthUsageResponse({}),
+      fetchedAt: observation?.observedAt ?? Date.now(),
+      observation,
+    };
   }
 
-  const requestPromise = (async () => {
-    try {
-      const resp = await fetch(OAUTH_USAGE_API, {
-        headers: {
-          Authorization: `Bearer ${provider.claudeOAuthCredentials!.accessToken}`,
-          'anthropic-beta': 'oauth-2025-04-20',
-        },
-      });
+  const requestEpoch = getProviderUsageEpoch(providerId);
 
-      if (!resp.ok) {
-        // Return stale cache if available, otherwise throw
-        if (cached) {
-          const stale: CachedOAuthUsage = {
-            ...cached,
-            error: `HTTP ${resp.status}`,
-          };
-          usageCache.set(providerId, stale);
-          return stale;
-        }
-        throw new Error(`Usage API returned ${resp.status}`);
+  let requestPromise!: Promise<CachedOAuthUsage>;
+  requestPromise = (async () => {
+    try {
+      if (!refreshAttempted && oauthCredentials.expiresAt <= Date.now()) {
+        await refreshProviderOAuthCredentials(providerId, oauthCredentials);
+        return fetchOAuthUsage(providerId, true, cached);
       }
 
-      const raw = (await resp.json()) as Record<string, unknown>;
-      const data: OAuthUsageResponse = {
-        five_hour: parseOAuthUsageBucket(raw.five_hour),
-        seven_day: parseOAuthUsageBucket(raw.seven_day),
-        seven_day_opus: parseOAuthUsageBucket(raw.seven_day_opus),
-        seven_day_sonnet: parseOAuthUsageBucket(raw.seven_day_sonnet),
-      };
+      const endpoint = await fetchOAuthEndpoint(
+        OAUTH_USAGE_API,
+        {
+          headers: {
+            Authorization: `Bearer ${oauthCredentials.accessToken}`,
+            'anthropic-beta': 'oauth-2025-04-20',
+          },
+        },
+        OAUTH_USAGE_TIMEOUT_MS,
+      );
+      let raw: Record<string, unknown>;
+      try {
+        // A credential update/delete invalidates the request that was started
+        // with the old token. Join (or start) the current epoch's request so
+        // the original caller cannot receive a stale account's usage body.
+        if (getProviderUsageEpoch(providerId) !== requestEpoch) {
+          return fetchOAuthUsage(providerId);
+        }
 
-      const result: CachedOAuthUsage = { data, fetchedAt: Date.now() };
-      usageCache.set(providerId, result);
+        if (endpoint.response.status === 401 && !refreshAttempted) {
+          endpoint.release();
+          await refreshProviderOAuthCredentials(providerId, oauthCredentials);
+          return fetchOAuthUsage(providerId, true, cached);
+        }
+        if (!endpoint.response.ok) {
+          throw new Error(`Usage API returned ${endpoint.response.status}`);
+        }
+        raw = (await endpoint.response.json()) as Record<string, unknown>;
+      } finally {
+        endpoint.release();
+      }
+      if (getProviderUsageEpoch(providerId) !== requestEpoch) {
+        return fetchOAuthUsage(providerId);
+      }
+      if (!hasOAuthUsageSignals(raw)) {
+        throw new Error('Usage API returned no recognized quota data');
+      }
+      const data = parseOAuthUsageResponse(raw);
+
+      const result: CachedOAuthUsage = {
+        data,
+        fetchedAt: Date.now(),
+        observation: getProviderQuotaObservation(providerId),
+      };
+      if (getProviderUsageEpoch(providerId) === requestEpoch) {
+        usageCache.set(providerId, result);
+      }
       return result;
+    } catch (err) {
+      if (getProviderUsageEpoch(providerId) !== requestEpoch) {
+        return fetchOAuthUsage(providerId);
+      }
+      if (err instanceof ProviderOAuthCredentialsChangedError) {
+        // A refresh performed outside this route can change the Provider
+        // without advancing our request epoch. Detach this exact promise
+        // before retrying so fetchOAuthUsage cannot join itself. Preserve the
+        // full snapshot because a token refresh stays within one account.
+        if (inFlightUsageRequests.get(providerId) === requestPromise) {
+          inFlightUsageRequests.delete(providerId);
+          advanceProviderUsageEpoch(providerId);
+        }
+        return fetchOAuthUsage(providerId, false, cached);
+      }
+      const message = err instanceof Error ? err.message : 'Usage API failed';
+      const fallback = usageFailureFallback(providerId, cached, message);
+      if (fallback) {
+        if (cached) usageCache.set(providerId, fallback);
+        return fallback;
+      }
+      throw err;
     } finally {
-      inFlightUsageRequests.delete(providerId);
+      if (inFlightUsageRequests.get(providerId) === requestPromise) {
+        inFlightUsageRequests.delete(providerId);
+      }
     }
   })();
 
@@ -873,86 +1125,10 @@ configRoutes.get(
         })),
         balancing,
         enabledCount: enabledProviders.length,
-        defaultProviderId: getDefaultProviderId(),
       });
     } catch (err) {
       logger.error({ err }, 'Failed to list providers');
       return c.json({ error: 'Failed to list providers' }, 500);
-    }
-  },
-);
-
-// ─── PUT /claude/default — 设置所有继承型 Agent 使用的默认模型配置 ─────
-configRoutes.put(
-  '/claude/default',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const providerId =
-      typeof body.providerId === 'string' ? body.providerId.trim() : '';
-    if (!providerId) {
-      return c.json({ error: 'providerId (string) is required' }, 400);
-    }
-    const actor = (c.get('user') as AuthUser).username;
-
-    try {
-      return await withClaudeConfigMutationLock(async () => {
-        const previousProviderId = getDefaultProviderId();
-        if (previousProviderId === providerId) {
-          const provider = getProviders().find(
-            (item) => item.id === providerId,
-          );
-          if (!provider) throw new Error('未找到指定模型配置');
-          return c.json({
-            provider: toPublicProvider(provider),
-            defaultProviderId: provider.id,
-            applied: {
-              success: true,
-              stoppedCount: 0,
-              failedCount: 0,
-              persisted: true,
-            },
-          });
-        }
-        const mutation = await mutateClaudeConfigForAllGroups(
-          actor,
-          {
-            trigger: 'default_model_update',
-            previousProviderId,
-            providerId,
-          },
-          () => {
-            const provider = setDefaultProvider(providerId);
-            appendClaudeConfigAuditBestEffort(actor, 'set_default_model', [
-              `id:${provider.id}`,
-            ]);
-            return provider;
-          },
-        );
-        if (!mutation.applied.success) {
-          return c.json(
-            {
-              error: mutation.applied.error,
-              applied: mutation.applied,
-              ...(mutation.value
-                ? { provider: toPublicProvider(mutation.value) }
-                : {}),
-            },
-            503,
-          );
-        }
-        return c.json({
-          provider: toPublicProvider(mutation.value!),
-          defaultProviderId: mutation.value!.id,
-          applied: mutation.applied,
-        });
-      });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to set default model';
-      logger.warn({ err, providerId }, 'Failed to set default model');
-      return c.json({ error: message }, 400);
     }
   },
 );
@@ -1172,13 +1348,14 @@ configRoutes.put(
 
         const commit = () => {
           const updated = updateProviderSecrets(id, validation.data);
+          invalidateProviderUsageCache(id);
           appendClaudeConfigAuditBestEffort(actor, 'update_provider_secrets', [
             `id:${id}`,
             ...changedFields,
           ]);
           return runAfterProviderPersistence(updated, () => {
             if (validation.data.claudeOAuthCredentials && updated.enabled) {
-              updateAllSessionCredentials(providerToConfig(updated));
+              updateProviderSessionCredentials(id, providerToConfig(updated));
               deps?.queue?.closeAllActiveForCredentialRefresh();
             }
           });
@@ -1268,6 +1445,7 @@ configRoutes.delete(
           () => {
             if (previous) {
               deleteProvider(id);
+              invalidateProviderUsageCache(id);
               appendClaudeConfigAuditBestEffort(actor, 'delete_provider', [
                 `id:${id}`,
               ]);
@@ -1588,6 +1766,7 @@ configRoutes.post(
             : tokenData.access_token,
           clearAnthropicApiKey: true,
         });
+        invalidateProviderUsageCache(flow.targetProviderId);
       } else {
         // Create new official provider
         provider = createProvider({
@@ -1601,7 +1780,10 @@ configRoutes.post(
 
       // Write .credentials.json to all sessions
       if (oauthCredentials) {
-        updateAllSessionCredentials(providerToConfig(provider));
+        updateProviderSessionCredentials(
+          provider.id,
+          providerToConfig(provider),
+        );
         deps?.queue?.closeAllActiveForCredentialRefresh();
       }
 
@@ -1738,12 +1920,20 @@ type ChannelChatInfo = NativeContextMetadata & {
 
 function getConversationKind(
   imJid: string,
-  group: Pick<RegisteredGroup, 'feishu_chat_mode'>,
+  group: Pick<
+    RegisteredGroup,
+    'feishu_chat_mode' | 'feishu_group_message_type' | 'native_context_type'
+  >,
   chatInfo?: ChannelChatInfo | null,
 ): ChannelConversationKind {
   return resolveChannelConversationKind(imJid, {
     feishu_chat_mode: group.feishu_chat_mode,
+    feishu_group_message_type: group.feishu_group_message_type,
+    native_context_type:
+      chatInfo?.native_context_type ?? group.native_context_type,
     chat_mode: chatInfo?.chat_mode,
+    group_message_type: chatInfo?.group_message_type,
+    thread_capable: chatInfo?.thread_capable,
   });
 }
 
@@ -1812,13 +2002,6 @@ function markNativeContextWorkspace(targetMainJid: string): void {
     conversation_source: 'native_thread',
     conversation_nav_mode: 'vertical_threads',
   });
-}
-
-function restoreDefaultChannelError(restored: { reason: string }): string {
-  if (restored.reason === 'account_mismatch') {
-    return 'Channel account does not match this chat or owner';
-  }
-  return 'Channel account has no default or owner home workspace';
 }
 
 configRoutes.get('/feishu', authMiddleware, systemConfigMiddleware, (c) => {
@@ -2189,6 +2372,8 @@ configRoutes.delete(
   },
 );
 
+configRoutes.route('/', brandAssetRoutes);
+
 // Public endpoint — no auth required (like /api/auth/status)
 configRoutes.get('/appearance/public', (c) => {
   try {
@@ -2200,6 +2385,8 @@ configRoutes.get('/appearance/public', (c) => {
       aiAvatarColor: config.aiAvatarColor,
       aiAvatarUrl: config.aiAvatarUrl,
       aiAvatarMode: config.aiAvatarMode,
+      brandIconUrl: config.brandIconUrl,
+      brandBannerUrl: config.brandBannerUrl,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load public appearance config');
@@ -3782,11 +3969,6 @@ configRoutes.post('/user-im/discord/test', authMiddleware, async (c) => {
 const WECHAT_API_BASE = 'https://ilinkai.weixin.qq.com';
 const WECHAT_QR_BOT_TYPE = '3';
 
-function randomWechatUin(): string {
-  const uint32 = randomBytes(4).readUInt32BE(0);
-  return Buffer.from(String(uint32), 'utf-8').toString('base64');
-}
-
 function maskBotToken(token: string | undefined): string | null {
   if (!token) return null;
   if (token.length <= 8) return '***';
@@ -4299,13 +4481,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
 
   // Unbind mode
   if (body.unbind === true) {
-    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
-    // Re-read + re-authorize after the await — fetchLiveChatInfo
-    // yields the event loop on a live network call, during which ownership
-    // or binding state may have changed. restoreDefaultChannelMount commits
-    // whatever `group` it's given, so building it from the stale pre-await
-    // snapshot would silently clobber a concurrent write and could cross
-    // the original authorization boundary.
+    // JSON parsing yields; re-check ownership before committing the unbind.
     const freshImGroup = getRegisteredGroup(imJid);
     if (!freshImGroup) {
       return c.json({ error: 'IM group not found' }, 404);
@@ -4322,38 +4498,13 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     const previousTargetAgentId = freshImGroup.target_agent_id;
     const previousTargetMainJid = freshImGroup.target_main_jid;
     const wasThreadMap = freshImGroup.binding_mode === 'thread_map';
-    const restored = restoreDefaultChannelMount(
-      imJid,
-      freshImGroup,
-      user.id,
-      chatInfo ?? {},
-    );
-    if (restored.status !== 'resolved') {
-      return c.json({ error: restoreDefaultChannelError(restored) }, 409);
-    }
+    unbindChannelMount(imJid, freshImGroup);
     if (wasThreadMap) {
-      detachThreadMapWorkspaceIfLast(
-        previousTargetMainJid,
-        imJid,
-        restored.workspaceJid,
-        restored.routingMode,
-      );
+      detachThreadMapWorkspaceIfLast(previousTargetMainJid, imJid);
     }
-    if (restored.routingMode === 'thread_map') {
-      markNativeContextWorkspace(restored.workspaceJid);
-    }
-    if (previousTargetAgentId) {
-      refreshAgentLastImJid(previousTargetAgentId);
-    }
-    logger.info(
-      {
-        imJid,
-        defaultWorkspaceJid: restored.workspaceJid,
-        userId: user.id,
-      },
-      'IM group restored to channel account default workspace (bindings page)',
-    );
-    return c.json({ success: true, target_main_jid: restored.workspaceJid });
+    if (previousTargetAgentId) refreshAgentLastImJid(previousTargetAgentId);
+    logger.info({ imJid, userId: user.id }, 'IM channel unbound');
+    return c.json({ success: true, target_main_jid: null });
   }
 
   const targetSessionId =
@@ -4363,8 +4514,33 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         ? body.target_agent_id.trim()
         : '';
 
+  // Parse once for named sessions, main/workspace binds, and policy-only updates.
+  const rawActivationMode = body.activation_mode;
+  let activationMode =
+    typeof rawActivationMode === 'string' &&
+    VALID_ACTIVATION_MODES.has(rawActivationMode)
+      ? (rawActivationMode as
+          | (typeof rawActivationMode & 'auto')
+          | 'always'
+          | 'when_mentioned'
+          | 'owner_mentioned'
+          | 'disabled')
+      : undefined;
+  let audienceMode: AudienceMode | undefined =
+    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
+      ? body.audience_mode
+      : undefined;
+  if (channelType === 'feishu') {
+    const normalized = normalizeLegacyOwnerMention({
+      activationMode,
+      audienceMode,
+    });
+    activationMode = normalized.activationMode;
+    audienceMode = normalized.audienceMode;
+  }
+
   // Bind to workspace session. Stored in target_agent_id for backward compatibility.
-  if (targetSessionId) {
+  if (targetSessionId && targetSessionId !== 'main') {
     const sessionId = targetSessionId;
     const agent = getAgent(sessionId);
     if (!agent) {
@@ -4451,11 +4627,21 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
 
     const force = body.force === true;
-    const replyPolicy =
-      body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+    const replyPolicy = 'source_only' as const;
     const hasConflict = hasSessionMountConflict(freshImGroup, sessionId);
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
+    }
+
+    if (
+      getChannelType(imJid) === 'feishu' &&
+      (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
+      isMentionActivationMode(activationMode)
+    ) {
+      return c.json(
+        { error: 'Feishu private chats do not support mention activation' },
+        400,
+      );
     }
 
     const updated: RegisteredGroup = buildSessionMountUpdate(
@@ -4463,6 +4649,8 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       sessionId,
       {
         replyPolicy,
+        activationMode,
+        audienceMode,
       },
     );
     applyBindingUpdate(imJid, updated);
@@ -4474,31 +4662,6 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       'IM group bound to workspace session (bindings page)',
     );
     return c.json({ success: true });
-  }
-
-  // Parse activation_mode for activation-only update
-  const rawActivationMode = body.activation_mode;
-  let activationMode =
-    typeof rawActivationMode === 'string' &&
-    VALID_ACTIVATION_MODES.has(rawActivationMode)
-      ? (rawActivationMode as
-          | (typeof rawActivationMode & 'auto')
-          | 'always'
-          | 'when_mentioned'
-          | 'owner_mentioned'
-          | 'disabled')
-      : undefined;
-  let audienceMode: AudienceMode | undefined =
-    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
-      ? body.audience_mode
-      : undefined;
-  if (channelType === 'feishu') {
-    const normalized = normalizeLegacyOwnerMention({
-      activationMode,
-      audienceMode,
-    });
-    activationMode = normalized.activationMode;
-    audienceMode = normalized.audienceMode;
   }
 
   // Parse owner_im_id for owner_mentioned mode
@@ -4545,7 +4708,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
     const bindingPolicyError = conversationBindingPolicyError(
       getConversationKind(imJid, freshImGroup, chatInfo),
-      'workspace',
+      targetSessionId === 'main' ? 'session' : 'workspace',
     );
     if (bindingPolicyError) {
       return c.json({ error: bindingPolicyError }, 400);
@@ -4567,8 +4730,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       activation_mode: activationMode ?? freshImGroup.activation_mode,
     });
     const force = body.force === true;
-    const replyPolicy =
-      body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+    const replyPolicy = 'source_only' as const;
     const legacyMainJid = `web:${freshTargetGroup.folder}`;
     const hasConflict = hasWorkspaceMountConflict(
       freshImGroup,
@@ -4648,7 +4810,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       return c.json(
         {
           error:
-            'Mention-activated and native-topic Feishu chats must bind to a workspace, not a fixed session',
+            'Native topic groups must bind to a workspace, not a fixed session',
         },
         400,
       );

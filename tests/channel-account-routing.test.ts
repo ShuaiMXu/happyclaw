@@ -12,7 +12,7 @@ const baseGroup = {
 };
 
 describe('channel account registration fallback', () => {
-  test('applies account workspace only to an unbound first registration', () => {
+  test('attaches account metadata without auto-binding a first registration', () => {
     expect(
       applyChannelAccountRegistrationFallback(
         baseGroup,
@@ -21,7 +21,6 @@ describe('channel account registration fallback', () => {
       ),
     ).toMatchObject({
       channel_account_id: 'bot-a',
-      target_main_jid: 'web:account-default',
     });
   });
 
@@ -72,7 +71,6 @@ describe('channel account registration fallback', () => {
     const fallbackBound = {
       ...baseGroup,
       channel_account_id: 'bot-a',
-      target_main_jid: 'web:account-default',
     };
     expect(
       applyChannelAccountRegistrationFallback(
@@ -81,6 +79,72 @@ describe('channel account registration fallback', () => {
         'web:account-default',
       ),
     ).toBe(fallbackBound);
+  });
+
+  test('does not bind an unbound direct chat to the account default workspace', () => {
+    expect(
+      applyChannelAccountRegistrationFallback(
+        baseGroup,
+        'bot-a',
+        'web:account-default',
+        'direct',
+      ),
+    ).toMatchObject({
+      channel_account_id: 'bot-a',
+    });
+    expect(
+      applyChannelAccountRegistrationFallback(
+        baseGroup,
+        'bot-a',
+        'web:account-default',
+        'direct',
+      ).target_main_jid,
+    ).toBeUndefined();
+  });
+
+  test.each(['direct', 'group', 'topic', 'unknown'] as const)(
+    'leaves discovered %s conversations unbound',
+    (kind) => {
+      const result = applyChannelAccountRegistrationFallback(
+        baseGroup,
+        'bot-a',
+        'web:default',
+        kind,
+      );
+      expect(result.channel_account_id).toBe('bot-a');
+      expect(result.target_main_jid).toBeUndefined();
+      expect(result.target_agent_id).toBeUndefined();
+    },
+  );
+
+  test('preserves a manual workspace or session bind on a direct chat', () => {
+    const workspaceBound = {
+      ...baseGroup,
+      channel_account_id: 'bot-a',
+      target_main_jid: 'web:user-selected',
+    };
+    expect(
+      applyChannelAccountRegistrationFallback(
+        workspaceBound,
+        'bot-a',
+        'web:account-default',
+        'direct',
+      ),
+    ).toBe(workspaceBound);
+
+    const sessionBound = {
+      ...baseGroup,
+      channel_account_id: 'bot-a',
+      target_agent_id: 'conversation-123',
+    };
+    expect(
+      applyChannelAccountRegistrationFallback(
+        sessionBound,
+        'bot-a',
+        'web:account-default',
+        'direct',
+      ),
+    ).toBe(sessionBound);
   });
 
   test('uses explicit workspace then home, never an Agent first-workspace fallback', () => {

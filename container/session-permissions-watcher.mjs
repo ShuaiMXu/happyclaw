@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import process from 'node:process';
 
 import { readDescriptorMountId } from './session-permissions-mount.mjs';
+import { createBoundedRescanScheduler } from './session-permissions-rescan-queue.mjs';
 
 const READY_FILE = '/run/happyclaw-session-watcher.ready';
 const FAILED_FILE = '/run/happyclaw-session-watcher.failed';
@@ -128,8 +129,8 @@ if (generatedKey !== undefined) {
 }
 
 const watchers = new Map();
+const rescanSchedulers = new Map();
 const recoveryFailures = new Map();
-const pendingDirectoryRescans = new Set();
 let stopping = false;
 let periodicTimer;
 
@@ -280,13 +281,28 @@ function normalizeDescriptor(fd, root, required = false) {
   return { stat, outsideRootMount: false };
 }
 
-function readDirectory(fd) {
-  // readdir follows only this trusted procfs magic-link to the already-open
-  // directory. Child opens are again anchored to the descriptor above.
-  return fs.readdirSync(procFdPath(fd), {
+function openDirectory(fd) {
+  // opendir follows only this trusted procfs magic-link to the already-open
+  // directory. Reading one bounded batch at a time avoids retaining every
+  // entry in a wide persistent directory during periodic and final scans.
+  return fs.opendirSync(procFdPath(fd), {
     encoding: 'buffer',
-    withFileTypes: true,
+    bufferSize: 32,
   });
+}
+
+function closeFrame(frame) {
+  if (frame.directory !== undefined) {
+    try {
+      frame.directory.closeSync();
+    } catch {}
+    frame.directory = undefined;
+  }
+  if (frame.closeWhenDone) {
+    try {
+      fs.closeSync(frame.fd);
+    } catch {}
+  }
 }
 
 function normalizeTreeFromDescriptor(
@@ -300,8 +316,7 @@ function normalizeTreeFromDescriptor(
       fd: startFd,
       closeWhenDone: closeStart,
       entered: false,
-      entries: [],
-      index: 0,
+      directory: undefined,
       required,
     },
   ];
@@ -313,45 +328,39 @@ function normalizeTreeFromDescriptor(
         const result = normalizeDescriptor(frame.fd, root, frame.required);
         frame.entered = true;
         if (!result.stat.isDirectory() || result.outsideRootMount) {
-          if (frame.closeWhenDone) fs.closeSync(frame.fd);
+          closeFrame(frame);
           stack.pop();
           continue;
         }
         try {
-          frame.entries = readDirectory(frame.fd);
+          frame.directory = openDirectory(frame.fd);
         } catch (error) {
           if (!isReadonlyError(error) || frame.required) throw error;
-          frame.entries = [];
+          closeFrame(frame);
+          stack.pop();
+          continue;
         }
       }
 
-      if (frame.index >= frame.entries.length) {
-        if (frame.closeWhenDone) fs.closeSync(frame.fd);
+      const entry = frame.directory.readSync();
+      if (entry === null) {
+        closeFrame(frame);
         stack.pop();
         continue;
       }
 
-      const entry = frame.entries[frame.index];
-      frame.index += 1;
       const childFd = openChild(frame.fd, entry.name);
       if (childFd === null) continue;
       stack.push({
         fd: childFd,
         closeWhenDone: true,
         entered: false,
-        entries: [],
-        index: 0,
+        directory: undefined,
         required: false,
       });
     }
   } finally {
-    for (const frame of stack) {
-      if (frame.closeWhenDone) {
-        try {
-          fs.closeSync(frame.fd);
-        } catch {}
-      }
-    }
+    for (const frame of stack) closeFrame(frame);
   }
 }
 
@@ -441,6 +450,8 @@ function failClosed(error) {
   } catch {}
   for (const watcher of watchers.values()) watcher.close();
   watchers.clear();
+  for (const scheduler of rescanSchedulers.values()) scheduler.stop();
+  rescanSchedulers.clear();
   if (periodicTimer) clearInterval(periodicTimer);
   closeRoots();
   try {
@@ -457,42 +468,22 @@ function rescanEventTarget(root, components) {
   normalizeTreeFromDescriptor(root, targetFd, true, false);
 }
 
-function scheduleDirectoryRescan(root, components) {
-  const key = `${root.path}:${Buffer.concat(components).toString('hex')}`;
-  if (pendingDirectoryRescans.has(key)) return;
-  pendingDirectoryRescans.add(key);
+function handleEvent(root, relativeName) {
+  if (stopping) return;
+  const scheduler = rescanSchedulers.get(root.path);
+  if (!scheduler) return;
+  const components = relativeComponents(relativeName);
+  if (!components) {
+    scheduler.enqueueFull();
+    return;
+  }
   const stableComponents = components.map((component) =>
     Buffer.from(component),
   );
-  setTimeout(() => {
-    pendingDirectoryRescans.delete(key);
-    try {
-      rescanEventTarget(root, stableComponents);
-    } catch (error) {
-      recoverRoot(root.path, error);
-    }
-  }, 50).unref();
-}
-
-function handleEvent(root, relativeName) {
-  if (stopping) return;
-  const components = relativeComponents(relativeName);
-  if (!components) {
-    recoverRoot(
-      root.path,
-      new Error('watch event omitted or escaped its relative path'),
-    );
-    return;
-  }
-  try {
-    const targetFd = openEventTarget(root, components);
-    if (targetFd === null) return;
-    const stat = fs.fstatSync(targetFd);
-    normalizeTreeFromDescriptor(root, targetFd, true, false);
-    if (stat.isDirectory()) scheduleDirectoryRescan(root, components);
-  } catch (error) {
-    recoverRoot(root.path, error);
-  }
+  const key = stableComponents
+    .map((component) => component.toString('hex'))
+    .join('/');
+  scheduler.enqueueTarget(key, stableComponents);
 }
 
 function startWatch(root) {
@@ -503,6 +494,14 @@ function startWatch(root) {
   );
   watcher.on('error', (error) => recoverRoot(root.path, error));
   watchers.set(root.path, watcher);
+  rescanSchedulers.set(
+    root.path,
+    createBoundedRescanScheduler({
+      runTarget: (components) => rescanEventTarget(root, components),
+      runFull: () => normalizeRoot(root),
+      onError: (error) => recoverRoot(root.path, error),
+    }),
+  );
 }
 
 function recoverRoot(rootPath, cause) {
@@ -511,6 +510,8 @@ function recoverRoot(rootPath, cause) {
   if (!root?.active) return failClosed(cause);
   watchers.get(rootPath)?.close();
   watchers.delete(rootPath);
+  rescanSchedulers.get(rootPath)?.stop();
+  rescanSchedulers.delete(rootPath);
   const failures = (recoveryFailures.get(rootPath) ?? 0) + 1;
   recoveryFailures.set(rootPath, failures);
   try {
@@ -532,6 +533,8 @@ function stop() {
   if (periodicTimer) clearInterval(periodicTimer);
   for (const watcher of watchers.values()) watcher.close();
   watchers.clear();
+  for (const scheduler of rescanSchedulers.values()) scheduler.stop();
+  rescanSchedulers.clear();
   try {
     normalizeAll();
     closeRoots();

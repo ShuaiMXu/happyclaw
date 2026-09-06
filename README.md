@@ -9,7 +9,7 @@
 <p align="center">
   <strong>自托管、多用户、智能体优先的 Claude Code 工作台</strong>
   <br />
-  让 Claude Code 通过 Web 与 7 种消息渠道长期在线，在宿主机或 Docker 沙箱中安全执行任务。
+  让 Claude Code 通过 Web 与 8 种消息渠道长期在线，在宿主机或 Docker 沙箱中安全执行任务。
 </p>
 
 <p align="center">
@@ -34,7 +34,9 @@
 <p align="center">
   <a href="https://happyclaw.cc/"><strong>访问官网</strong></a> ·
   <a href="docs/API.md">API 文档</a> ·
+  <a href="docs/RUNTIME-ARCHITECTURE.md">运行时架构</a> ·
   <a href="docs/ACL-MATRIX.md">权限矩阵</a> ·
+  <a href="DEPLOYMENT.md">生产部署</a> ·
   <a href="https://github.com/riba2534/happyclaw/issues">问题反馈</a>
 </p>
 
@@ -42,7 +44,7 @@
 
 ## HappyClaw 是什么
 
-HappyClaw 是一个基于 [Claude Agent SDK for TypeScript](https://github.com/anthropics/claude-agent-sdk-typescript) 的自托管 AI 智能体系统。它把完整的 Claude Code 运行时封装成一个可持续运行的多用户服务，让你可以从浏览器、飞书、Telegram、QQ、钉钉、微信、Discord 或 WhatsApp 使用同一套智能体、工作区、能力和自动化任务。
+HappyClaw 是一个基于 [Claude Agent SDK for TypeScript](https://github.com/anthropics/claude-agent-sdk-typescript) 的自托管 AI 智能体系统。它把完整的 Claude Code 运行时封装成一个可持续运行的多用户服务，让你可以从浏览器、飞书、Telegram、QQ、钉钉、微信、企业微信、Discord 或 WhatsApp 使用同一套智能体、工作区、能力和自动化任务。
 
 HappyClaw 不是一个简单的聊天 API Wrapper。智能体运行在真实的 Claude Code 环境中，可以读写项目文件、执行终端命令、使用浏览器、调用 MCP、加载 Skills，并在多个独立工作区和会话之间保持清晰的权限与上下文边界。
 
@@ -50,25 +52,25 @@ HappyClaw 不是一个简单的聊天 API Wrapper。智能体运行在真实的 
 
 - **Claude Code 原生运行时** — 直接使用版本锁定的 Claude Agent SDK 与 Claude Code CLI，不重新实现工具调用和运行循环。
 - **智能体优先工作台** — 智能体管身份和能力，工作区管文件与执行环境，会话管对话上下文，产品层级清晰。
-- **随时可访问** — Web、PWA 和 7 种 IM 渠道统一接入，任务完成后可以主动把结果送回消息渠道。
+- **随时可访问** — Web、PWA 和 8 种 IM 渠道统一接入，任务完成后可以主动把结果送回消息渠道。
 - **多用户与多账号** — 用户、渠道凭据、工作区及其 Memory、Skills、MCP 和运行数据彼此隔离。
 - **宿主机与容器双模式** — 管理员可以使用授权的本机项目目录，普通成员默认在 Docker 沙箱中运行。
 - **面向长期运行** — 提供调度任务、运行历史、消息回执、故障恢复、用量统计、监控与一致性备份。
 
 ## 功能总览
 
-| 模块           | 主要能力                                                                                |
-| -------------- | --------------------------------------------------------------------------------------- |
-| **智能体**     | 主 HappyClaw 对话式创建/编辑、自定义智能体、头像、结构化提示词、AI 优化、版本历史与恢复 |
-| **工作区**     | 智能体归属、宿主机/容器执行、独立目录、项目环境变量、项目 Claude 上下文、多会话         |
-| **能力治理**   | 用户 Skills、系统/用户 MCP、Claude Code Plugins 与最终生效预览；智能体工具权限完整开放  |
-| **消息渠道**   | 飞书、Telegram、QQ、钉钉、微信、Discord、WhatsApp，多账号、扫码登录、工作区/会话绑定    |
-| **模型提供商** | Anthropic 官方与第三方兼容端点、多 Provider、轮询/加权/故障转移、健康检查、会话粘性     |
-| **定时任务**   | Cron、固定间隔、一次性任务，智能体/Script 执行，隔离上下文，幂等立即运行，通知重试      |
-| **记忆与文件** | Workspace Memory（事实、决策、经验、待跟进）、来源与修订、CAS 编辑、搜索、文件与终端    |
-| **用量与计费** | Token 分类统计、智能体/工作区/模型筛选、明细与 CSV 导出、订阅、余额、兑换码与配额       |
-| **运维与安全** | RBAC、邀请注册、登录设备、审计日志、运行监控、Docker 镜像管理、备份与安全恢复           |
-| **客户端体验** | 实时流式输出、工具轨迹、Markdown/Mermaid/KaTeX、消息分享图片、响应式布局与 PWA          |
+| 模块           | 主要能力                                                                                       |
+| -------------- | ---------------------------------------------------------------------------------------------- |
+| **智能体**     | 主 HappyClaw 对话式创建/编辑、自定义智能体、头像、结构化提示词、AI 优化、版本历史与恢复        |
+| **工作区**     | 智能体归属、宿主机/容器执行、独立目录、项目环境变量、项目 Claude 上下文、多会话                |
+| **能力治理**   | 用户 Skills、系统/用户 MCP、Claude Code Plugins 与最终生效预览；智能体工具权限完整开放         |
+| **消息渠道**   | 飞书、Telegram、QQ、钉钉、微信、企业微信、Discord、WhatsApp，多账号、扫码登录、工作区/会话绑定 |
+| **模型提供商** | Anthropic 官方与第三方兼容端点、多 Provider、轮询/加权/故障转移、健康检查、会话粘性            |
+| **定时任务**   | Cron、固定间隔、一次性任务，智能体/Script 执行，隔离上下文，幂等立即运行，通知重试             |
+| **记忆与文件** | Workspace Memory（事实、决策、经验、待跟进）、来源与修订、CAS 编辑、搜索、文件与终端           |
+| **用量与计费** | Token 分类统计、智能体/工作区/模型筛选、明细与 CSV 导出、订阅、余额、兑换码与配额              |
+| **运维与安全** | RBAC、邀请注册、登录设备、审计日志、运行监控、Docker 镜像管理、备份与安全恢复                  |
+| **客户端体验** | 实时流式输出、工具轨迹、Markdown/Mermaid/KaTeX、消息分享图片、响应式布局与 PWA                 |
 
 ## 智能体优先工作模型
 
@@ -100,7 +102,7 @@ HappyClaw 使用统一的 `智能体 → Workspace → Runtime Session` 层级�
   保留。
 - **Workspace Memory** 是该工作区跨 Session 复用的结构化知识，不是用户全局记忆，也不是任意文件或日期归档。主人称呼由 Home 专用 Owner Profile facade 管理，不出现在通用 Memory 搜索、快照或修改接口中。
 - **Runtime Session** 是工作区内的一段独立对话上下文，不是另一个顶层智能体；Session 历史与 Workspace Memory 分开保存，忘记一条 Memory 不会删除聊天历史。
-- **Channel Mount** 把 IM 群聊、私聊或原生话题挂载到工作区或具体会话。
+- **Channel Mount** 将私聊、普通群显式绑定到具体 Session，将话题群绑定到 Workspace，再按话题映射 Session。完整规则见[业务模型](docs/BUSINESS-MODEL.md)。
 
 ### 执行模式
 
@@ -146,37 +148,36 @@ HappyClaw 区分不同层级的能力来源：
 
 ## 渠道接入
 
-每个用户都可以为同一渠道创建多个 Bot 账号，为每个账号设置默认工作区，再按群聊、
-私聊或原生话题覆盖绑定目标。账号身份会写入渠道地址和 mount，发送时不会借用其他
-Bot 的凭据。
+每个用户都可以为同一渠道创建多个 Bot 账号，并为渠道会话显式选择绑定目标。
+连接账号或发现聊天不会自动绑定，也不会触发回复。账号身份会写入渠道地址和 mount，
+发送时不会借用其他 Bot 的凭据。
 
-| 渠道         | 接入方式                          | 主要能力                                              |
-| ------------ | --------------------------------- | ----------------------------------------------------- |
-| **飞书**     | App ID / App Secret，WebSocket    | 流式卡片、图片与文件、Reaction、群聊 @ 控制、话题映射 |
-| **Telegram** | Bot Token，Long Polling           | Markdown/HTML、长消息分片、图片与文件、代理配置       |
-| **QQ**       | App ID / App Secret，WebSocket    | 私聊、群聊 @Bot、图片消息、配对码绑定                 |
-| **钉钉**     | Client ID / Client Secret，Stream | AI Card 流式回复、图片与文件、群聊 @ 控制             |
-| **微信**     | Web 界面扫码，iLink               | 二维码授权、媒体收发、Typing、断线恢复                |
-| **Discord**  | Bot Token，Gateway                | 私聊与服务器频道路由、多账号隔离、频道信息查询        |
-| **WhatsApp** | Web 界面扫码，Baileys             | 二维码登录、文本与媒体、会话持久化、断线恢复          |
-| **Web**      | 浏览器与 WebSocket                | 实时 Markdown、文件、终端、工具轨迹、PWA              |
+| 渠道         | 接入方式                          | 主要能力                                               |
+| ------------ | --------------------------------- | ------------------------------------------------------ |
+| **飞书**     | App ID / App Secret，WebSocket    | 流式卡片、图片与文件、Reaction、群聊 @ 控制、话题映射  |
+| **Telegram** | Bot Token，Long Polling           | Markdown/HTML、长消息分片、图片与文件、代理配置        |
+| **QQ**       | App ID / App Secret，WebSocket    | 私聊、群聊 @Bot、图片消息、配对码绑定                  |
+| **钉钉**     | Client ID / Client Secret，Stream | AI Card 流式回复、图片与文件、群聊 @ 控制              |
+| **微信**     | Web 界面扫码，iLink               | 二维码授权、媒体收发、Typing、断线恢复                 |
+| **企业微信** | Bot ID / Secret，WebSocket        | Markdown 流式回复、图片与文件、群聊 @ 控制、配对码绑定 |
+| **Discord**  | Bot Token，Gateway                | 私聊与服务器频道路由、多账号隔离、频道信息查询         |
+| **WhatsApp** | Web 界面扫码，Baileys             | 二维码登录、文本与媒体、会话持久化、断线恢复           |
+| **Web**      | 浏览器与 WebSocket                | 实时 Markdown、文件、终端、工具轨迹、PWA               |
 
-渠道账号的凭据和扫码会话按用户、账号隔离。当前绑定边界为：
+渠道账号的凭据和扫码会话按用户、账号隔离。绑定规则为：
 
-1. 渠道账号的默认智能体/工作区。
-2. 群聊绑定到工作区；一个工作区可以绑定多个账号下的多个群聊。
-3. 私聊绑定到工作区内的指定 Runtime Session。
-4. 飞书话题群、Telegram Forum 等原生线程自动映射为独立 Runtime Session。
+1. 私聊和普通群绑定到工作区内的指定 Session，也可以选择主会话。
+2. 飞书话题群、Telegram Forum 绑定到 Workspace，每个原生话题映射独立 Session。
+3. 未绑定或已经解绑的渠道保持静默；默认工作区和历史话题记录不会恢复绑定。
 
-飞书的“是否需要 @”与“响应所有人/仅主人”是两个独立维度。普通群在免 @ 模式下
-共享群上下文；需要 @ 时，首次 @ 消息建立原生话题和独立 Session，后续在该话题内
-无需再次 @。话题群始终按话题隔离上下文。
+飞书的“是否需要 @”与“响应所有人/仅主人”是两个独立维度。普通群始终沿用所绑定的
+Session，需要 @ 时也不会另建话题 Session。话题群按话题隔离上下文。
 
-一个 Runtime Session 第一次由原生 IM 触发后会持久记住渠道归属。后续即使从 Web
-继续回复，也会保留原渠道上下文，文件和图片使用当前 Turn 的精确聊天、话题与 Bot
-账号投递。
+每条输入独立保存回复来源：私聊、群聊、话题回复回到收到该输入的同一聊天、话题和
+Bot 账号；Web 输入只在对应 Web Session 回复。多个渠道可以共享一个 Session，
+但不同来源的输入分批执行，旧渠道归属或后续输入不能改写当前回复目标。
 
-在支持斜杠命令的渠道中，可以使用 `/list`、`/status`、`/where`、`/bind`、`/unbind`、`/new` 和 `/clear` 管理当前上下文。写操作受工作区 owner 和渠道发言者策略约束。
+在已经绑定且支持斜杠命令的渠道中，可以使用 `/list`、`/status`、`/where`、`/bind`、`/unbind`、`/new` 和 `/clear` 管理当前上下文。飞书里，Agent 忙碌时的普通消息会静默自然排队；在群聊中真实 `@Bot /steer <消息>` 可立即引导当前任务，真实 `@Bot /break` 可停止当前任务并取消此前已经排队的消息。两条 Runtime 控制命令只接受精确小写形式。写操作受工作区 owner 和渠道发言者策略约束。
 
 ## 模型与提供商
 
@@ -241,7 +242,7 @@ make start
 
 1. 创建第一个管理员账户。
 2. 配置 Anthropic 官方账号或第三方 Claude 兼容 Provider。
-3. 可选添加飞书、Telegram、QQ、钉钉、微信、Discord 或 WhatsApp 渠道账号。
+3. 可选添加飞书、Telegram、QQ、钉钉、微信、企业微信、Discord 或 WhatsApp 渠道账号。
 4. 进入工作台创建智能体、工作区和会话。
 
 ### 开发模式
@@ -280,10 +281,12 @@ docker pull riba2534/happyclaw-agent:latest
 `main` 分支每次推送都会重新构建
 `riba2534/happyclaw-agent`（amd64/arm64）。两个架构会分别在 GitHub 原生 x64
 与 ARM64 Hosted Runner 上并行构建，不使用 QEMU 模拟。每个 runner 先推送没有
-用户标签的 digest candidate，使用真实容器入口启动 Chromium，并通过 HTTP 请求
-`/json/version`；两边都验证通过后才合并、签名并提升 `git-<sha>` 和 `latest`
-manifest。镜像构建时会解析 Claude Code、Claude Agent SDK、agent-browser、
-feishu-cli、uv 和 Headroom 的最新稳定版；实际安装版本记录在镜像内的
+用户标签的 digest candidate，真实启动不可变 Runner、执行本地 fake provider
+SDK/CLI query，并在首次调用 agent-browser 后验证 `/json/version`；两边都验证通过
+后才合并、签名并提升 `git-<sha>` 和 `latest` manifest。默认 core 镜像不携带未启用
+的 Headroom Python 依赖；配置了 `headroom` MCP 的智能体会选择同版本
+`-headroom` 镜像。Claude Code、Claude Agent SDK、agent-browser、feishu-cli、uv
+和 Headroom 均使用源码锁定版本；实际安装版本记录在镜像内的
 `/usr/local/share/happyclaw-tool-versions.txt`，需要回滚时也可以通过 Docker
 build args 在发布工作流中指定精确版本。
 
@@ -296,7 +299,7 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 | 页面                    | 内容                                                  |
 | ----------------------- | ----------------------------------------------------- |
 | **设置 → 模型与提供商** | 官方/第三方 Provider、密钥、模型、1M 上下文和负载均衡 |
-| **设置 → 消息渠道**     | 渠道账号、扫码登录、连接状态、默认工作区和会话绑定    |
+| **设置 → 消息渠道**     | 渠道账号、扫码登录、连接状态和会话绑定                |
 | **设置 → 主 HappyClaw** | 默认智能体的 Skills 与 MCP                            |
 | **设置 → 执行与容量**   | 超时、并发、上下文窗口和运行限制                      |
 | **设置 → 宿主机集成**   | 管理员纯宿主机模式、Host 目录与 Claude 上下文来源     |
@@ -305,21 +308,23 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 
 ### 可选环境变量
 
-| 变量                         | 默认值                            | 说明                                                                               |
-| ---------------------------- | --------------------------------- | ---------------------------------------------------------------------------------- |
-| `WEB_PORT`                   | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
-| `WEB_SESSION_SECRET`         | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
-| `CONTAINER_IMAGE`            | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
-| `CONTAINER_TIMEOUT`          | `1800000`                         | 容器硬超时，毫秒                                                                   |
-| `IDLE_TIMEOUT`               | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
-| `ADMIN_HOST_ONLY_MODE`       | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
-| `MAX_CONCURRENT_CONTAINERS`  | `20`                              | 最大并发容器数                                                                     |
-| `MAX_FILE_SIZE_MB`           | `50`                              | Web 和 IM 入站文件大小上限                                                         |
-| `CORS_ALLOWED_ORIGINS`       | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
-| `TRUST_PROXY`                | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
-| `TZ`                         | 系统时区                          | 日志与定时任务时区                                                                 |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
-| `NO_PROXY`                   | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
+| 变量                                 | 默认值                            | 说明                                                                               |
+| ------------------------------------ | --------------------------------- | ---------------------------------------------------------------------------------- |
+| `WEB_PORT`                           | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
+| `WEB_SESSION_SECRET`                 | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
+| `CONTAINER_IMAGE`                    | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
+| `CONTAINER_IMAGE_HEADROOM`           | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
+| `CONTAINER_TIMEOUT`                  | `1800000`                         | 容器硬超时，毫秒                                                                   |
+| `IDLE_TIMEOUT`                       | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
+| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                              | IPC 债务强制恢复上限（整数分钟，范围 4–120；非法值回退默认）                       |
+| `ADMIN_HOST_ONLY_MODE`               | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
+| `MAX_CONCURRENT_CONTAINERS`          | `20`                              | 最大并发容器数                                                                     |
+| `MAX_FILE_SIZE_MB`                   | `50`                              | Web 和 IM 入站文件大小上限                                                         |
+| `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
+| `TRUST_PROXY`                        | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
+| `TZ`                                 | 系统时区                          | 日志与定时任务时区                                                                 |
+| `HTTPS_PROXY` / `HTTP_PROXY`         | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
+| `NO_PROXY`                           | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
 
 Provider 与渠道凭据建议只在 Web 设置中填写。它们使用 AES-256-GCM 加密存储，相关 API 只返回是否已配置，不返回密钥明文。
 
@@ -351,7 +356,7 @@ data/
 ```mermaid
 flowchart LR
     Web["Web / PWA"] --> Core["HappyClaw Node Service"]
-    IM["7 个 IM 渠道"] --> Core
+    IM["8 个 IM 渠道"] --> Core
 
     Core --> Auth["Auth / RBAC"]
     Core --> Router["消息路由与会话队列"]
@@ -377,14 +382,14 @@ flowchart LR
 
 ### 技术栈
 
-| 层               | 技术                                                                             |
-| ---------------- | -------------------------------------------------------------------------------- |
-| **主服务**       | Node.js、TypeScript、Hono、WebSocket、SQLite                                     |
-| **智能体运行时** | Claude Agent SDK、Claude Code CLI、MCP、文件 IPC                                 |
-| **Web**          | React 19、Vite、Tailwind CSS、Radix UI、Zustand、Recharts、xterm.js              |
-| **渠道**         | Feishu SDK、grammY、QQ Bot API、DingTalk Stream、Discord.js、Baileys、微信 iLink |
-| **隔离执行**     | Docker、非 root Node.js 容器、Chromium、常用开发与浏览器工具                     |
-| **质量保障**     | TypeScript、Vitest、Prettier、GitHub Actions                                     |
+| 层               | 技术                                                                                                     |
+| ---------------- | -------------------------------------------------------------------------------------------------------- |
+| **主服务**       | Node.js、TypeScript、Hono、WebSocket、SQLite                                                             |
+| **智能体运行时** | Claude Agent SDK、Claude Code CLI、MCP、文件 IPC                                                         |
+| **Web**          | React 19、Vite、Tailwind CSS、Radix UI、Zustand、原生 SVG 图表、xterm.js                                 |
+| **渠道**         | Feishu SDK、grammY、QQ Bot API、DingTalk Stream、企业微信智能机器人 SDK、Discord.js、Baileys、微信 iLink |
+| **隔离执行**     | Docker、非 root Node.js 容器、Chromium、常用开发与浏览器工具                                             |
+| **质量保障**     | TypeScript、Vitest、Prettier、GitHub Actions                                                             |
 
 ## 安全模型
 
@@ -400,6 +405,33 @@ HappyClaw 会执行代码和访问第三方消息平台，部署前请理解以�
 - 对公网开放时，建议使用 HTTPS 反向代理、强密码、关闭开放注册，并定期备份 `data/`。
 
 完整接口权限见 [ACL 权限矩阵](docs/ACL-MATRIX.md)。
+
+### 反向代理配置
+
+Web 界面依赖 `/ws` 上的 WebSocket 推送流式输出和运行状态。反向代理必须放行
+Upgrade 并把该连接的读超时设得足够长，否则前端会周期性弹出「连接中断，正在重连...」。
+
+服务端已内置 30 秒心跳（ping/pong），既用于保活，也用于回收半开的死连接，
+因此代理侧只需把读超时设得高于心跳间隔即可。nginx 示例：
+
+```nginx
+location /ws {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 3600s;   # 默认 60s 会掐断长连接
+    proxy_send_timeout 3600s;
+}
+```
+
+注意 `Connection` 应固定为 `"upgrade"`，不要写成 `$http_connection`——后者依赖
+客户端如实发送该头部，行为不稳定。
+
+若代理位于 Cloudflare 等平台之后，还需确认其空闲超时高于 30 秒心跳间隔。
+上传大文件时另需放宽 `client_max_body_size`（不小于 `MAX_FILE_SIZE_MB`，并预留
+multipart 开销）与 `client_body_timeout`。
 
 ## 开发与测试
 
@@ -450,6 +482,7 @@ happyclaw/
 | 文档                                                                  | 用途                                               |
 | --------------------------------------------------------------------- | -------------------------------------------------- |
 | [Web API](docs/API.md)                                                | REST API、认证、任务、渠道账号、智能体、用量等接口 |
+| [运行时架构](docs/RUNTIME-ARCHITECTURE.md)                            | 模块边界、依赖规则和性能预算                       |
 | [ACL 权限矩阵](docs/ACL-MATRIX.md)                                    | HTTP、WebSocket 与 IM 命令的权限要求               |
 | [Workspace Memory v2](docs/workspace-memory-v2.md)                    | Workspace 知识边界、数据模型、并发和 UI 语义       |
 | [智能体优先架构记录](docs/agent-first-architecture-plan.md)           | 智能体、工作区、运行会话与渠道挂载的迁移背景       |
@@ -493,6 +526,26 @@ Claude Code，并把实际版本写入
 <summary><strong>如何修改服务端口？</strong></summary>
 
 生产模式运行 `WEB_PORT=8080 make start`。开发模式需要同时设置后端端口和 Vite 的 API/WebSocket 代理目标。
+
+</details>
+
+<details>
+<summary><strong>如何检查旧版本遗留的私聊挂载？</strong></summary>
+
+两类旧安装可能需要此工具：一是 #666 之前的受支持版本曾把 WhatsApp `@c.us`
+及 device `@c.us` 私聊留在 workspace main；二是曾在 #659 的 WhatsApp LID 分类
+修复之前单独部署或 cherry-pick #655/schema v73 的非正式安装。升级到当前版本后运行
+`make leftover-direct-mounts`。诊断严格只读，并且只接受当前 schema；发现残留或
+存在无法自动判定的 WhatsApp alias 路由冲突时以退出码 2 返回。为保证读取完整且绝不
+创建 SQLite sidecar，诊断前也必须先干净停止 HappyClaw。
+
+修复前还必须停止 launchd/systemd 等进程守护，然后运行
+`make leftover-direct-mounts APPLY=1`。修复会把可判定私聊迁到独立
+`channel_direct` session，并永久清除受污染 workspace main 的模型恢复资格和
+SDK/runtime session；不会创建备份，也不能安全撤销。工具若无法确认数据库无人占用，
+会拒绝执行。如果同一 WhatsApp canonical 用户的多个 alias 指向不同 owner、workspace
+或 session，工具会 fail closed；请按诊断输出人工解绑冲突 alias 后重试，不会自动猜测
+应保留哪条路由。
 
 </details>
 

@@ -169,10 +169,18 @@ const PREVIEW_BLACKLIST_EXTENSIONS = new Set([
   'cache',
 ]);
 
-/** 判断文件是否可点击预览（排除系统文件和临时文件） */
-function isPreviewableFile(name: string, isSystem: boolean): boolean {
-  if (isSystem) return false;
-  const ext = getFileExt(name);
+/**
+ * 后端是否允许编辑该文件内容。
+ * 旧后端不返回 editable 字段时回退到原有的「非系统文件」判断。
+ */
+function isEntryEditable(item: FileEntry): boolean {
+  return item.type === 'file' && (item.editable ?? !item.isSystem);
+}
+
+/** 判断文件是否可点击预览（排除临时文件；系统文件仅在可编辑例外时开放） */
+function isPreviewableFile(item: FileEntry): boolean {
+  if (item.isSystem && !isEntryEditable(item)) return false;
+  const ext = getFileExt(item.name);
   if (PREVIEW_BLACKLIST_EXTENSIONS.has(ext)) return false;
   return true;
 }
@@ -908,7 +916,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
         setPreview({ kind: 'video', file: item });
       } else if (AUDIO_EXTENSIONS.has(ext)) {
         setPreview({ kind: 'audio', file: item });
-      } else if (ext === 'md' && !item.isSystem) {
+      } else if (ext === 'md' && isEntryEditable(item)) {
         setPreview({ kind: 'markdown', file: item });
       } else {
         setPreview({ kind: 'text', file: item });
@@ -1098,8 +1106,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
             <div className="space-y-0.5">
               {sortedFiles.map((item) => {
                 const clickable =
-                  item.type === 'directory' ||
-                  isPreviewableFile(item.name, !!item.isSystem);
+                  item.type === 'directory' || isPreviewableFile(item);
                 const summary = (
                   <>
                     <div className="flex-shrink-0 w-5 flex items-center justify-center">
@@ -1113,7 +1120,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                       <div className="flex items-center gap-1.5">
                         <span
                           className={`text-sm truncate ${
-                            item.isSystem
+                            item.isSystem && !isEntryEditable(item)
                               ? 'text-muted-foreground'
                               : 'text-foreground'
                           }`}
@@ -1173,9 +1180,9 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                       >
                         <Copy className="w-3.5 h-3.5" />
                       </button>
-                      {/* Edit button for non-system text files */}
-                      {!item.isSystem &&
-                        item.type === 'file' &&
+                      {/* Edit button for editable text files (系统文件里的
+                          CLAUDE.md 例外也可编辑，但仍然没有删除按钮) */}
+                      {isEntryEditable(item) &&
                         TEXT_EXTENSIONS.has(getFileExt(item.name)) && (
                           <button
                             onClick={(e) => {

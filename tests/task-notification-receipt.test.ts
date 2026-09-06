@@ -3,6 +3,7 @@ import { describe, expect, test, vi } from 'vitest';
 import {
   buildFailedTaskImageNotification,
   settleTaskNotificationDeliveries,
+  taskNotificationPreAcceptFailure,
 } from '../src/task-notification.js';
 
 function payload(targetJid: string) {
@@ -87,6 +88,83 @@ describe('scheduled task physical delivery receipts', () => {
       },
     });
     expect(result.retryPayload).toEqual(payload('feishu:direct'));
+  });
+
+  test('production missing-binding fan-out is a retryable pre-send failure', async () => {
+    const missing = taskNotificationPreAcceptFailure(
+      'No connected qq binding exists for this workspace',
+    );
+    const target = payload('qq:c2c:missing');
+    const result = await settleTaskNotificationDeliveries([
+      {
+        channel: 'qq',
+        payload: target,
+        failure: missing,
+        deliver: async () => false,
+      },
+    ]);
+
+    expect(missing.outcome).toBe('pre_accept');
+    expect(result.receipt).toMatchObject({
+      status: 'failed',
+      summary: { failed_channels: ['qq'] },
+    });
+    expect(result.receipt.summary.uncertain).toBeUndefined();
+    expect(result.retryPayload).toEqual(target);
+  });
+
+  test('uncertain provider acceptance is persisted but never queued for retry', async () => {
+    const timeout = Object.assign(new Error('ACK timed out after write'), {
+      code: 'ETIMEDOUT',
+    });
+    const failure = { error: timeout, outcome: 'uncertain' as const };
+    const result = await settleTaskNotificationDeliveries([
+      {
+        channel: 'feishu',
+        payload: payload('feishu:direct'),
+        failure,
+        deliver: async () => false,
+      },
+    ]);
+
+    expect(result).toEqual({
+      receipt: {
+        status: 'uncertain',
+        summary: {
+          attempted: 1,
+          succeeded: 0,
+          failed: 1,
+          failed_channels: ['feishu'],
+          uncertain: 1,
+          uncertain_channels: ['feishu'],
+        },
+        error: 'ACK timed out after write',
+      },
+      retryPayload: undefined,
+    });
+  });
+
+  test('mixed uncertainty retries only the definitively failed sibling', async () => {
+    const timeout = Object.assign(new Error('ACK lost'), {
+      code: 'ETIMEDOUT',
+    });
+    const result = await settleTaskNotificationDeliveries([
+      {
+        channel: 'feishu',
+        payload: payload('feishu:uncertain'),
+        failure: { error: timeout, outcome: 'uncertain' },
+        deliver: async () => false,
+      },
+      {
+        channel: 'telegram',
+        payload: payload('telegram:rejected'),
+        deliver: async () => false,
+      },
+    ]);
+
+    expect(result.receipt.status).toBe('uncertain');
+    expect(result.receipt.summary.uncertain_channels).toEqual(['feishu']);
+    expect(result.retryPayload).toEqual(payload('telegram:rejected'));
   });
 
   test('aggregates delayed success and failure without acknowledging early', async () => {

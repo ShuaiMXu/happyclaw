@@ -431,49 +431,6 @@ function parseSearchOutput(output: string): SearchResult[] {
   return results;
 }
 
-/**
- * Find skill entries under a path that were modified after the given timestamp.
- * Handles both real directories and symlinks (skills CLI creates symlinks in
- * ~/.claude/skills/ pointing to ~/.agents/skills/).
- * Returns entry names.
- */
-function findModifiedEntries(dir: string, afterMs: number): string[] {
-  const result: string[] = [];
-  if (!fs.existsSync(dir)) return result;
-  try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      try {
-        // Use lstat for symlinks, stat (follows symlink) for mtime of real target
-        const lstat = fs.lstatSync(fullPath);
-
-        if (lstat.isSymbolicLink()) {
-          // Symlink: check both the symlink creation time and target mtime
-          if (lstat.mtimeMs >= afterMs) {
-            result.push(entry.name);
-            continue;
-          }
-          // Also check the resolved target's mtime
-          const realStat = fs.statSync(fullPath);
-          if (realStat.mtimeMs >= afterMs) {
-            result.push(entry.name);
-          }
-        } else if (lstat.isDirectory()) {
-          if (lstat.mtimeMs >= afterMs) {
-            result.push(entry.name);
-          }
-        }
-      } catch {
-        // skip broken symlinks etc.
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return result;
-}
-
 // --- Search cache (LRU, 5min TTL, max 100 entries) ---
 
 interface CacheEntry<T> {

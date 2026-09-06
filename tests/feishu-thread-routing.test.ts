@@ -29,7 +29,7 @@ describe('parseFeishuRouteTarget', () => {
     });
   });
 
-  test('an ordinary-group mention becomes a reply_in_thread root target', () => {
+  test('an ordinary-group mention keeps the ordinary group reply target', () => {
     const plan = resolveFeishuConversationPlan({
       chatType: 'group',
       chatMode: 'group',
@@ -44,8 +44,7 @@ describe('parseFeishuRouteTarget', () => {
     );
     expect(target).toMatchObject({
       chatId: 'oc_ordinary',
-      rootMessageId: 'om_mention',
-      replyInThread: true,
+      replyInThread: false,
     });
   });
 });
@@ -65,10 +64,11 @@ describe('StreamingCardController Feishu thread reply', () => {
             create: vi
               .fn()
               .mockResolvedValue({ data: { card_id: 'card_life' } }),
-            settings: vi.fn().mockResolvedValue({}),
-            update: vi.fn().mockResolvedValue({}),
+            settings: vi.fn().mockResolvedValue({ code: 0 }),
+            update: vi.fn().mockResolvedValue({ code: 0 }),
+            batchUpdate: vi.fn().mockResolvedValue({ code: 0 }),
           },
-          cardElement: { content: vi.fn().mockResolvedValue({}) },
+          cardElement: { content: vi.fn().mockResolvedValue({ code: 0 }) },
         },
       },
       im: {
@@ -230,7 +230,7 @@ describe('StreamingCardController Feishu thread reply', () => {
   });
 
   test('preserves trace link when usage patch updates a legacy completed card', async () => {
-    const patch = vi.fn().mockResolvedValue({});
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
     const create = vi
       .fn()
       .mockResolvedValue({ data: { message_id: 'om_card' } });

@@ -181,6 +181,9 @@ describe('Feishu owner discovery is per channel account', () => {
       'const ownerOpenId = secret.ownerOpenId ?? senderOpenId',
     );
     expect(reload).toMatch(
+      /isSenderAllowedInGroup:\s*\(jid: string, sender\?: string\) =>\s*isSenderAllowedInGroup\(\s*jid,\s*sender,\s*\(\) => secret\.ownerOpenId \|\| undefined,\s*\)/,
+    );
+    expect(reload).toMatch(
       /backfillEmptyAllowlistsForChannelAccount\(\s*account\.owner_user_id,\s*account\.id,\s*ownerOpenId,\s*\)/,
     );
     expect(reload).not.toContain('saveUserFeishuConfig');

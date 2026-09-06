@@ -47,9 +47,6 @@ export function MainAgentCapabilitiesSection() {
   const modelConfigs = useAgentProfilesStore(
     (state) => state.modelConfigs ?? [],
   );
-  const defaultModelConfigId = useAgentProfilesStore(
-    (state) => state.defaultModelConfigId ?? null,
-  );
   const profilesLoading = useAgentProfilesStore((state) => state.loading);
   const loadProfiles = useAgentProfilesStore((state) => state.loadProfiles);
   const governance = useAgentProfilesStore((state) =>
@@ -271,10 +268,8 @@ export function MainAgentCapabilitiesSection() {
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="inherit">
-              跟随系统默认
-              {defaultModelConfigId
-                ? `（${modelConfigs.find((item) => item.id === defaultModelConfigId)?.name ?? '当前默认'}）`
-                : '（尚未配置）'}
+              自动选择已启用模型
+              {`（当前 ${modelConfigs.filter((item) => item.enabled).length} 个）`}
             </SelectItem>
             {modelConfigs.map((model) => (
               <SelectItem key={model.id} value={model.id}>
@@ -287,7 +282,7 @@ export function MainAgentCapabilitiesSection() {
         </Select>
         <p className="text-[11px] leading-5 text-muted-foreground">
           Home
-          工作区、主会话、独立会话与定时任务都会继承该选择。未启用的配置仍可在这里显式使用。
+          工作区、主会话、独立会话与定时任务都会继承该选择。自动选择只使用已启用配置；未启用的配置仍可在这里显式使用。
         </p>
       </div>
 

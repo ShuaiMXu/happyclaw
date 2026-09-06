@@ -7,6 +7,7 @@
 - 产品介绍、安装和常用操作：`README.md`
 - 路由族与主要 Web API：`docs/API.md`
 - 权限边界：`docs/ACL-MATRIX.md`
+- 生产部署与回滚：`DEPLOYMENT.md`
 - 运行时 Prompt：`container/agent-runner/prompts/`
 - 数据库 Schema：`src/db.ts` 中的 `CURRENT_SCHEMA_VERSION` 与建表/迁移代码
 - Web 路由：`web/src/App.tsx`
@@ -20,7 +21,7 @@
 ## 2. 产品模型
 
 HappyClaw 是基于 Claude Agent SDK 的自托管、多用户 Agent 工作台，支持 Web 与飞书、
-Telegram、QQ、钉钉、微信、Discord、WhatsApp。
+Telegram、QQ、钉钉、微信、企业微信、Discord、WhatsApp。
 
 当前产品层级：
 
@@ -67,6 +68,7 @@ Agent Profile（身份、四段 Prompt、能力策略）
 - `src/qq.ts`
 - `src/dingtalk.ts`
 - `src/wechat.ts`
+- `src/wecom.ts`、`src/wecom-streaming.ts`
 - `src/discord.ts`
 - `src/whatsapp.ts`
 
@@ -120,6 +122,11 @@ Radix UI。路由以 `web/src/App.tsx` 为准：
 
 - 同一序列化键内的消息保持顺序。
 - 不同飞书话题、不同 Runtime Session 使用不同序列化键，可以并发。
+- Agent loop 运行期间到达的普通消息逐条进入可见、可编辑和可排序的 durable 队列；
+  当前 loop 自然结束后，调度器原子快照当时剩余的普通队列，并将其作为一个批次交给
+  下一轮 Agent。Web 与飞书等渠道共用这套 Workspace/Session 级语义。
+- 显式“发送”或 `steer` 是单条优先屏障：它可以中断当前 loop，但不会顺带吞并后面的
+  普通排队消息；后续普通消息留到再下一轮合批。
 - 普通消息与定时任务使用明确的队列状态；失败采用有界指数退避。
 - `CONTAINER_TIMEOUT` 控制单次运行上限，`IDLE_TIMEOUT` 控制暖 Runner 的空闲保留时间。
 - Script 任务与其他任务共用 `CONTAINER_TIMEOUT`，不设置独立并发池或超时配置。
@@ -215,6 +222,26 @@ Host 模式没有 `maxConcurrentHostProcesses`。旧客户端提交该字段时�
 破坏性命令受 `OWNER_REQUIRED_IM_COMMANDS` 和渠道原生 sender ID 约束。
 响应对象策略不能因服务重启、同步聊天或恢复绑定而回退成默认值。
 
+另有三个精确的 Session 运行时控制命令，由渠道连接器在通用斜杠命令之前解析。
+群聊必须由渠道结构证明真实 `@Bot`，命令大小写敏感；私聊可直接使用。
+飞书支持全部三个；QQ 支持 `/steer` 和 `/break`，其 `/clear` 仍走通用命令处理器。
+QQ 群聊的结构证明来自平台本身 —— 网关只在真实 `@Bot` 时投递
+`GROUP_AT_MESSAGE_CREATE`：
+
+- `/steer <非空消息>`：先可靠进入当前 Session 的 durable pending，再 clean interrupt
+  当前 generation；当前已 pending 的普通消息与 steer 按可见顺序在下一轮合批，命令前缀
+  不进入 Agent Prompt，也不额外发送框架确认。可携带图片。
+- `/break`：必须无附件且正文精确匹配；以到达时为截止点取消此前 pending 并中断 active
+  Loop，保留 transcript，之后到达的消息继续运行；固定回复 `Current task stopped.` 或
+  `No active task to stop.`。
+- `/clear`：必须无附件且正文精确匹配；重置当前逻辑 Session 并固定回复
+  `Session context cleared.`。
+
+普通消息默认就是 durable queue，不存在显式 `/queue` 控制命令。旧的 `/queue ...`
+按普通 Agent 输入处理。飞书 Reaction 属于真正执行的 batch，而不是入站消息：同一 batch
+最多在最后一条飞书输入上显示一个 `OnIt`，queued 消息不显示；同一 Session 的上一批必须
+完成清理后才能为下一批添加，彼此独立的 Session 可以并发显示。
+
 ## 7. 数据与目录
 
 运行时数据默认位于 `data/`，不进入 Git：
@@ -280,18 +307,19 @@ Web 持久设置 > 环境变量 > 代码默认值
 
 常用环境变量：
 
-| 变量                        | 默认值                            | 说明                              |
-| --------------------------- | --------------------------------- | --------------------------------- |
-| `WEB_PORT`                  | `3000`                            | HTTP、WebSocket 端口              |
-| `WEB_SESSION_SECRET`        | 自动生成并持久化                  | Cookie 签名                       |
-| `CONTAINER_IMAGE`           | `riba2534/happyclaw-agent:latest` | GitHub Actions 发布的 Runner 镜像 |
-| `CONTAINER_TIMEOUT`         | `1800000`                         | 默认运行超时                      |
-| `IDLE_TIMEOUT`              | `1800000`                         | 暖 Runner 空闲时间                |
-| `MAX_CONCURRENT_CONTAINERS` | `20`                              | Docker 并发                       |
-| `MAX_FILE_SIZE_MB`          | `50`                              | Web/IM 入站文件上限               |
-| `CORS_ALLOWED_ORIGINS`      | 仅 localhost                      | WebSocket Origin 白名单           |
-| `TRUST_PROXY`               | `false`                           | 是否信任反向代理来源头            |
-| `TZ`                        | 系统时区                          | 调度时区                          |
+| 变量                                 | 默认值                            | 说明                               |
+| ------------------------------------ | --------------------------------- | ---------------------------------- |
+| `WEB_PORT`                           | `3000`                            | HTTP、WebSocket 端口               |
+| `WEB_SESSION_SECRET`                 | 自动生成并持久化                  | Cookie 签名                        |
+| `CONTAINER_IMAGE`                    | `riba2534/happyclaw-agent:latest` | GitHub Actions 发布的 Runner 镜像  |
+| `CONTAINER_TIMEOUT`                  | `1800000`                         | 默认运行超时                       |
+| `IDLE_TIMEOUT`                       | `1800000`                         | 暖 Runner 空闲时间                 |
+| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                              | IPC 债务强制恢复上限（4–120 分钟） |
+| `MAX_CONCURRENT_CONTAINERS`          | `20`                              | Docker 并发                        |
+| `MAX_FILE_SIZE_MB`                   | `50`                              | Web/IM 入站文件上限                |
+| `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | WebSocket Origin 白名单            |
+| `TRUST_PROXY`                        | `false`                           | 是否信任反向代理来源头             |
+| `TZ`                                 | 系统时区                          | 调度时区                           |
 
 Provider 和渠道账号应优先通过 Web 配置。Legacy `/api/config/user-im/*` 只用于兼容，
 新功能统一使用 `/api/channel-accounts`。

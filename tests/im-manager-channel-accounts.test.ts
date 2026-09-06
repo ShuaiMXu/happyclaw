@@ -38,6 +38,37 @@ const callbacks = (onNewChat = vi.fn()): IMChannelConnectOpts => ({
 });
 
 describe('IM manager account lifecycle', () => {
+  test('custom inbound normalization runs after account scoping and not while inbound is paused', async () => {
+    const manager = new IMConnectionManager();
+    const whatsapp = fakeChannel('whatsapp');
+    const normalizeIncomingJid = vi.fn((jid: string) => jid);
+    await manager.connectChannel(
+      'normalize-owner',
+      'whatsapp',
+      whatsapp.channel,
+      {
+        ...callbacks(),
+        normalizeIncomingJid,
+      },
+      'normalize-account',
+    );
+    const connected = whatsapp.getOpts()!;
+    expect(
+      connected.normalizeIncomingJid?.('whatsapp:15551234567@s.whatsapp.net'),
+    ).toBe('whatsapp:15551234567@s.whatsapp.net#account:normalize-account');
+    expect(normalizeIncomingJid).toHaveBeenCalledWith(
+      'whatsapp:15551234567@s.whatsapp.net#account:normalize-account',
+    );
+
+    manager.pauseInbound();
+    normalizeIncomingJid.mockClear();
+    expect(
+      connected.normalizeIncomingJid?.('whatsapp:15550001111@s.whatsapp.net'),
+    ).toBeNull();
+    expect(normalizeIncomingJid).not.toHaveBeenCalled();
+    await manager.disconnectAll();
+  });
+
   test('shutdown pause and startup recovery both defer durable inbound before policy callbacks', async () => {
     const manager = new IMConnectionManager();
     const feishu = fakeChannel('feishu');

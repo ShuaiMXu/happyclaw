@@ -23,11 +23,16 @@ function writeDelivery(
       receipt: {
         deliveryId: `delivery-${id}`,
         chatJid,
-        coveredCursors: coveredIds.map((coveredId) => ({
+        coveredCursors: coveredIds.map((coveredId, index) => ({
           timestamp: '2026-07-10T00:00:01.000Z',
           id: coveredId,
+          sequence: index + 1,
         })),
-        cursor: { timestamp: '2026-07-10T00:00:01.000Z', id },
+        cursor: {
+          timestamp: '2026-07-10T00:00:01.000Z',
+          id,
+          sequence: coveredIds.length,
+        },
       },
     }),
   );
@@ -121,6 +126,28 @@ describe('startup typed IPC delivery recovery', () => {
       'm2',
     ]);
     expect(recovered[0].cursor.id).toBe('m2');
+    expect(recovered[0].cursor.sequence).toBe(2);
     expect(fs.existsSync(deliveryFile)).toBe(false);
+  });
+
+  test('treats a Runner crash claim as the same durable startup delivery', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ipc-startup-claim-'));
+    roots.push(root);
+    const claimedFile = path.join(
+      root,
+      'folder',
+      'agents',
+      'agent-1',
+      'input',
+      'pending.json.happyclaw-claimed-123-1-test',
+    );
+    writeDelivery(claimedFile, 'web:main#agent:agent-1', 'a1');
+
+    const recovered = discardStartupTypedIpcDeliveries(root);
+
+    expect(recovered.map((receipt) => receipt.deliveryId)).toEqual([
+      'delivery-a1',
+    ]);
+    expect(fs.existsSync(claimedFile)).toBe(false);
   });
 });

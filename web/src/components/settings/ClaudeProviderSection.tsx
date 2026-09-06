@@ -19,20 +19,38 @@ interface ClaudeProviderSectionProps {
   setError: (msg: string | null) => void;
 }
 
+export function createBalancingMutationQueue() {
+  let tail: Promise<void> = Promise.resolve();
+
+  return function enqueue<T>(request: () => Promise<T>): Promise<T> {
+    const operation = tail.then(request);
+    tail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  };
+}
+
 export function ClaudeProviderSection({
   setNotice,
   setError,
 }: ClaudeProviderSectionProps) {
   const [providers, setProviders] = useState<ProviderWithHealth[]>([]);
   const enabledCount = providers.filter((provider) => provider.enabled).length;
-  const [defaultProviderId, setDefaultProviderId] = useState<string | null>(
-    null,
-  );
   const [balancing, setBalancing] = useState<BalancingConfig | null>(null);
+  const balancingRef = useRef<BalancingConfig | null>(null);
+  const balancingRevisionRef = useRef(0);
+  const balancingPendingRef = useRef(0);
+  const balancingQueueRef = useRef<ReturnType<
+    typeof createBalancingMutationQueue
+  > | null>(null);
+  balancingQueueRef.current ??= createBalancingMutationQueue();
 
   const [loading, setLoading] = useState(true);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [balancingSaving, setBalancingSaving] = useState(false);
 
   // 编辑器状态
   const [editorOpen, setEditorOpen] = useState(false);
@@ -53,7 +71,7 @@ export function ClaudeProviderSection({
         '/api/config/claude/providers',
       );
       setProviders(data.providers);
-      setDefaultProviderId(data.defaultProviderId);
+      balancingRef.current = data.balancing;
       setBalancing(data.balancing);
     } catch (err) {
       setError(getErrorMessage(err, '加载模型配置列表失败'));
@@ -145,25 +163,6 @@ export function ClaudeProviderSection({
     [loadProviders, setNotice, setError],
   );
 
-  const handleSetDefault = useCallback(
-    async (provider: ProviderWithHealth) => {
-      setTogglingId(provider.id);
-      try {
-        await api.put('/api/config/claude/default', {
-          providerId: provider.id,
-        });
-        await loadProviders();
-        setNotice(`已将「${provider.name}」设为系统默认模型`);
-      } catch (err) {
-        await loadProviders().catch(() => {});
-        setError(getErrorMessage(err, '设置默认模型失败'));
-      } finally {
-        setTogglingId(null);
-      }
-    },
-    [loadProviders, setError, setNotice],
-  );
-
   // ─── 删除提供商 ───────────────────────────────────────────────
   const handleDeleteConfirm = useCallback(async () => {
     if (!pendingDeleteProvider) return;
@@ -207,22 +206,43 @@ export function ClaudeProviderSection({
   // ─── 更新负载均衡设置 ─────────────────────────────────────────
   const handleBalancingChange = useCallback(
     async (updates: Partial<BalancingConfig>) => {
-      if (!balancing) return;
-      const next = { ...balancing, ...updates };
-      setBalancing(next); // 乐观更新；失败时 loadProviders 会拉回真实值
+      const current = balancingRef.current;
+      if (!current) return;
+      const next = { ...current, ...updates };
+      const revision = ++balancingRevisionRef.current;
+      balancingRef.current = next;
+      setBalancing(next);
+      balancingPendingRef.current += 1;
+      setBalancingSaving(true);
+
       try {
-        const saved = await api.put<BalancingConfig>(
-          '/api/config/claude/balancing',
-          next,
+        // Serialize full-snapshot PUTs so the server cannot persist them in a
+        // different order. The revision guard also prevents a stale response
+        // from replacing a newer optimistic value in the UI.
+        const saved = await balancingQueueRef.current!(() =>
+          api.put<BalancingConfig>('/api/config/claude/balancing', next),
         );
-        setBalancing(saved);
-        setNotice('负载均衡设置已更新');
+        if (revision === balancingRevisionRef.current) {
+          balancingRef.current = saved;
+          setBalancing(saved);
+          setNotice('负载均衡设置已更新');
+        }
       } catch (err) {
-        await loadProviders().catch(() => {});
-        setError(getErrorMessage(err, '更新负载均衡设置失败'));
+        if (revision === balancingRevisionRef.current) {
+          await loadProviders().catch(() => {});
+          setError(getErrorMessage(err, '更新负载均衡设置失败'));
+        }
+      } finally {
+        balancingPendingRef.current = Math.max(
+          0,
+          balancingPendingRef.current - 1,
+        );
+        if (balancingPendingRef.current === 0) {
+          setBalancingSaving(false);
+        }
       }
     },
-    [balancing, loadProviders, setNotice, setError],
+    [loadProviders, setNotice, setError],
   );
 
   // ─── 编辑器回调 ───────────────────────────────────────────────
@@ -237,7 +257,8 @@ export function ClaudeProviderSection({
     setEditingProvider(null);
   }, []);
 
-  const busy = loading || togglingId !== null || deletingId !== null;
+  const busy =
+    loading || togglingId !== null || deletingId !== null || balancingSaving;
 
   if (loading && providers.length === 0) {
     return (
@@ -252,7 +273,6 @@ export function ClaudeProviderSection({
       {/* 提供商列表 */}
       <ProviderList
         providers={providers}
-        defaultProviderId={defaultProviderId}
         onEdit={(p) => {
           setEditingProvider(p);
           setEditorOpen(true);
@@ -260,7 +280,6 @@ export function ClaudeProviderSection({
         onDelete={(p) => setPendingDeleteProvider(p)}
         onToggle={handleToggle}
         onResetHealth={handleResetHealth}
-        onSetDefault={handleSetDefault}
         onDuplicate={handleDuplicate}
         onAdd={() => {
           setEditingProvider(null);
@@ -277,6 +296,7 @@ export function ClaudeProviderSection({
           balancing={balancing}
           onChange={handleBalancingChange}
           disabled={busy}
+          saving={balancingSaving}
         />
       )}
 

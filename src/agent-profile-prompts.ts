@@ -2,14 +2,6 @@ import type { AgentProfilePromptMode, AgentProfilePrompts } from './types.js';
 
 export const AGENT_PROMPT_SECTION_MAX_LENGTH = 20_000;
 
-export const EMPTY_AGENT_PROFILE_PROMPTS: AgentProfilePrompts = {
-  identity_prompt: '',
-  soul_prompt: '',
-  agents_prompt: '',
-  tools_prompt: '',
-  prompt_mode: 'append',
-};
-
 export function promptModeFromLegacyPreset(
   includeClaudePreset: boolean | undefined,
 ): AgentProfilePromptMode {

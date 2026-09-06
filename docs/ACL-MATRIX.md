@@ -36,16 +36,17 @@
 
 ## 2. Public 接口
 
-| 路由                            | 方法 | 附加条件               |
-| ------------------------------- | ---- | ---------------------- |
-| `/api/auth/status`              | GET  | 无                     |
-| `/api/auth/setup`               | POST | 仅用户表为空           |
-| `/api/auth/login`               | POST | 登录限流               |
-| `/api/auth/register/status`     | GET  | 无                     |
-| `/api/auth/register`            | POST | 注册策略、邀请码、限流 |
-| `/api/auth/avatars/:filename`   | GET  | 仅允许受管头像路径     |
-| `/api/config/appearance/public` | GET  | 只返回公开外观         |
-| `/api/health`                   | GET  | 不返回敏感运行详情     |
+| 路由                                 | 方法 | 附加条件               |
+| ------------------------------------ | ---- | ---------------------- |
+| `/api/auth/status`                   | GET  | 无                     |
+| `/api/auth/setup`                    | POST | 仅用户表为空           |
+| `/api/auth/login`                    | POST | 登录限流               |
+| `/api/auth/register/status`          | GET  | 无                     |
+| `/api/auth/register`                 | POST | 注册策略、邀请码、限流 |
+| `/api/auth/avatars/:filename`        | GET  | 仅允许受管头像路径     |
+| `/api/config/appearance/public`      | GET  | 只返回公开外观         |
+| `/api/config/brand-assets/:filename` | GET  | 仅允许受管品牌资源名   |
+| `/api/health`                        | GET  | 不返回敏感运行详情     |
 
 `/ws` 不是 Public。Upgrade 时必须同时通过 Cookie Session 与 Origin 校验。
 
@@ -208,6 +209,8 @@ read-only 投影按 host-issued turn ID 精确匹配当前或已接纳的 queued
 | `/api/billing/admin/*`                            | `manage_billing`                                   |
 | `/api/docker/pull`、运行监控管理                  | `manage_system_config`                             |
 | `/api/status/channel-outbox/*` 人工裁决           | `manage_system_config`                             |
+| 系统外观读写（`GET/PUT /api/config/appearance`）  | `manage_system_config`                             |
+| 品牌资源上传/删除（图标、横幅头像文件写入）       | admin（`adminRoleMiddleware`）                     |
 | `POST /api/groups/:jid/reset-owner`               | admin break-glass，同时仍验证目标资源              |
 
 系统 MCP 默认仅 admin 可用；只有显式设置为 shared 后，普通成员的 Agent 才能进入
@@ -257,17 +260,18 @@ Owner Claim：
 命令由主进程 `handleCommand()` 处理，不经过 Web Middleware，但使用渠道 sender ID
 执行独立 Owner Gate。
 
-| 命令                                 | 权限                                         |
-| ------------------------------------ | -------------------------------------------- |
-| `/list`、`/ls`、`/status`、`/where`  | 只读                                         |
-| `/recall`、`/rc`                     | 只读，带节流                                 |
-| `/allowlist`                         | 只读                                         |
-| `/clear`、`/bind`、`/unbind`、`/new` | IM Owner                                     |
-| `/sw`、`/spawn`                      | IM Owner                                     |
-| `/release_owner`                     | IM Owner                                     |
-| `/owner_mention`                     | 未认领群的 bootstrap，不可被 Owner Gate 锁死 |
-| `/allow`、`/disallow`                | Handler 内检查 IM Owner                      |
-| `/require_mention`                   | Handler 内按当前 owner/策略检查              |
+| 命令                                 | 权限                                              |
+| ------------------------------------ | ------------------------------------------------- |
+| `/list`、`/ls`、`/status`、`/where`  | 只读                                              |
+| `/recall`、`/rc`                     | 只读，带节流                                      |
+| `/allowlist`                         | 只读                                              |
+| `/clear`、`/bind`、`/unbind`、`/new` | IM Owner                                          |
+| `/sw`、`/spawn`                      | IM Owner                                          |
+| `/release_owner`                     | IM Owner                                          |
+| `/owner_mention`                     | 未认领群的 bootstrap，不可被 Owner Gate 锁死      |
+| `/allow`、`/disallow`                | Handler 内检查 IM Owner                           |
+| `/require_mention`                   | Handler 内按当前 owner/策略检查                   |
+| 飞书 `/steer <消息>`、`/break`       | 必须结构化真实 @Bot，并通过当前 audience/激活策略 |
 
 不同 Provider 的原生 sender ID namespace 不得混用。例如 QQ C2C 与 Group 使用不同
 ID 空间；owner 比对必须使用渠道适配器传入的规范化 ID。

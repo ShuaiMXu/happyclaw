@@ -50,6 +50,7 @@ async function startRunner(
   options: {
     containerName?: string | null;
     feishuCliAccountId?: string | null;
+    interactionMode?: 'assistant' | 'proactive';
   } = {},
 ): Promise<void> {
   queue.enqueueMessageCheck(JID);
@@ -67,6 +68,7 @@ async function startRunner(
       containerName: options.containerName ?? null,
       groupFolder: FOLDER,
       feishuCliAccountId: options.feishuCliAccountId,
+      interactionMode: options.interactionMode,
     },
   );
 }
@@ -107,6 +109,66 @@ afterEach(async () => {
 });
 
 describe('GroupQueue IPC delivery receipts', () => {
+  test('closes the runner boot window when an incompatible suffix is already queued', async () => {
+    queue.enqueueMessageCheck(JID);
+    await tick();
+    // Simulates processGroupMessages splitting the durable input prefix before
+    // onProcess has registered the child/input directory.
+    queue.enqueueMessageCheck(JID);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
+
+    queue.registerProcess(JID, { killed: false, kill: () => true } as never, {
+      containerName: null,
+      groupFolder: FOLDER,
+      interactionMode: 'assistant',
+    });
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(true);
+  });
+
+  test('drains a warm runner before injecting another interaction contract', async () => {
+    await startRunner({ interactionMode: 'assistant' });
+
+    expect(queue.requiresInteractionModeRestart(JID, 'proactive')).toBe(true);
+    expect(
+      queue.sendMessage(
+        JID,
+        'proactive scheduled prompt',
+        undefined,
+        undefined,
+        JID,
+        'task-proactive',
+        undefined,
+        undefined,
+        undefined,
+        { interactionMode: 'proactive' },
+      ),
+    ).toBe('no_active');
+    expect(readPayloads()).toEqual([]);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(true);
+  });
+
+  test('accepts a warm scheduled prompt with the runner frozen mode', async () => {
+    await startRunner({ interactionMode: 'proactive' });
+
+    expect(queue.requiresInteractionModeRestart(JID, 'proactive')).toBe(false);
+    expect(
+      queue.sendMessage(
+        JID,
+        'proactive scheduled prompt',
+        undefined,
+        undefined,
+        JID,
+        'task-proactive',
+        undefined,
+        undefined,
+        undefined,
+        { interactionMode: 'proactive' },
+      ),
+    ).toBe('sent');
+    expect(readPayloads()).toHaveLength(1);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
+  });
+
   test('restarts a container before switching the injected Feishu Bot', async () => {
     await startRunner({
       containerName: 'happyclaw-bot-a',
@@ -331,6 +393,50 @@ describe('GroupQueue IPC delivery receipts', () => {
     expect(committedId).toBe('m2');
   });
 
+  test('removes a Runner claim before committing its healthy receipt', async () => {
+    await startRunner();
+    const receipt = inject('claim-cleanup');
+    const original = fs
+      .readdirSync(inputDir())
+      .find((name) => name.endsWith('.json'))!;
+    const claim = path.join(
+      inputDir(),
+      `${original}.happyclaw-claimed-123-1-test`,
+    );
+    fs.renameSync(path.join(inputDir(), original), claim);
+    const commit = vi.fn(() => {
+      expect(fs.existsSync(claim)).toBe(false);
+    });
+
+    queue.acknowledgeIpcDeliveries(JID, [receipt], commit);
+
+    expect(commit).toHaveBeenCalledWith([receipt]);
+    expect(fs.existsSync(claim)).toBe(false);
+  });
+
+  test('does not commit a healthy receipt when the IPC directory cannot be listed', async () => {
+    await startRunner();
+    const receipt = inject('claim-list-failure');
+    const commit = vi.fn();
+    const listError = Object.assign(new Error('permission denied'), {
+      code: 'EACCES',
+    });
+    const readdir = vi.spyOn(fs, 'readdirSync').mockImplementationOnce(() => {
+      throw listError;
+    });
+
+    expect(() =>
+      queue.acknowledgeIpcDeliveries(JID, [receipt], commit),
+    ).toThrow(/Failed to remove acknowledged IPC claim/);
+    expect(commit).not.toHaveBeenCalled();
+
+    readdir.mockRestore();
+    expect(queue.flushAcknowledgedIpcDeliveries(JID, commit)).toEqual([
+      receipt,
+    ]);
+    expect(commit).toHaveBeenCalledWith([receipt]);
+  });
+
   test('preserves each covered input provider route across accounts and channels', async () => {
     await startRunner();
     const coveredCursors = [
@@ -369,6 +475,28 @@ describe('GroupQueue IPC delivery receipts', () => {
         chatJid: JID,
         coveredCursors: [cursor('m2')],
         cursor: cursor('m1'),
+      }),
+    ).toBe('no_active');
+    expect(readPayloads()).toEqual([]);
+  });
+
+  test('rejects a mixed or mismatched ingest sequence receipt', async () => {
+    await startRunner();
+    const first = { ...cursor('m1'), sequence: 10 };
+    const second = { ...cursor('m2'), sequence: 11 };
+
+    expect(
+      queue.sendMessage(JID, 'invalid', undefined, undefined, JID, undefined, {
+        chatJid: JID,
+        coveredCursors: [first, second],
+        cursor: { ...second, sequence: 99 },
+      }),
+    ).toBe('no_active');
+    expect(
+      queue.sendMessage(JID, 'mixed', undefined, undefined, JID, undefined, {
+        chatJid: JID,
+        coveredCursors: [first, cursor('m2')],
+        cursor: cursor('m2'),
       }),
     ).toBe('no_active');
     expect(readPayloads()).toEqual([]);

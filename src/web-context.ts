@@ -9,15 +9,13 @@ import {
 } from './group-queue.js';
 import type {
   AuthUser,
+  AgentKind,
+  AgentStatus,
   NewMessage,
   MessageCursor,
   UserSessionWithUser,
 } from './types.js';
-import {
-  getJidsByFolder,
-  getRegisteredGroup,
-  getSessionWithUser,
-} from './db.js';
+import { getSessionWithUser } from './db.js';
 import type { WhatsAppConnectionState } from './whatsapp.js';
 import type { ChannelAccount } from './types.js';
 import type { ChannelAccountSecret } from './channel-account-secrets.js';
@@ -239,6 +237,29 @@ export interface WebDeps {
     messageId: string,
     expectedRunId: string,
   ) => FollowUpActionResult;
+  /** Web projection is injected so route modules do not import the Web gateway. */
+  broadcastNewMessage?: (
+    chatJid: string,
+    message: NewMessage & { is_from_me?: boolean },
+    agentId?: string,
+    source?: string,
+  ) => void;
+  broadcastMessageDeleted?: (chatJid: string, messageId: string) => void;
+  broadcastAgentStatus?: (
+    chatJid: string,
+    agentId: string,
+    status: AgentStatus,
+    name: string,
+    prompt: string,
+    resultSummary?: string,
+    kind?: AgentKind,
+    titleGenerating?: boolean,
+  ) => void;
+  broadcastAgentRemoved?: (
+    chatJid: string,
+    agentId: string,
+    name: string,
+  ) => void;
 }
 
 export type Variables = {
@@ -248,13 +269,69 @@ export type Variables = {
 
 let deps: WebDeps | null = null;
 export const wsClients = new Map<WebSocket, WsClientInfo>();
-export const MAX_GROUP_NAME_LEN = 40;
-
 export function setWebDeps(d: WebDeps): void {
   deps = d;
 }
 export function getWebDeps(): WebDeps | null {
   return deps;
+}
+
+function missingProjection(name: string): never {
+  throw new Error(`Web projection is not initialized: ${name}`);
+}
+
+export function projectWebNewMessage(
+  chatJid: string,
+  message: NewMessage & { is_from_me?: boolean },
+  agentId?: string,
+  source?: string,
+): void {
+  const project = deps?.broadcastNewMessage;
+  if (!project) missingProjection('broadcastNewMessage');
+  project(chatJid, message, agentId, source);
+}
+
+export function projectWebMessageDeleted(
+  chatJid: string,
+  messageId: string,
+): void {
+  const project = deps?.broadcastMessageDeleted;
+  if (!project) missingProjection('broadcastMessageDeleted');
+  project(chatJid, messageId);
+}
+
+export function projectWebAgentStatus(
+  chatJid: string,
+  agentId: string,
+  status: AgentStatus,
+  name: string,
+  prompt: string,
+  resultSummary?: string,
+  kind?: AgentKind,
+  titleGenerating?: boolean,
+): void {
+  const project = deps?.broadcastAgentStatus;
+  if (!project) missingProjection('broadcastAgentStatus');
+  project(
+    chatJid,
+    agentId,
+    status,
+    name,
+    prompt,
+    resultSummary,
+    kind,
+    titleGenerating,
+  );
+}
+
+export function projectWebAgentRemoved(
+  chatJid: string,
+  agentId: string,
+  name: string,
+): void {
+  const project = deps?.broadcastAgentRemoved;
+  if (!project) missingProjection('broadcastAgentRemoved');
+  project(chatJid, agentId, name);
 }
 
 // lastActiveCache - 5 min debounce for session activity tracking
@@ -346,74 +423,4 @@ export function isHostExecutionGroup(group: RegisteredGroup): boolean {
 
 export function hasHostExecutionPermission(user: AuthUser): boolean {
   return user.role === 'admin';
-}
-
-/**
- * Check if a user can access (view messages, send messages to) a group.
- * All users (including admin) follow the same visibility rules:
- * - is_home groups → only the owner (created_by) can access
- * - IM groups → only the owner
- * - Web groups → only the creator
- */
-export function canAccessGroup(
-  user: { id: string; role: UserRole },
-  group: RegisteredGroup & { jid: string },
-): boolean {
-  if (group.is_home) return group.created_by === user.id;
-  // IM groups: check ownership if created_by is set.
-  // For legacy rows without created_by, resolve owner from sibling home group.
-  if (!group.jid.startsWith('web:')) {
-    if (group.created_by === user.id) return true;
-    if (group.created_by) return false;
-    const siblingJids = getJidsByFolder(group.folder);
-    for (const jid of siblingJids) {
-      if (jid === group.jid) continue;
-      const sibling = getRegisteredGroup(jid);
-      if (sibling?.is_home && sibling.created_by) {
-        return sibling.created_by === user.id;
-      }
-    }
-    // Ownership cannot be resolved for this IM group → deny by default.
-    return false;
-  }
-  return group.created_by === user.id;
-}
-
-/**
- * Check if a user can modify (rename, reset) a group.
- * - Users can modify their own home group.
- * - Users can modify web groups they created.
- * - IM groups can be modified by their owner (created_by).
- */
-export function canModifyGroup(
-  user: { id: string; role: UserRole },
-  group: RegisteredGroup & { jid: string },
-): boolean {
-  if (group.is_home) return group.created_by === user.id;
-  if (!group.jid.startsWith('web:')) {
-    if (group.created_by) return group.created_by === user.id;
-    // Sibling home group fallback for legacy IM groups auto-bound to a home folder.
-    const siblingJids = getJidsByFolder(group.folder);
-    for (const jid of siblingJids) {
-      if (jid === group.jid) continue;
-      const sibling = getRegisteredGroup(jid);
-      if (sibling?.is_home && sibling.created_by) {
-        return sibling.created_by === user.id;
-      }
-    }
-    return false;
-  }
-  return group.created_by === user.id;
-}
-
-/**
- * Check if a user can delete a group.
- * - is_home groups cannot be deleted by anyone.
- */
-export function canDeleteGroup(
-  user: { id: string; role: UserRole },
-  group: RegisteredGroup & { jid: string },
-): boolean {
-  if (group.is_home) return false;
-  return canModifyGroup(user, group);
 }

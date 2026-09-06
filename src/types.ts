@@ -43,6 +43,19 @@ export type ImBindingMode = 'single_context' | 'thread_map';
 export type ChannelRoutingMode = 'single_session' | 'thread_map';
 export type AudienceMode = 'everyone' | 'owner_only';
 
+/** Provider-proven relation between two physical inbound messages. */
+export interface ChannelContentLink {
+  kind: 'forward_bundle' | 'rapid_topic_bundle';
+  /** Stable identity for one forward operation, normally its root message id. */
+  bundleId: string;
+  role: 'forwarded_content' | 'forwarder_comment';
+  relatedMessageId?: string;
+  /** The host resolved the complete provider material and may reuse it. */
+  materialResolved?: boolean;
+  /** Product fallback when an admitted forward receives no authored note. */
+  defaultAction?: 'summarize';
+}
+
 /**
  * Provider-fetched context for a message referenced by the current inbound
  * turn. The text is prompt-only metadata: `NewMessage.content` remains scoped
@@ -52,6 +65,10 @@ export interface ChannelReferencedMessage {
   id: string;
   sender?: string;
   text: string;
+  /** Structural relation asserted by the provider adapter, never inferred from text. */
+  contentLink?: ChannelContentLink;
+  /** Provider material was fetched beyond a placeholder-only forward shell. */
+  materialResolved?: boolean;
   /** Prompt hints for referenced files/images that were materialized locally. */
   attachmentHints?: string[];
   /**
@@ -97,6 +114,8 @@ export interface ChannelTurnContext {
     parentId?: string;
     threadId?: string;
     type?: string;
+    /** Structural relation asserted by the provider adapter. */
+    contentLink?: ChannelContentLink;
     referencedMessages?: ChannelReferencedMessage[];
   };
   sender?: {
@@ -178,8 +197,9 @@ export interface RegisteredGroup {
   target_agent_id?: string;
   /**
    * Binding target stored as the canonical workspace JID.
-   * - group chats: the workspace itself owns the channel context;
-   * - direct chats: the workspace's main session owns the channel context.
+   * Group chats own the workspace main context. Direct chats must not use
+   * this slot — they bind through `target_agent_id` so they do not share
+   * the workspace main channel-owner key with a group.
    */
   target_main_jid?: string;
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
@@ -216,6 +236,7 @@ export type ChannelProvider =
   | 'telegram'
   | 'qq'
   | 'wechat'
+  | 'wecom'
   | 'dingtalk'
   | 'discord'
   | 'whatsapp';
@@ -403,6 +424,8 @@ export interface AgentBuilderDraft {
 export interface NewMessage {
   id: string;
   chat_jid: string;
+  /** Host-assigned durable arrival order. Provider clocks never participate. */
+  ingest_sequence?: number;
   source_jid?: string;
   sender: string;
   sender_name: string;
@@ -429,11 +452,20 @@ export interface NewMessage {
 
 export type FollowUpMode = 'queue' | 'steer';
 
-export type FollowUpStatus = 'queued' | 'promoting' | 'released' | 'cancelled';
+export type FollowUpStatus =
+  | 'queued'
+  | 'promoting'
+  | 'released'
+  | 'cancelled'
+  /** Forward material is visible but intentionally held for a companion note. */
+  | 'awaiting_companion'
+  /** Preserved in history, but already delivered through a linked physical input. */
+  | 'subsumed';
 
 export interface QueuedFollowUp {
   id: string;
   chat_jid: string;
+  ingest_sequence?: number;
   source_jid?: string;
   sender: string;
   sender_name: string;
@@ -474,6 +506,12 @@ export type MessageSourceKind =
   | 'sdk_send_message'
   | 'proactive_sdk_fallback'
   | 'input_rejection_warning'
+  /**
+   * Standalone notice that the primary model hit a model-scope wall and the
+   * turn is being answered by the configured fallback model instead. Like
+   * 'input_rejection_warning' it is an out-of-band notice, never the answer.
+   */
+  | 'provider_fallback_notice'
   | 'interrupt_partial'
   | 'overflow_partial'
   | 'compact_partial'
@@ -502,6 +540,8 @@ export interface MessageAttachment {
 export interface MessageCursor {
   timestamp: string;
   id: string;
+  /** Durable host ingest position. Missing only on legacy persisted cursors. */
+  sequence?: number;
 }
 
 export interface ScheduledTask {
@@ -560,6 +600,7 @@ export type TaskRunNotificationStatus =
   | 'success'
   | 'partial_failed'
   | 'failed'
+  | 'uncertain'
   | 'skipped';
 
 export interface TaskRunNotificationSummary {
@@ -567,6 +608,9 @@ export interface TaskRunNotificationSummary {
   succeeded: number;
   failed: number;
   failed_channels: string[];
+  /** Subset of failed attempts whose provider acceptance is unknown. */
+  uncertain?: number;
+  uncertain_channels?: string[];
 }
 
 export interface TaskRunNotificationReceipt {
@@ -589,6 +633,13 @@ export interface TaskRunDefinitionSnapshot {
   execution_mode: 'host' | 'container' | null;
   script_command: string | null;
   notify_channels: string[] | null;
+  /**
+   * Delivery contract frozen when a group-mode occurrence crosses the durable
+   * workspace-prompt hand-off.  It is intentionally absent on historical and
+   * isolated runs; consumers fall back to the workspace mode only for those
+   * legacy rows.
+   */
+  interaction_mode?: InteractionMode;
 }
 
 /** Durable state for one scheduled/manual occurrence. */
@@ -812,7 +863,13 @@ export interface SubAgent {
   last_im_jid: string | null;
   /** 发起 /spawn 命令的源会话 JID，用于完成后结果回注 */
   spawned_from_jid: string | null;
-  source_kind?: 'manual' | 'native_thread' | 'feishu_thread' | 'auto_im' | null;
+  source_kind?:
+    | 'manual'
+    | 'native_thread'
+    | 'feishu_thread'
+    | 'auto_im'
+    | 'channel_direct'
+    | null;
   thread_id?: string | null;
   root_message_id?: string | null;
   title_source?:
@@ -862,6 +919,15 @@ export type WsMessageOut =
       message: NewMessage & { is_from_me: boolean };
       agentId?: string;
       source?: string;
+    }
+  | {
+      type: 'message_deleted';
+      /** Workspace JID used to route the event in the Web client. */
+      chatJid: string;
+      /** Exact composite-key chat_jid of the deleted SQLite row. */
+      messageChatJid: string;
+      messageId: string;
+      agentId?: string;
     }
   | {
       type: 'agent_reply';
@@ -1179,13 +1245,6 @@ export interface RedeemCode {
   notes: string | null;
   batch_id: string | null;
   created_at: string;
-}
-
-export interface RedeemCodeUsage {
-  id: number;
-  code: string;
-  user_id: string;
-  redeemed_at: string;
 }
 
 export type BillingAuditEventType =

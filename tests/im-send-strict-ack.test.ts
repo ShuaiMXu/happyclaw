@@ -3,6 +3,9 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { retryUnscopedImSend } from '../src/im-send-retry-policy.js';
+import { settleTaskNotificationDeliveries } from '../src/task-notification.js';
+
 const controls = vi.hoisted(() => ({
   feishuMessageCreate: vi.fn(),
   feishuMessageReply: vi.fn(),
@@ -161,6 +164,15 @@ async function connectedTransports() {
   return { feishu, telegram };
 }
 
+function feishuHttp400(message = 'provider rejected image') {
+  return Object.assign(new Error(message), {
+    response: {
+      status: 400,
+      data: { code: 230001, msg: message },
+    },
+  });
+}
+
 describe('IM strict send acknowledgement', () => {
   test('Feishu native presentation uses post while default keeps interactive cards', async () => {
     const { feishu } = await connectedTransports();
@@ -196,6 +208,277 @@ describe('IM strict send acknowledgement', () => {
       receive_id: 'oc_1',
       msg_type: 'interactive',
     });
+  });
+
+  test.each([
+    ['generated card', 'normal markdown'],
+    [
+      'prebuilt card',
+      JSON.stringify({ type: 'interactive', card: { body: { elements: [] } } }),
+    ],
+  ])(
+    'Feishu %s accepted-timeout never falls back to a second post',
+    async (_label, text) => {
+      const { feishu } = await connectedTransports();
+      const acceptedTimeout = Object.assign(
+        new Error('interactive create ACK timed out after acceptance'),
+        { code: 'ETIMEDOUT' },
+      );
+      controls.feishuMessageCreate.mockRejectedValueOnce(acceptedTimeout);
+
+      const result = await retryUnscopedImSend(
+        () => feishu.sendMessage('oc_1', text),
+        { sleep: async () => {} },
+      );
+
+      expect(result).toMatchObject({ ok: false, outcome: 'uncertain' });
+      expect(controls.feishuMessageCreate).toHaveBeenCalledOnce();
+      expect(controls.feishuMessageCreate.mock.calls[0][0].data).toMatchObject({
+        msg_type: 'interactive',
+      });
+    },
+  );
+
+  test('Feishu explicit interactive rejection may safely fall back to one post', async () => {
+    const { feishu } = await connectedTransports();
+    controls.feishuMessageCreate.mockResolvedValueOnce({
+      code: 230001,
+      msg: 'card format rejected',
+    });
+
+    await expect(feishu.sendMessage('oc_1', 'fallback body')).resolves.toBe(
+      undefined,
+    );
+
+    expect(controls.feishuMessageCreate).toHaveBeenCalledTimes(2);
+    expect(
+      controls.feishuMessageCreate.mock.calls.map(
+        (call) => call[0].data.msg_type,
+      ),
+    ).toEqual(['interactive', 'post']);
+  });
+
+  test('Feishu missing interactive acknowledgement is uncertain and never format-falls back', async () => {
+    const { feishu } = await connectedTransports();
+    controls.feishuMessageCreate.mockResolvedValueOnce({});
+
+    const result = await retryUnscopedImSend(
+      () => feishu.sendMessage('oc_1', 'missing ACK'),
+      { sleep: async () => {} },
+    );
+
+    expect(result).toMatchObject({ ok: false, outcome: 'uncertain' });
+    expect(controls.feishuMessageCreate).toHaveBeenCalledOnce();
+    expect(controls.feishuMessageCreate.mock.calls[0][0].data.msg_type).toBe(
+      'interactive',
+    );
+  });
+
+  test('Feishu text ACK plus image HTTP 400 is partial and creates no task retry payload', async () => {
+    const { feishu } = await connectedTransports();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-partial-'));
+    const imagePath = path.join(tempDir, 'image.png');
+    await fs.writeFile(imagePath, 'image');
+    cleanup.push(() => fs.rm(tempDir, { recursive: true, force: true }));
+    controls.feishuImageCreate.mockRejectedValueOnce(feishuHttp400());
+
+    const transport = await retryUnscopedImSend(
+      () => feishu.sendMessage('oc_1', 'scheduled result', [imagePath]),
+      { sleep: async () => {} },
+    );
+    const payload = {
+      kind: 'im_message' as const,
+      targetJid: 'feishu:oc_1',
+      text: 'scheduled result',
+      localImagePaths: [imagePath],
+    };
+    const settled = await settleTaskNotificationDeliveries([
+      {
+        channel: 'feishu',
+        payload,
+        failure: {
+          error: transport.error,
+          outcome:
+            transport.outcome === 'delivered' ? undefined : transport.outcome,
+        },
+        deliver: async () => transport.ok,
+      },
+    ]);
+
+    expect(transport).toMatchObject({
+      ok: false,
+      outcome: 'uncertain',
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 1,
+        totalOutputs: 2,
+      },
+    });
+    expect(settled.receipt.status).toBe('uncertain');
+    expect(settled.retryPayload).toBeUndefined();
+    expect(controls.feishuMessageCreate).toHaveBeenCalledOnce();
+    expect(controls.feishuMessageCreate.mock.calls[0][0].data.msg_type).toBe(
+      'interactive',
+    );
+  });
+
+  test('Feishu tracks body plus each acknowledged image before a later attachment failure', async () => {
+    const { feishu } = await connectedTransports();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-partial-'));
+    const imagePaths = [
+      path.join(tempDir, 'first.png'),
+      path.join(tempDir, 'second.png'),
+    ];
+    await Promise.all(imagePaths.map((item) => fs.writeFile(item, 'image')));
+    cleanup.push(() => fs.rm(tempDir, { recursive: true, force: true }));
+    controls.feishuImageCreate
+      .mockResolvedValueOnce({ image_key: 'img_first' })
+      .mockRejectedValueOnce(feishuHttp400('second image rejected'));
+
+    await expect(
+      feishu.sendMessage('oc_1', 'body', imagePaths),
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      deliveredOutputs: 2,
+      totalOutputs: 3,
+    });
+    expect(
+      controls.feishuMessageCreate.mock.calls.map(
+        (call) => call[0].data.msg_type,
+      ),
+    ).toEqual(['interactive', 'image']);
+  });
+
+  test('Feishu missing local image after body ACK is partial before upload starts', async () => {
+    const { feishu } = await connectedTransports();
+    const missingPath = path.join(
+      os.tmpdir(),
+      `missing-feishu-image-${Date.now()}.png`,
+    );
+
+    await expect(
+      feishu.sendMessage('oc_1', 'body', [missingPath]),
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      deliveredOutputs: 1,
+      totalOutputs: 2,
+    });
+    expect(controls.feishuMessageCreate).toHaveBeenCalledOnce();
+    expect(controls.feishuImageCreate).not.toHaveBeenCalled();
+  });
+
+  test('Feishu image-message timeout after body ACK is partial without connector replay', async () => {
+    const { feishu } = await connectedTransports();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-partial-'));
+    const imagePath = path.join(tempDir, 'image.png');
+    await fs.writeFile(imagePath, 'image');
+    cleanup.push(() => fs.rm(tempDir, { recursive: true, force: true }));
+    controls.feishuMessageCreate
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_body' } })
+      .mockRejectedValueOnce(
+        Object.assign(new Error('image create ACK timed out'), {
+          code: 'ETIMEDOUT',
+        }),
+      );
+
+    const result = await retryUnscopedImSend(
+      () => feishu.sendMessage('oc_1', 'body', [imagePath]),
+      { sleep: async () => {} },
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      outcome: 'uncertain',
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 1,
+        totalOutputs: 2,
+      },
+    });
+    expect(controls.feishuImageCreate).toHaveBeenCalledOnce();
+    expect(
+      controls.feishuMessageCreate.mock.calls.map(
+        (call) => call[0].data.msg_type,
+      ),
+    ).toEqual(['interactive', 'image']);
+  });
+
+  test('Feishu prebuilt interactive card still delivers requested local images', async () => {
+    const { feishu } = await connectedTransports();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-partial-'));
+    const imagePath = path.join(tempDir, 'image.png');
+    await fs.writeFile(imagePath, 'image');
+    cleanup.push(() => fs.rm(tempDir, { recursive: true, force: true }));
+    const card = JSON.stringify({
+      type: 'interactive',
+      card: { body: { elements: [] } },
+    });
+
+    await expect(
+      feishu.sendMessage('oc_1', card, [imagePath]),
+    ).resolves.toBeUndefined();
+    expect(
+      controls.feishuMessageCreate.mock.calls.map(
+        (call) => call[0].data.msg_type,
+      ),
+    ).toEqual(['interactive', 'image']);
+  });
+
+  test('Feishu image ACK plus rejected caption is partial and never resends the image', async () => {
+    const { feishu } = await connectedTransports();
+    controls.feishuMessageCreate
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_image' } })
+      .mockResolvedValueOnce({ code: 230001, msg: 'caption rejected' });
+
+    const transport = await retryUnscopedImSend(
+      () =>
+        feishu.sendImage('oc_1', Buffer.from('image'), 'image/png', 'caption'),
+      { sleep: async () => {} },
+    );
+
+    expect(transport).toMatchObject({
+      ok: false,
+      outcome: 'uncertain',
+      error: {
+        code: 'CHANNEL_DELIVERY_PARTIAL',
+        deliveredOutputs: 1,
+        totalOutputs: 2,
+      },
+    });
+    expect(controls.feishuImageCreate).toHaveBeenCalledOnce();
+    expect(
+      controls.feishuMessageCreate.mock.calls.map(
+        (call) => call[0].data.msg_type,
+      ),
+    ).toEqual(['image', 'text']);
+  });
+
+  test('Feishu failures before any visible message retain safe retry phases', async () => {
+    const { feishu } = await connectedTransports();
+    controls.feishuImageCreate.mockRejectedValueOnce(
+      feishuHttp400('upload rejected'),
+    );
+
+    const rejected = await retryUnscopedImSend(
+      () => feishu.sendImage('oc_1', Buffer.from('image'), 'image/png'),
+      { sleep: async () => {} },
+    );
+    expect(rejected).toMatchObject({ ok: false, outcome: 'rejected' });
+    expect(controls.feishuImageCreate).toHaveBeenCalledOnce();
+    expect(controls.feishuMessageCreate).not.toHaveBeenCalled();
+
+    const missingFile = await retryUnscopedImSend(
+      () =>
+        feishu.sendFile(
+          'oc_1',
+          path.join(os.tmpdir(), `missing-feishu-file-${Date.now()}`),
+          'missing.txt',
+        ),
+      { sleep: async () => {} },
+    );
+    expect(missingFile).toMatchObject({ ok: false, outcome: 'pre_accept' });
+    expect(controls.feishuFileCreate).not.toHaveBeenCalled();
+    expect(controls.feishuMessageCreate).not.toHaveBeenCalled();
   });
 
   test('Feishu chat inventory reports every visible chat to registration', async () => {
@@ -411,6 +694,26 @@ describe('IM strict send acknowledgement', () => {
     ).rejects.toThrow('document denied');
   });
 
+  test('message create and reply require an explicit code=0 acknowledgement', async () => {
+    const { feishu } = await connectedTransports();
+
+    controls.feishuMessageCreate.mockResolvedValueOnce({});
+    await expect(
+      feishu.sendMessage('oc_1', 'create', undefined, {
+        presentation: 'native',
+      }),
+    ).rejects.toThrow('code=undefined');
+
+    controls.feishuMessageReply.mockResolvedValueOnce({
+      data: { message_id: 'om_unwrapped_reply' },
+    });
+    await expect(
+      feishu.sendMessage('oc_1#root:om_root', 'reply', undefined, {
+        presentation: 'native',
+      }),
+    ).rejects.toThrow('code=undefined');
+  });
+
   test('accepts SDK-unwrapped upload acknowledgements without code=0', async () => {
     const { feishu } = await connectedTransports();
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'strict-im-ack-'));
@@ -439,11 +742,19 @@ describe('IM strict send acknowledgement', () => {
     controls.feishuImageCreate.mockRejectedValue(new Error('upload denied'));
     await expect(
       feishu.sendMessage('oc_1', 'hello', [imagePath]),
-    ).rejects.toThrow('upload denied');
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      deliveredOutputs: 1,
+      totalOutputs: 2,
+    });
 
     controls.telegramSendPhoto.mockRejectedValue(new Error('photo denied'));
     await expect(
       telegram.sendMessage('1', 'hello', [imagePath]),
-    ).rejects.toThrow('photo denied');
+    ).rejects.toMatchObject({
+      code: 'CHANNEL_DELIVERY_PARTIAL',
+      deliveredOutputs: 1,
+      cause: expect.objectContaining({ message: 'photo denied' }),
+    });
   });
 });

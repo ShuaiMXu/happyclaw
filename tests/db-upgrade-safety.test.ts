@@ -149,6 +149,25 @@ describe('database upgrade safety gate', () => {
     afterFailure.close();
 
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = migrationBackups;
+    const backupsBeforeCurrentOnlyRefusal = fs.readdirSync(migrationBackups);
+    expect(() => db.initDatabase({ requireCurrentSchema: true })).toThrow(
+      'Database must already be schema v74',
+    );
+    expect(fs.readdirSync(migrationBackups)).toEqual(
+      backupsBeforeCurrentOnlyRefusal,
+    );
+    const afterCurrentOnlyRefusal = new Database(dbPath, { readonly: true });
+    expect(
+      (
+        afterCurrentOnlyRefusal
+          .prepare(
+            "SELECT value FROM router_state WHERE key = 'schema_version'",
+          )
+          .get() as { value: string }
+      ).value,
+    ).toBe('50');
+    afterCurrentOnlyRefusal.close();
+
     db.initDatabase();
     db.closeDatabase();
     const backupCountAfterRetry = fs.readdirSync(migrationBackups).length;
@@ -171,8 +190,9 @@ describe('schema version head', () => {
     // one assertion that fails when the head moves, forcing whoever bumps it
     // to confirm the matching migration block — and a test covering it —
     // actually landed. Update the literal in the same commit as the migration.
-    // v69: adds Agent-level reasoning effort; see
-    // tests/schema-v69-agent-effort.test.ts for migration coverage.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(69);
+    // v74: introduces the host-owned monotonic message ingest sequence used by
+    // durable consumption and stable Web pagination. See
+    // tests/schema-v74-message-ingest-sequence.test.ts.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(74);
   });
 });

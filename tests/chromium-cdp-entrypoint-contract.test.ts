@@ -22,21 +22,34 @@ describe('managed Chromium CDP contract', () => {
     expect(dockerfile).toContain('ENV HAPPYCLAW_CHROMIUM_CDP_PORT=9222');
     expect(dockerfile).toContain('ENV AGENT_BROWSER_CDP=9222');
 
-    expect(entrypoint).toContain(
-      '--remote-debugging-address="$HAPPYCLAW_CHROMIUM_CDP_HOST"',
-    );
-    expect(entrypoint).toContain(
-      '--remote-debugging-port="$HAPPYCLAW_CHROMIUM_CDP_PORT"',
-    );
+    expect(entrypoint).toContain('--remote-debugging-address="$HOST"');
+    expect(entrypoint).toContain('--remote-debugging-port="$PORT"');
     expect(entrypoint).toContain(
       'export AGENT_BROWSER_CDP="$HAPPYCLAW_CHROMIUM_CDP_PORT"',
     );
   });
 
+  test('starts Chromium only through the first agent-browser invocation', () => {
+    expect(entrypoint).toContain('cat > "$AGENT_BROWSER_WRAPPER"');
+    expect(entrypoint).toContain('happyclaw_startup_metric browser_deferred');
+    expect(entrypoint).toContain('ensure_browser');
+    expect(entrypoint).toContain(
+      'phase=%s elapsed_ms=%s browser_elapsed_ms=%s',
+    );
+    expect(entrypoint.indexOf('ensure_browser')).toBeLessThan(
+      entrypoint.indexOf(
+        '/app/node_modules/agent-browser/bin/agent-browser.js "$@"',
+      ),
+    );
+  });
+
   test('waits for the real HTTP endpoint and cleans up the managed browser', () => {
     expect(entrypoint).toContain('/json/version');
-    expect(entrypoint).toContain('kill "$CHROMIUM_PID"');
-    expect(entrypoint).toContain('wait "$CHROMIUM_PID"');
+    expect(entrypoint).toContain('kill "$chromium_pid"');
+    expect(entrypoint).toContain('wait "$chromium_pid"');
+    expect(entrypoint).toContain(
+      'CHROMIUM_PID_FILE=/tmp/happyclaw-chromium.pid',
+    );
   });
 
   test('does not expose the privileged raw CDP port to the host', () => {

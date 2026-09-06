@@ -210,7 +210,6 @@ export function AgentProfilesPage() {
   const {
     profiles,
     modelConfigs = [],
-    defaultModelConfigId = null,
     loading,
     profilesError,
     loadProfiles,
@@ -1536,10 +1535,8 @@ export function AgentProfilesPage() {
                           </SelectTrigger>
                           <SelectContent>
                             <SelectItem value="inherit">
-                              跟随系统默认
-                              {defaultModelConfigId
-                                ? `（${modelConfigs.find((item) => item.id === defaultModelConfigId)?.name ?? '当前默认'}）`
-                                : '（尚未配置）'}
+                              自动选择已启用模型
+                              {`（当前 ${modelConfigs.filter((item) => item.enabled).length} 个）`}
                             </SelectItem>
                             {modelConfigs.map((model) => (
                               <SelectItem key={model.id} value={model.id}>
@@ -1855,7 +1852,7 @@ export function AgentProfilesPage() {
                           label="模型配置"
                           value={
                             modelConfigId === 'inherit'
-                              ? `跟随系统默认${defaultModelConfigId ? `：${modelConfigs.find((item) => item.id === defaultModelConfigId)?.name ?? '当前默认'}` : ''}`
+                              ? `自动选择已启用模型（当前 ${modelConfigs.filter((item) => item.enabled).length} 个）`
                               : (modelConfigs.find(
                                   (item) => item.id === modelConfigId,
                                 )?.name ?? '不可用模型配置')

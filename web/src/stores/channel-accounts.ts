@@ -6,6 +6,7 @@ export type ChannelProvider =
   | 'telegram'
   | 'qq'
   | 'wechat'
+  | 'wecom'
   | 'dingtalk'
   | 'discord'
   | 'whatsapp';

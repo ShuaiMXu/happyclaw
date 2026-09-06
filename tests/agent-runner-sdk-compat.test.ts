@@ -31,8 +31,8 @@ describe('Claude SDK compatibility adapter', () => {
     });
     expect(result.audit).toMatchObject({
       enabled: true,
-      sdkCompatibility: 'claude-agent-sdk-0.3.205',
-      cliCompatibility: 'claude-code-2.1.205',
+      sdkCompatibility: 'claude-agent-sdk-0.3.238',
+      cliCompatibility: 'claude-code-2.1.238',
     });
     expect(result.audit.hash).toMatch(/^[a-f0-9]{64}$/);
   });

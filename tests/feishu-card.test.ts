@@ -2,7 +2,6 @@ import { describe, expect, test } from 'vitest';
 import {
   buildAgentReplyCard,
   buildFollowUpActionResultCard,
-  buildQueuedFollowUpCard,
   buildStreamingAgentCard,
 } from '../src/feishu-cards/builder.js';
 import { resolveStatusTheme } from '../src/feishu-cards/status-theme.js';
@@ -27,7 +26,11 @@ import {
   buildTimelineText,
   parseToolParam,
 } from '../src/feishu-cards/sections.js';
-import { resolveFeishuFollowUpMode } from '../src/follow-up-policy.js';
+import {
+  isRuntimeControlLike,
+  parseRuntimeControl,
+  resolveFollowUpMode,
+} from '../src/follow-up-policy.js';
 
 // ─── Recursive schema validation helpers ───────────────────────────
 
@@ -1068,32 +1071,71 @@ describe('buildStreamingAgentCard rich skeleton (Phase F)', () => {
   });
 });
 
-describe('queued follow-up cards', () => {
-  test('ordinary messages queue, replies steer, and slash overrides win', () => {
-    expect(resolveFeishuFollowUpMode(undefined, false)).toBe('queue');
-    expect(resolveFeishuFollowUpMode(undefined, true)).toBe('steer');
-    expect(resolveFeishuFollowUpMode('queue', true)).toBe('queue');
-    expect(resolveFeishuFollowUpMode('steer', false)).toBe('steer');
+describe('Feishu follow-up controls', () => {
+  test('ordinary messages and card replies queue; only an explicit override steers', () => {
+    expect(resolveFollowUpMode(undefined)).toBe('queue');
+    expect(resolveFollowUpMode('queue')).toBe('queue');
+    expect(resolveFollowUpMode('steer')).toBe('steer');
   });
 
-  test('offers the same send-now or delete decision without duplicate interrupt actions', () => {
-    const card = buildQueuedFollowUpCard({
-      content: 'Please inspect the failing test',
-      position: 2,
-      sourceJid: 'feishu:oc_chat',
-      targetJid: 'web:main',
-      messageId: 'msg-2',
-      expectedRunId: 'run-1',
-    });
-    expect(validateV2Shape(card)).toEqual([]);
-    const serialized = JSON.stringify(card);
-    expect(serialized).toContain('steer_queued');
-    expect(serialized).not.toContain('interrupt_and_run');
-    expect(serialized).toContain('cancel_queued');
-    expect(serialized).toContain('立即发送');
-    expect(serialized).toContain('删除');
-    expect(serialized).toContain('"expectedRunId":"run-1"');
-    expect(serialized).toContain('消息已排队 · 第 2 位');
+  test('accepts only exact lowercase, structurally eligible runtime controls', () => {
+    expect(
+      parseRuntimeControl({
+        commandText: '/steer inspect this',
+        eligible: true,
+        hasAttachments: false,
+      }),
+    ).toEqual({ kind: 'steer', text: 'inspect this' });
+    expect(
+      parseRuntimeControl({
+        commandText: ' /clear ',
+        eligible: true,
+        hasAttachments: false,
+      }),
+    ).toEqual({ kind: 'clear' });
+    expect(
+      parseRuntimeControl({
+        commandText: ' /break ',
+        eligible: true,
+        hasAttachments: false,
+      }),
+    ).toEqual({ kind: 'break' });
+    expect(
+      parseRuntimeControl({
+        commandText: '/queue later',
+        eligible: true,
+        hasAttachments: false,
+      }),
+    ).toBeUndefined();
+    expect(
+      parseRuntimeControl({
+        commandText: '/break',
+        eligible: false,
+        hasAttachments: false,
+      }),
+    ).toBeUndefined();
+    expect(
+      parseRuntimeControl({
+        commandText: '/BREAK',
+        eligible: true,
+        hasAttachments: false,
+      }),
+    ).toBeUndefined();
+    expect(
+      parseRuntimeControl({
+        commandText: '/break now',
+        eligible: true,
+        hasAttachments: false,
+      }),
+    ).toBeUndefined();
+    expect(
+      parseRuntimeControl({
+        commandText: '/break',
+        eligible: true,
+        hasAttachments: true,
+      }),
+    ).toBeUndefined();
+    expect(isRuntimeControlLike('/StEeR later')).toBe(true);
   });
 
   test('uses neutral stop language on the active streaming card', () => {

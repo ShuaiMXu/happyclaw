@@ -197,6 +197,19 @@ export const KABOO_MODEL_PRICING: readonly KabooModelPricing[] = Object.freeze([
     1.25,
     5,
   ),
+  // Claude 5 generation. Fable 5.1 keeps Fable 5's $10/$50 in/out but cuts
+  // cache reads 75% to $0.25/MTok; cache writes follow the 1.25x-input rule
+  // and reasoning is billed as output.
+  price(
+    'claude-fable-5-1%',
+    'Claude Fable 5.1',
+    'anthropic',
+    10,
+    50,
+    0.25,
+    12.5,
+    50,
+  ),
 ]);
 
 const TOKEN_FIELDS: readonly (keyof KabooTokenUsage)[] = [

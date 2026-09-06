@@ -14,6 +14,7 @@ import {
   partitionIpcMessagesForLogicalTurn,
   requeueIpcInputMessages,
   resolveLogicalQueryInputTurnId,
+  scheduledGroupRunIdFromIpcMessages,
   shouldAcceptIpcMessagesDuringQuery,
   serializeIpcInputMessage,
   type IpcDeliveryReceipt,
@@ -40,6 +41,33 @@ function message(id: string): IpcInputMessage {
 }
 
 describe('agent-runner IPC delivery turn tracker', () => {
+  test('recovers the scheduled group occurrence from a warm-runner receipt', () => {
+    const scheduled: IpcInputMessage = {
+      text: 'scheduled',
+      taskId: 'task-42',
+      receipt: {
+        deliveryId: 'delivery-random',
+        chatJid: 'web:main',
+        coveredCursors: [
+          {
+            timestamp: '2026-08-13T00:00:00.000Z',
+            id: 'scheduled-task-prompt:run-abc',
+          },
+        ],
+        cursor: {
+          timestamp: '2026-08-13T00:00:00.000Z',
+          id: 'scheduled-task-prompt:run-abc',
+        },
+      },
+    };
+    expect(scheduledGroupRunIdFromIpcMessages([scheduled], 'task-42')).toBe(
+      'run-abc',
+    );
+    expect(
+      scheduledGroupRunIdFromIpcMessages([scheduled], 'another-task'),
+    ).toBeNull();
+  });
+
   test('orders requeued older messages before newly written messages by durable cursor', () => {
     const olderRequeued = message('1');
     const newerArrival = message('2');
@@ -48,6 +76,24 @@ describe('agent-runner IPC delivery turn tracker', () => {
       olderRequeued,
       newerArrival,
     ]);
+  });
+
+  test('uses host ingest sequence when provider clocks and random IDs disagree', () => {
+    const first = message('1');
+    first.receipt!.cursor = {
+      timestamp: '2026-08-31T00:00:00.000Z',
+      id: 'z-random',
+      sequence: 41,
+    };
+    const late = message('2');
+    late.receipt!.cursor = {
+      timestamp: '2020-01-01T00:00:00.000Z',
+      id: 'a-random',
+      sequence: 42,
+    };
+
+    expect(orderIpcInputMessages([late, first])).toEqual([first, late]);
+    expect(latestIpcInputMessage([late, first])).toBe(late);
   });
 
   test('preserves filesystem order when a mixed batch has no complete durable ordering', () => {
@@ -105,6 +151,24 @@ describe('agent-runner IPC delivery turn tracker', () => {
     expect(tracker.unacknowledgedMessages).toEqual([]);
   });
 
+  test('deduplicates a crash claim and Host re-emission by delivery id', () => {
+    const original = message('1');
+    const tracker = new IpcTurnDeliveryTracker([original]);
+    const duplicate = {
+      ...original,
+      text: 'same durable input re-emitted after claim recovery',
+      receipt: {
+        ...original.receipt!,
+        deliveryId: 'replacement-attempt-delivery-id',
+      },
+    };
+
+    expect(tracker.acceptTurn([duplicate])).toEqual([]);
+    expect(tracker.pendingTurnCount).toBe(1);
+    expect(tracker.unacknowledgedMessages).toEqual([original]);
+    expect(tracker.completeNextTurn()).toEqual([original.receipt]);
+  });
+
   test('mid-query turns are FIFO and later receipts cannot attach to an earlier result', () => {
     const tracker = new IpcTurnDeliveryTracker([]);
     tracker.acceptTurn([message('1')]);
@@ -123,6 +187,19 @@ describe('agent-runner IPC delivery turn tracker', () => {
     expect(tracker.completeNextTurn().map((r) => r.cursor.id)).toEqual(['2']);
     expect(tracker.pendingTurnCount).toBe(0);
     expect(tracker.hasPendingTurns).toBe(false);
+  });
+
+  test('after interrupt, exposes only the next turn and not every later turn', () => {
+    const turnA = message('1');
+    const turnB = message('2');
+    const turnC = message('3');
+    const tracker = new IpcTurnDeliveryTracker([turnA]);
+    tracker.acceptTurn([turnB]);
+    tracker.acceptTurn([turnC]);
+
+    expect(tracker.cancelCurrentTurn()).toEqual([turnA]);
+    expect(tracker.currentTurnReceipts).toEqual([turnB.receipt]);
+    expect(tracker.laterTurnMessages).toEqual([turnC]);
   });
 
   test('keeps slow turn A as output owner until A completes, then advances to queued B', () => {
@@ -181,6 +258,7 @@ describe('agent-runner IPC delivery turn tracker', () => {
     ]);
 
     expect(tracker.completeNextTurn()).toEqual([turnA.receipt]);
+    expect(tracker.currentTurnReceipts).toEqual([turnB.receipt]);
     correlation.syncCurrentTurn();
     const firstBEvent = correlation.correlate({
       status: 'stream',
@@ -342,17 +420,20 @@ describe('agent-runner IPC delivery turn tracker', () => {
         {
           timestamp: '2026-07-10T00:00:01.000Z',
           id: 'm1',
+          sequence: 81,
           sourceJid: 'feishu:oc_chat#account:account-a',
         },
         {
           timestamp: '2026-07-10T00:00:02.000Z',
           id: 'm2',
+          sequence: 82,
           sourceJid: 'telegram:-100123#account:account-b',
         },
       ],
       cursor: {
         timestamp: '2026-07-10T00:00:02.000Z',
         id: 'm2',
+        sequence: 82,
         sourceJid: 'telegram:-100123#account:account-b',
       },
     });
@@ -366,6 +447,10 @@ describe('agent-runner IPC delivery turn tracker', () => {
       'telegram:-100123#account:account-b',
     ]);
     expect(parsed?.cursor.sourceJid).toBe('telegram:-100123#account:account-b');
+    expect(parsed?.coveredCursors?.map((cursor) => cursor.sequence)).toEqual([
+      81, 82,
+    ]);
+    expect(parsed?.cursor.sequence).toBe(82);
   });
 
   test('malformed or stale receipt payloads are rejected at the runner boundary', () => {

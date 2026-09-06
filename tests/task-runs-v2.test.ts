@@ -589,6 +589,112 @@ describe('notification-only retry state', () => {
     expect(finished.notification_status).toBe('success');
   });
 
+  test('uncertain delivery is terminally fenced and never auto-claimed', () => {
+    const task = createDefinition('notification-uncertain-terminal');
+    const created = db.createTaskRun({ task, triggerType: 'manual' });
+    const execution = db.claimNextTaskRun('uncertain-worker', 60_000)!;
+    expect(
+      db.completeTaskRun(
+        execution.id,
+        execution.lease_owner,
+        execution.lease_token,
+        { status: 'success', notificationStatus: 'pending' },
+      ),
+    ).toBe(true);
+    expect(
+      db.recordTaskRunNotificationReceipt(created.run.id, {
+        status: 'uncertain',
+        summary: {
+          attempted: 1,
+          succeeded: 0,
+          failed: 1,
+          failed_channels: ['feishu'],
+          uncertain: 1,
+          uncertain_channels: ['feishu'],
+        },
+        error: 'provider acceptance is unknown',
+      }),
+    ).toBe(true);
+
+    expect(db.getTaskRunById(created.run.id)).toMatchObject({
+      notification_status: 'uncertain',
+      notification_error: 'provider acceptance is unknown',
+      notification_summary: {
+        uncertain: 1,
+        uncertain_channels: ['feishu'],
+      },
+    });
+    expect(
+      db.claimTaskRunNotificationById(created.run.id, 'must-not-retry', 60_000),
+    ).toBeUndefined();
+  });
+
+  test('safe sibling retry cannot erase an earlier uncertain receipt', async () => {
+    const task = createDefinition('notification-uncertain-with-safe-sibling');
+    const created = db.createTaskRun({ task, triggerType: 'manual' });
+    const execution = db.claimNextTaskRun('mixed-worker', 60_000)!;
+    expect(
+      db.completeTaskRun(
+        execution.id,
+        execution.lease_owner,
+        execution.lease_token,
+        { status: 'success', notificationStatus: 'pending' },
+      ),
+    ).toBe(true);
+    const safeRetry = retryPayload('safe-sibling');
+    expect(
+      db.recordTaskRunNotificationReceipt(
+        created.run.id,
+        {
+          status: 'uncertain',
+          summary: {
+            attempted: 2,
+            succeeded: 0,
+            failed: 2,
+            failed_channels: ['feishu', 'telegram'],
+            uncertain: 1,
+            uncertain_channels: ['feishu'],
+          },
+          error: 'feishu uncertain; telegram rejected',
+        },
+        safeRetry,
+      ),
+    ).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    const claim = db.claimTaskRunNotificationById(
+      created.run.id,
+      'safe-sibling-worker',
+      60_000,
+    )!;
+    expect(claim.payload).toEqual(safeRetry);
+    expect(
+      db.completeTaskRunNotificationAttempt(claim, {
+        status: 'success',
+        summary: {
+          attempted: 1,
+          succeeded: 1,
+          failed: 0,
+          failed_channels: [],
+        },
+      }),
+    ).toBe(true);
+    expect(db.getTaskRunById(created.run.id)).toMatchObject({
+      notification_status: 'uncertain',
+      notification_summary: {
+        uncertain: 1,
+        uncertain_channels: ['feishu'],
+      },
+    });
+    expect(
+      db.claimTaskRunNotificationById(
+        created.run.id,
+        'must-not-replay-uncertain',
+        60_000,
+      ),
+    ).toBeUndefined();
+  });
+
   test('stores partial and all-failed summaries truthfully', () => {
     const task = createDefinition('notification-summary');
     const created = db.createTaskRun({ task, triggerType: 'manual' });

@@ -153,8 +153,8 @@ describe('/api/agent-profiles routes', () => {
   });
 
   test('lists model configurations and persists an Agent selection', async () => {
-    const inheritedDefault = runtimeConfig.createProvider({
-      name: 'Default model config',
+    const automaticModel = runtimeConfig.createProvider({
+      name: 'Automatic model config',
       type: 'official',
       anthropicApiKey: 'default-test-key',
       anthropicModel: 'claude-default-test',
@@ -168,26 +168,24 @@ describe('/api/agent-profiles routes', () => {
       anthropicModel: 'research-model',
       enabled: false,
     });
-    runtimeConfig.setDefaultProvider(inheritedDefault.id);
-
     const listRes = await routes.request('/', { method: 'GET' });
     const listBody = await listRes.json();
-    expect(listBody.default_model_config_id).toBe(inheritedDefault.id);
+    expect(listBody).not.toHaveProperty('default_model_config_id');
     expect(listBody.model_configs).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          id: inheritedDefault.id,
-          name: 'Default model config',
-          is_default: true,
+          id: automaticModel.id,
+          name: 'Automatic model config',
+          enabled: true,
         }),
         expect.objectContaining({
           id: selectedModel.id,
           name: 'Research model config',
           enabled: false,
-          is_default: false,
         }),
       ]),
     );
+    expect(listBody.model_configs[0]).not.toHaveProperty('is_default');
 
     const createRes = await routes.request('/', {
       method: 'POST',

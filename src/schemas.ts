@@ -4,13 +4,14 @@ import { z } from 'zod';
 import { AGENT_EFFORT_LEVELS } from './agent-effort.js';
 import { ALL_PERMISSIONS } from './permissions.js';
 import type { Permission } from './types.js';
-import { MAX_GROUP_NAME_LEN } from './web-context.js';
+import { MAX_GROUP_NAME_LEN } from './group-constants.js';
 
 export const ChannelProviderSchema = z.enum([
   'feishu',
   'telegram',
   'qq',
   'wechat',
+  'wecom',
   'dingtalk',
   'discord',
   'whatsapp',
@@ -96,6 +97,7 @@ export const TaskPatchSchema = z.object({
         'telegram',
         'qq',
         'wechat',
+        'wecom',
         'dingtalk',
         'discord',
         'whatsapp',
@@ -150,6 +152,7 @@ export const TaskCreateSchema = z
           'telegram',
           'qq',
           'wechat',
+          'wecom',
           'dingtalk',
           'discord',
           'whatsapp',
@@ -628,47 +631,6 @@ export const HappyClawOwnerProfileMutationSchema = z.discriminatedUnion(
   ],
 );
 
-export const ClaudeConfigSchema = z.object({
-  anthropicBaseUrl: z.string(),
-  anthropicModel: z.string().max(128).optional(),
-});
-
-export const ClaudeThirdPartyProfileCreateSchema = z.object({
-  name: z.string().min(1).max(64),
-  anthropicBaseUrl: z.string().max(2000),
-  anthropicAuthToken: z.string().max(2000),
-  anthropicModel: z.string().max(128).optional(),
-  customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
-});
-
-export const ClaudeThirdPartyProfilePatchSchema = z
-  .object({
-    name: z.string().min(1).max(64).optional(),
-    anthropicBaseUrl: z.string().max(2000).optional(),
-    anthropicModel: z.string().max(128).optional(),
-    customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
-  })
-  .refine(
-    (data) =>
-      typeof data.name === 'string' ||
-      typeof data.anthropicBaseUrl === 'string' ||
-      typeof data.anthropicModel === 'string' ||
-      data.customEnv !== undefined,
-    { message: 'At least one profile field must be provided' },
-  );
-
-export const ClaudeThirdPartyProfileSecretsSchema = z
-  .object({
-    anthropicAuthToken: z.string().max(2000).optional(),
-    clearAnthropicAuthToken: z.boolean().optional(),
-  })
-  .refine(
-    (data) =>
-      typeof data.anthropicAuthToken === 'string' ||
-      data.clearAnthropicAuthToken === true,
-    { message: 'At least one secret field must be provided' },
-  );
-
 export const GroupPatchSchema = z.object({
   name: z.string().min(1).max(MAX_GROUP_NAME_LEN).optional(),
   is_pinned: z.boolean().optional(),
@@ -773,6 +735,18 @@ export const AppearanceConfigSchema = z.object({
     .nullable()
     .optional(),
   aiAvatarMode: z.enum(['brand', 'emoji']).optional(),
+  brandIconUrl: z
+    .string()
+    .regex(/^\/api\/config\/brand-assets\/brand-icon-[a-f0-9]{8}\.(?:jpg|png)$/)
+    .nullable()
+    .optional(),
+  brandBannerUrl: z
+    .string()
+    .regex(
+      /^\/api\/config\/brand-assets\/brand-banner-[a-f0-9]{8}\.(?:jpg|png)$/,
+    )
+    .nullable()
+    .optional(),
 });
 
 export const ChangePasswordSchema = z.object({
@@ -859,49 +833,6 @@ export const InviteCreateSchema = z.object({
   max_uses: z.number().int().min(0).max(1000).optional(),
   expires_in_hours: z.number().int().min(1).max(8760).optional(),
 });
-
-export const ClaudeOAuthCredentialsSchema = z.object({
-  accessToken: z.string().min(1),
-  refreshToken: z.string().min(1),
-  expiresAt: z.number(),
-  scopes: z.array(z.string()).default([]),
-  subscriptionType: z.string().optional(),
-});
-
-export const ClaudeSecretsSchema = z
-  .object({
-    anthropicAuthToken: z.string().optional(),
-    clearAnthropicAuthToken: z.boolean().optional(),
-    anthropicApiKey: z.string().optional(),
-    clearAnthropicApiKey: z.boolean().optional(),
-    claudeCodeOauthToken: z.string().optional(),
-    clearClaudeCodeOauthToken: z.boolean().optional(),
-    claudeOAuthCredentials: ClaudeOAuthCredentialsSchema.optional(),
-    clearClaudeOAuthCredentials: z.boolean().optional(),
-  })
-  .refine(
-    (data) => {
-      const hasAnthropicAuthToken =
-        typeof data.anthropicAuthToken === 'string' ||
-        data.clearAnthropicAuthToken === true;
-      const hasAnthropicApiKey =
-        typeof data.anthropicApiKey === 'string' ||
-        data.clearAnthropicApiKey === true;
-      const hasClaudeCodeOauthToken =
-        typeof data.claudeCodeOauthToken === 'string' ||
-        data.clearClaudeCodeOauthToken === true;
-      const hasClaudeOAuthCredentials =
-        data.claudeOAuthCredentials !== undefined ||
-        data.clearClaudeOAuthCredentials === true;
-      return (
-        hasAnthropicAuthToken ||
-        hasAnthropicApiKey ||
-        hasClaudeCodeOauthToken ||
-        hasClaudeOAuthCredentials
-      );
-    },
-    { message: 'At least one secret field must be provided' },
-  );
 
 // 飞书/Lark 官方 appId 形如 `cli_xxxxxxxxxxxxxxxx`(cli_ 前缀 + 小写字母数字)。
 // 历史上有用户把用户名 / 手机号 / 邮箱前缀填进去,后端不校验直接存,飞书 SDK 拿这串
@@ -1137,6 +1068,14 @@ export const BugReportSubmitSchema = z.object({
 });
 
 // ─── 统一供应商 (V4) ────────────────────────────────────────
+
+const ClaudeOAuthCredentialsSchema = z.object({
+  accessToken: z.string().min(1),
+  refreshToken: z.string().min(1),
+  expiresAt: z.number(),
+  scopes: z.array(z.string()).default([]),
+  subscriptionType: z.string().optional(),
+});
 
 const ProviderBaseUrlSchema = z
   .string()

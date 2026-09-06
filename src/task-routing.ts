@@ -31,21 +31,22 @@ export function extractLastTaskId(
 }
 
 /**
- * Inputs observable on an IPC message from agent-runner. Mirrors the fields
- * the real IPC consumer in src/index.ts inspects; keep this in sync if new
- * fields become load-bearing for routing.
+ * Host-verified durable occurrence fields consumed by the IPC router.
+ *
+ * Routing must never be derived from the runner-supplied task id or the live
+ * task definition. A task may be edited while an occurrence is running, and
+ * an IPC writer is not a trusted authority for choosing another task's
+ * recipients. The durable run is correlated by the host and its definition
+ * snapshot is immutable for the lifetime of the occurrence.
  */
-export interface IpcMessageInputs {
-  /** Legacy isolated-run flag (tasks-run/{runId}/ IPC namespace). */
-  isScheduledTask?: boolean;
-  /** Per-message task attribution, emitted by group-mode task turns. */
-  taskId?: string | null;
-}
-
-/** Task record fields consumed by the IPC router. */
-export interface TaskRecordForRouting {
-  notify_channels?: string[] | null;
-  chat_jid?: string | null;
+export interface TaskRunForRouting {
+  task_id: string;
+  definition_snapshot: {
+    group_folder: string;
+    notify_channels?: string[] | null;
+    chat_jid?: string | null;
+    delivery_route_jid?: string | null;
+  };
 }
 
 /**
@@ -77,7 +78,6 @@ export type TaskRoutingDecision =
     };
 
 export interface ResolveTaskRoutingDeps {
-  getTaskById: (taskId: string) => TaskRecordForRouting | null | undefined;
   /** Should mirror src/im-channel.ts#getChannelType: non-null iff the jid belongs to an IM channel. */
   getChannelType: (jid: string) => string | null;
 }
@@ -89,45 +89,39 @@ export interface ResolveTaskRoutingDeps {
  * without booting the main service.
  *
  * Contract (locked by tests/task-routing-decision.test.ts):
- * - `hasCreatedBy` must be true for any non-none result (owner attribution is
- *   required to look up notify channels).
- * - A message is a task message iff `data.isScheduledTask || data.taskId`.
- * - `effectiveTaskId` prefers per-message `data.taskId` over the legacy
- *   `ipcTaskId` (the directory-derived id used by isolated-run tasks).
- * - Direct-mode requires the task record's `chat_jid` to be a valid IM JID
+ * - A host-verified durable run, matching source workspace, and owner
+ *   attribution are all required for task routing.
+ * - Delivery settings come only from the run's immutable definition snapshot.
+ * - Direct-mode requires the frozen `delivery_route_jid`/`chat_jid` to be a valid IM JID
  *   (getChannelType non-null). A null/web/unknown chat_jid falls back to
  *   broadcast so tasks without a configured IM target still fan out.
  */
 export function resolveTaskRoutingDecision(
-  data: IpcMessageInputs,
-  ipcTaskId: string | null | undefined,
+  run: TaskRunForRouting | null | undefined,
+  sourceFolder: string,
   hasCreatedBy: boolean,
   deps: ResolveTaskRoutingDeps,
 ): TaskRoutingDecision {
-  const isTaskMessage = !!(data.isScheduledTask || data.taskId);
-  if (!isTaskMessage || !hasCreatedBy) {
+  if (
+    !run ||
+    !hasCreatedBy ||
+    run.definition_snapshot.group_folder !== sourceFolder
+  ) {
     return { mode: 'none' };
   }
 
-  const effectiveTaskId =
-    typeof data.taskId === 'string' && data.taskId
-      ? data.taskId
-      : (ipcTaskId ?? undefined);
-
-  let notifyChannels: string[] | null | undefined;
-  let taskChatJid: string | null | undefined;
-  if (effectiveTaskId) {
-    const taskRecord = deps.getTaskById(effectiveTaskId);
-    notifyChannels = taskRecord?.notify_channels;
-    taskChatJid = taskRecord?.chat_jid;
-  }
+  const effectiveTaskId = run.task_id;
+  const notifyChannels = run.definition_snapshot.notify_channels;
+  const taskChatJid =
+    run.definition_snapshot.delivery_route_jid ??
+    run.definition_snapshot.chat_jid;
 
   if (taskChatJid && deps.getChannelType(taskChatJid)) {
     return {
       mode: 'direct',
       taskChatJid,
       notifyChannels,
-      effectiveTaskId: effectiveTaskId as string, // non-empty per the branch above
+      effectiveTaskId,
     };
   }
 
@@ -140,9 +134,7 @@ export function resolveTaskRoutingDecision(
 
 export interface BroadcastToOwnerIMChannelsDeps {
   getConnectedChannelTypes: (userId: string) => string[];
-  getGroupsByOwner: (
-    userId: string,
-  ) => Array<{
+  getGroupsByOwner: (userId: string) => Array<{
     jid: string;
     folder: string;
     /**
@@ -160,6 +152,49 @@ export interface BroadcastToOwnerIMChannelsDeps {
    * back to the IM group's own folder.
    */
   resolveJidFolder: (jid: string) => string | null;
+}
+
+/**
+ * Resolve every physical target required by one frozen task occurrence.
+ *
+ * A configured delivery route is always included. Explicit notify channels
+ * are additional recipients, not an alternative to the bound route. When no
+ * direct route exists, legacy null/undefined selection keeps the historical
+ * all-connected-channel fan-out; an explicit list is a strict contract and
+ * unresolved channel types are returned to the durable receipt caller.
+ */
+export function resolveTaskNotificationTargets(
+  userId: string,
+  sourceFolder: string,
+  decision: TaskRoutingDecision,
+  deps: BroadcastToOwnerIMChannelsDeps,
+): { targetJids: string[]; unavailableChannels: string[] } {
+  if (decision.mode === 'none') {
+    return { targetJids: [], unavailableChannels: [] };
+  }
+
+  const targetJids: string[] = [];
+  const alreadySelected = new Set<string>();
+  if (decision.mode === 'direct') {
+    targetJids.push(decision.taskChatJid);
+    alreadySelected.add(decision.taskChatJid);
+  }
+
+  const shouldFanOut =
+    decision.mode === 'broadcast' ||
+    (Array.isArray(decision.notifyChannels) &&
+      decision.notifyChannels.length > 0);
+  const unavailableChannels = shouldFanOut
+    ? broadcastToOwnerIMChannels(
+        userId,
+        sourceFolder,
+        alreadySelected,
+        (jid) => targetJids.push(jid),
+        decision.notifyChannels,
+        deps,
+      )
+    : [];
+  return { targetJids, unavailableChannels };
 }
 
 /**
@@ -235,7 +270,7 @@ export function broadcastToOwnerIMChannels(
   sendFn: (jid: string) => void,
   notifyChannels: string[] | null | undefined,
   deps: BroadcastToOwnerIMChannelsDeps,
-): void {
+): string[] {
   const sentChannelTypes = new Set<string>();
   for (const jid of alreadySentJids) {
     const ct = deps.getChannelType(jid);
@@ -253,7 +288,10 @@ export function broadcastToOwnerIMChannels(
       // Without this, ImBindingDialog-bound IM groups (whose own folder
       // stays at 'main') silently miss scheduled-task broadcasts from
       // non-home workspaces.
-      const effectiveFolder = resolveImGroupEffectiveFolder(g, deps.resolveJidFolder);
+      const effectiveFolder = resolveImGroupEffectiveFolder(
+        g,
+        deps.resolveJidFolder,
+      );
       return effectiveFolder === sourceFolder;
     });
     if (target) {
@@ -261,4 +299,13 @@ export function broadcastToOwnerIMChannels(
       sentChannelTypes.add(channelType);
     }
   }
+  // An explicit notification selection is a delivery contract, not a best-
+  // effort hint. Return requested channel types that could not be resolved to
+  // a connected binding so the caller can persist a truthful failed receipt.
+  // Legacy fan-out (`null` / `undefined`) keeps its best-effort semantics.
+  return notifyChannels
+    ? [...new Set(notifyChannels)].filter(
+        (channelType) => !sentChannelTypes.has(channelType),
+      )
+    : [];
 }

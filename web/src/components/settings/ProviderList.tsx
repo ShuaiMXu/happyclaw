@@ -7,7 +7,6 @@ import {
   Plus,
   RotateCcw,
   Shield,
-  Star,
   Trash2,
 } from 'lucide-react';
 
@@ -18,12 +17,10 @@ import { UsageBars } from './UsageBars';
 
 interface ProviderListProps {
   providers: ProviderWithHealth[];
-  defaultProviderId: string | null;
   onEdit: (provider: ProviderWithHealth) => void;
   onDelete: (provider: ProviderWithHealth) => void;
   onToggle: (provider: ProviderWithHealth) => void;
   onResetHealth: (provider: ProviderWithHealth) => void;
-  onSetDefault: (provider: ProviderWithHealth) => void;
   onDuplicate: (provider: ProviderWithHealth) => void;
   onAdd: () => void;
   togglingId: string | null;
@@ -143,12 +140,10 @@ function CredentialBadges({ provider }: { provider: ProviderWithHealth }) {
 
 export function ProviderList({
   providers,
-  defaultProviderId,
   onEdit,
   onDelete,
   onToggle,
   onResetHealth,
-  onSetDefault,
   onDuplicate,
   onAdd,
   togglingId,
@@ -179,7 +174,6 @@ export function ProviderList({
               const toggling = togglingId === provider.id;
               const deleting = deletingId === provider.id;
               const health = provider.health;
-              const isDefault = provider.id === defaultProviderId;
 
               return (
                 <div
@@ -204,40 +198,17 @@ export function ProviderList({
                       >
                         {provider.type === 'official' ? '官方' : '第三方'}
                       </span>
-                      {isDefault && (
-                        <span className="inline-flex items-center gap-1 rounded bg-primary/10 px-1.5 py-0.5 text-[11px] text-primary">
-                          <Star className="size-3 fill-current" />
-                          系统默认
-                        </span>
-                      )}
                     </div>
 
                     <div className="flex items-center gap-1.5 shrink-0">
                       <Switch
                         checked={provider.enabled}
-                        disabled={disabled || toggling || deleting || isDefault}
+                        disabled={disabled || toggling || deleting}
                         onCheckedChange={() => onToggle(provider)}
                         aria-label={
                           provider.enabled ? '禁用模型配置' : '启用模型配置'
                         }
                       />
-                      {!isDefault && (
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => onSetDefault(provider)}
-                          disabled={disabled || toggling || deleting}
-                          title={
-                            provider.enabled
-                              ? undefined
-                              : '设为默认（将同时启用该模型）'
-                          }
-                          className="h-7 px-2 text-xs"
-                        >
-                          <Star className="size-3.5" />
-                          设为默认
-                        </Button>
-                      )}
                       {health && !health.healthy && provider.enabled && (
                         <Button
                           size="sm"
@@ -276,7 +247,7 @@ export function ProviderList({
                         size="sm"
                         variant="ghost"
                         onClick={() => onDelete(provider)}
-                        disabled={disabled || toggling || deleting || isDefault}
+                        disabled={disabled || toggling || deleting}
                         className="h-7 px-2 text-xs text-muted-foreground hover:text-red-600"
                       >
                         {deleting ? (
@@ -344,8 +315,11 @@ export function ProviderList({
                     )}
 
                   {/* OAuth 用量 */}
-                  {provider.hasClaudeOAuthCredentials && (
-                    <UsageBars providerId={provider.id} />
+                  {provider.type === 'official' && (
+                    <UsageBars
+                      providerId={provider.id}
+                      providerVersion={provider.updatedAt}
+                    />
                   )}
                 </div>
               );

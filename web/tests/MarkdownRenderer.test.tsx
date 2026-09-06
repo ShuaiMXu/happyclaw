@@ -4,7 +4,12 @@ import {
   decodeMarkdownImagePath,
   resolveMarkdownImageSrc,
 } from '../src/utils/markdownImageSrc';
-import { MarkdownRenderer } from '../src/components/chat/MarkdownRenderer';
+import {
+  MarkdownRenderer,
+  detectMarkdownFeatures,
+  needsEnhancedMarkdown,
+} from '../src/components/chat/MarkdownRenderer';
+import { EnhancedMarkdownRenderer } from '../src/components/chat/EnhancedMarkdownRenderer';
 
 function renderedImageSrc(markdown: string): string {
   const html = renderToStaticMarkup(
@@ -118,5 +123,81 @@ describe('MarkdownRenderer local image paths through react-markdown/micromark', 
     expect(renderedImageSrc('![截图](images/photo.png)')).toContain(
       '/api/groups/test-group/files/download/',
     );
+  });
+});
+
+describe('MarkdownRenderer progressive enhancement', () => {
+  it('keeps ordinary Markdown and autolinks on the basic path', () => {
+    const plain = detectMarkdownFeatures(
+      '普通 **Markdown** 与 <https://example.com> 链接',
+    );
+    expect(plain).toEqual({
+      hasMath: false,
+      hasCodeFence: false,
+      hasRawHtml: false,
+    });
+    expect(needsEnhancedMarkdown(plain, false)).toBe(false);
+  });
+
+  it('detects code fences, block math, and raw HTML', () => {
+    expect(detectMarkdownFeatures('```ts\nconst value = 1\n```')).toMatchObject(
+      {
+        hasCodeFence: true,
+      },
+    );
+    expect(detectMarkdownFeatures('$$x^2$$')).toMatchObject({ hasMath: true });
+    expect(detectMarkdownFeatures('<strong>内容</strong>')).toMatchObject({
+      hasRawHtml: true,
+    });
+  });
+
+  it('defers math and raw HTML until streaming settles', () => {
+    expect(needsEnhancedMarkdown(detectMarkdownFeatures('$$x^2$$'), true)).toBe(
+      false,
+    );
+    expect(
+      needsEnhancedMarkdown(
+        detectMarkdownFeatures('<strong>内容</strong>'),
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      needsEnhancedMarkdown(
+        detectMarkdownFeatures('```ts\nconst value = 1\n```'),
+        true,
+      ),
+    ).toBe(true);
+  });
+
+  it('marks the lazy fallback so share-image export waits for enhancement', () => {
+    const html = renderToStaticMarkup(
+      <MarkdownRenderer content={'```ts\nconst value = 1\n```'} />,
+    );
+    expect(html).toContain('data-markdown-pending="true"');
+  });
+
+  it('retains syntax highlighting on the enhanced path', () => {
+    const content = '```ts\nconst value: number = 1\n```';
+    const html = renderToStaticMarkup(
+      <EnhancedMarkdownRenderer
+        content={content}
+        features={detectMarkdownFeatures(content)}
+      />,
+    );
+    expect(html).toContain('hljs-keyword');
+  });
+
+  it('retains KaTeX rendering and sanitizes raw HTML', () => {
+    const content = '$$x^2$$\n\n<strong>保留</strong><script>alert(1)</script>';
+    const html = renderToStaticMarkup(
+      <EnhancedMarkdownRenderer
+        content={content}
+        features={detectMarkdownFeatures(content)}
+      />,
+    );
+    expect(html).toContain('class="katex"');
+    expect(html).toContain('<strong>保留</strong>');
+    expect(html).not.toContain('<script');
+    expect(html).not.toContain('alert(1)');
   });
 });

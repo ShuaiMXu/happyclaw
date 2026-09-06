@@ -46,6 +46,87 @@ export class DefinitiveFeishuCapabilityError extends Error {
   }
 }
 
+const FEISHU_PRE_ACCEPTANCE_RETRY_DELAYS_MS = [2_000, 4_000] as const;
+
+/**
+ * Axios/Node can prove that a request never crossed the provider mutation
+ * boundary in a small set of transport failures. In particular, HTTP content
+ * cannot be sent before TLS is established. DNS and connection-refused errors
+ * likewise happen before there is a provider socket to accept the request.
+ *
+ * Keep this deliberately narrower than a generic ECONNRESET/timeout check:
+ * those errors can also happen after Feishu accepted the message and must
+ * remain uncertain to avoid duplicate visible output.
+ */
+export function definitiveFeishuPreAcceptanceFailure(
+  error: unknown,
+): DefinitiveFeishuCapabilityError | null {
+  if (error instanceof DefinitiveFeishuCapabilityError) return null;
+  const value = record(error);
+  if (Object.keys(record(value.response)).length > 0) return null;
+
+  const code = optionalString(value.code);
+  const message =
+    error instanceof Error
+      ? error.message
+      : optionalString(value.message) || String(error);
+  const disconnectedBeforeTls =
+    /Client network socket disconnected before secure TLS connection was established/i.test(
+      message,
+    );
+  const failedBeforeConnect =
+    code === 'ENOTFOUND' || code === 'EAI_AGAIN' || code === 'ECONNREFUSED';
+  if (!disconnectedBeforeTls && !failedBeforeConnect) return null;
+
+  return new DefinitiveFeishuCapabilityError(
+    `Feishu was unreachable before the request was sent${code ? ` (${code})` : ''}`,
+    { cause: error },
+  );
+}
+
+/**
+ * Retry only failures which prove that Feishu could not have accepted the
+ * request. The retry happens inside one durable Outbox send attempt, so a
+ * successful retry still persists exactly one provider acknowledgement.
+ */
+export async function withFeishuPreAcceptanceRetry<T>(
+  operation: () => Promise<T>,
+  options: {
+    retryDelaysMs?: readonly number[];
+    sleep?: (delayMs: number) => Promise<void>;
+    onRetry?: (input: {
+      attempt: number;
+      nextAttempt: number;
+      delayMs: number;
+      error: DefinitiveFeishuCapabilityError;
+    }) => void;
+  } = {},
+): Promise<T> {
+  const retryDelaysMs =
+    options.retryDelaysMs ?? FEISHU_PRE_ACCEPTANCE_RETRY_DELAYS_MS;
+  const sleep =
+    options.sleep ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      const failure = definitiveFeishuPreAcceptanceFailure(error);
+      const delayMs = retryDelaysMs[attempt - 1];
+      if (!failure || delayMs === undefined) throw failure ?? error;
+      options.onRetry?.({
+        attempt,
+        nextAttempt: attempt + 1,
+        delayMs,
+        error: failure,
+      });
+      await sleep(delayMs);
+    }
+  }
+}
+
 const FEISHU_READ_OPERATIONS = new Set<FeishuCapabilityOperation>([
   'get_chat',
   'list_members',

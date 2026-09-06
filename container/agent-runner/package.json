@@ -9,14 +9,14 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.220",
-    "@anthropic-ai/claude-code": "2.1.220",
-    "agent-browser": "0.33.1",
+    "@anthropic-ai/claude-agent-sdk": "0.3.238",
+    "@anthropic-ai/claude-code": "2.1.238",
+    "agent-browser": "0.34.0",
     "cron-parser": "^5.0.0",
     "zod": "^4.0.0"
   },
   "overrides": {
-    "hono": "4.12.32"
+    "hono": "4.13.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",

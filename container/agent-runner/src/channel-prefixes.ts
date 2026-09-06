@@ -4,6 +4,7 @@ export const CHANNEL_PREFIXES: Record<string, string> = {
   telegram: 'telegram:',
   qq: 'qq:',
   wechat: 'wechat:',
+  wecom: 'wecom:',
   dingtalk: 'dingtalk:',
   discord: 'discord:',
   whatsapp: 'whatsapp:',
