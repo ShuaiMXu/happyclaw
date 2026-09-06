@@ -283,7 +283,8 @@ docker pull riba2534/happyclaw-agent:latest
 用户标签的 digest candidate，使用真实容器入口启动 Chromium，并通过 HTTP 请求
 `/json/version`；两边都验证通过后才合并、签名并提升 `git-<sha>` 和 `latest`
 manifest。镜像构建时会解析 Claude Code、Claude Agent SDK、agent-browser、
-feishu-cli、uv 和 Headroom 的最新稳定版；实际安装版本记录在镜像内的
+feishu-cli、lark-cli（官方 `@larksuite/cli`）、uv 和 Headroom 的最新稳定版；
+实际安装版本记录在镜像内的
 `/usr/local/share/happyclaw-tool-versions.txt`，需要回滚时也可以通过 Docker
 build args 在发布工作流中指定精确版本。
 

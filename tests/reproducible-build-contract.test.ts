@@ -83,6 +83,7 @@ describe('reproducible build contract', () => {
     expect(dockerfile).toContain('ARG AGENT_BROWSER_VERSION=latest');
     expect(dockerfile).toContain('ARG HEADROOM_VERSION=latest');
     expect(dockerfile).toContain('ARG FEISHU_CLI_VERSION=latest');
+    expect(dockerfile).toContain('ARG LARK_CLI_VERSION=latest');
     expect(dockerfile).toContain('ARG OH_MY_ZSH_REF=master');
     expect(dockerfile).toContain(
       'github.com/riba2534/feishu-cli/releases/latest/download',
