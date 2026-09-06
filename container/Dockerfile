@@ -128,14 +128,17 @@ COPY agent-runner/package.json agent-runner/package-lock.json ./
 ARG CLAUDE_AGENT_SDK_VERSION=latest
 ARG CLAUDE_CODE_VERSION=latest
 ARG AGENT_BROWSER_VERSION=latest
+ARG LARK_CLI_VERSION=latest
 RUN npm ci \
     && npm install --no-save --package-lock=false \
       "@anthropic-ai/claude-agent-sdk@${CLAUDE_AGENT_SDK_VERSION}" \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "agent-browser@${AGENT_BROWSER_VERSION}" \
+      "@larksuite/cli@${LARK_CLI_VERSION}" \
     && npm cache clean --force \
     && ln -s /app/node_modules/.bin/agent-browser /usr/local/bin/agent-browser \
-    && node -e "const fs=require('node:fs'); for (const p of ['@anthropic-ai/claude-agent-sdk','@anthropic-ai/claude-code','agent-browser']) { const j=JSON.parse(fs.readFileSync('/app/node_modules/'+p+'/package.json','utf8')); console.log(p+' '+j.version); }"
+    && ln -s /app/node_modules/.bin/lark-cli /usr/local/bin/lark-cli \
+    && node -e "const fs=require('node:fs'); for (const p of ['@anthropic-ai/claude-agent-sdk','@anthropic-ai/claude-code','agent-browser','@larksuite/cli']) { const j=JSON.parse(fs.readFileSync('/app/node_modules/'+p+'/package.json','utf8')); console.log(p+' '+j.version); }"
 
 # Headroom (https://github.com/chopratejas/headroom) - 工具输出/RAG/日志压缩.
 # 装上 binary 但默认不启用——用户在 /mcp-servers 自行添加才生效, 配置:
@@ -251,7 +254,7 @@ RUN set -eu; \
       printf 'node=%s\n' "$(node --version)"; \
       printf 'npm=%s\n' "$(npm --version)"; \
       printf 'uv=%s\n' "$(uv --version | awk '{print $2}')"; \
-      node -e "const fs=require('node:fs'); for (const p of ['@anthropic-ai/claude-agent-sdk','@anthropic-ai/claude-code','agent-browser']) { const j=JSON.parse(fs.readFileSync('/app/node_modules/'+p+'/package.json','utf8')); console.log(p+'='+j.version); }"; \
+      node -e "const fs=require('node:fs'); for (const p of ['@anthropic-ai/claude-agent-sdk','@anthropic-ai/claude-code','agent-browser','@larksuite/cli']) { const j=JSON.parse(fs.readFileSync('/app/node_modules/'+p+'/package.json','utf8')); console.log(p+'='+j.version); }"; \
       printf 'feishu-cli=%s\n' "$(cat /usr/local/share/feishu-cli-version)"; \
       printf 'headroom=%s\n' "$(python3 -c "from importlib.metadata import version; print(version('headroom-ai'))")"; \
       printf 'chromium=%s\n' "$(chromium --version | awk '{print $2}')"; \

@@ -10565,6 +10565,40 @@ export function backfillEmptyAllowlistsForChannelAccount(
 }
 
 /**
+ * A P2P (private DM) chat with a Feishu bot is inherently 1:1 — its own
+ * message sender IS its rightful owner, unconditionally. Unlike group
+ * chats, there is no ambiguity to resolve by learning from a trusted DM
+ * elsewhere: forcing this jid's owner_im_id/sender_allowlist to its actual
+ * sender is always correct and must never be skipped just because an
+ * account-wide owner value happens to already be set from a *different*
+ * person's earlier DM to the same bot — that's exactly the bug this
+ * guards against (see feishu-channel-account-owner.test.ts). Returns true
+ * if the row was changed.
+ */
+export function correctP2pChatOwner(
+  chatJid: string,
+  senderOpenId: string,
+): boolean {
+  const normalizedSender = senderOpenId.trim();
+  if (!normalizedSender) return false;
+  const group = getRegisteredGroup(chatJid);
+  if (!group || group.owner_claim_source === 'transfer_reset') return false;
+  const alreadyCorrect =
+    group.owner_im_id === normalizedSender &&
+    Array.isArray(group.sender_allowlist) &&
+    group.sender_allowlist.length === 1 &&
+    group.sender_allowlist[0] === normalizedSender;
+  if (alreadyCorrect) return false;
+  setRegisteredGroup(chatJid, {
+    ...group,
+    owner_im_id: normalizedSender,
+    owner_claim_source: 'auto_feishu' as const,
+    sender_allowlist: [normalizedSender],
+  });
+  return true;
+}
+
+/**
  * Clear `sender_allowlist` for a single group (set to NULL = unrestricted).
  * Used as a manual escape hatch from the owner-locked trap.
  */

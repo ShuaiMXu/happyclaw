@@ -176,6 +176,7 @@ import {
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
   backfillEmptyAllowlistsForChannelAccount,
+  correctP2pChatOwner as persistCorrectedP2pChatOwner,
   getChannelMount,
   migrateAgentProfileAutoCompactWindow,
   getChannelAccount,
@@ -18012,6 +18013,29 @@ function applyAutoIsolateContext(userId: string, enable: boolean): number {
 }
 
 /**
+ * A P2P (private DM) chat with a Feishu bot is inherently 1:1 — its own
+ * message sender IS its rightful owner, unconditionally. `onNewChat`
+ * registers a brand-new chat (P2P or group) using the channel account's
+ * shared `ownerOpenId`, which is correct for groups (there's no other
+ * signal) but wrong for P2P: if a *different* person than whoever first
+ * ever DM'd this bot opens their own new private chat with it, that shared
+ * value would lock them out of their own chat with `owner_only` +
+ * `audience_rejected` forever. Force-correct this specific chat's
+ * owner_im_id/sender_allowlist to match its actual sender every time a P2P
+ * message from it is observed.
+ */
+function correctP2pChatOwner(chatJid: string, senderOpenId: string): void {
+  const previousOwner = getRegisteredGroup(chatJid)?.owner_im_id;
+  if (!persistCorrectedP2pChatOwner(chatJid, senderOpenId)) return;
+  const fresh = getRegisteredGroup(chatJid);
+  if (fresh) registeredGroups[chatJid] = fresh;
+  logger.info(
+    { chatJid, senderOpenId, previousOwner },
+    'Corrected P2P chat owner to its actual DM sender',
+  );
+}
+
+/**
  * Record the Feishu owner's open_id (auto-detected from a P2P DM) and
  * unstick any of this user's groups whose `sender_allowlist=[]` —
  * the "owner-locked trap" that buildOnNewChat creates when a group is
@@ -18020,6 +18044,7 @@ function applyAutoIsolateContext(userId: string, enable: boolean): number {
 function learnFeishuOwner(
   userId: string,
   senderOpenId: string,
+  chatJid: string,
   ownerRef: { value: string | undefined },
 ): void {
   const ownerOpenId = ownerRef.value ?? senderOpenId;
@@ -18027,6 +18052,7 @@ function learnFeishuOwner(
     ownerRef.value = senderOpenId;
     saveFeishuOwnerOpenId(userId, senderOpenId);
   }
+  correctP2pChatOwner(chatJid, senderOpenId);
   const backfilled = backfillEmptyAllowlistsForUser(userId, ownerOpenId);
   for (const jid of backfilled) {
     const fresh = getRegisteredGroup(jid);
@@ -19160,7 +19186,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           onFollowUpMessage: handleIncomingFollowUp,
           onFollowUpCardAction: handleFollowUpCardAction,
           onCardInterrupt: handleCardInterrupt,
-          onP2pSender: (senderOpenId: string) => {
+          onP2pSender: (senderOpenId: string, chatJid: string) => {
             // First valid DM claims this bot. Never let a later arbitrary DM
             // replace the account owner.
             if (!senderOpenId) return;
@@ -19172,6 +19198,12 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
                 saveFeishuOwnerOpenId(account.owner_user_id, senderOpenId);
               }
             }
+            // A P2P chat is inherently 1:1 — its own DM sender IS its
+            // rightful owner. Never let the account-wide owner learned from
+            // a *different* person's earlier DM to this same bot leak into
+            // this chat's owner_im_id, or that person gets silently
+            // audience_rejected forever inside their own private chat.
+            correctP2pChatOwner(chatJid, senderOpenId);
             for (const jid of backfillEmptyAllowlistsForChannelAccount(
               account.owner_user_id,
               account.id,
@@ -19990,8 +20022,8 @@ async function main(): Promise<void> {
       ) {
         const reloadOwnerRef = { value: config.ownerOpenId ?? undefined };
         const getReloadOwnerOpenId = () => reloadOwnerRef.value;
-        const onReloadP2pSender = (senderOpenId: string) =>
-          learnFeishuOwner(userId, senderOpenId, reloadOwnerRef);
+        const onReloadP2pSender = (senderOpenId: string, chatJid: string) =>
+          learnFeishuOwner(userId, senderOpenId, chatJid, reloadOwnerRef);
         const onNewChat = buildOnNewChat(
           userId,
           homeFolder,

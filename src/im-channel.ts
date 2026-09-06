@@ -185,8 +185,11 @@ export interface IMChannelConnectOpts {
     chatJid: string,
     operatorImId: string,
   ) => FollowUpActionResult;
-  /** P2P（私聊）消息到达时调用，用于自动检测 owner open_id（仅飞书） */
-  onP2pSender?: (senderOpenId: string) => void;
+  /**
+   * P2P（私聊）消息到达时调用，用于自动检测 owner open_id（仅飞书）。
+   * chatJid 是触发消息的具体私聊会话，供调用方纠正该会话自身的 owner。
+   */
+  onP2pSender?: (senderOpenId: string, chatJid: string) => void;
   /** Canonicalize an inbound provider JID before persistence/callbacks. */
   normalizeIncomingJid?: (jid: string) => string;
   /** Persist the provider event but postpone policy/routing execution. */

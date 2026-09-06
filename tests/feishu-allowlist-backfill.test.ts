@@ -32,6 +32,7 @@ const {
   deleteRegisteredGroup,
   findEmptyAllowlistFeishuGroupsForUser,
   backfillEmptyAllowlistsForUser,
+  correctP2pChatOwner,
   clearSenderAllowlist,
   getChannelMount,
   getAgentChannelMount,
@@ -67,6 +68,8 @@ beforeEach(() => {
     'web:owner-projection-workspace',
     'telegram:also-locked',
     'wechat:also-locked',
+    'feishu:p2p-chat-a',
+    'feishu:p2p-chat-b',
   ]) {
     deleteRegisteredGroup(jid);
   }
@@ -256,6 +259,65 @@ describe('backfillEmptyAllowlistsForUser', () => {
     expect(getRegisteredGroup('feishu:locked-1')?.sender_allowlist).toEqual([
       OWNER_A,
     ]);
+  });
+});
+
+describe('correctP2pChatOwner', () => {
+  // Regression: a channel account's account-wide "owner" (learned from
+  // whoever DM'd this bot first) must never leak into a *different*
+  // person's own new P2P chat with the same bot — that locks them out of
+  // their own private conversation with owner_only + audience_rejected
+  // forever. See feishu-channel-account-owner.test.ts for the wiring test.
+  test("forces owner_im_id/sender_allowlist to the chat's own sender even when a different owner was already set", () => {
+    setRegisteredGroup('feishu:p2p-chat-a', {
+      name: 'feishu:p2p-chat-a',
+      folder: `home-${USER_A}`,
+      added_at: new Date().toISOString(),
+      created_by: USER_A,
+      sender_allowlist: [OWNER_A],
+      owner_im_id: OWNER_A,
+    });
+
+    // A different person (OWNER_B) is the actual sender in this chat —
+    // the account-wide owner (OWNER_A, learned elsewhere) must not stick.
+    expect(correctP2pChatOwner('feishu:p2p-chat-a', OWNER_B)).toBe(true);
+
+    expect(getRegisteredGroup('feishu:p2p-chat-a')?.owner_im_id).toBe(OWNER_B);
+    expect(getRegisteredGroup('feishu:p2p-chat-a')?.sender_allowlist).toEqual([
+      OWNER_B,
+    ]);
+    expect(getRegisteredGroup('feishu:p2p-chat-a')?.owner_claim_source).toBe(
+      'auto_feishu',
+    );
+  });
+
+  test('is a no-op when the chat is already owned by its actual sender', () => {
+    setRegisteredGroup('feishu:p2p-chat-a', {
+      name: 'feishu:p2p-chat-a',
+      folder: `home-${USER_A}`,
+      added_at: new Date().toISOString(),
+      created_by: USER_A,
+      sender_allowlist: [OWNER_A],
+      owner_im_id: OWNER_A,
+    });
+
+    expect(correctP2pChatOwner('feishu:p2p-chat-a', OWNER_A)).toBe(false);
+  });
+
+  test('does not touch credential-transfer quarantined chats', () => {
+    makeGroup('feishu:p2p-chat-a', USER_A, [], 'transfer_reset');
+
+    expect(correctP2pChatOwner('feishu:p2p-chat-a', OWNER_B)).toBe(false);
+    expect(getRegisteredGroup('feishu:p2p-chat-a')).toMatchObject({
+      owner_claim_source: 'transfer_reset',
+    });
+    expect(
+      getRegisteredGroup('feishu:p2p-chat-a')?.owner_im_id,
+    ).toBeUndefined();
+  });
+
+  test('is a no-op for a jid that does not exist', () => {
+    expect(correctP2pChatOwner('feishu:p2p-chat-missing', OWNER_A)).toBe(false);
   });
 });
 

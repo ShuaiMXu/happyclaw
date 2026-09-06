@@ -159,8 +159,12 @@ export interface ConnectOptions {
     chatJid: string,
     operatorImId: string,
   ) => FollowUpActionResult;
-  /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
-  onP2pSender?: (senderOpenId: string) => void;
+  /**
+   * P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id。
+   * chatJid 是触发这条消息的具体私聊会话，用于让调用方把该会话自己的
+   * owner_im_id 纠正为它真实的发送者，而不是整个渠道账号共享的 owner。
+   */
+  onP2pSender?: (senderOpenId: string, chatJid: string) => void;
   normalizeIncomingJid?: (jid: string) => string;
   /** Recovery gate: durable Inbox remains replayable instead of ignored. */
   shouldDeferInbound?: () => boolean;
@@ -2344,14 +2348,29 @@ export function createFeishuConnection(
       // onNewChat/onP2pSender are idempotent no-ops once already
       // registered, so calling them again in their normal position below
       // is safe and keeps this bootstrap narrowly scoped to P2P.
-      if (
-        chatType === 'p2p' &&
-        resolveEffectiveChatJid &&
-        !resolveEffectiveChatJid(chatJid)
-      ) {
+      //
+      // resolveEffectiveChatJid's declared type is `{...} | null`, but the
+      // account-scoped connection wrapper installed by
+      // im-manager.ts#scopeConnectOpts throws ChannelRouteRejectedError
+      // instead of returning null when a chat has no route yet (that throw
+      // is intentional for the *admitted* lookup below, where the outer
+      // catch turns it into a scheduled retry). Called here — before any
+      // registration has happened — an unguarded call synchronously throws
+      // out of this bootstrap check, so onNewChat/onP2pSender never run and
+      // every message from that brand-new P2P chat gets stuck retrying
+      // forever. Treat a throw the same as a null/no-route result.
+      let hasExistingRoute = true;
+      if (chatType === 'p2p' && resolveEffectiveChatJid) {
+        try {
+          hasExistingRoute = !!resolveEffectiveChatJid(chatJid);
+        } catch {
+          hasExistingRoute = false;
+        }
+      }
+      if (chatType === 'p2p' && !hasExistingRoute) {
         onNewChat?.(chatJid, resolvedChatName);
         if (senderOpenId && onP2pSender) {
-          onP2pSender(senderOpenId);
+          onP2pSender(senderOpenId, chatJid);
         }
       }
 
@@ -2426,7 +2445,7 @@ export function createFeishuConnection(
 
       onNewChat?.(chatJid, resolvedChatName);
       if (chatType === 'p2p' && senderOpenId && onP2pSender) {
-        onP2pSender(senderOpenId);
+        onP2pSender(senderOpenId, chatJid);
       }
       lastMessageIdByChat.set(chatId, messageId);
       const resolvedCreateTimeMs = createTimeMs > 0 ? createTimeMs : Date.now();
