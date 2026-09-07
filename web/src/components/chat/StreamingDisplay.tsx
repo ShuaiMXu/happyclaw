@@ -79,6 +79,8 @@ const TASK_STATUS_LABELS: Record<string, string> = {
   running: '执行中',
   completed: '已完成',
   error: '出错',
+  stopped: '已停止',
+  aborted: '已停止',
 };
 
 function formatSystemStatus(status: string): string {

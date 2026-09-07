@@ -279,6 +279,37 @@ export class QuiescentResultGate {
 }
 
 /**
+ * Hard deadline for a Result withheld solely by protocol completion debt.
+ * Re-observing the same debt never extends the original boundary; otherwise a
+ * stream of unrelated SDK frames could postpone terminal recovery forever.
+ */
+export class BackgroundProtocolDebtWatchdog {
+  private armedAt: number | undefined;
+
+  arm(now: number = Date.now()): number {
+    this.armedAt ??= now;
+    return this.armedAt;
+  }
+
+  clear(): void {
+    this.armedAt = undefined;
+  }
+
+  isExpired(timeoutMs: number, now: number = Date.now()): boolean {
+    return this.armedAt !== undefined && now - this.armedAt >= timeoutMs;
+  }
+
+  remainingMs(timeoutMs: number, now: number = Date.now()): number {
+    if (this.armedAt === undefined) return timeoutMs;
+    return Math.max(0, timeoutMs - (now - this.armedAt));
+  }
+
+  get isArmed(): boolean {
+    return this.armedAt !== undefined;
+  }
+}
+
+/**
  * Tracks whether the input currently owning Runner output has crossed a
  * healthy, durable result boundary.
  *

@@ -3,11 +3,19 @@ import type { MessageFinalizationReason } from './types.js';
 
 export interface UnacknowledgedProactiveFinalProjectionResult {
   projected: boolean;
+  /** The canonical Web answer fully satisfies the user-visible final even
+   * though the native provider definitively rejected its channel copy. */
+  webCompleted: boolean;
   finalizationReason: Extract<
     MessageFinalizationReason,
-    'delivery_uncertain' | 'error'
+    'completed' | 'delivery_uncertain' | 'error'
   >;
 }
+
+export type NativeFinalDeliveryFailure =
+  | 'rejected'
+  | 'uncertain'
+  | 'unavailable';
 
 /**
  * Preserve the exact explicit final in the canonical Web session when native
@@ -21,16 +29,23 @@ export async function preserveUnacknowledgedProactiveFinal(input: {
   scopeKey: string;
   inputTurnId: string;
   text: string;
-  uncertain: boolean;
+  nativeFailure: NativeFinalDeliveryFailure;
   project: (
     text: string,
     finalizationReason: Extract<
       MessageFinalizationReason,
-      'delivery_uncertain' | 'error'
+      'completed' | 'delivery_uncertain' | 'error'
     >,
   ) => Promise<boolean>;
 }): Promise<UnacknowledgedProactiveFinalProjectionResult> {
-  const finalizationReason = input.uncertain ? 'delivery_uncertain' : 'error';
+  // Web is the canonical record. An authoritative native rejection says only
+  // that the channel copy failed; it must not downgrade the answer itself.
+  const finalizationReason =
+    input.nativeFailure === 'rejected'
+      ? 'completed'
+      : input.nativeFailure === 'uncertain'
+        ? 'delivery_uncertain'
+        : 'error';
   const projected = await input.project(input.text, finalizationReason);
   if (projected) {
     input.registry.recordProjectedUtterance({
@@ -40,5 +55,9 @@ export async function preserveUnacknowledgedProactiveFinal(input: {
       text: input.text,
     });
   }
-  return { projected, finalizationReason };
+  return {
+    projected,
+    webCompleted: projected && input.nativeFailure === 'rejected',
+    finalizationReason,
+  };
 }

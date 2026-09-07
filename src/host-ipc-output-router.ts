@@ -73,6 +73,7 @@ export type HostIpcOutputRoute =
       delivered: false;
       staged: false;
       deliveryRole: TurnMessageDeliveryRole | null;
+      reason: 'unauthorized' | 'conflicting_final';
     };
 
 function normalizeDeliveryRole(value: unknown): TurnMessageDeliveryRole | null {
@@ -101,6 +102,7 @@ export function routeHostIpcOutput(
       delivered: false,
       staged: false,
       deliveryRole,
+      reason: 'unauthorized',
     };
   }
   if (
@@ -118,15 +120,31 @@ export function routeHostIpcOutput(
   }
 
   if (input.interactionMode === 'proactive') {
-    const attemptedFinalRecorded =
+    let attemptedFinalRecorded = false;
+    if (
       deliveryRole === 'final' &&
       typeof input.inputTurnId === 'string' &&
-      Boolean(input.inputTurnId) &&
-      activeTurnOutputs.recordAttemptedFinal({
+      input.inputTurnId
+    ) {
+      attemptedFinalRecorded = activeTurnOutputs.recordAttemptedFinal({
         scopeKey: channelTurnScope(input.sourceGroup, input.agentId),
         inputTurnId: input.inputTurnId,
         text: input.text,
       });
+      if (!attemptedFinalRecorded) {
+        // The first explicit final seals the physical provider lane. Returning
+        // a rejected route is essential: merely recording `false` while still
+        // selecting separate_provider allowed a second, different final to be
+        // irreversibly sent.
+        return {
+          path: 'rejected',
+          delivered: false,
+          staged: false,
+          deliveryRole,
+          reason: 'conflicting_final',
+        };
+      }
+    }
     return {
       path: 'separate_provider',
       delivered: false,

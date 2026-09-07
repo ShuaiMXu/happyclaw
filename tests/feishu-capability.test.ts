@@ -2,8 +2,11 @@ import type { Client } from '@larksuiteoapi/node-sdk';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  definitiveFeishuPreAcceptanceFailure,
+  DefinitiveFeishuCapabilityError,
   executeFeishuCapability,
   normalizeFeishuCardForSend,
+  withFeishuPreAcceptanceRetry,
 } from '../src/feishu-capability.js';
 import type { ChannelTurnContext } from '../src/types.js';
 
@@ -52,6 +55,65 @@ function mockClient() {
   };
   return client as unknown as Client & typeof client;
 }
+
+describe('Feishu pre-acceptance delivery recovery', () => {
+  it('retries a TLS pre-connect reset and returns the later acknowledgement', async () => {
+    const operation = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(
+        Object.assign(
+          new Error(
+            'Client network socket disconnected before secure TLS connection was established',
+          ),
+          { code: 'ECONNRESET' },
+        ),
+      )
+      .mockResolvedValueOnce('om_recovered');
+    const sleep = vi.fn(async () => undefined);
+
+    await expect(
+      withFeishuPreAcceptanceRetry(operation, {
+        retryDelaysMs: [2_000],
+        sleep,
+      }),
+    ).resolves.toBe('om_recovered');
+    expect(operation).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(2_000);
+  });
+
+  it('does not retry an ambiguous reset after the request may have been sent', async () => {
+    const error = Object.assign(new Error('socket hang up'), {
+      code: 'ECONNRESET',
+    });
+    const operation = vi.fn(async () => {
+      throw error;
+    });
+    const sleep = vi.fn(async () => undefined);
+
+    expect(definitiveFeishuPreAcceptanceFailure(error)).toBeNull();
+    await expect(
+      withFeishuPreAcceptanceRetry(operation, { sleep }),
+    ).rejects.toBe(error);
+    expect(operation).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('does not retry an authoritative provider rejection', async () => {
+    const error = new DefinitiveFeishuCapabilityError(
+      'send_card failed (code=230028, msg=content audit rejected)',
+    );
+    const operation = vi.fn(async () => {
+      throw error;
+    });
+    const sleep = vi.fn(async () => undefined);
+
+    await expect(
+      withFeishuPreAcceptanceRetry(operation, { sleep }),
+    ).rejects.toBe(error);
+    expect(operation).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+});
 
 describe('Feishu Capability Broker executor', () => {
   it('reads only the current thread and returns sanitized message fields', async () => {

@@ -8,6 +8,13 @@
 export type { StreamEventType, StreamEvent } from './stream-event.types.js';
 import type { ClaudeContextAudit, StreamEvent } from './stream-event.types.js';
 
+export interface ChannelContentLink {
+  kind: 'forward_bundle' | 'rapid_topic_bundle';
+  bundleId: string;
+  role: 'forwarded_content' | 'forwarder_comment';
+  relatedMessageId?: string;
+}
+
 /**
  * Sanitized, per-input-turn channel identity supplied by the HappyClaw host.
  *
@@ -44,6 +51,7 @@ export interface ChannelTurnContext {
     parentId?: string;
     threadId?: string;
     type?: string;
+    contentLink?: ChannelContentLink;
   };
   sender?: {
     openId?: string;
@@ -79,6 +87,27 @@ function compactObject<T extends UnknownRecord>(value: T): T | undefined {
   return Object.values(value).some((item) => item !== undefined)
     ? value
     : undefined;
+}
+
+function normalizeContentLink(value: unknown): ChannelContentLink | undefined {
+  const link = asRecord(value);
+  const bundleId = optionalString(link?.bundleId);
+  const kind = optionalString(link?.kind);
+  const role = optionalString(link?.role);
+  if (
+    (kind !== 'forward_bundle' && kind !== 'rapid_topic_bundle') ||
+    !bundleId ||
+    (role !== 'forwarded_content' && role !== 'forwarder_comment')
+  ) {
+    return undefined;
+  }
+  const relatedMessageId = optionalString(link?.relatedMessageId);
+  return {
+    kind,
+    bundleId,
+    role,
+    ...(relatedMessageId ? { relatedMessageId } : {}),
+  };
 }
 
 /**
@@ -163,6 +192,7 @@ export function normalizeChannelTurnContext(
       parentId: optionalString(message?.parentId),
       threadId: optionalString(message?.threadId),
       type: optionalString(message?.type),
+      contentLink: normalizeContentLink(message?.contentLink),
     }),
     sender: compactObject({
       openId: optionalString(sender?.openId),
@@ -195,6 +225,8 @@ export interface ContainerInput {
   prompt: string;
   sessionId?: string;
   turnId?: string;
+  /** Persisted message IDs already represented by the cold bootstrap prompt. */
+  currentBatchMessageIds?: readonly string[];
   /** Exact GroupQueue query attempt for Web stream fencing. */
   queryRunId?: string;
   groupFolder: string;
@@ -301,6 +333,30 @@ export interface ContainerOutput {
   error?: string;
   providerFailure?: boolean;
   /**
+   * Passive SDK rate-limit observation. `utilization` is the SDK/header
+   * fraction (0..1), not the OAuth usage endpoint's 0..100 percentage.
+   */
+  providerQuotaObservation?: {
+    source: 'sdk_rate_limit_event';
+    /** Unix epoch milliseconds. */
+    observedAt: number;
+    status: 'allowed' | 'allowed_warning' | 'rejected';
+    rateLimitType?: string;
+    utilization?: number;
+    /** Unix epoch seconds. */
+    resetsAt?: number;
+    overageStatus?: 'allowed' | 'allowed_warning' | 'rejected';
+    /** Unix epoch seconds. */
+    overageResetsAt?: number;
+    overageDisabledReason?: string;
+    isUsingOverage?: boolean;
+    overageInUse?: boolean;
+    surpassedThreshold?: number;
+    errorCode?: string;
+    canUserPurchaseCredits?: boolean;
+    hasChargeableSavedPaymentMethod?: boolean;
+  };
+  /**
    * Upstream `rate_limit_event.resetsAt` for an account-scope rejection. The
    * host quarantines the provider until this instant instead of the flat
    * recovery interval, so a five-hour account limit cannot re-enter rotation
@@ -322,6 +378,26 @@ export interface ContainerOutput {
   /** The model that was actually in use when the limit was reported. */
   providerRateLimitModel?: string;
   /**
+   * What the failure says about the account, which is what the host's
+   * disposition is keyed on:
+   *
+   * - `account` — a verdict on this profile: quarantine it and let the pool
+   *   decide whether another account replays the input.
+   * - `transient` — upstream/transport noise: never touch account health, keep
+   *   the durable input replayable on the same provider within its budget.
+   * - `config` — unserviceable as configured: end visibly without quarantining,
+   *   because every account would fail the same way.
+   *
+   * Absent on outputs from an older runner; the host then falls back to the
+   * pre-classification behaviour of treating the failure as `account`.
+   */
+  providerFailureClass?: 'account' | 'transient' | 'config';
+  /**
+   * Host-set: arrived as `transient` and was rewritten to `account` once its
+   * replay budget was spent and the same input failed transiently again. The
+   * runner never sets this; it only ever reports what it observed.
+   */
+  /**
    * Set by the host after it quarantines the failed provider and checks the
    * remaining pool. The agent runner itself only emits providerFailure.
    */
@@ -333,6 +409,14 @@ export interface ContainerOutput {
    * completed. The host quarantines it without replaying or notifying again.
    */
   providerFailureMaintenance?: boolean;
+  /**
+   * The SDK stream produced no model response event within the liveness
+   * deadline. Always accompanied by `providerFailureClass: 'transient'`, which
+   * is what suppresses the quarantine and keeps the input replayable; this flag
+   * only distinguishes a silent stall from a reported upstream error so the
+   * user-facing wording can name the right cause.
+   */
+  providerLivenessTimeout?: boolean;
   streamEvent?: StreamEvent;
   /**
    * Immutable identity of the user input turn that produced this output.
@@ -351,6 +435,7 @@ export interface ContainerOutput {
     | 'sdk_send_message'
     | 'proactive_sdk_fallback'
     | 'input_rejection_warning'
+    | 'provider_fallback_notice'
     | 'interrupt_partial'
     | 'overflow_partial'
     | 'compact_partial'
@@ -376,9 +461,35 @@ export interface ContainerOutput {
     coveredCursors?: Array<{
       timestamp: string;
       id: string;
+      sequence?: number;
       sourceJid?: string;
     }>;
-    cursor: { timestamp: string; id: string; sourceJid?: string };
+    cursor: {
+      timestamp: string;
+      id: string;
+      sequence?: number;
+      sourceJid?: string;
+    };
+  }>;
+  /** Exact durable inputs that became the current SDK turn immediately after
+   * this completion. Present only while the same streaming query stays busy.
+   * Hosts use it to bind provider coalescing to the real current turn rather
+   * than to a later IPC message that merely entered the stream. */
+  activeIpcReceipts?: Array<{
+    deliveryId: string;
+    chatJid: string;
+    coveredCursors?: Array<{
+      timestamp: string;
+      id: string;
+      sequence?: number;
+      sourceJid?: string;
+    }>;
+    cursor: {
+      timestamp: string;
+      id: string;
+      sequence?: number;
+      sourceJid?: string;
+    };
   }>;
 }
 

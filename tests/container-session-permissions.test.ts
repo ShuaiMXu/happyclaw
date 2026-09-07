@@ -357,6 +357,10 @@ describe('entrypoint permission contract', () => {
     path.join(repoRoot, 'container', 'session-permissions-watcher.mjs'),
     'utf8',
   );
+  const rescanQueue = fs.readFileSync(
+    path.join(repoRoot, 'container', 'session-permissions-rescan-queue.mjs'),
+    'utf8',
+  );
   const mountBoundaryPath = path.join(
     repoRoot,
     'container',
@@ -395,9 +399,10 @@ describe('entrypoint permission contract', () => {
     expect(entrypoint).toContain(
       'runuser -u node -- env HOME=/home/node /usr/bin/git',
     );
-    expect(dockerfile).toContain('chown -R root:root /app/prompts');
-    expect(dockerfile).toContain('find /app/prompts -type d -exec chmod 0555');
-    expect(dockerfile).toContain('find /app/prompts -type f -exec chmod 0444');
+    expect(dockerfile).toContain('session-permissions-rescan-queue.mjs');
+    expect(dockerfile).toContain('chown -R root:root dist prompts');
+    expect(dockerfile).toContain('find dist prompts -type d -exec chmod 0555');
+    expect(dockerfile).toContain('find dist prompts -type f -exec chmod 0444');
   });
 
   test('contains no world-permission fallback', () => {
@@ -429,6 +434,11 @@ describe('entrypoint permission contract', () => {
     expect(watcher).not.toContain('lstatSync');
     expect(watcher).toContain('RESCAN_INTERVAL_MS = 30_000');
     expect(watcher).not.toContain('RESCAN_INTERVAL_MS = 500');
+    expect(watcher).toContain('fs.opendirSync');
+    expect(watcher).not.toContain('fs.readdirSync');
+    expect(watcher).toContain('createBoundedRescanScheduler');
+    expect(rescanQueue).toContain('MAX_PENDING_RESCAN_TARGETS = 256');
+    expect(rescanQueue).toContain('pendingTargets.clear()');
     expect(mountBoundary).not.toMatch(/catch\s*\{/);
   });
 
@@ -470,6 +480,14 @@ try {
 
 describe.skipIf(!integrationImageAvailable)(
   'permission helper behavior in the branch image',
+  {
+    // Every test below starts one or more real Docker containers. Hosted
+    // runner scheduling and cold-overlay setup have exceeded Vitest's generic
+    // 5s unit-test budget on both amd64 and arm64 even though the command then
+    // completed successfully. Keep a per-test bound, but size it for an image
+    // integration contract rather than an in-process unit test.
+    timeout: 30_000,
+  },
   () => {
     const helperPath = path.join(
       repoRoot,
@@ -480,6 +498,11 @@ describe.skipIf(!integrationImageAvailable)(
       repoRoot,
       'container',
       'session-permissions-watcher.mjs',
+    );
+    const rescanQueuePath = path.join(
+      repoRoot,
+      'container',
+      'session-permissions-rescan-queue.mjs',
     );
     const mountBoundaryPath = path.join(
       repoRoot,
@@ -516,6 +539,8 @@ describe.skipIf(!integrationImageAvailable)(
           `${helperPath}:/tmp/session-permissions.sh:ro`,
           '-v',
           `${watcherPath}:/app/session-permissions-watcher.mjs:ro`,
+          '-v',
+          `${rescanQueuePath}:/app/session-permissions-rescan-queue.mjs:ro`,
           '-v',
           `${mountBoundaryPath}:/app/session-permissions-mount.mjs:ro`,
           ...extraArgs,

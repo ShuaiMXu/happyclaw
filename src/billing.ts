@@ -14,9 +14,6 @@ import {
   getUserBalance,
   adjustUserBalance,
   getMonthlyUsage,
-  incrementMonthlyUsage,
-  incrementDailyUsage,
-  incrementUsageBoth,
   getDailyUsage,
   getWeeklyUsageSummary,
   getUserGroupCount,
@@ -43,11 +40,6 @@ import type {
 
 export function isBillingEnabled(): boolean {
   return getSystemSettings().billingEnabled === true;
-}
-
-/** @deprecated No longer needed — isBillingEnabled reads from getSystemSettings cache */
-export function clearBillingEnabledCache(): void {
-  // no-op: getSystemSettings() handles its own cache invalidation via file mtime
 }
 
 // --- Plan management ---
@@ -625,40 +617,6 @@ export function batchAssignPlans(
   const count = dbBatchAssignPlan(userIds, planId, actorId, durationDays);
   for (const userId of userIds) invalidateUserBillingCache(userId);
   return count;
-}
-
-// --- Usage tracking ---
-
-export function updateUsage(
-  userId: string,
-  costUSD: number,
-  inputTokens: number,
-  outputTokens: number,
-): ReturnType<typeof getUserEffectivePlan> {
-  // Apply rate_multiplier
-  const effective = getUserEffectivePlan(userId);
-  const multiplier = effective?.plan.rate_multiplier ?? 1.0;
-  const effectiveCost = costUSD * multiplier;
-
-  const now = new Date();
-  const month = now.toISOString().slice(0, 7);
-  const date = now.toISOString().slice(0, 10);
-
-  // 走 atomic helper 让 monthly + daily 在同一 SQLite 事务里写入，
-  // 避免进程在两次 UPSERT 之间崩溃留下永久 drift（quota 计算两边依赖一致性）。
-  incrementUsageBoth(
-    userId,
-    month,
-    date,
-    inputTokens,
-    outputTokens,
-    effectiveCost,
-  );
-
-  // Invalidate quota cache
-  invalidateUserBillingCache(userId);
-
-  return effective;
 }
 
 export function deductUsageCost(

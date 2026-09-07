@@ -13,6 +13,7 @@ export interface ActiveFeishuContext {
 export interface FeishuConversationPolicyInput {
   chatType?: 'p2p' | 'group';
   chatMode?: string;
+  groupMessageType?: string;
   activationMode?: FeishuActivationMode;
   requireMention?: boolean;
   mentionedBot: boolean;
@@ -37,7 +38,6 @@ export interface FeishuConversationPlan {
     | 'disabled'
     | 'direct'
     | 'shared_chat'
-    | 'new_mention_context'
     | 'new_native_topic'
     | 'active_context'
     | 'mention_required';
@@ -67,8 +67,14 @@ export function isMentionActivationMode(
   );
 }
 
-export function isFeishuTopicChat(chatMode: string | undefined): boolean {
-  return chatMode === 'topic';
+export function isFeishuTopicChat(
+  chatMode: string | undefined,
+  groupMessageType?: string,
+): boolean {
+  return (
+    chatMode !== 'p2p' &&
+    (chatMode === 'topic' || groupMessageType === 'thread')
+  );
 }
 
 /**
@@ -103,15 +109,12 @@ export function resolveFeishuConversationPlan(
     input.activationMode,
     input.requireMention,
   );
-  const topicChat = isFeishuTopicChat(input.chatMode);
+  const topicChat = isFeishuTopicChat(input.chatMode, input.groupMessageType);
 
   // A real Feishu topic/thread keeps its durable identity even when the user
   // mentions the bot again inside that topic. Mentions inside an established
   // thread must never create nested conversation agents.
-  if (
-    input.activeContext &&
-    (topicChat || (mentionRequired && input.threadId))
-  ) {
+  if (topicChat && input.activeContext) {
     return {
       disabled: false,
       allowWithoutMention: true,
@@ -142,73 +145,17 @@ export function resolveFeishuConversationPlan(
     };
   }
 
-  // Feishu can deliver the first bot mention from an already-existing native
-  // thread before HappyClaw has created its durable context binding. Preserve
-  // that native thread identity instead of anchoring a second, nested topic to
-  // the triggering message. Once admitted, subsequent messages resolve via
-  // the active-context branch above and no longer require another mention.
-  if (mentionRequired && input.threadId) {
-    if (!input.mentionedBot) {
-      return {
-        disabled: false,
-        allowWithoutMention: false,
-        independentContext: false,
-        reason: 'mention_required',
-      };
-    }
-    return {
-      disabled: false,
-      allowWithoutMention: false,
-      independentContext: true,
-      contextId: input.threadId,
-      rootMessageId: input.rootId || input.messageId,
-      reason: 'new_native_topic',
-    };
-  }
-
-  if (!mentionRequired) {
-    return {
-      disabled: false,
-      allowWithoutMention: true,
-      independentContext: false,
-      reason: 'shared_chat',
-    };
-  }
-
-  if (!input.mentionedBot) {
-    // Feishu may omit thread_id on an early follow-up while still supplying
-    // root_id. The durable binding is authoritative for an unmentioned
-    // follow-up, so it remains in the already-active topic.
-    if (input.activeContext) {
-      return {
-        disabled: false,
-        allowWithoutMention: true,
-        independentContext: true,
-        contextId: input.activeContext.contextId,
-        rootMessageId: input.activeContext.rootMessageId,
-        reason: 'active_context',
-      };
-    }
-    return {
-      disabled: false,
-      allowWithoutMention: false,
-      independentContext: false,
-      reason: 'mention_required',
-    };
-  }
-
-  // In an ordinary group, every valid mention outside a real Feishu thread
-  // starts a new topic anchored to the mentioned message itself. A native
-  // root_id here can describe an ordinary reply chain; inheriting it would
-  // incorrectly merge the new request into an older Agent session. The old
-  // chain remains useful only as bounded referenced context.
-  const rootMessageId = input.messageId;
+  // Ordinary group threads are reply locations within the bound session.
+  // Neither mentions nor historical topic bindings may allocate a new session
+  // or bypass the current mention gate.
   return {
     disabled: false,
-    allowWithoutMention: false,
-    independentContext: true,
-    contextId: rootMessageId,
-    rootMessageId,
-    reason: 'new_mention_context',
+    allowWithoutMention: !mentionRequired,
+    independentContext: false,
+    ...(input.rootId ? { rootMessageId: input.rootId } : {}),
+    reason:
+      mentionRequired && !input.mentionedBot
+        ? 'mention_required'
+        : 'shared_chat',
   };
 }

@@ -1,15 +1,14 @@
 import { Hono, type Context } from 'hono';
 import type { Variables } from '../web-context.js';
 import {
-  canAccessGroup,
-  canModifyGroup,
   hasHostExecutionPermission,
   isHostExecutionGroup,
 } from '../web-context.js';
+import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import { authMiddleware } from '../middleware/auth.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import {
-  getAgentProfile,
+  getAgentProfileForUser,
   getRegisteredGroup,
   getWorkspaceAgentProfileId,
   getWorkspaceInteractionMode,
@@ -68,9 +67,11 @@ function getAgentProfileSnapshot(
   includePolicy: boolean,
 ) {
   const profileId = getWorkspaceAgentProfileId(workspace.folder);
-  if (!profileId) return null;
-  const profile = getAgentProfile(profileId);
-  if (!profile || profile.status !== 'active') return null;
+  if (!profileId || !workspace.owner_user_id) return null;
+  // Legacy mappings may predate ownership validation. Workspace access never
+  // grants permission to inspect another user's top-level Agent or policy.
+  const profile = getAgentProfileForUser(profileId, workspace.owner_user_id);
+  if (!profile) return null;
   return {
     id: profile.id,
     name: profile.name,

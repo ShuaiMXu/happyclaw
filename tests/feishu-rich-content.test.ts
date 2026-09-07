@@ -116,7 +116,7 @@ describe('Feishu rich inbound normalization', () => {
     expect(result.imageKeys).toEqual(['img_v3_forwarded']);
     expect(result.currentImageRefs).toEqual([
       {
-        messageId: 'om_child_card',
+        messageId: 'om_forward',
         imageKey: 'img_v3_forwarded',
       },
     ]);
@@ -126,6 +126,147 @@ describe('Feishu rich inbound normalization', () => {
         params: { card_msg_content_type: 'user_card_content' },
       }),
     );
+  });
+
+  test('does not mark a placeholder-only merged-forward shell as resolved material', async () => {
+    const client = clientWith(() => ({
+      data: {
+        items: [
+          {
+            message_id: 'om_forward_shell',
+            msg_type: 'merge_forward',
+            body: { content: 'Merged and Forwarded Message' },
+          },
+        ],
+      },
+    }));
+    const result = await enrichFeishuInboundContent({
+      client,
+      messageId: 'om_note',
+      messageType: 'text',
+      fallbackText: '请分析',
+      parentId: 'om_forward_shell',
+      parseContent,
+    });
+
+    expect(result.references?.[0]?.id).toBe('om_forward_shell');
+    expect(result.references?.[0].materialResolved).toBeUndefined();
+  });
+
+  test('does not mark a text-truncated merged-forward reference as complete', async () => {
+    const forwardedText = '长材料'.repeat(4_000);
+    const client = clientWith(() => ({
+      data: {
+        items: [
+          {
+            message_id: 'om_forward_long',
+            msg_type: 'merge_forward',
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          {
+            message_id: 'om_forward_long_child',
+            upper_message_id: 'om_forward_long',
+            msg_type: 'text',
+            sender: { id: 'ou_alice', name: 'Alice' },
+            body: { content: JSON.stringify({ text: forwardedText }) },
+          },
+        ],
+      },
+    }));
+
+    const result = await enrichFeishuInboundContent({
+      client,
+      messageId: 'om_long_note',
+      messageType: 'text',
+      fallbackText: '请分析',
+      parentId: 'om_forward_long',
+      parseContent,
+    });
+
+    expect(result.references?.[0]?.text.length).toBeLessThan(
+      forwardedText.length,
+    );
+    expect(result.references?.[0]?.materialResolved).toBeUndefined();
+  });
+
+  test('does not mark an item-capped merged-forward reference as complete', async () => {
+    const rootId = 'om_forward_over_item_limit';
+    const client = clientWith(() => ({
+      data: {
+        items: [
+          {
+            message_id: rootId,
+            msg_type: 'merge_forward',
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          ...['第一条', '第二条', '第三条'].map((text, index) => ({
+            message_id: `${rootId}_child_${index}`,
+            upper_message_id: rootId,
+            msg_type: 'text',
+            body: { content: JSON.stringify({ text }) },
+          })),
+        ],
+      },
+    }));
+
+    const result = await enrichFeishuInboundContent({
+      client,
+      messageId: 'om_item_limit_note',
+      messageType: 'text',
+      fallbackText: '请分析',
+      parentId: rootId,
+      parseContent,
+      limits: { maxForwardItems: 2 },
+    });
+
+    expect(result.references?.[0]?.text).toContain('第一条');
+    expect(result.references?.[0]?.text).toContain('第二条');
+    expect(result.references?.[0]?.text).not.toContain('第三条');
+    expect(result.references?.[0]?.materialResolved).toBeUndefined();
+  });
+
+  test('does not mark an internally truncated card child as complete', async () => {
+    const rootId = 'om_forward_card_over_image_limit';
+    const client = clientWith(() => ({
+      data: {
+        items: [
+          {
+            message_id: rootId,
+            msg_type: 'merge_forward',
+            body: { content: 'Merged and Forwarded Message' },
+          },
+          {
+            message_id: `${rootId}_card`,
+            upper_message_id: rootId,
+            msg_type: 'interactive',
+            body: {
+              content: JSON.stringify({
+                schema: '2.0',
+                body: {
+                  elements: ['img_1', 'img_2', 'img_3'].map((img_key) => ({
+                    tag: 'img',
+                    img_key,
+                  })),
+                },
+              }),
+            },
+          },
+        ],
+      },
+    }));
+
+    const result = await enrichFeishuInboundContent({
+      client,
+      messageId: 'om_card_limit_note',
+      messageType: 'text',
+      fallbackText: '请分析',
+      parentId: rootId,
+      parseContent,
+      limits: { maxImageKeys: 2 },
+    });
+
+    expect(result.references?.[0]?.text.match(/\[引用图片/g)).toHaveLength(2);
+    expect(result.references?.[0]?.materialResolved).toBeUndefined();
   });
 
   test('keeps an ordinary reply chain separate from the current message', async () => {
@@ -303,7 +444,7 @@ describe('Feishu rich inbound normalization', () => {
     expect(result.references?.[0].text).not.toContain('[引用图');
   });
 
-  test('keeps child ownership for images inside a referenced merged forward', async () => {
+  test('uses outer ownership for images inside a referenced merged forward', async () => {
     const client = clientWith(() => ({
       data: {
         items: [
@@ -334,7 +475,7 @@ describe('Feishu rich inbound normalization', () => {
 
     expect(result.referencedImageRefs).toEqual([
       {
-        messageId: 'om_forward_child_image',
+        messageId: 'om_forward_parent',
         referenceMessageId: 'om_forward_parent',
         imageKey: 'img_v3_child_owned',
         marker: '[引用图片 1]',

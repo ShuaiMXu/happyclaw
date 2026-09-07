@@ -241,7 +241,7 @@ describe('Claude Agent SDK result usage scopes', () => {
       numTurns: 8,
     });
 
-    // Official SDK 0.3.205 shape: root usage, total cost and modelUsage have
+    // Official SDK shape: root usage, total cost and modelUsage have
     // grown from the previous result. Only numTurns/duration are per-result.
     const second = extractResultUsage(
       {

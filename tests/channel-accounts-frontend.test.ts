@@ -111,6 +111,7 @@ describe('channel account frontend behavior', () => {
     expect(supportsChannelConnectionTest('telegram')).toBe(true);
     expect(supportsChannelConnectionTest('qq')).toBe(true);
     expect(supportsChannelConnectionTest('wechat')).toBe(true);
+    expect(supportsChannelConnectionTest('wecom')).toBe(true);
     expect(supportsChannelConnectionTest('dingtalk')).toBe(true);
     expect(supportsChannelConnectionTest('discord')).toBe(true);
     expect(supportsChannelConnectionTest('whatsapp')).toBe(false);
@@ -130,7 +131,7 @@ describe('channel account frontend behavior', () => {
   });
 
   test('gives every channel an actionable protocol-specific setup guide', () => {
-    expect(CHANNEL_PROVIDER_OPTIONS).toHaveLength(7);
+    expect(CHANNEL_PROVIDER_OPTIONS).toHaveLength(8);
     for (const provider of CHANNEL_PROVIDER_OPTIONS) {
       expect(provider.setupGuide.title.length).toBeGreaterThan(0);
       expect(provider.setupGuide.steps.length).toBeGreaterThanOrEqual(3);
@@ -148,6 +149,9 @@ describe('channel account frontend behavior', () => {
     );
     expect(providerDefinition('dingtalk').setupGuide.action?.url).toBe(
       'https://open-dev.dingtalk.com/fe/app',
+    );
+    expect(providerDefinition('wecom').setupGuide.action?.url).toContain(
+      'developer.work.weixin.qq.com',
     );
     expect(providerDefinition('discord').setupGuide.action?.url).toBe(
       'https://discord.com/developers/applications',
@@ -178,6 +182,31 @@ describe('channel account frontend behavior', () => {
       'appSecret',
     ]);
     expect(JSON.stringify(feishu)).not.toContain('ownerOpenId');
+  });
+
+  test('models WeCom credentials and pairing explicitly', () => {
+    const wecom = providerDefinition('wecom');
+    expect(wecom.authMode).toBe('credentials');
+    expect(wecom.supportsPairing).toBe(true);
+    expect(wecom.credentials.map((field) => field.key)).toEqual([
+      'botId',
+      'secret',
+      'corpId',
+    ]);
+    expect(
+      validateChannelAccountForm(
+        {
+          provider: 'wecom',
+          name: '企微 Bot',
+          enabled: true,
+          isDefault: false,
+          defaultWorkspaceJid: 'web:main',
+          credentials: { botId: 'bot', secret: 'secret', corpId: '' },
+          replaceCredentials: true,
+        },
+        'create',
+      ),
+    ).toBeNull();
   });
 
   test('downgrades every WhatsApp socket state without retaining false online or stale QR', () => {

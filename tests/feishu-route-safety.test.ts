@@ -11,7 +11,7 @@ describe('Feishu route safety integration', () => {
 
     expect(source).toContain('resolveAdmittedChannelRoute<FeishuMessageMeta>');
     expect(source).toContain(
-      'Feishu binding resolver rejected route; dropping message',
+      'Feishu binding resolver rejected route; ignoring without retry',
     );
     expect(source).not.toContain('agentRouting?.effectiveJid ?? chatJid');
   });
@@ -30,7 +30,7 @@ describe('Feishu route safety integration', () => {
     // forever. See channel-admission.ts's "pairing establishes ownership
     // before routing" contract.
     const bootstrapIdx = source.indexOf(
-      "chatType === 'p2p' &&\n        resolveEffectiveChatJid &&\n        !resolveEffectiveChatJid(chatJid)",
+      "if (chatType === 'p2p' && resolveEffectiveChatJid) {",
     );
     const routeCheckIdx = source.indexOf(
       'resolveAdmittedChannelRoute<FeishuMessageMeta>',
@@ -39,5 +39,33 @@ describe('Feishu route safety integration', () => {
     expect(bootstrapIdx).toBeGreaterThan(-1);
     expect(routeCheckIdx).toBeGreaterThan(-1);
     expect(bootstrapIdx).toBeLessThan(routeCheckIdx);
+  });
+
+  test('bootstrap swallows only ChannelRouteRejectedError from the per-account resolveEffectiveChatJid wrapper', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'src/feishu.ts'),
+      'utf8',
+    );
+
+    // im-manager wraps resolveEffectiveChatJid per-account and throws
+    // ChannelRouteRejectedError instead of returning null for an unbound
+    // chat. A bare `!resolveEffectiveChatJid(...)` truthiness check never
+    // observes that case — the throw unwinds past the bootstrap block
+    // straight to the outer catch, onNewChat never runs, and the chat can
+    // never register (every first DM permanently fails-closed). The
+    // bootstrap must catch that specific error and treat it as "not yet
+    // registered", while still rethrowing anything else.
+    expect(source).toContain(
+      "import {\n  resolveAdmittedChannelRoute,\n  ChannelRouteRejectedError,\n} from './channel-admission.js';",
+    );
+    const bootstrapIdx = source.indexOf(
+      "if (chatType === 'p2p' && resolveEffectiveChatJid) {",
+    );
+    expect(bootstrapIdx).toBeGreaterThan(-1);
+    const catchIdx = source.indexOf(
+      'if (!(err instanceof ChannelRouteRejectedError)) throw err;',
+      bootstrapIdx,
+    );
+    expect(catchIdx).toBeGreaterThan(bootstrapIdx);
   });
 });

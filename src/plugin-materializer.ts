@@ -45,14 +45,10 @@ import path from 'path';
 
 import { logger } from './logger.js';
 import { isValidNameSegment } from './plugin-manifest.js';
-import {
-  getSnapshotPath,
-  type CatalogPluginEntry,
-} from './plugin-catalog.js';
+import { getSnapshotPath, type CatalogPluginEntry } from './plugin-catalog.js';
 import {
   getUserRuntimeRoot as getUserRuntimeRootFromUtils,
   readUserPluginsV2,
-  type UserPluginsV2,
 } from './plugin-utils.js';
 
 /**
@@ -308,8 +304,12 @@ export function cleanupOrphanRuntime(
   isSnapshotInUse?: ActiveRuntimeRefCheck,
   report?: MaterializeReport,
 ): MaterializeReport {
-  const out: MaterializeReport =
-    report ?? { reused: 0, built: 0, cleaned: 0, warnings: [] };
+  const out: MaterializeReport = report ?? {
+    reused: 0,
+    built: 0,
+    cleaned: 0,
+    warnings: [],
+  };
 
   if (!userId || !isValidNameSegment(userId)) return out;
 
@@ -344,9 +344,7 @@ export function cleanupOrphanRuntime(
       fs.rmSync(dir, { recursive: true, force: true });
       out.cleaned += 1;
     } catch (err) {
-      out.warnings.push(
-        `Cleanup of ${dir} failed: ${describe(err)}`,
-      );
+      out.warnings.push(`Cleanup of ${dir} failed: ${describe(err)}`);
       logger.warn(
         { userId, snapshot: name, err },
         'plugin-materializer: cleanup failed',
@@ -549,12 +547,6 @@ function hasManifest(dir: string): boolean {
 
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-/** Helper for callers that want to enumerate a user's catalog refs. */
-export function listEnabledRefs(userId: string): UserPluginsV2['enabled'] {
-  const cfg = readUserPluginsV2(userId);
-  return cfg ? cfg.enabled : {};
 }
 
 /** Re-export for callers wiring up admin tooling that need catalog metadata. */

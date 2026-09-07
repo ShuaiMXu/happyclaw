@@ -156,6 +156,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       setupStatus: null,
       initialized: true,
     });
+    // Registration responses intentionally contain only user data. Hydrate the
+    // public brand immediately so the authenticated shell does not flash or
+    // retain the default identity until the next full auth check.
+    await get().fetchAppearance();
   },
 
   logout: async () => {

@@ -165,11 +165,6 @@ export interface CapabilityCheckResult {
 
 let cachedCheck: Promise<CapabilityCheckResult> | null = null;
 
-/** Test-only: drop the cached result so the next call re-probes the host. */
-export function resetHostCapabilitiesCache(): void {
-  cachedCheck = null;
-}
-
 /** Detect which agent capabilities are present on the host. Result is cached
  * for the process lifetime — host tools don't appear/disappear at runtime. */
 export function checkHostCapabilities(): Promise<CapabilityCheckResult> {

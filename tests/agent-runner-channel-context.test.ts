@@ -44,6 +44,12 @@ function feishuContext(messageId = 'om-trigger'): ChannelTurnContext {
       id: messageId,
       rootId: 'om_root',
       threadId: 'omt_thread',
+      contentLink: {
+        kind: 'forward_bundle',
+        bundleId: 'om_root',
+        role: 'forwarder_comment',
+        relatedMessageId: 'om_root',
+      },
     },
     sender: {
       openId: 'ou_sender',
@@ -109,11 +115,49 @@ describe('Agent Runner channel turn context', () => {
       provider: 'feishu',
       channelAccountId: 'account-2',
       chat: { id: 'oc_group', isTopicStyle: true },
-      message: { id: 'om-trigger', threadId: 'omt_thread' },
+      message: {
+        id: 'om-trigger',
+        threadId: 'omt_thread',
+        contentLink: {
+          kind: 'forward_bundle',
+          bundleId: 'om_root',
+          role: 'forwarder_comment',
+        },
+      },
       sender: { openId: 'ou_sender', userId: 'u_sender' },
     });
     expect(JSON.stringify(normalized)).not.toContain('must-not-cross-boundary');
     expect(JSON.stringify(normalized)).not.toContain('prompt-only quoted body');
+    expect(
+      normalizeChannelTurnContext({
+        ...feishuContext(),
+        message: {
+          id: 'om_bad',
+          contentLink: {
+            kind: 'forward_bundle',
+            bundleId: 'om_root',
+            role: 'untrusted_role',
+          },
+        },
+      })?.message?.contentLink,
+    ).toBeUndefined();
+    expect(
+      normalizeChannelTurnContext({
+        ...feishuContext(),
+        message: {
+          id: 'om_rapid_note',
+          contentLink: {
+            kind: 'rapid_topic_bundle',
+            bundleId: 'om_rapid_root',
+            role: 'forwarder_comment',
+          },
+        },
+      })?.message?.contentLink,
+    ).toEqual({
+      kind: 'rapid_topic_bundle',
+      bundleId: 'om_rapid_root',
+      role: 'forwarder_comment',
+    });
   });
 
   test('creates a compact host-verified per-turn prompt block', () => {

@@ -37,6 +37,23 @@ export const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'riba2534/happyclaw-agent:latest';
 
+export function deriveContainerProfileImage(
+  image: string,
+  profile: 'headroom',
+): string | null {
+  if (image.includes('@')) return null;
+  const slash = image.lastIndexOf('/');
+  const colon = image.lastIndexOf(':');
+  const repository = colon > slash ? image.slice(0, colon) : image;
+  const tag = colon > slash ? image.slice(colon + 1) : 'latest';
+  return `${repository}:${tag}-${profile}`;
+}
+
+export const CONTAINER_IMAGE_HEADROOM =
+  process.env.CONTAINER_IMAGE_HEADROOM ||
+  deriveContainerProfileImage(CONTAINER_IMAGE, 'headroom') ||
+  '';
+
 export interface ContainerProxyConfig {
   httpsProxy: string;
   httpProxy: string;

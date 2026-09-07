@@ -91,7 +91,7 @@ describe('IM response audience policy', () => {
     };
     const plan = resolveFeishuConversationPlan({
       chatType: 'group',
-      chatMode: 'group',
+      chatMode: 'topic',
       activationMode: 'when_mentioned',
       mentionedBot: false,
       messageId: 'om_followup',

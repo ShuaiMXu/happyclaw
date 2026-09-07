@@ -15,13 +15,29 @@ import type { AppearanceConfig } from '../../stores/auth';
 const BRAND_ASSET_MAX_BYTES = 3 * 1024 * 1024;
 const BRAND_ASSET_TYPES = ['image/png', 'image/jpeg'];
 
+export function createAppearanceMutationQueue() {
+  let tail: Promise<void> = Promise.resolve();
+
+  return function enqueue<T>(request: () => Promise<T>): Promise<T> {
+    const operation = tail.then(request);
+    tail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  };
+}
+
 interface BrandAssetUploadProps {
   kind: 'icon' | 'banner' | 'favicon' | 'loadingIcon';
   title: string;
   desc: string;
   url: string | null;
   canManageAssets: boolean;
-  onChange: (appearance: AppearanceConfig) => void;
+  mutationDisabled: boolean;
+  executeMutation: (
+    request: () => Promise<AppearanceConfig>,
+  ) => Promise<AppearanceConfig>;
   previewClassName: string;
   imageClassName: string;
 }
@@ -32,11 +48,13 @@ function BrandAssetUpload({
   desc,
   url,
   canManageAssets,
-  onChange,
+  mutationDisabled,
+  executeMutation,
   previewClassName,
   imageClassName,
 }: BrandAssetUploadProps) {
   const [uploading, setUploading] = useState(false);
+  const [removing, setRemoving] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const fieldName = kind;
 
@@ -56,14 +74,16 @@ function BrandAssetUpload({
     body.append(fieldName, file);
     setUploading(true);
     try {
-      const result = await apiFetch<{
-        assetUrl: string;
-        appearance: AppearanceConfig;
-      }>(`/api/config/appearance/brand-${kind}`, {
-        method: 'POST',
-        body,
+      await executeMutation(async () => {
+        const result = await apiFetch<{
+          assetUrl: string;
+          appearance: AppearanceConfig;
+        }>(`/api/config/appearance/brand-${kind}`, {
+          method: 'POST',
+          body,
+        });
+        return result.appearance;
       });
-      onChange(result.appearance);
       toast.success(`${title}已更新`);
     } catch (err) {
       toast.error(getErrorMessage(err, `上传${title}失败`));
@@ -73,14 +93,19 @@ function BrandAssetUpload({
   };
 
   const remove = async () => {
+    setRemoving(true);
     try {
-      const appearance = await api.delete<AppearanceConfig>(
-        `/api/config/appearance/brand-${kind}`,
-      );
-      onChange(appearance);
+      await executeMutation(async () => {
+        const result = await api.delete<{ appearance: AppearanceConfig }>(
+          `/api/config/appearance/brand-${kind}`,
+        );
+        return result.appearance;
+      });
       toast.success(`已恢复默认${title}`);
     } catch (err) {
       toast.error(getErrorMessage(err, `移除${title}失败`));
+    } finally {
+      setRemoving(false);
     }
   };
 
@@ -114,7 +139,9 @@ function BrandAssetUpload({
             type="button"
             variant="outline"
             size="sm"
-            disabled={uploading || !canManageAssets}
+            disabled={
+              uploading || removing || mutationDisabled || !canManageAssets
+            }
             onClick={() => inputRef.current?.click()}
           >
             {uploading ? (
@@ -129,10 +156,16 @@ function BrandAssetUpload({
               type="button"
               variant="ghost"
               size="sm"
-              disabled={!canManageAssets}
+              disabled={
+                uploading || removing || mutationDisabled || !canManageAssets
+              }
               onClick={remove}
             >
-              <RotateCcw className="size-3.5" />
+              {removing ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <RotateCcw className="size-3.5" />
+              )}
               恢复默认
             </Button>
           )}
@@ -159,11 +192,60 @@ export function AppearanceSection() {
   );
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [pendingMutations, setPendingMutations] = useState(0);
+  const mutationQueueRef = useRef<ReturnType<
+    typeof createAppearanceMutationQueue
+  > | null>(null);
+  mutationQueueRef.current ??= createAppearanceMutationQueue();
 
   const canManage = hasPermission('manage_system_config');
   // Brand asset upload/delete is gated to admin on the backend
   // (`adminRoleMiddleware`), which is stricter than `manage_system_config`.
   const canManageAssets = user?.role === 'admin';
+
+  const applyAppearance = (
+    appearance: AppearanceConfig,
+    updateNameDraft: boolean,
+  ) => {
+    if (updateNameDraft) setAppName(appearance.appName);
+    setBrandIconUrl(appearance.brandIconUrl);
+    setBrandBannerUrl(appearance.brandBannerUrl);
+    setFaviconUrl(appearance.faviconUrl);
+    setBrandLoadingIconUrl(appearance.brandLoadingIconUrl);
+    useAuthStore.setState({ appearance });
+  };
+
+  const executeMutation = (
+    request: () => Promise<AppearanceConfig>,
+    updateNameDraft = false,
+  ): Promise<AppearanceConfig> => {
+    setPendingMutations((count) => count + 1);
+
+    // Keep all appearance writes in one client-side sequence. Each endpoint
+    // returns a full appearance snapshot, so allowing requests to overlap can
+    // let an older response replace a newer icon, banner, or app name.
+    const operation = mutationQueueRef.current!(async () => {
+      const responseAppearance = await request();
+      applyAppearance(responseAppearance, updateNameDraft);
+
+      // Reconcile the final server snapshot after the mutation. Failure here
+      // does not turn a committed write into an apparent failure; the serialized
+      // mutation response remains a safe fallback until the next refresh.
+      try {
+        const current = await api.get<AppearanceConfig>(
+          '/api/config/appearance',
+        );
+        applyAppearance(current, updateNameDraft);
+        return current;
+      } catch {
+        return responseAppearance;
+      }
+    });
+
+    return operation.finally(() => {
+      setPendingMutations((count) => Math.max(0, count - 1));
+    });
+  };
 
   useEffect(() => {
     if (!canManage) {
@@ -174,11 +256,7 @@ export function AppearanceSection() {
       setLoading(true);
       try {
         const data = await api.get<AppearanceConfig>('/api/config/appearance');
-        setAppName(data.appName);
-        setBrandIconUrl(data.brandIconUrl);
-        setBrandBannerUrl(data.brandBannerUrl);
-        setFaviconUrl(data.faviconUrl);
-        setBrandLoadingIconUrl(data.brandLoadingIconUrl);
+        applyAppearance(data, true);
       } catch (err) {
         toast.error(getErrorMessage(err, '加载外观配置失败'));
       } finally {
@@ -187,24 +265,16 @@ export function AppearanceSection() {
     })();
   }, [canManage]);
 
-  const syncBrandAsset =
-    (
-      setter: (url: string | null) => void,
-      pick: (a: AppearanceConfig) => string | null,
-    ) =>
-    (appearance: AppearanceConfig) => {
-      setter(pick(appearance));
-      useAuthStore.setState({ appearance });
-    };
-
   const handleSave = async () => {
     setSaving(true);
     try {
-      const data = await api.put<AppearanceConfig>('/api/config/appearance', {
-        appName: appName.trim(),
-      });
-      setAppName(data.appName);
-      useAuthStore.setState({ appearance: data });
+      await executeMutation(
+        () =>
+          api.put<AppearanceConfig>('/api/config/appearance', {
+            appName: appName.trim(),
+          }),
+        true,
+      );
       toast.success('外观设置已保存');
     } catch (err) {
       toast.error(getErrorMessage(err, '保存外观设置失败'));
@@ -261,7 +331,7 @@ export function AppearanceSection() {
 
       <Button
         onClick={handleSave}
-        disabled={saving || !appName.trim()}
+        disabled={saving || pendingMutations > 0 || !appName.trim()}
         className="w-full sm:w-auto"
       >
         {saving && <Loader2 className="size-4 animate-spin" />}
@@ -274,7 +344,8 @@ export function AppearanceSection() {
         desc="建议尺寸 400x400，显示在侧边栏折叠图标位置，支持 PNG/JPG"
         url={brandIconUrl}
         canManageAssets={canManageAssets}
-        onChange={syncBrandAsset(setBrandIconUrl, (a) => a.brandIconUrl)}
+        mutationDisabled={pendingMutations > 0}
+        executeMutation={(request) => executeMutation(request)}
         previewClassName="h-16 w-16 justify-center"
         imageClassName="h-full w-full"
       />
@@ -285,7 +356,8 @@ export function AppearanceSection() {
         desc="建议尺寸 600x200，左对齐显示在工作区列表上方，支持 PNG/JPG"
         url={brandBannerUrl}
         canManageAssets={canManageAssets}
-        onChange={syncBrandAsset(setBrandBannerUrl, (a) => a.brandBannerUrl)}
+        mutationDisabled={pendingMutations > 0}
+        executeMutation={(request) => executeMutation(request)}
         previewClassName="h-[60px] w-[200px] justify-start px-2"
         imageClassName="h-full w-full object-contain object-left"
       />
@@ -296,7 +368,8 @@ export function AppearanceSection() {
         desc="建议尺寸 32x32 或以上的正方形图片，主站加载时显示在浏览器标签页，支持 PNG/JPG"
         url={faviconUrl}
         canManageAssets={canManageAssets}
-        onChange={syncBrandAsset(setFaviconUrl, (a) => a.faviconUrl)}
+        mutationDisabled={pendingMutations > 0}
+        executeMutation={(request) => executeMutation(request)}
         previewClassName="h-10 w-10 justify-center"
         imageClassName="h-full w-full"
       />
@@ -307,10 +380,8 @@ export function AppearanceSection() {
         desc="建议尺寸 400x400 的正方形图片（透明底效果最佳），登录前和鉴权校验期间的全屏加载动画使用，支持 PNG/JPG"
         url={brandLoadingIconUrl}
         canManageAssets={canManageAssets}
-        onChange={syncBrandAsset(
-          setBrandLoadingIconUrl,
-          (a) => a.brandLoadingIconUrl,
-        )}
+        mutationDisabled={pendingMutations > 0}
+        executeMutation={(request) => executeMutation(request)}
         previewClassName="h-16 w-16 justify-center"
         imageClassName="h-full w-full"
       />

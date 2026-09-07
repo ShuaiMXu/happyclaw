@@ -95,8 +95,9 @@ function waitForRenderComplete(container: HTMLElement): Promise<void> {
     }
 
     function check() {
-      // Mermaid loading placeholders use animate-pulse
-      const loading = container.querySelectorAll('.animate-pulse');
+      const loading = container.querySelectorAll(
+        '.animate-pulse, [data-markdown-pending="true"]',
+      );
       const images = container.querySelectorAll('img');
       images.forEach(watchImage);
       // `complete` is true once the image has either successfully loaded OR

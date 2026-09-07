@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../../../api/client';
 import { useChatStore } from '../../../stores/chat';
 import type { AvailableImGroup, AgentInfo } from '../../../types';
+import { buildImBindingRequest } from '../../../utils/im-binding-policy';
 import { getAgentProfileDisplayName } from '../../../utils/agent-product';
 
 export interface BindingTarget {
-  type: 'main' | 'session';
+  type: 'workspace' | 'session';
   groupJid: string;
   groupName: string;
   agentProfileId?: string;
@@ -33,6 +34,7 @@ export function useImBindings() {
 
   const groups = useChatStore((s) => s.groups);
   const loadGroups = useChatStore((s) => s.loadGroups);
+  const loadAgents = useChatStore((s) => s.loadAgents);
   const loadAvailableImGroups = useChatStore((s) => s.loadAvailableImGroups);
   const syncAvailableImGroups = useChatStore((s) => s.syncAvailableImGroups);
 
@@ -83,7 +85,7 @@ export function useImBindings() {
 
       for (const [jid, group] of webGroups) {
         allTargets.push({
-          type: 'main',
+          type: 'workspace',
           groupJid: jid,
           groupName: group.name,
           agentProfileId: group.agent_profile_id,
@@ -99,7 +101,7 @@ export function useImBindings() {
             `/api/groups/${encodeURIComponent(jid)}/sessions`,
           );
           return data.sessions
-            .filter((a) => a.kind === 'conversation' && a.id !== 'main')
+            .filter((a) => a.kind === 'conversation' || a.kind === 'main')
             .map((a) => ({
               type: 'session' as const,
               groupJid: jid,
@@ -200,6 +202,31 @@ export function useImBindings() {
     [loadBindings],
   );
 
+  const bindTarget = useCallback(
+    async (
+      group: AvailableImGroup,
+      target: BindingTarget,
+      force: boolean,
+    ): Promise<string | null> => {
+      setError(null);
+      try {
+        const request = buildImBindingRequest(group, target, { force });
+        await api.put(request.url, request.body);
+        await Promise.all([
+          loadGroups(),
+          loadAgents(target.groupJid, { force: true }),
+        ]);
+        await loadBindings();
+        return null;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : '绑定失败';
+        setError(message);
+        return message;
+      }
+    },
+    [loadBindings, loadGroups, loadAgents],
+  );
+
   const reload = useCallback(() => {
     void syncBindings();
     loadTargets();
@@ -235,6 +262,7 @@ export function useImBindings() {
     targetsLoading,
     reload,
     rebind,
+    bindTarget,
     resetAllowlist,
     error,
     clearError,

@@ -64,7 +64,7 @@ describe('provider fallback source contracts', () => {
       'Model tiers exhausted on this account; quarantining profile for failover',
     );
     expect(agentRunner).toMatch(
-      /publishProviderAccountFailure\(\s*'rate_limit',\s*info\.resetsAt,\s*MODEL_LIMIT_EXHAUSTED_NOTICE,/,
+      /publishProviderFailure\(\{\s*error: 'rate_limit',\s*failureClass: 'account',\s*rateLimitResetsAt: info\.resetsAt,\s*failureNotice: MODEL_LIMIT_EXHAUSTED_NOTICE,/,
     );
     expect(agentRunner).not.toContain('pendingRejectedRateLimit');
   });
@@ -83,10 +83,13 @@ describe('provider fallback source contracts', () => {
 
   test('a synthetic assistant provider error cannot park the SDK stream', () => {
     expect(agentRunner).toContain(
-      'isAccountProviderAssistantError(assistantError)',
+      'classifyProviderAssistantError(assistantError)',
     );
-    expect(agentRunner).toContain(
-      'publishProviderAccountFailure(assistantError)',
+    // The published class must come from the classifier, never a hard-coded
+    // label: borrowing 'server_error' is exactly how the liveness watchdog
+    // inherited the account-verdict disposition it had no business having.
+    expect(agentRunner).toMatch(
+      /publishProviderFailure\(\{\s*error: assistantError,\s*failureClass: assistantErrorClass,\s*\}\)/,
     );
     expect(agentRunner).toContain(
       'const ipcReceipts = ipcDeliveryTracker.completeNextTurn()',
@@ -123,8 +126,8 @@ describe('provider fallback source contracts', () => {
     expect(hostRunner).toMatch(
       /hasCandidateForTier\(primaryTier\)[\s\S]*?hasCandidateForTier\(fallbackModel\)/,
     );
-    expect(agentRunner).toContain(
-      "publishProviderAccountFailure('rate_limit', info.resetsAt)",
+    expect(agentRunner).toMatch(
+      /publishProviderFailure\(\{\s*error: 'rate_limit',\s*failureClass: 'account',\s*rateLimitResetsAt: info\.resetsAt,\s*\}\)/,
     );
     expect(hostRunner).toMatch(
       /providerPool\.refreshFromConfig\([\s\S]*?providerPool\.refreshRecoveryState\(\)/,

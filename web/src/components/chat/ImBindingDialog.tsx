@@ -23,6 +23,7 @@ import { Button } from '@/components/ui/button';
 import { SearchInput } from '@/components/common/SearchInput';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { useChatStore } from '../../stores/chat';
+import { api } from '../../api/client';
 import { showToast } from '../../utils/toast';
 import type { AgentInfo, AvailableImGroup } from '../../types';
 import { ChannelAccountBadge, ChannelBadge } from '../settings/channel-meta';
@@ -40,6 +41,9 @@ import {
   channelAccountKey,
 } from '../../utils/channel-accounts';
 import {
+  buildImBindingRequest,
+  isBoundToImDestination,
+  resolveBindingTargetType,
   resolveBindingActivationMode,
   resolveBindingAudienceMode,
 } from '../../utils/im-binding-policy';
@@ -99,7 +103,8 @@ function isFeishuDirectChat(group: AvailableImGroup): boolean {
 
 function conversationKindLabel(group: AvailableImGroup): string {
   if (group.conversation_kind === 'direct') return '私聊';
-  if (group.conversation_kind === 'group') return '群聊';
+  if (group.conversation_kind === 'group') return '普通群';
+  if (group.conversation_kind === 'topic') return '话题群';
   return '类型待确认';
 }
 
@@ -136,18 +141,18 @@ function activationDescription(
   if (isFeishuDirectChat(group)) {
     return resolvedMode === 'disabled'
       ? null
-      : '私聊始终响应，并共享一个上下文。';
+      : '绑定后，私聊使用所选会话，并按响应对象设置回复。';
   }
   if (group.channel_type !== 'feishu') return null;
   if (resolvedMode === 'when_mentioned' || resolvedMode === 'owner_mentioned') {
     return isNativeFeishuTopicGroup(group)
       ? '每个新话题首次需要 @，激活后话题内无需再次 @。'
-      : '每次在群主时间线 @ 都会创建独立话题，话题内后续无需再次 @。';
+      : '每条消息需要 @机器人，均使用已绑定会话，不创建新会话。';
   }
   if (resolvedMode === 'always') {
     return isNativeFeishuTopicGroup(group)
       ? '所有话题自动响应，每个话题使用独立上下文。'
-      : '群内消息免 @，整个普通群共享一个上下文。';
+      : '群内消息免 @，使用已绑定会话。';
   }
   return null;
 }
@@ -187,41 +192,32 @@ export function ImBindingDialog({
 
   const loadAvailableImGroups = useChatStore((s) => s.loadAvailableImGroups);
   const syncAvailableImGroups = useChatStore((s) => s.syncAvailableImGroups);
-  const bindImGroup = useChatStore((s) => s.bindImGroup);
+  const loadGroups = useChatStore((s) => s.loadGroups);
+  const loadAgents = useChatStore((s) => s.loadAgents);
   const unbindImGroup = useChatStore((s) => s.unbindImGroup);
-  const bindMainImGroup = useChatStore((s) => s.bindMainImGroup);
   const unbindMainImGroup = useChatStore((s) => s.unbindMainImGroup);
-  const bindWorkspaceImGroup = useChatStore((s) => s.bindWorkspaceImGroup);
   const unbindWorkspaceImGroup = useChatStore((s) => s.unbindWorkspaceImGroup);
 
   const isMainMode = agentId === null;
   const isWorkspaceMode = targetMode === 'workspace';
 
+  const destination = useMemo(
+    () => ({
+      type: isWorkspaceMode ? ('workspace' as const) : ('session' as const),
+      groupJid,
+      ...(!isWorkspaceMode ? { sessionId: agentId ?? 'main' } : {}),
+    }),
+    [isWorkspaceMode, groupJid, agentId],
+  );
+
   const compatibleGroups = useMemo(
     () =>
-      imGroups.filter((group) => {
-        const capabilities = getImChannelCapabilities(group.channel_type);
-        if (isWorkspaceMode) {
-          return (
-            capabilities?.can_bind_workspace === true &&
-            group.conversation_kind === 'group'
-          );
-        }
-        if (
-          capabilities?.can_bind_session === true &&
-          group.conversation_kind === 'direct'
-        ) {
-          return true;
-        }
-        // Keep a legacy group->fixed-session mismatch visible in the exact
-        // session that owns it, so the user can restore it instead of ending
-        // up with an unreachable binding after this policy became strict.
-        return (
-          !isMainMode &&
-          (group.bound_session_id ?? group.bound_agent_id) === agentId
-        );
-      }),
-    [agentId, groupJid, imGroups, isMainMode, isWorkspaceMode],
+      imGroups.filter(
+        (group) =>
+          resolveBindingTargetType(group) === destination.type ||
+          isBoundToImDestination(group, destination),
+      ),
+    [imGroups, destination],
   );
 
   const loadGroupsForDialog = useCallback(
@@ -364,9 +360,7 @@ export function ImBindingDialog({
 
     const recentCutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
     const priority = (group: AvailableImGroup): number => {
-      const boundToCurrent = isMainMode
-        ? (group.bound_workspace_jid ?? group.bound_main_jid) === groupJid
-        : (group.bound_session_id ?? group.bound_agent_id) === agentId;
+      const boundToCurrent = isBoundToImDestination(group, destination);
       if (boundToCurrent) return 0;
       const addedAt = Date.parse(group.added_at);
       if (Number.isFinite(addedAt) && addedAt >= recentCutoff) return 1;
@@ -387,18 +381,15 @@ export function ImBindingDialog({
     accountFilter,
     agentId,
     compatibleGroups,
+    destination,
     channelFilter,
     filter,
     groupJid,
     isMainMode,
   ]);
 
-  const isBoundToThis = (group: AvailableImGroup): boolean => {
-    if (isWorkspaceMode || isMainMode) {
-      return (group.bound_workspace_jid ?? group.bound_main_jid) === groupJid;
-    }
-    return (group.bound_session_id ?? group.bound_agent_id) === agentId;
-  };
+  const isBoundToThis = (group: AvailableImGroup): boolean =>
+    isBoundToImDestination(group, destination);
 
   const isBoundToOther = (group: AvailableImGroup): boolean => {
     if (isBoundToThis(group)) return false;
@@ -419,46 +410,31 @@ export function ImBindingDialog({
     }
   };
 
-  const handleBind = async (imJid: string) => {
-    setActionLoading(imJid);
-    try {
-      let ok: boolean;
-      if (isWorkspaceMode || isMainMode) {
-        const target = imGroups.find((g) => g.jid === imJid);
-        const mode =
-          isWorkspaceMode &&
-          target?.conversation_kind === 'group' &&
-          supportsActivationModes(target.channel_type)
-            ? resolveBindingActivationMode(target, activationModes[imJid])
-            : undefined;
-        const bindTarget = isWorkspaceMode
-          ? bindWorkspaceImGroup
-          : bindMainImGroup;
-        ok = await bindTarget(
-          groupJid,
-          imJid,
-          false,
-          mode,
-          undefined,
-          isWorkspaceMode && target?.channel_type === 'feishu'
-            ? resolveBindingAudienceMode(target, audienceModes[imJid])
-            : undefined,
-        );
-      } else {
-        ok = await bindImGroup(groupJid, agentId, imJid);
-      }
-      if (ok) {
-        await reloadGroups();
-      } else {
-        showToast('绑定失败');
-      }
-    } catch {
-      showToast('绑定失败');
-    }
-    setActionLoading(null);
+  const bindCurrentTarget = async (group: AvailableImGroup, force = false) => {
+    const request = buildImBindingRequest(group, destination, {
+      force,
+      activationMode: activationModes[group.jid],
+      audienceMode: audienceModes[group.jid],
+    });
+    await api.put(request.url, request.body);
+    await Promise.all([loadGroups(), loadAgents(groupJid, { force: true })]);
+    await reloadGroups();
   };
 
-  const handleRestoreDefault = async (imJid: string) => {
+  const handleBind = async (imJid: string) => {
+    const group = imGroups.find((item) => item.jid === imJid);
+    if (!group) return;
+    setActionLoading(imJid);
+    try {
+      await bindCurrentTarget(group);
+    } catch {
+      showToast('绑定失败');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleUnbind = async (imJid: string) => {
     setActionLoading(imJid);
     try {
       let ok: boolean;
@@ -472,10 +448,10 @@ export function ImBindingDialog({
       if (ok) {
         await reloadGroups();
       } else {
-        showToast('恢复账号默认路由失败');
+        showToast('解除绑定失败');
       }
     } catch {
-      showToast('恢复账号默认路由失败');
+      showToast('解除绑定失败');
     }
     setActionLoading(null);
   };
@@ -489,19 +465,14 @@ export function ImBindingDialog({
         activationModes[imJid],
       );
       setActivationModes((prev) => ({ ...prev, [imJid]: mode }));
-      // Re-bind with force to update activation_mode on already-bound group
+      // Update activation without changing the binding destination.
       try {
-        const ok = await bindWorkspaceImGroup(
-          groupJid,
-          imJid,
-          true,
-          mode,
-          undefined,
-          target.channel_type === 'feishu'
-            ? resolveBindingAudienceMode(target, audienceModes[imJid])
-            : undefined,
+        await api.put(
+          `/api/config/user-im/bindings/${encodeURIComponent(imJid)}`,
+          {
+            activation_mode: mode,
+          },
         );
-        if (!ok) throw new Error('activation update rejected');
         await reloadGroups();
       } catch {
         setActivationModes((prev) => ({
@@ -511,7 +482,7 @@ export function ImBindingDialog({
         showToast('更新触发模式失败');
       }
     },
-    [activationModes, audienceModes, groupJid, imGroups, bindWorkspaceImGroup],
+    [activationModes, imGroups],
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleAudienceModeChange = useCallback(
@@ -524,15 +495,12 @@ export function ImBindingDialog({
       );
       setAudienceModes((prev) => ({ ...prev, [imJid]: audienceMode }));
       try {
-        const ok = await bindWorkspaceImGroup(
-          groupJid,
-          imJid,
-          true,
-          resolveBindingActivationMode(target, activationModes[imJid]),
-          undefined,
-          audienceMode,
+        await api.put(
+          `/api/config/user-im/bindings/${encodeURIComponent(imJid)}`,
+          {
+            audience_mode: audienceMode,
+          },
         );
-        if (!ok) throw new Error('audience update rejected');
         await reloadGroups();
       } catch {
         setAudienceModes((prev) => ({
@@ -542,7 +510,7 @@ export function ImBindingDialog({
         showToast('更新响应对象失败');
       }
     },
-    [activationModes, audienceModes, bindWorkspaceImGroup, groupJid, imGroups],
+    [audienceModes, imGroups],
   ); // eslint-disable-line react-hooks/exhaustive-deps
 
   const describeBindTarget = (group: AvailableImGroup): string => {
@@ -556,7 +524,7 @@ export function ImBindingDialog({
         : `会话「${group.bound_target_name}」`;
     }
     if (group.bound_main_jid && group.bound_target_name) {
-      return group.conversation_kind === 'direct'
+      return resolveBindingTargetType(group) === 'session'
         ? `主会话「${group.bound_target_name}」`
         : `工作区「${group.bound_target_name}」`;
     }
@@ -569,35 +537,7 @@ export function ImBindingDialog({
     setRebindTarget(null);
     setActionLoading(imJid);
     try {
-      let ok: boolean;
-      if (isWorkspaceMode || isMainMode) {
-        const mode =
-          isWorkspaceMode &&
-          rebindGroup.conversation_kind === 'group' &&
-          supportsActivationModes(rebindGroup.channel_type)
-            ? resolveBindingActivationMode(rebindGroup, activationModes[imJid])
-            : undefined;
-        const bindTarget = isWorkspaceMode
-          ? bindWorkspaceImGroup
-          : bindMainImGroup;
-        ok = await bindTarget(
-          groupJid,
-          imJid,
-          true,
-          mode,
-          undefined,
-          isWorkspaceMode && rebindGroup.channel_type === 'feishu'
-            ? resolveBindingAudienceMode(rebindGroup, audienceModes[imJid])
-            : undefined,
-        );
-      } else {
-        ok = await bindImGroup(groupJid, agentId!, imJid, true);
-      }
-      if (ok) {
-        await reloadGroups();
-      } else {
-        showToast('换绑失败');
-      }
+      await bindCurrentTarget(rebindGroup, true);
     } catch {
       showToast('换绑失败');
     }
@@ -609,13 +549,10 @@ export function ImBindingDialog({
     : `会话绑定${agent ? ` — ${agent.name}` : ' — 主会话'}`;
 
   const renderThreadCapability = (group: AvailableImGroup) => {
-    if (!group.is_thread_capable) return null;
-    const nativeTopic = isNativeFeishuTopicGroup(group);
+    if (group.conversation_kind !== 'topic') return null;
     return (
       <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-medium text-sky-700 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-300">
-        {group.channel_type !== 'feishu' || nativeTopic
-          ? '原生话题'
-          : '按 @ 分话题'}
+        原生话题
       </span>
     );
   };
@@ -636,8 +573,8 @@ export function ImBindingDialog({
               <Info className="mt-0.5 size-3.5 shrink-0" />
               <span>
                 {isWorkspaceMode
-                  ? '这里只绑定群聊：普通群进入工作区主会话，话题群按话题创建独立会话。'
-                  : '这里只绑定私聊：绑定后，该私聊会继续使用当前会话上下文。'}
+                  ? '话题群绑定工作区，每个话题使用独立会话。回复返回当前话题；未绑定时不响应。'
+                  : '私聊和普通群绑定当前会话。回复返回当前消息所在渠道；未绑定时不响应。'}
               </span>
             </DialogDescription>
             <DialogClose asChild>
@@ -821,8 +758,8 @@ export function ImBindingDialog({
               {!loading && !loadError && compatibleGroups.length === 0 && (
                 <div className="py-12 text-center text-sm text-muted-foreground">
                   {isWorkspaceMode
-                    ? '暂无可绑定群聊。请确认 Bot 已加入群聊，然后点击“同步聊天”。'
-                    : '暂无可绑定私聊。请先向 Bot 发送一条私聊消息，然后点击“同步聊天”。'}
+                    ? '暂无可绑定话题群。请确认 Bot 已加入话题群，然后点击“同步聊天”。'
+                    : '暂无可绑定私聊或普通群。请确认 Bot 已加入群聊或收到私聊消息，然后点击“同步聊天”。'}
                 </div>
               )}
 
@@ -844,8 +781,8 @@ export function ImBindingDialog({
                   const boundToOther = isBoundToOther(group);
                   const isActioning = actionLoading === group.jid;
                   const supportsActivation =
-                    isWorkspaceMode &&
-                    group.conversation_kind === 'group' &&
+                    (group.conversation_kind === 'group' ||
+                      group.conversation_kind === 'topic') &&
                     supportsActivationModes(group.channel_type);
                   const effectiveMode = resolveBindingActivationMode(
                     group,
@@ -853,11 +790,11 @@ export function ImBindingDialog({
                   );
                   const activationOptions = activationOptionsFor(group);
                   const supportsAudience =
-                    isWorkspaceMode &&
-                    group.conversation_kind === 'group' &&
+                    (group.conversation_kind === 'group' ||
+                      group.conversation_kind === 'topic') &&
                     group.channel_type === 'feishu';
                   const policyMismatch =
-                    !isWorkspaceMode && group.conversation_kind !== 'direct';
+                    resolveBindingTargetType(group) !== destination.type;
                   const effectiveAudience = resolveBindingAudienceMode(
                     group,
                     audienceModes[group.jid],
@@ -916,7 +853,7 @@ export function ImBindingDialog({
                           <div className="mt-2 flex items-start gap-1 text-[11px] leading-4 text-amber-700 dark:text-amber-300">
                             <AlertTriangle className="mt-0.5 size-3 shrink-0" />
                             <span>
-                              历史绑定不符合新规则：群聊应绑定工作区。请恢复默认后到工作区绑定中重新配置。
+                              此绑定与渠道类型不符：私聊和普通群应绑定会话，话题群应绑定工作区。请解除绑定后重新配置。
                             </span>
                           </div>
                         )}
@@ -1101,7 +1038,7 @@ export function ImBindingDialog({
                           )}
                           <Button
                             variant="outline"
-                            onClick={() => handleRestoreDefault(group.jid)}
+                            onClick={() => handleUnbind(group.jid)}
                             disabled={isActioning}
                             className="h-9 min-w-24"
                           >
@@ -1110,7 +1047,7 @@ export function ImBindingDialog({
                             ) : (
                               <RotateCcw className="size-3.5" />
                             )}
-                            恢复默认
+                            解除绑定
                           </Button>
                         </div>
                       ) : boundToOther ? (

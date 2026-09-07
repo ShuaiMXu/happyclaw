@@ -106,6 +106,7 @@ const NOTIFICATION_LABEL: Record<string, string> = {
   success: '发送成功',
   partial_failed: '部分失败',
   failed: '发送失败',
+  uncertain: '送达待确认',
   skipped: '无需通知',
 };
 
@@ -878,7 +879,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
                       {log.attempt ?? 1}
                     </td>
                     <td
-                      className={`px-4 py-2.5 whitespace-nowrap ${log.notification_status === 'failed' || log.notification_status === 'partial_failed' ? 'text-error' : 'text-foreground'}`}
+                      className={`px-4 py-2.5 whitespace-nowrap ${log.notification_status === 'uncertain' ? 'text-warning' : log.notification_status === 'failed' || log.notification_status === 'partial_failed' ? 'text-error' : 'text-foreground'}`}
                       title={log.notification_error || ''}
                     >
                       {NOTIFICATION_LABEL[

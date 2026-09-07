@@ -3,11 +3,24 @@ import type {
   TaskRunNotificationPayload,
   TaskRunNotificationReceipt,
 } from './db.js';
+import {
+  classifyImSendFailure,
+  preAcceptImDeliveryError,
+  type ImSendFailureRef,
+} from './im-send-retry-policy.js';
+
+export function taskNotificationPreAcceptFailure(
+  message: string,
+): ImSendFailureRef {
+  const error = preAcceptImDeliveryError(message);
+  return { error, outcome: error.deliveryPhase };
+}
 
 export interface TaskNotificationDeliveryAttempt {
   channel: string;
   payload: TaskRunAtomicNotificationPayload;
   deliver: () => Promise<boolean>;
+  failure?: ImSendFailureRef;
 }
 
 /** Build durable retry work when image IPC processing fails before delivery
@@ -90,17 +103,39 @@ export async function settleTaskNotificationDeliveries(
   const outcomes = await Promise.all(
     attempts.map(async (attempt) => {
       try {
-        return { attempt, success: (await attempt.deliver()) === true };
+        const success = (await attempt.deliver()) === true;
+        const outcome = success
+          ? undefined
+          : (attempt.failure?.outcome ??
+            (attempt.failure?.error !== undefined
+              ? classifyImSendFailure(attempt.failure.error)
+              : undefined));
+        return {
+          attempt,
+          success,
+          uncertain: outcome === 'uncertain',
+          error: attempt.failure?.error,
+        };
       } catch (error) {
-        return { attempt, success: false, error };
+        return {
+          attempt,
+          success: false,
+          uncertain: classifyImSendFailure(error) === 'uncertain',
+          error,
+        };
       }
     }),
   );
-  const failed = outcomes.filter((outcome) => !outcome.success);
+  const notDelivered = outcomes.filter((outcome) => !outcome.success);
+  const failed = notDelivered.filter((outcome) => !outcome.uncertain);
+  const uncertain = notDelivered.filter((outcome) => outcome.uncertain);
   const failedChannels = [
-    ...new Set(failed.map((outcome) => outcome.attempt.channel)),
+    ...new Set(notDelivered.map((outcome) => outcome.attempt.channel)),
   ];
-  const succeeded = outcomes.length - failed.length;
+  const uncertainChannels = [
+    ...new Set(uncertain.map((outcome) => outcome.attempt.channel)),
+  ];
+  const succeeded = outcomes.length - notDelivered.length;
   const failedPayloads = failed.map((outcome) => outcome.attempt.payload);
   const retryPayload =
     failedPayloads.length === 0
@@ -108,7 +143,7 @@ export async function settleTaskNotificationDeliveries(
       : failedPayloads.length === 1
         ? failedPayloads[0]
         : ({ kind: 'batch', items: failedPayloads } as const);
-  const errorMessages = failed
+  const errorMessages = notDelivered
     .map((outcome) =>
       'error' in outcome
         ? outcome.error instanceof Error
@@ -121,21 +156,31 @@ export async function settleTaskNotificationDeliveries(
   return {
     receipt: {
       status:
-        failed.length === 0
-          ? 'success'
-          : succeeded > 0
-            ? 'partial_failed'
-            : 'failed',
+        uncertain.length > 0
+          ? 'uncertain'
+          : failed.length === 0
+            ? 'success'
+            : succeeded > 0
+              ? 'partial_failed'
+              : 'failed',
       summary: {
         attempted: outcomes.length,
         succeeded,
-        failed: failed.length,
+        failed: notDelivered.length,
         failed_channels: failedChannels,
+        ...(uncertain.length > 0
+          ? {
+              uncertain: uncertain.length,
+              uncertain_channels: uncertainChannels,
+            }
+          : {}),
       },
       error:
-        failed.length > 0
+        notDelivered.length > 0
           ? errorMessages.join('; ') ||
-            `Notification delivery failed: ${failedChannels.join(', ')}`
+            (uncertain.length > 0
+              ? `Notification delivery is uncertain: ${uncertainChannels.join(', ')}`
+              : `Notification delivery failed: ${failedChannels.join(', ')}`)
           : null,
     },
     retryPayload,

@@ -60,6 +60,7 @@ describe('Codex-style Web follow-up product contract', () => {
     expect(input).toMatch(/beginEditingFollowUp/);
     expect(input).toMatch(/立即发送/);
     expect(input).toMatch(/删除排队消息/);
+    expect(input).toMatch(/条消息已排队，将合并为下一轮/);
     expect(input).not.toMatch(/queuedFollowUps\.slice\(0, 3\)/);
     expect(input).not.toMatch(/index > 0/);
   });

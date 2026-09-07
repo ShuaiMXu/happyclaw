@@ -18,7 +18,7 @@ import {
   type WorkspaceMemoryValue,
 } from './memory-store.js';
 import { getRegisteredGroup, getWorkspaceRecord } from './db.js';
-import { canAccessGroup, canModifyGroup } from './web-context.js';
+import { canAccessGroup, canModifyGroup } from './group-acl.js';
 import type { UserRole } from './types.js';
 
 const MAX_CONTENT_LENGTH = 32_768;

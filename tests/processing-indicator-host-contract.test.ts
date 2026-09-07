@@ -13,54 +13,48 @@ function sourceBetween(source: string, start: string, end: string): string {
 }
 
 describe('exact processing indicator host contract', () => {
-  test('cold main and conversation-agent batches retain every covered DB input', () => {
-    expect(main).toMatch(
-      /processingIndicatorInputsByCompletion[\s\S]*missedMessages\.map\(\(message\) => message\.id\)/,
+  test('cold main and conversation-agent batches activate selected batch owners', () => {
+    expect(
+      main.match(/await activateBatchProcessingIndicators\(/g),
+    ).toHaveLength(2);
+    expect(main).toContain(
+      'initialProcessingIndicatorOwners.map((owner) => owner.inputTurnId)',
     );
-    expect(main).toMatch(
-      /agentProcessingIndicatorInputsByCompletion[\s\S]*missedMessages\.map\(\(message\) => message\.id\)/,
+    expect(main).toContain(
+      'initialAgentProcessingIndicatorOwners.map((owner) => owner.inputTurnId)',
     );
   });
 
-  test('warm delivery ids expand back to their covered original input ids', () => {
+  test('warm delivery ids select one Feishu batch owner from covered inputs', () => {
     expect(main).toMatch(
       /receipt\.coveredCursors \?\? \[receipt\.cursor\]\)\.map\(\(cursor\) => \(\{\s*id: cursor\.id,\s*sourceJid: cursor\.sourceJid/,
     );
-    expect(main).toMatch(
-      /processingIndicatorInputsByCompletion\.set\(inputTurnId, exactInputIds\)/,
-    );
-    expect(main).toMatch(
-      /agentProcessingIndicatorInputsByCompletion\.set\([\s\S]*inputTurnId,[\s\S]*exactInputIds/,
-    );
-    // Provider ACK owners are only original DB inputs. The delivery id is a
-    // separate typing lease, so cleanup cannot confuse one namespace for the
-    // other.
     expect(
       main.match(/coveredInputs && coveredInputs\.length > 0/g),
     ).toHaveLength(2);
     expect(
-      main.match(/new Set\(exactInputs\.map\(\(input\) => input\.id\)\)/g),
-    ).toHaveLength(2);
+      main.match(/selectBatchProcessingIndicatorOwners\(/g)?.length,
+    ).toBeGreaterThanOrEqual(4);
     expect(main).toContain(
       'processingTypingLeaseIdsByCompletion.set(inputTurnId, inputTurnId)',
     );
     expect(main).toContain('agentProcessingTypingLeaseIdsByCompletion.set(');
   });
 
-  test('warm main and agent inputs retain exact cross-route ack ownership', () => {
+  test('warm main and agent inputs retain selected cross-route ack ownership', () => {
     expect(main).toMatch(
       /candidateSourceJid = message\.source_jid \?\? message\.chat_jid/,
     );
     expect(
       main.match(
-        /exactInput\.sourceJid && getChannelType\(exactInput\.sourceJid\)/g,
+        /selectedIndicatorOwners\.map\(\(owner\) => owner\.inputTurnId\)/g,
       ),
     ).toHaveLength(2);
     expect(
       main.match(
-        /(?:agentProcessingIndicatorJidsByInput|processingIndicatorJidsByInput)\.set\(\s*exactInput\.id,\s*processingIndicatorJid/g,
+        /(?:agentProcessingIndicatorJidsByInput|processingIndicatorJidsByInput)\.set\(\s*owner\.inputTurnId,\s*owner\.transportJid/g,
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(4);
   });
 
   test('terminal cleanup releases the delivery typing lease separately and retains failed ack owners', () => {
@@ -77,6 +71,12 @@ describe('exact processing indicator host contract', () => {
     ).toHaveLength(2);
     expect(main).toMatch(
       /if \(ackCleared\) untrackProcessingIndicator\(logicalJid, inputTurnId\)/,
+    );
+  });
+
+  test('queued batch hand-off waits for old provider cleanup before adding the next reaction', () => {
+    expect(main).toMatch(
+      /await clearTrackedProcessingIndicators\(chatJid\);\s+await beginBatchAckReactions\(chatJid, prePublishedIndicatorOwners\)/,
     );
   });
 
@@ -97,9 +97,21 @@ describe('exact processing indicator host contract', () => {
   });
 
   test('provider registry keys omit HappyClaw account scoping on attach', () => {
-    for (const file of ['src/feishu.ts', 'src/discord.ts', 'src/dingtalk.ts']) {
-      expect(fs.readFileSync(file, 'utf8')).toMatch(/extractProviderTarget/);
-    }
+    const manager = fs.readFileSync('src/im-manager.ts', 'utf8');
+    const attach = sourceBetween(
+      manager,
+      'async beginAckReaction(',
+      'async clearAckReaction(',
+    );
+    const clear = sourceBetween(
+      manager,
+      'async clearAckReaction(',
+      'async createStreamingSession(',
+    );
+    expect(attach).toMatch(/const chatId = extractProviderTarget\(jid\)/);
+    expect(clear).toMatch(/const chatId = extractProviderTarget\(jid\)/);
+    expect(attach).not.toMatch(/scopeChannelJid/);
+    expect(clear).not.toMatch(/scopeChannelJid/);
   });
 
   test('ack provider release failures propagate back to the ownership registry', () => {
@@ -112,7 +124,7 @@ describe('exact processing indicator host contract', () => {
     expect(strictFeishuRemoval).toMatch(/messageReaction\.delete/);
     expect(strictFeishuRemoval).not.toMatch(/\bcatch\b/);
     expect(feishu).toMatch(
-      /ackReactions[\s\S]*removeReactionStrict\(ackMessageId, reactionId\)/,
+      /ackReactions[\s\S]*removeReactionStrict\(messageId, reactionId\)/,
     );
 
     // The best-effort variant is gone along with its only caller, the

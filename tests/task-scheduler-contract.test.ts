@@ -10,6 +10,12 @@ import {
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { settleTaskNotificationDeliveries } from '../src/task-notification.js';
+import {
+  ImDeliveryPhaseError,
+  preAcceptImDeliveryError,
+  retryUnscopedImSend,
+} from '../src/im-send-retry-policy.js';
 
 const tmpDir = fs.mkdtempSync(
   path.join(os.tmpdir(), 'task-scheduler-contract-'),
@@ -131,6 +137,9 @@ const {
   hasAuthoritativeScheduledGroupTerminal,
   processClaimedTaskRunNotification,
   resolveScheduledGroupRunsForOutput,
+  resolveScheduledGroupDeliveryRoute,
+  resolveScheduledTaskIpcRunId,
+  selectInteractionModeCompatibleMessagePrefix,
   resolveTerminalScheduledGroupPromptRun,
   scheduledGroupPromptMessageId,
   shouldFinalizeScheduledRunOutput,
@@ -139,6 +148,187 @@ const {
 
 const GROUP_JID = 'web:task-contract';
 const GROUP_FOLDER = 'task-contract';
+
+describe('scheduled-task IPC durable occurrence correlation', () => {
+  const run = {
+    id: 'run-abc',
+    task_id: 'task-42',
+    definition_snapshot: {
+      context_mode: 'group',
+      group_folder: GROUP_FOLDER,
+    },
+  } as never;
+
+  test('accepts cold prompt ids and warm-runner occurrence stamps', () => {
+    const getRun = (id: string) => (id === 'run-abc' ? run : undefined);
+    expect(
+      resolveScheduledTaskIpcRunId(
+        {
+          inputTurnId: scheduledGroupPromptMessageId('run-abc'),
+          taskId: 'task-42',
+        },
+        null,
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBe('run-abc');
+    expect(
+      resolveScheduledTaskIpcRunId(
+        {
+          inputTurnId: 'delivery-random',
+          taskId: 'task-42',
+          scheduledTaskRunId: 'run-abc',
+        },
+        null,
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBe('run-abc');
+  });
+
+  test('rejects mismatched task or workspace ownership', () => {
+    const getRun = (id: string) => (id === 'run-abc' ? run : undefined);
+    expect(
+      resolveScheduledTaskIpcRunId(
+        {
+          inputTurnId: scheduledGroupPromptMessageId('run-abc'),
+          taskId: 'another-task',
+        },
+        null,
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBeNull();
+    expect(
+      resolveScheduledTaskIpcRunId(
+        {
+          scheduledTaskRunId: 'run-abc',
+          taskId: 'task-42',
+        },
+        null,
+        'another-folder',
+        getRun,
+      ),
+    ).toBeNull();
+  });
+
+  test('validates isolated namespace runs instead of trusting the directory name', () => {
+    const isolatedRun = {
+      ...run,
+      definition_snapshot: {
+        context_mode: 'isolated',
+        group_folder: GROUP_FOLDER,
+      },
+    } as never;
+    const getRun = (id: string) =>
+      id === 'run-isolated' ? isolatedRun : undefined;
+
+    expect(
+      resolveScheduledTaskIpcRunId(
+        { taskId: 'task-42', scheduledTaskRunId: 'run-isolated' },
+        'run-isolated',
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBe('run-isolated');
+    expect(
+      resolveScheduledTaskIpcRunId(
+        { taskId: 'forged-task' },
+        'run-isolated',
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBeNull();
+    expect(
+      resolveScheduledTaskIpcRunId(
+        { taskId: 'task-42' },
+        'missing-run',
+        GROUP_FOLDER,
+        getRun,
+      ),
+    ).toBeNull();
+    expect(
+      resolveScheduledTaskIpcRunId(
+        { taskId: 'task-42' },
+        'run-isolated',
+        'another-workspace',
+        getRun,
+      ),
+    ).toBeNull();
+  });
+});
+
+describe('scheduled group frozen delivery route', () => {
+  const message = {
+    id: scheduledGroupPromptMessageId('run-route'),
+    chat_jid: 'feishu:source-chat',
+    source_kind: 'scheduled_task_prompt',
+    task_id: 'task-route',
+  };
+  const run = {
+    id: 'run-route',
+    task_id: 'task-route',
+    status: 'delivered',
+    definition_snapshot: {
+      context_mode: 'group',
+      group_folder: GROUP_FOLDER,
+      chat_jid: 'feishu:source-chat',
+      delivery_route_jid: 'feishu:frozen-target',
+    },
+  } as never;
+
+  test('uses the exact snapshot route instead of a sticky session owner', () => {
+    expect(
+      resolveScheduledGroupDeliveryRoute(
+        [message],
+        GROUP_FOLDER,
+        (id) => (id === 'run-route' ? run : undefined),
+        (jid) => (jid.startsWith('feishu:') ? 'feishu' : null),
+      ),
+    ).toBe('feishu:frozen-target');
+  });
+
+  test('fails closed on folder mismatch or conflicting batch routes', () => {
+    const getRun = (id: string) => {
+      if (id === 'run-route') return run;
+      if (id === 'run-other') {
+        return {
+          ...run,
+          id: 'run-other',
+          task_id: 'task-other',
+          definition_snapshot: {
+            ...run.definition_snapshot,
+            delivery_route_jid: 'feishu:other-target',
+          },
+        } as never;
+      }
+      return undefined;
+    };
+    expect(
+      resolveScheduledGroupDeliveryRoute(
+        [message],
+        'another-folder',
+        getRun,
+        () => 'feishu',
+      ),
+    ).toBeNull();
+    expect(
+      resolveScheduledGroupDeliveryRoute(
+        [
+          message,
+          {
+            ...message,
+            id: scheduledGroupPromptMessageId('run-other'),
+            task_id: 'task-other',
+          },
+        ],
+        GROUP_FOLDER,
+        getRun,
+        () => 'feishu',
+      ),
+    ).toBeNull();
+  });
+});
 
 function makeDeps(
   groups: Record<string, any>,
@@ -178,6 +368,7 @@ function makeDeps(
         senderName: input.senderName,
         text: input.text,
         queuedResult: input.queuedResult,
+        interactionMode: input.interactionMode,
       }),
     ),
     storeResultAndNotify: vi.fn(),
@@ -630,6 +821,55 @@ describe('scheduled task workspace/session contract', () => {
     expect(runContainerAgentMock).toHaveBeenCalledOnce();
   });
 
+  test('treats Provider quota control frames as activity-only scheduler output', async () => {
+    const taskId = createTask({ id: 'task-provider-quota-control-frame' });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    runContainerAgentMock.mockImplementationOnce(
+      async (_group, input, onProcess, onOutput) => {
+        onProcess?.({} as never, `container-${input.taskRunId}`, null);
+        await onOutput?.({
+          status: 'stream',
+          result: 'must-not-project',
+          streamEvent: { type: 'text', text: 'must-not-broadcast' },
+          providerQuotaObservation: {
+            source: 'sdk_rate_limit_event',
+            observedAt: Date.now(),
+            status: 'allowed_warning',
+            utilization: 0.75,
+          },
+        });
+        return {
+          status: 'success',
+          result: 'task result after quota control',
+          inputTurnCompleted: true,
+        };
+      },
+    );
+    const { deps, waitForRun } = makeDeps(groups);
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+
+    expect(trigger.success).toBe(true);
+    expect(deps.broadcastStreamEvent).not.toHaveBeenCalled();
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      result: 'task result after quota control',
+    });
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('task result after quota control'),
+      expect.any(Object),
+    );
+    expect(deps.storeResultAndNotify).not.toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('must-not-project'),
+      expect.any(Object),
+    );
+  });
+
   test('persists and retries a failed canonical workspace result without rerunning isolated Agent work', async () => {
     const taskId = createTask({ id: 'task-workspace-projection-retry' });
     const groups = {
@@ -715,7 +955,8 @@ describe('scheduled task workspace/session contract', () => {
     };
     const { deps, queue } = makeDeps(groups);
 
-    expect(triggerTaskNow(taskId, deps).success).toBe(true);
+    const trigger = triggerTaskNow(taskId, deps);
+    expect(trigger.success).toBe(true);
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(queue.enqueueMessageCheck).toHaveBeenCalledWith(GROUP_JID);
@@ -741,6 +982,126 @@ describe('scheduled task workspace/session contract', () => {
     expect(storedPrompt).toContain('不得只回复“已完成”“已发送”');
     expect(storedPrompt).toContain('feishu-cli');
     expect(storedPrompt).toContain('工具投递不能替代上述完整最终文本');
+    // Assistant 模式（默认）：框架会把最终文本自动投递到绑定渠道，framing 必须如实声明
+    // 并禁止 agent 再用 send_message 重复发送，否则用户收到两份相同内容。
+    expect(storedPrompt).toContain('也会自动发送到该渠道');
+    expect(storedPrompt).toContain('不要再用 send_message');
+    expect(storedPrompt).not.toContain('不会自动发送到 IM 渠道');
+    expect(
+      db.getTaskRunById(trigger.runId!)?.definition_snapshot.interaction_mode,
+    ).toBe('assistant');
+  });
+
+  test('proactive workspaces get the archive-only delivery framing', async () => {
+    db.assignWorkspaceAgentProfile(GROUP_FOLDER, 'profile-proactive');
+    expect(db.setWorkspaceInteractionMode(GROUP_FOLDER, 'proactive')).toBe(
+      true,
+    );
+    try {
+      const taskId = createTask({
+        id: 'task-group-proactive-framing',
+        context_mode: 'group',
+      });
+      const groups = {
+        [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+      };
+      const { deps } = makeDeps(groups);
+
+      const trigger = triggerTaskNow(taskId, deps);
+      expect(trigger.success).toBe(true);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const storedPrompt = (deps.storeGroupPromptAndDeliverRun as any).mock
+        .calls[0][0].text as string;
+      // Proactive 模式：管线只把最终文本归档（sendToIM: false），渠道投递仍由 agent 的
+      // send_message 负责；framing 不得禁止 send_message，否则用户什么都收不到。
+      expect(storedPrompt).toContain('不会自动发送到 IM 渠道');
+      expect(storedPrompt).toContain('通过 send_message 主动发送');
+      expect(storedPrompt).not.toContain('不要再用 send_message');
+      expect(storedPrompt).toContain('完整、可独立阅读的业务结果');
+      expect(storedPrompt).toContain('feishu-cli');
+
+      // The prompt is already queued. A later workspace toggle cannot
+      // reinterpret either its final SDK output or its send_message duty.
+      expect(db.setWorkspaceInteractionMode(GROUP_FOLDER, 'assistant')).toBe(
+        true,
+      );
+      const pending = db
+        .getMessagesSince(GROUP_JID, { timestamp: '', id: '' })
+        .filter((message) => message.task_id === taskId);
+      const frozen = selectInteractionModeCompatibleMessagePrefix(
+        pending,
+        'assistant',
+        db.getTaskRunById,
+      );
+      expect(frozen).toMatchObject({
+        interactionMode: 'proactive',
+        hasDeferredMessages: false,
+      });
+      expect(
+        db.getTaskRunById(trigger.runId!)?.definition_snapshot.interaction_mode,
+      ).toBe('proactive');
+    } finally {
+      db.deleteWorkspaceAgentProfile(GROUP_FOLDER);
+    }
+  });
+
+  test('does not coalesce queued scheduler prompts frozen under different modes', async () => {
+    db.assignWorkspaceAgentProfile(GROUP_FOLDER, 'profile-batch-freeze');
+    const groups = { [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)! };
+
+    const assistantTask = createTask({
+      id: 'task-group-assistant-batch',
+      context_mode: 'group',
+    });
+    const assistantDeps = makeDeps(groups);
+    expect(triggerTaskNow(assistantTask, assistantDeps.deps).success).toBe(
+      true,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(db.setWorkspaceInteractionMode(GROUP_FOLDER, 'proactive')).toBe(
+      true,
+    );
+    const proactiveTask = createTask({
+      id: 'task-group-proactive-batch',
+      context_mode: 'group',
+    });
+    const proactiveDeps = makeDeps(groups);
+    expect(triggerTaskNow(proactiveTask, proactiveDeps.deps).success).toBe(
+      true,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const pending = db
+      .getMessagesSince(GROUP_JID, { timestamp: '', id: '' })
+      .filter(
+        (message) =>
+          message.task_id === assistantTask ||
+          message.task_id === proactiveTask,
+      );
+    const firstBatch = selectInteractionModeCompatibleMessagePrefix(
+      pending,
+      'proactive',
+      db.getTaskRunById,
+    );
+    expect(firstBatch.interactionMode).toBe('assistant');
+    expect(firstBatch.hasDeferredMessages).toBe(true);
+    expect(firstBatch.messages).toHaveLength(1);
+    expect(firstBatch.messages[0].task_id).toBe(assistantTask);
+
+    const secondBatch = selectInteractionModeCompatibleMessagePrefix(
+      pending.slice(1),
+      'proactive',
+      db.getTaskRunById,
+    );
+    expect(secondBatch).toMatchObject({
+      interactionMode: 'proactive',
+      hasDeferredMessages: false,
+    });
+    expect(secondBatch.messages[0].task_id).toBe(proactiveTask);
+    db.deleteWorkspaceAgentProfile(GROUP_FOLDER);
   });
 
   test('cancels a delivered group run and durably projects the cancellation into its workspace', async () => {
@@ -1062,6 +1423,7 @@ describe('scheduled task workspace/session contract', () => {
       senderName: '定时任务',
       text: 'run the production-shaped cold report',
       queuedResult: '已排队',
+      interactionMode: 'assistant',
     });
 
     const coldMessages = db.getMessagesSince(chatJid, {
@@ -1181,6 +1543,7 @@ describe('scheduled task workspace/session contract', () => {
         senderName: '定时任务',
         text: 'atomic prompt',
         queuedResult: '已排队',
+        interactionMode: 'assistant',
       }),
     ).toThrow(/lost its execution fence/);
     expect(db.getMessage(GROUP_JID, messageId)).toBeNull();
@@ -1198,6 +1561,7 @@ describe('scheduled task workspace/session contract', () => {
         senderName: '定时任务',
         text: 'atomic prompt',
         queuedResult: '已排队',
+        interactionMode: 'assistant',
       }),
     ).toBe(messageId);
     expect(db.getMessage(GROUP_JID, messageId)).toMatchObject({
@@ -1586,6 +1950,7 @@ describe('scheduled task workspace/session contract', () => {
       senderName: '定时任务',
       text: 'run the report',
       queuedResult: '已排队',
+      interactionMode: 'assistant',
     });
     const resultMessageId = `scheduled-group-result:${claim.id}`;
     const retryPayload: db.TaskRunNotificationPayload = {
@@ -1683,6 +2048,7 @@ describe('scheduled task workspace/session contract', () => {
       senderName: '定时任务',
       text: 'run terminal report',
       queuedResult: '已排队',
+      interactionMode: 'assistant',
     });
     const error = '处理失败，已达最大重试次数';
     const messageId = `scheduled-group-terminal:${claim.id}`;
@@ -1951,6 +2317,84 @@ describe('scheduled task workspace/session contract', () => {
       status: 'success',
       result: 'script result',
     });
+  });
+
+  test('accepted-timeout source receipt stays uncertain and is never resent', async () => {
+    const ownerId = 'script-source-accepted-timeout-owner';
+    const sourceJid = 'feishu:script-source-accepted-timeout';
+    const now = new Date().toISOString();
+    db.createUser({
+      id: ownerId,
+      username: ownerId,
+      password_hash: 'hash',
+      display_name: ownerId,
+      role: 'admin',
+      status: 'active',
+      must_change_password: false,
+      created_at: now,
+      updated_at: now,
+    });
+    const scriptGroup = {
+      ...db.getRegisteredGroup(GROUP_JID)!,
+      jid: sourceJid,
+      created_by: ownerId,
+      executionMode: 'host' as const,
+    };
+    db.setRegisteredGroup(sourceJid, scriptGroup);
+    const taskId = createTask({
+      id: 'script-source-accepted-timeout',
+      execution_type: 'script',
+      execution_mode: 'host',
+      script_command: 'printf ok',
+      created_by: ownerId,
+      chat_jid: sourceJid,
+    });
+    const { deps, waitForRun } = makeDeps({ [sourceJid]: scriptGroup });
+    deps.sendMessage.mockRejectedValue(
+      new ImDeliveryPhaseError(
+        'uncertain',
+        'provider accepted but acknowledgement timed out',
+      ),
+    );
+    deps.storeResultAndNotify.mockResolvedValue({
+      status: 'skipped',
+      summary: {
+        attempted: 0,
+        succeeded: 0,
+        failed: 0,
+        failed_channels: [],
+      },
+    });
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+    await vi.waitFor(() => {
+      expect(db.getTaskRunById(trigger.runId!)?.status).not.toBe('running');
+    });
+
+    expect(deps.sendMessage).toHaveBeenCalledOnce();
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      notification_status: 'uncertain',
+      notification_summary: {
+        uncertain: 1,
+        uncertain_channels: [sourceJid],
+      },
+    });
+    expect(
+      (
+        db.getTaskRunById(trigger.runId!) as unknown as {
+          notification_payload: string | null;
+        }
+      ).notification_payload,
+    ).toBeNull();
+    expect(
+      db.claimTaskRunNotificationById(
+        trigger.runId!,
+        'must-not-resend-accepted-timeout',
+        60_000,
+      ),
+    ).toBeUndefined();
   });
 
   test('an owner-revoked script abort is recorded as failed and never sends a success notification', async () => {
@@ -2283,6 +2727,209 @@ describe('scheduled task workspace/session contract', () => {
       summary: { failed_channels: ['web:notification-retry-source'] },
     });
     expect(result.retryPayload).toEqual(payload);
+  });
+
+  test('persisted retry worker never requeues an uncertain provider outcome', async () => {
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'im_message',
+      targetJid: 'feishu:uncertain',
+      text: 'scheduled output',
+      localImagePaths: [],
+    };
+    const result = await deliverPersistedNotificationPayload(payload, {
+      retryTaskNotification: vi.fn(async () => ({
+        status: 'uncertain' as const,
+        summary: {
+          attempted: 1,
+          succeeded: 0,
+          failed: 1,
+          failed_channels: ['feishu'],
+          uncertain: 1,
+          uncertain_channels: ['feishu'],
+        },
+        error: 'provider acceptance is unknown',
+      })),
+      sendMessage: vi.fn(),
+    } as never);
+
+    expect(result.receipt.status).toBe('uncertain');
+    expect(result.retryPayload).toBeUndefined();
+  });
+
+  test.each(['im_image', 'im_file'] as const)(
+    '%s accepted-timeout removes durable retry work after one physical attempt',
+    async (kind) => {
+      const taskId = createTask({ id: `media-accepted-timeout-${kind}` });
+      const task = db.getTaskById(taskId)!;
+      const created = db.createTaskRun({ task, triggerType: 'manual' });
+      const execution = db.claimNextTaskRun(
+        `media-accepted-timeout-executor-${kind}`,
+        60_000,
+      )!;
+      expect(
+        db.completeTaskRun(
+          execution.id,
+          execution.lease_owner,
+          execution.lease_token,
+          { status: 'success', notificationStatus: 'pending' },
+        ),
+      ).toBe(true);
+
+      let sends = 0;
+      const transport = await retryUnscopedImSend(async () => {
+        sends += 1;
+        throw Object.assign(new Error('provider accepted; ACK timed out'), {
+          code: 'ETIMEDOUT',
+        });
+      });
+      const payload: db.TaskRunAtomicNotificationPayload =
+        kind === 'im_image'
+          ? {
+              kind,
+              targetJid: 'feishu:media-timeout',
+              workspaceFolder: GROUP_FOLDER,
+              filePath: 'same-artifact.png',
+              mimeType: 'image/png',
+              fileName: 'same-artifact.png',
+            }
+          : {
+              kind,
+              targetJid: 'feishu:media-timeout',
+              workspaceFolder: GROUP_FOLDER,
+              filePath: 'same-artifact.bin',
+              fileName: 'same-artifact.bin',
+            };
+      const initial = await settleTaskNotificationDeliveries([
+        {
+          channel: 'feishu',
+          payload,
+          failure: {
+            error: transport.error,
+            outcome:
+              transport.outcome === 'delivered' ? undefined : transport.outcome,
+          },
+          deliver: async () => transport.ok,
+        },
+      ]);
+
+      expect(sends).toBe(1);
+      expect(initial.receipt.status).toBe('uncertain');
+      expect(initial.retryPayload).toBeUndefined();
+      expect(
+        db.recordTaskRunNotificationReceipt(
+          created.run.id,
+          initial.receipt,
+          initial.retryPayload,
+        ),
+      ).toBe(true);
+      expect(
+        db.claimTaskRunNotificationById(
+          created.run.id,
+          `must-not-resend-${kind}`,
+          60_000,
+        ),
+      ).toBeUndefined();
+      expect(db.getTaskRunById(created.run.id)).toMatchObject({
+        notification_status: 'uncertain',
+        notification_payload: null,
+      });
+    },
+  );
+
+  test('typed pre-send failure survives the DB scheduler retry chain', async () => {
+    const taskId = createTask({ id: 'typed-pre-send-retry-chain' });
+    const task = db.getTaskById(taskId)!;
+    const created = db.createTaskRun({ task, triggerType: 'manual' });
+    const execution = db.claimNextTaskRun('typed-pre-send-executor', 60_000)!;
+    expect(
+      db.completeTaskRun(
+        execution.id,
+        execution.lease_owner,
+        execution.lease_token,
+        { status: 'success', notificationStatus: 'pending' },
+      ),
+    ).toBe(true);
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'im_message',
+      targetJid: 'feishu:missing-binding',
+      text: 'scheduled output',
+      localImagePaths: [],
+    };
+    const error = preAcceptImDeliveryError('No connected binding');
+    const initial = await settleTaskNotificationDeliveries([
+      {
+        channel: 'feishu',
+        payload,
+        failure: { error, outcome: error.deliveryPhase },
+        deliver: async () => false,
+      },
+    ]);
+    expect(initial.receipt.status).toBe('failed');
+    expect(initial.retryPayload).toEqual(payload);
+    expect(
+      db.recordTaskRunNotificationReceipt(
+        created.run.id,
+        initial.receipt,
+        initial.retryPayload,
+      ),
+    ).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    const claim = db.claimTaskRunNotificationById(
+      created.run.id,
+      'typed-pre-send-notifier',
+      60_000,
+    )!;
+    const retryTaskNotification = vi.fn(async () => ({
+      status: 'success' as const,
+      summary: {
+        attempted: 1,
+        succeeded: 1,
+        failed: 0,
+        failed_channels: [],
+      },
+    }));
+    expect(
+      await processClaimedTaskRunNotification(
+        claim,
+        { retryTaskNotification, sendMessage: vi.fn() } as never,
+        60_000,
+      ),
+    ).toBe(true);
+    expect(retryTaskNotification).toHaveBeenCalledWith(payload);
+    expect(db.getTaskRunById(created.run.id)).toMatchObject({
+      notification_status: 'success',
+      notification_payload: null,
+    });
+  });
+
+  test('persists unresolved explicit channel work until a binding can be resolved', async () => {
+    const payload: db.TaskRunNotificationPayload = {
+      kind: 'im_channel_file',
+      targetChannel: 'wechat',
+      ownerId: 'owner-1',
+      workspaceFolder: GROUP_FOLDER,
+      filePath: 'report.pdf',
+      fileName: 'report.pdf',
+    };
+    const retryTaskNotification = vi.fn(async () => ({
+      status: 'success' as const,
+      summary: {
+        attempted: 1,
+        succeeded: 1,
+        failed: 0,
+        failed_channels: [],
+      },
+    }));
+
+    const result = await deliverPersistedNotificationPayload(payload, {
+      retryTaskNotification,
+      sendMessage: vi.fn(),
+    } as never);
+
+    expect(result.receipt.status).toBe('success');
+    expect(result.retryPayload).toBeUndefined();
+    expect(retryTaskNotification).toHaveBeenCalledWith(payload);
   });
 
   test('strictly acknowledged script source is excluded from fallback', async () => {

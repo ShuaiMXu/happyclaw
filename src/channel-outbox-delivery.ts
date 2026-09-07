@@ -71,6 +71,7 @@ export class ChannelDeliveryProcessCrash extends Error {
  * and are always fenced as `uncertain` instead.
  */
 export class DefinitiveChannelDeliveryError extends Error {
+  readonly code = 'CHANNEL_DELIVERY_REJECTED';
   readonly retryAt?: string;
 
   constructor(

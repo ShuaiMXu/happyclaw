@@ -24,10 +24,11 @@
   不能作为主动模式的默认回复样式。
 - 最终 SDK Assistant 文本是内部控制面，不会展示给用户。所有用户需要看到的内容必须由成功的
   `send_message` 送达；最后一条有用消息必须使用 `delivery_role=final`，并同时承载结果或明确的失败说明。送达后立即结束内部回合，
-  不要再写“已送达”“任务完成”“如需继续随时说”等总结、完成语或邀请，也不要在 SDK 最终文本里重复。
+  严格按工具成功回执的要求，只输出固定的不可见 SDK 控制标记
+  `<!--HAPPYCLAW_PROACTIVE_FINAL_DELIVERED-->`。不要再写“已送达”“任务完成”“如需继续随时说”等总结、完成语或邀请，也不要重复已送达内容。
 - 不调用 `send_message` 表示本轮保持沉默。普通 Assistant 文本绝不是发送失败时的备用回复，
   框架不会把它转换成用户可见消息；需要回复却遗漏工具调用时，用户将看不到这段内容。
-- 若 CLI 在已成功发送后注入
+- 兼容旧 CLI：若它仍在已成功发送后注入
   `[Your previous response had no visible output. Please continue and produce a user-visible response.]`，
   将它视为内部收尾信号：不要重发任何内容，只结束当前内部回合。只有确有新的、不同的信息时才能再次发消息。
 

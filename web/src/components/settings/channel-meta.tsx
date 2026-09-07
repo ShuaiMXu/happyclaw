@@ -3,6 +3,7 @@ export const CHANNEL_LABEL: Record<string, string> = {
   telegram: 'Telegram',
   qq: 'QQ',
   wechat: '微信',
+  wecom: '企业微信',
   dingtalk: '钉钉',
   discord: 'Discord',
   whatsapp: 'WhatsApp',
@@ -14,6 +15,7 @@ export const CHANNEL_COLORS: Record<string, string> = {
   qq: 'bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300',
   wechat:
     'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300',
+  wecom: 'bg-lime-100 dark:bg-lime-900/40 text-lime-700 dark:text-lime-300',
   dingtalk: 'bg-cyan-100 dark:bg-cyan-900/40 text-cyan-700 dark:text-cyan-300',
   discord:
     'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300',
@@ -69,6 +71,7 @@ export const CHANNEL_ICON: Record<string, React.FC> = {
   telegram: TelegramIcon,
   qq: QQIcon,
   wechat: WeChatIcon,
+  wecom: WeChatIcon,
   dingtalk: DingTalkIcon,
   discord: DiscordIcon,
   whatsapp: WhatsAppIcon,

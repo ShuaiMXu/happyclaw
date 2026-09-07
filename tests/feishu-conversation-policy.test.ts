@@ -61,97 +61,76 @@ describe('Feishu conversation policy', () => {
     });
   });
 
-  test('ordinary top-level mention starts an isolated context anchored to itself', () => {
-    expect(
-      plan({ activationMode: 'when_mentioned', mentionedBot: true }),
-    ).toMatchObject({
-      allowWithoutMention: false,
-      independentContext: true,
-      contextId: 'om_message',
-      rootMessageId: 'om_message',
-      reason: 'new_mention_context',
+  test.each([
+    {},
+    { rootId: 'om_old_root' },
+    { threadId: 'omt_existing', rootId: 'om_old_root' },
+    { activeContext: { contextId: 'old', rootMessageId: 'om_old' } },
+    {
+      threadId: 'omt_existing',
+      activeContext: { contextId: 'old', rootMessageId: 'om_old' },
+    },
+  ])('ordinary mentions always use the bound session: %j', (context) => {
+    const result = plan({
+      ...context,
+      activationMode: 'when_mentioned',
+      mentionedBot: true,
     });
+    expect(result).toMatchObject({
+      independentContext: false,
+      allowWithoutMention: false,
+      reason: 'shared_chat',
+    });
+    expect(result.contextId).toBeUndefined();
   });
 
-  test('ordinary reply-chain mention starts a fresh context on the mentioned message', () => {
-    expect(
-      plan({
-        activationMode: 'when_mentioned',
-        mentionedBot: true,
-        rootId: 'om_old_chain_root',
-        parentId: 'om_old_chain_parent',
-        activeContext: {
-          contextId: 'om_old_chain_root',
-          rootMessageId: 'om_old_chain_root',
-        },
-      }),
-    ).toMatchObject({
-      allowWithoutMention: false,
-      independentContext: true,
-      contextId: 'om_message',
-      rootMessageId: 'om_message',
-      reason: 'new_mention_context',
+  test.each(['when_mentioned', 'owner_mentioned', 'auto'] as const)(
+    'old ordinary-group context cannot bypass %s activation',
+    (activationMode) => {
+      const result = plan({
+        activationMode,
+        requireMention: true,
+        mentionedBot: false,
+        threadId: 'omt_old',
+        rootId: 'om_old',
+        activeContext: { contextId: 'old', rootMessageId: 'om_old' },
+      });
+      expect(result).toMatchObject({
+        independentContext: false,
+        allowWithoutMention: false,
+        reason: 'mention_required',
+      });
+      expect(result.contextId).toBeUndefined();
+    },
+  );
+
+  test('ordinary group preserves only the current reply anchor, not an old active context', () => {
+    const result = plan({
+      rootId: 'om_current_root',
+      activeContext: { contextId: 'old', rootMessageId: 'om_old_root' },
     });
+    expect(result).toMatchObject({
+      independentContext: false,
+      rootMessageId: 'om_current_root',
+    });
+    expect(result.contextId).toBeUndefined();
   });
 
-  test('ordinary real thread mention stays in its durable active context', () => {
+  test('provider group_message_type marks a native topic group independently of activation', () => {
     expect(
       plan({
-        activationMode: 'when_mentioned',
-        mentionedBot: true,
-        threadId: 'omt_active_topic',
-        rootId: 'om_active_topic_root',
-        parentId: 'om_previous_topic_message',
-        activeContext: {
-          contextId: 'om_active_topic_root',
-          rootMessageId: 'om_active_topic_root',
-        },
+        groupMessageType: 'thread',
+        rootId: 'om_topic',
+        threadId: 'omt_topic',
       }),
     ).toMatchObject({
-      allowWithoutMention: true,
       independentContext: true,
-      contextId: 'om_active_topic_root',
-      rootMessageId: 'om_active_topic_root',
-      reason: 'active_context',
-    });
-  });
-
-  test('first mention inside an existing native thread adopts that thread instead of nesting', () => {
-    expect(
-      plan({
-        activationMode: 'when_mentioned',
-        mentionedBot: true,
-        threadId: 'omt_existing_topic',
-        rootId: 'om_existing_topic_root',
-        parentId: 'om_existing_topic_parent',
-      }),
-    ).toMatchObject({
-      allowWithoutMention: false,
-      independentContext: true,
-      contextId: 'omt_existing_topic',
-      rootMessageId: 'om_existing_topic_root',
+      contextId: 'omt_topic',
       reason: 'new_native_topic',
     });
-  });
-
-  test('ordinary active topic follows the durable binding without another mention', () => {
-    expect(
-      plan({
-        activationMode: 'when_mentioned',
-        threadId: 'omt_returned_later',
-        rootId: 'om_message',
-        activeContext: {
-          contextId: 'om_message',
-          rootMessageId: 'om_message',
-        },
-      }),
-    ).toMatchObject({
-      allowWithoutMention: true,
-      independentContext: true,
-      contextId: 'om_message',
-      rootMessageId: 'om_message',
-      reason: 'active_context',
-    });
+    expect(plan({ chatType: 'p2p', groupMessageType: 'thread' })).toMatchObject(
+      { independentContext: false, reason: 'direct' },
+    );
   });
 
   test('topic groups isolate every topic in always mode', () => {

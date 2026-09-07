@@ -3,6 +3,15 @@ import path from 'node:path';
 
 import type { IpcDeliveryReceipt } from './group-queue.js';
 
+const IPC_INPUT_CLAIM_MARKER = '.json.happyclaw-claimed-';
+
+/** Runner-owned claims remain durable IPC payloads until tracker registration. */
+export function isIpcInputPayloadFilename(filename: string): boolean {
+  return (
+    filename.endsWith('.json') || filename.includes(IPC_INPUT_CLAIM_MARKER)
+  );
+}
+
 function parseTypedDeliveryFile(filepath: string): IpcDeliveryReceipt | null {
   try {
     const payload = JSON.parse(fs.readFileSync(filepath, 'utf8')) as {
@@ -13,9 +22,15 @@ function parseTypedDeliveryFile(filepath: string): IpcDeliveryReceipt | null {
         coveredCursors?: Array<{
           timestamp?: unknown;
           id?: unknown;
+          sequence?: unknown;
           sourceJid?: unknown;
         }>;
-        cursor?: { timestamp?: unknown; id?: unknown; sourceJid?: unknown };
+        cursor?: {
+          timestamp?: unknown;
+          id?: unknown;
+          sequence?: unknown;
+          sourceJid?: unknown;
+        };
       };
     };
     const receipt = payload.receipt;
@@ -43,6 +58,11 @@ function parseTypedDeliveryFile(filepath: string): IpcDeliveryReceipt | null {
             coveredCursors: receipt.coveredCursors.map((cursor) => ({
               timestamp: cursor.timestamp as string,
               id: cursor.id as string,
+              ...(typeof cursor.sequence === 'number' &&
+              Number.isSafeInteger(cursor.sequence) &&
+              cursor.sequence >= 0
+                ? { sequence: cursor.sequence }
+                : {}),
               ...(typeof cursor.sourceJid === 'string'
                 ? { sourceJid: cursor.sourceJid }
                 : {}),
@@ -52,6 +72,11 @@ function parseTypedDeliveryFile(filepath: string): IpcDeliveryReceipt | null {
       cursor: {
         timestamp: receipt.cursor.timestamp,
         id: receipt.cursor.id,
+        ...(typeof receipt.cursor.sequence === 'number' &&
+        Number.isSafeInteger(receipt.cursor.sequence) &&
+        receipt.cursor.sequence >= 0
+          ? { sequence: receipt.cursor.sequence }
+          : {}),
         ...(typeof receipt.cursor.sourceJid === 'string'
           ? { sourceJid: receipt.cursor.sourceJid }
           : {}),
@@ -68,9 +93,7 @@ function scanInputDir(
 ): void {
   let filenames: string[];
   try {
-    filenames = fs
-      .readdirSync(inputDir)
-      .filter((name) => name.endsWith('.json'));
+    filenames = fs.readdirSync(inputDir).filter(isIpcInputPayloadFilename);
   } catch {
     return;
   }

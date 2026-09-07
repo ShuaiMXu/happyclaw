@@ -54,6 +54,7 @@ export type TaskNotificationStatus =
   | 'success'
   | 'partial_failed'
   | 'failed'
+  | 'uncertain'
   | 'skipped';
 
 export interface TaskNotificationSummary {
@@ -61,6 +62,8 @@ export interface TaskNotificationSummary {
   succeeded: number;
   failed: number;
   failed_channels: string[];
+  uncertain?: number;
+  uncertain_channels?: string[];
 }
 
 export interface TaskPermissions {

@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  getMessagesPage: vi.fn(),
+  getConversationHistoryMessagesPage: vi.fn(),
 }));
 
 vi.mock('../src/db.js', () => ({
-  getMessagesPage: mocks.getMessagesPage,
+  getConversationHistoryMessagesPage: mocks.getConversationHistoryMessagesPage,
 }));
 
 const { buildRecentConversationHistoryContext } =
@@ -13,11 +13,11 @@ const { buildRecentConversationHistoryContext } =
 
 describe('conversation history recovery context', () => {
   beforeEach(() => {
-    mocks.getMessagesPage.mockReset();
+    mocks.getConversationHistoryMessagesPage.mockReset();
   });
 
   test('returns stable message IDs and tags every recovered turn', () => {
-    mocks.getMessagesPage.mockReturnValue([
+    mocks.getConversationHistoryMessagesPage.mockReturnValue([
       {
         id: 'assistant-1',
         content: '收到',
@@ -48,7 +48,7 @@ describe('conversation history recovery context', () => {
   });
 
   test('excludes the pending turn from both context and known IDs', () => {
-    mocks.getMessagesPage.mockReturnValue([
+    mocks.getConversationHistoryMessagesPage.mockReturnValue([
       {
         id: 'pending-1',
         content: '当前消息',
@@ -71,5 +71,31 @@ describe('conversation history recovery context', () => {
 
     expect(result?.messageIds).toEqual(['history-1']);
     expect(result?.context).not.toContain('id="pending-1"');
+  });
+
+  test('uses the recovery-safe DB page and forwards the full pending-ID exclusion', () => {
+    mocks.getConversationHistoryMessagesPage.mockReturnValue([
+      {
+        id: 'safe-history',
+        content: '新的群聊消息',
+        sender_name: 'Bob',
+        is_from_me: false,
+      },
+    ]);
+
+    const pending = new Set(
+      Array.from({ length: 30 }, (_, index) => `pending-${index}`),
+    );
+    const result = buildRecentConversationHistoryContext('web:main', pending, {
+      intro: '恢复上下文',
+    });
+
+    expect(mocks.getConversationHistoryMessagesPage).toHaveBeenCalledWith(
+      'web:main',
+      pending,
+      30,
+    );
+    expect(result?.messageIds).toEqual(['safe-history']);
+    expect(result?.context).toContain('新的群聊消息');
   });
 });

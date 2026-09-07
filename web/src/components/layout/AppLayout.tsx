@@ -104,6 +104,20 @@ export function AppLayout() {
     };
   }, []);
 
+  // Message deletion is a durable server mutation. Apply it globally so a
+  // second tab/device cannot retain a deleted main or Runtime Session bubble.
+  useEffect(() => {
+    const unsub = wsManager.on('message_deleted', (data: any) => {
+      if (!data.messageChatJid || !data.messageId) return;
+      void useChatStore
+        .getState()
+        .handleMessageDeleted(data.messageChatJid, data.messageId);
+    });
+    return () => {
+      unsub();
+    };
+  }, []);
+
   // 监听 group_created（定时任务工作区创建），刷新侧边栏和任务列表
   useEffect(() => {
     const unsub = wsManager.on('group_created', () => {

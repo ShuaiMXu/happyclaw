@@ -385,6 +385,63 @@ describe('ActiveTurnOutputRegistry exactly-one staging', () => {
     expect(agentDelivered).toHaveBeenCalledOnce();
   });
 
+  test('counts progress delivery without turning it into a terminal reply ACK', () => {
+    const registry = new ActiveTurnOutputRegistry();
+    const terminalDelivered = vi.fn();
+    const progressDelivered = vi.fn();
+    const coordinator = registry.bind('workspace:main', 'turn-1', {
+      onProgress: () => true,
+      onFinalCandidate: () => true,
+      onUtteranceDelivered: terminalDelivered,
+      onNonTerminalDelivered: progressDelivered,
+    });
+
+    expect(
+      registry.recordDeliveredUtterance({
+        scopeKey: 'workspace:main',
+        inputTurnId: 'turn-1',
+        role: 'progress',
+        text: '仍在处理',
+      }),
+    ).toBe(true);
+    expect(coordinator.deliveredUtterances).toBe(1);
+    expect(progressDelivered).toHaveBeenCalledOnce();
+    expect(terminalDelivered).not.toHaveBeenCalled();
+
+    expect(
+      registry.recordDeliveredUtterance({
+        scopeKey: 'workspace:main',
+        inputTurnId: 'turn-1',
+        role: 'final',
+        text: '完成',
+      }),
+    ).toBe(true);
+    expect(terminalDelivered).toHaveBeenCalledOnce();
+  });
+
+  test('treats a separate utterance as non-terminal', () => {
+    const registry = new ActiveTurnOutputRegistry();
+    const terminalDelivered = vi.fn();
+    const nonTerminalDelivered = vi.fn();
+    registry.bind('workspace:main', 'turn-1', {
+      onProgress: () => true,
+      onFinalCandidate: () => true,
+      onUtteranceDelivered: terminalDelivered,
+      onNonTerminalDelivered: nonTerminalDelivered,
+    });
+
+    expect(
+      registry.recordDeliveredUtterance({
+        scopeKey: 'workspace:main',
+        inputTurnId: 'turn-1',
+        role: 'separate',
+        text: '旁路信息',
+      }),
+    ).toBe(true);
+    expect(nonTerminalDelivered).toHaveBeenCalledOnce();
+    expect(terminalDelivered).not.toHaveBeenCalled();
+  });
+
   test('projection failure does not poison dedupe or staged-final state', () => {
     const registry = new ActiveTurnOutputRegistry();
     const final = vi

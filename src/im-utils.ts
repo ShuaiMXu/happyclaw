@@ -93,6 +93,8 @@ export interface DedupCacheOptions {
 export interface DedupCache {
   isDuplicate(id: string): boolean;
   markSeen(id: string): void;
+  /** Release a provisional mark when processing must be replayed. */
+  forget(id: string): void;
   /** 重置 cache（断线重连时丢弃旧状态）。 */
   clear(): void;
   /** 仅用于测试 / 监控：当前 cache 大小。 */
@@ -129,6 +131,9 @@ export function createDedupCache(opts: DedupCacheOptions): DedupCache {
       // delete + set 把 id 移到末尾刷新 LRU 顺序。
       cache.delete(id);
       cache.set(id, Date.now());
+    },
+    forget(id: string): void {
+      cache.delete(id);
     },
     clear(): void {
       cache.clear();

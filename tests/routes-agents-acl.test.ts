@@ -103,6 +103,11 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  webContext.setWebDeps({
+    getRegisteredGroups: () => ({}),
+    broadcastAgentStatus: vi.fn(),
+    broadcastAgentRemoved: vi.fn(),
+  } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
   try {
     db.deleteRegisteredGroup(GROUP_JID);
   } catch {
@@ -614,11 +619,11 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       im_jid: imJid,
     });
     expect(status).toBe(400);
-    expect(body.error).toMatch(/only accept group chats/i);
+    expect(body.error).toMatch(/only accept native topic groups/i);
     expect(db.getRegisteredGroup(imJid)?.target_main_jid).toBeUndefined();
   });
 
-  test('session binding rejects a group chat', async () => {
+  test('session binding accepts an ordinary group chat', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
     const created = await postSession({ name: 'Direct-only session' });
@@ -641,17 +646,14 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       channel_account_id: account.id,
     });
 
-    const { status, body } = await req(
-      `/sessions/${sessionId}/im-binding`,
-      'PUT',
-      { im_jid: imJid },
-    );
-    expect(status).toBe(400);
-    expect(body.error).toMatch(/only accept direct chats/i);
-    expect(db.getRegisteredGroup(imJid)?.target_agent_id).toBeUndefined();
+    const { status } = await req(`/sessions/${sessionId}/im-binding`, 'PUT', {
+      im_jid: imJid,
+    });
+    expect(status).toBe(200);
+    expect(db.getRegisteredGroup(imJid)?.target_agent_id).toBe(sessionId);
   });
 
-  test('ordinary Feishu mention mode binds as thread_map and returns to one shared context in always mode', async () => {
+  test('ordinary Feishu mention and always modes keep the selected main session', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
     const suffix = Date.now().toString(36);
@@ -682,18 +684,18 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 
     try {
-      const mentioned = await req('/im-binding', 'PUT', {
+      const mentioned = await req('/sessions/main/im-binding', 'PUT', {
         im_jid: imJid,
         activation_mode: 'when_mentioned',
       });
       expect(mentioned.status, JSON.stringify(mentioned.body)).toBe(200);
       expect(db.getRegisteredGroup(imJid)).toMatchObject({
         target_main_jid: GROUP_JID,
-        binding_mode: 'thread_map',
+        binding_mode: 'single_context',
         activation_mode: 'when_mentioned',
       });
 
-      const always = await req('/im-binding', 'PUT', {
+      const always = await req('/sessions/main/im-binding', 'PUT', {
         im_jid: imJid,
         activation_mode: 'always',
         force: true,
@@ -743,11 +745,15 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 
     try {
-      const ownerWithoutMention = await req('/im-binding', 'PUT', {
-        im_jid: imJid,
-        activation_mode: 'always',
-        audience_mode: 'owner_only',
-      });
+      const ownerWithoutMention = await req(
+        '/sessions/main/im-binding',
+        'PUT',
+        {
+          im_jid: imJid,
+          activation_mode: 'always',
+          audience_mode: 'owner_only',
+        },
+      );
       expect(ownerWithoutMention.status).toBe(200);
       expect(db.getRegisteredGroup(imJid)).toMatchObject({
         activation_mode: 'always',
@@ -755,7 +761,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
         binding_mode: 'single_context',
       });
 
-      const ownerWithMention = await req('/im-binding', 'PUT', {
+      const ownerWithMention = await req('/sessions/main/im-binding', 'PUT', {
         im_jid: imJid,
         activation_mode: 'when_mentioned',
         audience_mode: 'owner_only',
@@ -765,23 +771,27 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       expect(db.getRegisteredGroup(imJid)).toMatchObject({
         activation_mode: 'when_mentioned',
         audience_mode: 'owner_only',
-        binding_mode: 'thread_map',
+        binding_mode: 'single_context',
       });
 
-      const everyoneWithMention = await req('/im-binding', 'PUT', {
-        im_jid: imJid,
-        activation_mode: 'when_mentioned',
-        audience_mode: 'everyone',
-        force: true,
-      });
+      const everyoneWithMention = await req(
+        '/sessions/main/im-binding',
+        'PUT',
+        {
+          im_jid: imJid,
+          activation_mode: 'when_mentioned',
+          audience_mode: 'everyone',
+          force: true,
+        },
+      );
       expect(everyoneWithMention.status).toBe(200);
       expect(db.getRegisteredGroup(imJid)).toMatchObject({
         activation_mode: 'when_mentioned',
         audience_mode: 'everyone',
-        binding_mode: 'thread_map',
+        binding_mode: 'single_context',
       });
 
-      const legacyComposite = await req('/im-binding', 'PUT', {
+      const legacyComposite = await req('/sessions/main/im-binding', 'PUT', {
         im_jid: imJid,
         activation_mode: 'owner_mentioned',
         force: true,
@@ -1152,7 +1162,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     }
   });
 
-  test('deleting a session binding restores the account default workspace', async () => {
+  test('deleting a session binding leaves the direct chat unbound', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
     const created = await postSession({ name: 'Temporary session' });
@@ -1185,16 +1195,19 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       'DELETE',
     );
     expect(status).toBe(200);
-    expect(body.target_main_jid).toBe(GROUP_JID);
-    expect(db.getRegisteredGroup(imJid)).toMatchObject({
-      target_main_jid: GROUP_JID,
-      target_agent_id: undefined,
+    expect(body.target_main_jid).toBeNull();
+    const restored = db.getRegisteredGroup(imJid);
+    expect(restored).toMatchObject({
+      target_main_jid: undefined,
       binding_mode: 'single_context',
       activation_mode: 'when_mentioned',
       owner_im_id: 'owner-im',
       sender_allowlist: ['owner-im'],
       reply_policy: 'source_only',
     });
+    expect(restored?.target_agent_id).toBeUndefined();
+    expect(db.getChannelMount(imJid)).toBeUndefined();
+    expect(db.getAgent(sessionId)).toBeDefined();
   });
 
   test('unbinding one of multiple chats keeps the agent fallback route on a remaining chat', async () => {
@@ -1278,7 +1291,7 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
     db.deleteRegisteredGroup(workspaceJid);
   });
 
-  test('REST restore detaches native navigation only after the last source leaves', async () => {
+  test('REST unbind detaches native navigation only after the last source leaves', async () => {
     seedTestGroup();
     asUser(OWNER_ID);
     const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -1350,8 +1363,8 @@ describe('agents IM-binding ACL (owner-only, mirrors CRUD)', () => {
       conversation_nav_mode: 'horizontal',
     });
     expect(db.getRegisteredGroup(defaultWorkspaceJid)).toMatchObject({
-      conversation_source: 'native_thread',
-      conversation_nav_mode: 'vertical_threads',
+      conversation_source: 'manual',
+      conversation_nav_mode: 'horizontal',
     });
 
     for (const sourceJid of sourceJids) db.deleteRegisteredGroup(sourceJid);

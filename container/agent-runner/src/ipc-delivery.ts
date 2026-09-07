@@ -17,6 +17,59 @@ export interface IpcInputMessage {
   sourceJid?: string;
   channelContext?: ChannelTurnContext;
   receipt?: IpcDeliveryReceipt;
+  /** Runner-private crash-recovery claim. Never serialized back to Host IPC. */
+  ipcClaimPath?: string;
+}
+
+function compareReceiptCursors(
+  a: { timestamp: string; id: string; sequence?: number },
+  b: { timestamp: string; id: string; sequence?: number },
+): number {
+  if (a.sequence !== undefined && b.sequence !== undefined) {
+    return a.sequence - b.sequence;
+  }
+  if (a.timestamp !== b.timestamp) return a.timestamp < b.timestamp ? -1 : 1;
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? -1 : 1;
+}
+
+function optionalSequence(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+export function ipcReceiptInputIdentity(receipt: IpcDeliveryReceipt): string {
+  const cursors = receipt.coveredCursors ?? [receipt.cursor];
+  return `${receipt.chatJid}\0${cursors
+    .map((cursor) =>
+      cursor.sequence !== undefined
+        ? `s:${cursor.sequence}`
+        : `l:${cursor.timestamp}\0${cursor.id}`,
+    )
+    .join('\u0001')}`;
+}
+
+const SCHEDULED_GROUP_PROMPT_ID_PREFIX = 'scheduled-task-prompt:';
+
+/** Recover the exact group-mode task occurrence from its durable input batch. */
+export function scheduledGroupRunIdFromIpcMessages(
+  messages: readonly IpcInputMessage[],
+  taskId: string | null | undefined,
+): string | null {
+  if (!taskId) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.taskId !== taskId || !message.receipt) continue;
+    const cursors = message.receipt.coveredCursors ?? [message.receipt.cursor];
+    for (let j = cursors.length - 1; j >= 0; j--) {
+      const id = cursors[j]?.id;
+      if (!id?.startsWith(SCHEDULED_GROUP_PROMPT_ID_PREFIX)) continue;
+      const runId = id.slice(SCHEDULED_GROUP_PROMPT_ID_PREFIX.length);
+      if (runId && /^[a-zA-Z0-9-]+$/.test(runId)) return runId;
+    }
+  }
+  return null;
 }
 
 /**
@@ -37,11 +90,7 @@ export function orderIpcInputMessages(
   return [...messages].sort((a, b) => {
     const aCursor = a.receipt!.cursor;
     const bCursor = b.receipt!.cursor;
-    if (aCursor.timestamp !== bCursor.timestamp) {
-      return aCursor.timestamp < bCursor.timestamp ? -1 : 1;
-    }
-    if (aCursor.id === bCursor.id) return 0;
-    return aCursor.id < bCursor.id ? -1 : 1;
+    return compareReceiptCursors(aCursor, bCursor);
   });
 }
 
@@ -61,7 +110,12 @@ export function parseIpcReceipt(
     return undefined;
   }
   let coveredCursors:
-    | Array<{ timestamp: string; id: string; sourceJid?: string }>
+    | Array<{
+        timestamp: string;
+        id: string;
+        sequence?: number;
+        sourceJid?: string;
+      }>
     | undefined;
   if (Object.prototype.hasOwnProperty.call(receipt, 'coveredCursors')) {
     if (
@@ -81,19 +135,23 @@ export function parseIpcReceipt(
       coveredCursors.push({
         timestamp: covered.timestamp,
         id: covered.id,
+        ...(optionalSequence(covered.sequence) !== undefined
+          ? { sequence: optionalSequence(covered.sequence) }
+          : {}),
         ...(typeof covered.sourceJid === 'string'
           ? { sourceJid: covered.sourceJid }
           : {}),
       });
     }
-    const maximum = [...coveredCursors].sort((a, b) => {
-      if (a.timestamp !== b.timestamp) {
-        return a.timestamp < b.timestamp ? -1 : 1;
-      }
-      if (a.id === b.id) return 0;
-      return a.id < b.id ? -1 : 1;
-    })[coveredCursors.length - 1];
-    if (maximum.timestamp !== cursor.timestamp || maximum.id !== cursor.id)
+    const maximum = [...coveredCursors].sort(compareReceiptCursors)[
+      coveredCursors.length - 1
+    ];
+    if (
+      maximum.timestamp !== cursor.timestamp ||
+      maximum.id !== cursor.id ||
+      (maximum.sequence !== undefined &&
+        maximum.sequence !== optionalSequence(cursor.sequence))
+    )
       return undefined;
   }
   return {
@@ -103,6 +161,9 @@ export function parseIpcReceipt(
     cursor: {
       timestamp: cursor.timestamp,
       id: cursor.id,
+      ...(optionalSequence(cursor.sequence) !== undefined
+        ? { sequence: optionalSequence(cursor.sequence) }
+        : {}),
       ...(typeof cursor.sourceJid === 'string'
         ? { sourceJid: cursor.sourceJid }
         : {}),
@@ -137,9 +198,7 @@ export function latestIpcInputMessage(
     if (!receipt) continue;
     if (
       !latest?.receipt ||
-      receipt.cursor.timestamp > latest.receipt.cursor.timestamp ||
-      (receipt.cursor.timestamp === latest.receipt.cursor.timestamp &&
-        receipt.cursor.id > latest.receipt.cursor.id)
+      compareReceiptCursors(receipt.cursor, latest.receipt.cursor) > 0
     ) {
       latest = message;
     }
@@ -153,15 +212,38 @@ export function latestIpcInputMessage(
 export class IpcTurnDeliveryTracker {
   readonly unacknowledgedMessages: IpcInputMessage[];
   private readonly turns: IpcInputMessage[][];
+  private readonly seenInputIdentities = new Set<string>();
 
   constructor(initialMessages: IpcInputMessage[] = []) {
-    this.unacknowledgedMessages = [...initialMessages];
-    this.turns = [[...initialMessages]];
+    const accepted = this.filterUnseen(initialMessages);
+    this.unacknowledgedMessages = [...accepted];
+    // Preserve the explicit cold/non-IPC turn even when it has no receipt.
+    this.turns = [[...accepted]];
   }
 
-  acceptTurn(messages: IpcInputMessage[]): void {
-    this.unacknowledgedMessages.push(...messages);
-    this.turns.push([...messages]);
+  private filterUnseen(
+    messages: readonly IpcInputMessage[],
+  ): IpcInputMessage[] {
+    const accepted: IpcInputMessage[] = [];
+    for (const message of messages) {
+      const receipt = message.receipt;
+      if (receipt) {
+        const identity = ipcReceiptInputIdentity(receipt);
+        if (this.seenInputIdentities.has(identity)) continue;
+        this.seenInputIdentities.add(identity);
+      }
+      accepted.push(message);
+    }
+    return accepted;
+  }
+
+  /** Register one durable turn, dropping stale-claim/re-emission duplicates. */
+  acceptTurn(messages: IpcInputMessage[]): IpcInputMessage[] {
+    const accepted = this.filterUnseen(messages);
+    if (accepted.length === 0) return [];
+    this.unacknowledgedMessages.push(...accepted);
+    this.turns.push([...accepted]);
+    return accepted;
   }
 
   /** Number of accepted user-input turns that have not produced a healthy SDK
@@ -186,6 +268,13 @@ export class IpcTurnDeliveryTracker {
    * removes the turn ahead of it. */
   get currentTurnDeliveryId(): string | undefined {
     return latestIpcDeliveryId(this.turns[0] ?? []);
+  }
+
+  /** Durable receipts owned by the SDK turn producing output right now. */
+  get currentTurnReceipts(): IpcDeliveryReceipt[] {
+    return this.currentTurnMessages
+      .map((message) => message.receipt)
+      .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
   }
 
   /** Accepted follow-up turns after the current one, kept in delivery order. */

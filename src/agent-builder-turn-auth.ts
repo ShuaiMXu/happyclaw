@@ -121,6 +121,10 @@ export function ownerImIdFromDirectConversationJid(
         : null;
     case 'wechat':
       return id || null;
+    case 'wecom':
+      return id.startsWith('c2c:') && id.length > 'c2c:'.length
+        ? id.slice('c2c:'.length)
+        : null;
     case 'qq':
       return id.startsWith('c2c:') && id.length > 'c2c:'.length ? id : null;
     case 'whatsapp': {
@@ -164,6 +168,12 @@ export function ownerImIdFromPersistedSender(
     case 'wechat': {
       const subject = sender.startsWith('wechat:')
         ? sender.slice('wechat:'.length)
+        : '';
+      return subject || null;
+    }
+    case 'wecom': {
+      const subject = sender.startsWith('wecom:')
+        ? sender.slice('wecom:'.length)
         : '';
       return subject || null;
     }

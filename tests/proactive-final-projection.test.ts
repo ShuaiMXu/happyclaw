@@ -28,11 +28,12 @@ describe('Explicit Proactive final projection', () => {
         scopeKey: SCOPE,
         inputTurnId: TURN,
         text: '# 完整总结\n\n四个 AI-native 工作方式',
-        uncertain: true,
+        nativeFailure: 'uncertain',
         project,
       }),
     ).resolves.toEqual({
       projected: true,
+      webCompleted: false,
       finalizationReason: 'delivery_uncertain',
     });
     expect(project).toHaveBeenCalledWith(
@@ -56,13 +57,42 @@ describe('Explicit Proactive final projection', () => {
         scopeKey: SCOPE,
         inputTurnId: TURN,
         text: '工具明确发送的 final',
-        uncertain: false,
+        nativeFailure: 'unavailable',
         project: async () => false,
       }),
     ).resolves.toEqual({
       projected: false,
+      webCompleted: false,
       finalizationReason: 'error',
     });
     expect(registry.get(SCOPE, TURN)?.hasDeliveredUtterance).toBe(false);
+  });
+
+  test('preserves a definitively rejected native final without claiming uncertainty', async () => {
+    const registry = new ActiveTurnOutputRegistry();
+    registry.bind(SCOPE, TURN, {
+      onProgress: () => true,
+      onFinalCandidate: () => true,
+    });
+    const project = vi.fn(async () => true);
+
+    await expect(
+      preserveUnacknowledgedProactiveFinal({
+        registry,
+        scopeKey: SCOPE,
+        inputTurnId: TURN,
+        text: '包含公开邮件地址的完整答案',
+        nativeFailure: 'rejected',
+        project,
+      }),
+    ).resolves.toEqual({
+      projected: true,
+      webCompleted: true,
+      finalizationReason: 'completed',
+    });
+    expect(project).toHaveBeenCalledWith(
+      '包含公开邮件地址的完整答案',
+      'completed',
+    );
   });
 });

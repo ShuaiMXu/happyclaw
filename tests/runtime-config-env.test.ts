@@ -4,6 +4,8 @@ import {
   buildClaudeEnvLines,
   buildContainerEnvLines,
   clearInheritedClaudeProviderEnv,
+  hasExplicitWorkspaceClaudeAuth,
+  mergeClaudeEnvConfig,
   type ClaudeProviderConfig,
 } from '../src/runtime-config.js';
 
@@ -27,6 +29,68 @@ function config(patch: Partial<ClaudeProviderConfig>): ClaudeProviderConfig {
 const NO_CUSTOM_ENV: Record<string, string> = {};
 
 describe('buildClaudeEnvLines', () => {
+  test.each([
+    {
+      override: { anthropicApiKey: 'workspace-api-key' },
+      expectedKey: 'workspace-api-key',
+      expectedToken: '',
+    },
+    {
+      override: { anthropicAuthToken: 'Bearer workspace-auth-token' },
+      expectedKey: '',
+      expectedToken: 'Bearer workspace-auth-token',
+    },
+  ])(
+    'treats explicit workspace key/token as the authoritative auth mode',
+    ({ override, expectedKey, expectedToken }) => {
+      const merged = mergeClaudeEnvConfig(
+        config({
+          anthropicBaseUrl: '',
+          anthropicApiKey: 'global-api-key',
+          anthropicAuthToken: 'global-auth-token',
+          claudeCodeOauthToken: 'global-oauth-token',
+          claudeOAuthCredentials: {
+            accessToken: 'oauth-access',
+            refreshToken: 'oauth-refresh',
+            expiresAt: 2_000_000_000_000,
+            scopes: ['user:inference'],
+          },
+        }),
+        override,
+      );
+
+      expect(hasExplicitWorkspaceClaudeAuth(override)).toBe(true);
+      expect(merged.anthropicApiKey).toBe(expectedKey);
+      expect(merged.anthropicAuthToken).toBe(expectedToken);
+      expect(merged.claudeCodeOauthToken).toBe('');
+      expect(merged.claudeOAuthCredentials).toBeNull();
+    },
+  );
+
+  test('treats a workspace base URL as non-OAuth while retaining inherited key credentials', () => {
+    const merged = mergeClaudeEnvConfig(
+      config({
+        anthropicBaseUrl: '',
+        anthropicApiKey: 'global-api-key',
+        anthropicAuthToken: 'global-auth-token',
+        claudeCodeOauthToken: 'global-oauth-token',
+        claudeOAuthCredentials: {
+          accessToken: 'oauth-access',
+          refreshToken: 'oauth-refresh',
+          expiresAt: 2_000_000_000_000,
+          scopes: ['user:inference'],
+        },
+      }),
+      { anthropicBaseUrl: 'https://workspace-proxy.test' },
+    );
+
+    expect(merged.anthropicBaseUrl).toBe('https://workspace-proxy.test');
+    expect(merged.anthropicApiKey).toBe('global-api-key');
+    expect(merged.anthropicAuthToken).toBe('global-auth-token');
+    expect(merged.claudeCodeOauthToken).toBe('');
+    expect(merged.claudeOAuthCredentials).toBeNull();
+  });
+
   test('maps plain third-party auth tokens to ANTHROPIC_API_KEY', () => {
     const lines = buildClaudeEnvLines(
       config({ anthropicAuthToken: 'plain-token' }),

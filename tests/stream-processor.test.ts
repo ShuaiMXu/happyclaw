@@ -158,6 +158,45 @@ describe('StreamEventProcessor observability mapping', () => {
     expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
   });
 
+  test('treats stopped and aborted task_updated as terminal SDK statuses', () => {
+    const { processor } = makeProcessor();
+
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'stopped-1',
+      description: 'user stopped this task',
+      task_type: 'local_agent',
+    });
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'aborted-1',
+      description: 'user aborted this task',
+      task_type: 'local_agent',
+    });
+    expect(processor.getPendingSdkTaskCount()).toBe(2);
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(2);
+
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: 'stopped-1',
+      patch: { status: 'stopped' },
+    });
+    expect(processor.getPendingSdkTaskCount()).toBe(1);
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(1);
+
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: 'aborted-1',
+      patch: { status: 'aborted' },
+    });
+    expect(processor.getPendingSdkTaskCount()).toBe(0);
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
+  });
+
   test('maps SDK task_progress to structured task_progress event', () => {
     const { processor, outputs } = makeProcessor();
 

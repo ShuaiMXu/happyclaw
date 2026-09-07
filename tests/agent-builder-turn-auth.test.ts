@@ -447,6 +447,13 @@ describe('Agent Builder owner identity', () => {
       sender: 'wechat:owner-open-id',
     },
     {
+      name: 'WeCom account-scoped group sender',
+      sourceJid: 'wecom:group:conversation-1#account:account-a',
+      groupJid: 'wecom:group:conversation-1#account:account-a',
+      ownerImId: 'owner-open-id',
+      sender: 'wecom:owner-open-id',
+    },
+    {
       name: 'QQ C2C namespace',
       sourceJid: 'qq:c2c:conversation-1',
       groupJid: 'qq:c2c:conversation-1',
@@ -631,11 +638,13 @@ describe('paired direct conversation identity', () => {
     ['discord:dm:456#account:bot-a', '456'],
     ['dingtalk:c2c:staff-a', 'staff-a'],
     ['wechat:user-a', 'user-a'],
+    ['wecom:c2c:user-a#account:bot-a', 'user-a'],
     ['qq:c2c:open-a#account:bot-a', 'c2c:open-a'],
     [
       'whatsapp:15551234:42@s.whatsapp.net#account:bot-a',
       '15551234@s.whatsapp.net',
     ],
+    ['whatsapp:15551234@c.us#account:bot-a', '15551234@s.whatsapp.net'],
   ])('derives the native owner from %s', (jid, owner) => {
     expect(ownerImIdFromDirectConversationJid(jid)).toBe(owner);
   });
@@ -645,6 +654,7 @@ describe('paired direct conversation identity', () => {
     'discord:channel-1',
     'dingtalk:group-1',
     'qq:group:open-a',
+    'wecom:group:open-a',
     'whatsapp:group@g.us',
     'feishu:p2p-ambiguous',
     'unknown:chat',

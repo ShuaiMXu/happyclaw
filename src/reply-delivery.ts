@@ -8,6 +8,81 @@
  * without the surrounding IO/streaming machinery.
  */
 
+import type { InteractionMode } from './types.js';
+
+export interface ScheduledGroupDeliveryContract {
+  /** SDK final is the one physical IM delivery lane. */
+  frameworkDeliversFinalText: boolean;
+  /** Agent must call send_message; SDK final remains archive-only. */
+  agentDeliversWithSendMessage: boolean;
+}
+
+export interface ScheduledProactiveArchiveCandidateInput {
+  status: 'success' | 'error' | 'stream' | 'closed';
+  inputTurnCompleted?: boolean;
+  hasScheduledGroupRuns: boolean;
+  /** Interactive Proactive runner output lane. */
+  proactiveFinalCandidate?: string | null;
+  /** Task-output runner lane (scheduled turns intentionally use this lane). */
+  result?: string | null;
+}
+
+/** Select the archive-only SDK final after a healthy scheduled input ends. */
+export function resolveScheduledProactiveArchiveCandidate(
+  input: ScheduledProactiveArchiveCandidateInput,
+): string {
+  if (
+    !input.hasScheduledGroupRuns ||
+    input.status !== 'success' ||
+    input.inputTurnCompleted !== true
+  ) {
+    return '';
+  }
+  return (input.proactiveFinalCandidate ?? input.result ?? '').trim();
+}
+
+/** Exactly one lane owns physical IM delivery for a scheduled group turn. */
+export function resolveScheduledGroupDeliveryContract(
+  interactionMode: InteractionMode,
+): ScheduledGroupDeliveryContract {
+  return interactionMode === 'assistant'
+    ? {
+        frameworkDeliversFinalText: true,
+        agentDeliversWithSendMessage: false,
+      }
+    : {
+        frameworkDeliversFinalText: false,
+        agentDeliversWithSendMessage: true,
+      };
+}
+
+export interface StreamingCardReplyAcknowledgementInput {
+  /** An ACK-lost/partial provider mutation can never advance the turn. */
+  streamingDeliveryUncertain: boolean;
+  /** True when the provider card owns the native IM presentation. */
+  streamingCardHandled: boolean;
+  /** Every separately delivered local attachment has an exact physical ACK. */
+  attachmentsDelivered: boolean;
+  /** A safe card rejection made a post-finalizer static send mandatory. */
+  postFinalizationStaticRequired: boolean;
+  /** The mandatory static fallback itself received a physical ACK. */
+  postFinalizationStaticDelivered: boolean;
+  /** Delivery result from the original DB/Web projection call. */
+  projectedTargetDelivered: boolean;
+}
+
+/** Resolve the physical IM ACK without mistaking a Web-only projection for it. */
+export function resolveStreamingCardReplyAcknowledgement(
+  input: StreamingCardReplyAcknowledgementInput,
+): boolean {
+  if (input.streamingDeliveryUncertain) return false;
+  if (input.streamingCardHandled) return input.attachmentsDelivered;
+  if (input.postFinalizationStaticRequired) {
+    return input.postFinalizationStaticDelivered && input.attachmentsDelivered;
+  }
+  return input.projectedTargetDelivered;
+}
+
 export interface ReplyResultInfo {
   /**
    * Non-null means this result is an interim checkpoint, not the final
@@ -30,6 +105,10 @@ export function isGenuineReplyResult(info: ReplyResultInfo): boolean {
   if (info.holdReason) return false;
   if (
     info.sourceKind === 'input_rejection_warning' ||
+    // A model-fallback notice is emitted *before* the retry produces the real
+    // answer. Counting it as a delivered reply would let a later error skip the
+    // retry, leaving the user with the notice and no answer at all.
+    info.sourceKind === 'provider_fallback_notice' ||
     info.sourceKind === 'overflow_partial' ||
     info.sourceKind === 'compact_partial'
   ) {
@@ -71,7 +150,10 @@ export function shouldFinalizeScheduledGroupPrimaryResult(
 export function occupiesPrimaryReplyDeliverySlot(
   sourceKind?: string | null,
 ): boolean {
-  return sourceKind !== 'input_rejection_warning';
+  return (
+    sourceKind !== 'input_rejection_warning' &&
+    sourceKind !== 'provider_fallback_notice'
+  );
 }
 
 export function resolveHeldReplyDbText(input: {

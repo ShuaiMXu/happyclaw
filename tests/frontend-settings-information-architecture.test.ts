@@ -141,8 +141,8 @@ describe('settings information architecture', () => {
     expect(providerModel).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
     expect(provider).toContain('1M 上下文');
     expect(provider).toContain('系统预填 Claude Code 运行环境');
-    expect(providerList).toContain('设为默认');
-    expect(providerList).toContain('系统默认');
+    expect(providerList).not.toContain('设为默认');
+    expect(providerList).not.toContain('系统默认');
     expect(providerList).not.toContain('权重');
     expect(settings).toContain('toast.success(message)');
     expect(settings).toContain('toast.error(message)');
@@ -254,17 +254,17 @@ describe('settings information architecture', () => {
     expect(sessions).toContain('? () => onBindSession(null)');
     expect(chatView).toContain('setBindingAgentId(id ?? MAIN_BINDING)');
     expect(chatView).toContain('setBindingAgentId(WORKSPACE_BINDING)');
-    expect(chatView).toContain('title="管理工作区群聊绑定"');
+    expect(chatView).toContain('title="管理工作区话题群绑定"');
     expect(chatView).not.toContain('{!isHome && canModifyWorkspaceConfig && (');
     expect(chatView).toContain("? 'workspace' : 'session'");
     expect(bindingDialog).toContain(
-      'capabilities?.can_bind_workspace === true',
+      'resolveBindingTargetType(group) === destination.type',
     );
     expect(bindingDialog).toContain("group.conversation_kind === 'group'");
     expect(bindingDialog).toContain("group.conversation_kind === 'direct'");
-    expect(bindings).toContain("rebindGroup.conversation_kind === 'group'");
-    expect(bindings).toContain("item.conversation_kind === 'direct'");
-    expect(bindings).toContain('恢复账号默认工作区');
+    expect(bindings).toContain('resolveBindingTargetType(rebindGroup)');
+    expect(bindings).toContain("resolveBindingTargetType(item) === 'session'");
+    expect(bindings).toContain('解除渠道绑定');
     expect(mobileChat).toMatch(/onRename=|onTogglePin=|onDelete=/);
     expect(createWorkspace).toContain('effective_runtime_policy');
     expect(bindingRoute).toContain(

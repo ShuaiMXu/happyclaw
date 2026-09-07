@@ -243,6 +243,67 @@ describe('POST /api/messages — validation & lookup', () => {
   });
 });
 
+describe('GET /api/groups/:jid/messages — stable sequence cursor', () => {
+  test('paginates same-timestamp messages and polls late arrivals', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const timestamp = '2026-08-31T00:00:00.000Z';
+    for (let index = 0; index < 52; index++) {
+      db.ensureChatExists(GROUP_JID);
+      db.storeMessageDirect(
+        `same-ts-${String(51 - index).padStart(2, '0')}`,
+        GROUP_JID,
+        OWNER_ID,
+        'Alice',
+        `message ${index}`,
+        timestamp,
+        false,
+      );
+    }
+
+    const firstResponse = await app.request(
+      `/api/groups/${encodeURIComponent(GROUP_JID)}/messages?limit=20`,
+    );
+    expect(firstResponse.status).toBe(200);
+    const first = (await firstResponse.json()) as {
+      messages: Array<{ id: string; ingest_sequence: number }>;
+      hasMore: boolean;
+    };
+    expect(first.messages).toHaveLength(20);
+    expect(first.hasMore).toBe(true);
+
+    const boundary = first.messages.at(-1)!.ingest_sequence;
+    const secondResponse = await app.request(
+      `/api/groups/${encodeURIComponent(GROUP_JID)}/messages?limit=20&beforeSequence=${boundary}`,
+    );
+    const second = (await secondResponse.json()) as typeof first;
+    expect(second.messages).toHaveLength(20);
+    expect(
+      new Set(
+        [...first.messages, ...second.messages].map((message) => message.id),
+      ).size,
+    ).toBe(40);
+
+    const newestSequence = first.messages[0].ingest_sequence;
+    db.storeMessageDirect(
+      'late-old-provider-clock',
+      GROUP_JID,
+      OWNER_ID,
+      'Alice',
+      'late arrival',
+      '2020-01-01T00:00:00.000Z',
+      false,
+    );
+    const pollResponse = await app.request(
+      `/api/groups/${encodeURIComponent(GROUP_JID)}/messages?limit=20&afterSequence=${newestSequence}`,
+    );
+    const poll = (await pollResponse.json()) as typeof first;
+    expect(poll.messages.map((message) => message.id)).toEqual([
+      'late-old-provider-clock',
+    ]);
+  });
+});
+
 describe('POST /api/messages — /clear interception ACL', () => {
   test('non-owner is denied (403 Access denied)', async () => {
     seedTestGroup();
@@ -304,6 +365,9 @@ describe('POST /api/messages — active-run steering', () => {
       disposition: 'steered',
       runId: 'run-active',
     });
+    const cursor = db.getMessageCursor(GROUP_JID, body.messageId);
+    expect(body.ingestSequence).toBe(cursor?.sequence);
+    expect(body.ingestSequence).toBeGreaterThan(0);
     expect(promoteFollowUpCalls).toEqual([
       {
         chatJid: GROUP_JID,

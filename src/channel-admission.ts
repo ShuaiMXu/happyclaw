@@ -119,6 +119,16 @@ export async function evaluateChannelAdmission(
  * A configured resolver owns routing authority. Its null means stale/invalid
  * binding and therefore fail-closed; only standalone connectors without a
  * resolver may persist directly under the source JID.
+ *
+ * im-manager wraps `resolver` per-account and throws ChannelRouteRejectedError
+ * instead of returning null for an unbound/unauthorized chat (see
+ * im-manager.ts). Every channel's own call site used to receive that throw
+ * unfiltered, so a rejected route fell through to whatever generic outer
+ * try/catch happened to wrap the caller instead of this function's own
+ * `null` contract — at best a misleading error log, at worst (Feishu's P2P
+ * bootstrap incident, 2026-08-04) skipping registration side effects that
+ * needed to run first. Catch it here once so every caller's `!resolvedRoute`
+ * branch is reliable regardless of whether the resolver is wrapped.
  */
 export function resolveAdmittedChannelRoute<TContext = undefined>(
   sourceJid: string,
@@ -126,6 +136,12 @@ export function resolveAdmittedChannelRoute<TContext = undefined>(
   context?: TContext,
 ): { targetJid: string; routing: ChannelRouteTarget | null } | null {
   if (!resolver) return { targetJid: sourceJid, routing: null };
-  const routing = resolver(sourceJid, context);
+  let routing: ChannelRouteTarget | null;
+  try {
+    routing = resolver(sourceJid, context);
+  } catch (err) {
+    if (!(err instanceof ChannelRouteRejectedError)) throw err;
+    return null;
+  }
   return routing ? { targetJid: routing.effectiveJid, routing } : null;
 }

@@ -49,6 +49,20 @@ describe('buildSendMessageData — task attribution stamping', () => {
     expect(data.groupFolder).toBe('ws-x');
   });
 
+  test('durable group occurrence is stamped separately from the task definition', () => {
+    const data = buildSendMessageData(
+      baseCtx({
+        currentTaskId: 'task-42',
+        currentScheduledTaskRunId: 'run-abc',
+      }),
+      { type: 'message', text: 'hi' },
+    );
+    expect(data).toMatchObject({
+      taskId: 'task-42',
+      scheduledTaskRunId: 'run-abc',
+    });
+  });
+
   test('currentTaskId null → data has NO taskId key (not undefined value)', () => {
     const ctx = baseCtx({ currentTaskId: null });
     const data = buildSendMessageData(ctx, { type: 'message', text: 'hi' });

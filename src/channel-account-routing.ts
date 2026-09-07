@@ -1,3 +1,4 @@
+import type { ChannelConversationKind } from './channel-conversation-kind.js';
 import type { ChannelAccount, RegisteredGroup } from './types.js';
 
 export interface ChannelAccountFallbackWorkspace {
@@ -26,30 +27,13 @@ export function resolveChannelAccountFallbackWorkspace(
   return home ? { jid: home.jid, folder: home.folder } : null;
 }
 
-/**
- * Attach an inbound chat to its channel account without changing a binding the
- * user already selected. Account defaults are only a registration fallback;
- * they must never turn every subsequent IM message into a binding update.
- * Returns the input object unchanged when nothing needs to move, so callers
- * can skip persistence — every inbound message funnels through this path, and
- * an unconditional setRegisteredGroup costs ~10 statements per message.
- */
+/** Discovery records the channel account; only an explicit bind selects a target. */
 export function applyChannelAccountRegistrationFallback(
   group: RegisteredGroup,
   accountId: string,
-  fallbackWorkspaceJid: string,
+  _fallbackWorkspaceJid: string,
+  _conversationKind: ChannelConversationKind = 'unknown',
 ): RegisteredGroup {
-  const hasExplicitBinding = Boolean(
-    group.target_main_jid || group.target_agent_id,
-  );
-  const nextAccountId = group.channel_account_id ?? accountId;
-  const changed =
-    nextAccountId !== group.channel_account_id ||
-    (!hasExplicitBinding && group.target_main_jid !== fallbackWorkspaceJid);
-  if (!changed) return group;
-  return {
-    ...group,
-    channel_account_id: nextAccountId,
-    ...(hasExplicitBinding ? {} : { target_main_jid: fallbackWorkspaceJid }),
-  };
+  if (group.channel_account_id) return group;
+  return { ...group, channel_account_id: accountId };
 }

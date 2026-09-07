@@ -37,6 +37,7 @@ import {
   partitionAgentWorkspaceSections,
 } from '../../utils/agent-product';
 import { useDeleteWorkspace } from '../../hooks/useDeleteWorkspace';
+import { withBasePath } from '../../utils/url';
 
 interface UnifiedSidebarProps {
   collapsed: boolean;
@@ -243,11 +244,12 @@ export function UnifiedSidebar({
           >
             <img
               src={
-                appearance?.brandIconUrl ||
-                `${import.meta.env.BASE_URL}icons/icon-192.png`
+                appearance?.brandIconUrl
+                  ? withBasePath(appearance.brandIconUrl)
+                  : `${import.meta.env.BASE_URL}icons/icon-192.png`
               }
               alt={appearance?.appName || 'SoftopiaAI'}
-              className="w-[50px] h-[50px] rounded-xl object-cover"
+              className="w-full h-full object-cover"
             />
           </button>
 
@@ -369,8 +371,9 @@ export function UnifiedSidebar({
             <div className="flex items-center gap-1 px-4 pt-3 mb-3 flex-shrink-0">
               <img
                 src={
-                  appearance?.brandBannerUrl ||
-                  `${import.meta.env.BASE_URL}icons/logo-text.svg`
+                  appearance?.brandBannerUrl
+                    ? withBasePath(appearance.brandBannerUrl)
+                    : `${import.meta.env.BASE_URL}icons/logo-text.svg`
                 }
                 alt={appearance?.appName || 'SoftopiaAI'}
                 className={cn(

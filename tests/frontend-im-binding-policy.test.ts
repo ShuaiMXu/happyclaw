@@ -3,6 +3,10 @@ import { describe, expect, test } from 'vitest';
 import {
   resolveBindingActivationMode,
   resolveBindingAudienceMode,
+  resolveBindingTargetType,
+  hasBindingPolicyMismatch,
+  isBoundToImDestination,
+  buildImBindingRequest,
 } from '../web/src/utils/im-binding-policy.js';
 import type { AvailableImGroup } from '../web/src/types.js';
 
@@ -55,5 +59,173 @@ describe('IM binding policy selection', () => {
 
     expect(resolveBindingActivationMode(group, 'invalid')).toBe('auto');
     expect(resolveBindingAudienceMode(group, 'invalid')).toBe('everyone');
+  });
+
+  test('private Feishu binding drops obsolete mention activation while preserving audience and disabled state', () => {
+    const group = makeGroup({
+      conversation_kind: 'direct',
+      activation_mode: 'owner_mentioned',
+    });
+    expect(resolveBindingActivationMode(group)).toBe('auto');
+    expect(resolveBindingAudienceMode(group)).toBe('owner_only');
+    expect(resolveBindingActivationMode(group, 'disabled')).toBe('disabled');
+  });
+});
+
+describe('IM binding destinations', () => {
+  test.each(['direct', 'group'] as const)(
+    '%s binds to named sessions and main, never to a workspace',
+    (kind) => {
+      const group = makeGroup({
+        conversation_kind: kind,
+        activation_mode: 'when_mentioned',
+      });
+      expect(resolveBindingTargetType(group)).toBe('session');
+      for (const sessionId of ['main', 'session-a']) {
+        const request = buildImBindingRequest(group, {
+          type: 'session',
+          groupJid: 'web:main',
+          sessionId,
+        });
+        expect(request.url).toBe(
+          `/api/groups/web%3Amain/sessions/${sessionId}/im-binding`,
+        );
+        expect(request.body).toMatchObject({
+          im_jid: group.jid,
+          reply_policy: 'source_only',
+          activation_mode: kind === 'direct' ? 'auto' : 'when_mentioned',
+        });
+      }
+      expect(() =>
+        buildImBindingRequest(group, {
+          type: 'workspace',
+          groupJid: 'web:main',
+        }),
+      ).toThrow();
+    },
+  );
+
+  test('topic groups select workspaces and cannot bind to main or another fixed session', () => {
+    const group = makeGroup({ conversation_kind: 'topic' });
+    expect(resolveBindingTargetType(group)).toBe('workspace');
+    expect(
+      buildImBindingRequest(group, { type: 'workspace', groupJid: 'web:main' })
+        .url,
+    ).toBe('/api/groups/web%3Amain/im-binding');
+    for (const sessionId of ['main', 'other']) {
+      expect(() =>
+        buildImBindingRequest(group, {
+          type: 'session',
+          groupJid: 'web:main',
+          sessionId,
+        }),
+      ).toThrow();
+    }
+  });
+
+  test('unknown kinds cannot make binding requests even when stale capabilities suggest threads', () => {
+    const group = makeGroup({
+      conversation_kind: 'unknown',
+      is_thread_capable: true,
+    });
+    expect(resolveBindingTargetType(group)).toBeNull();
+    expect(() =>
+      buildImBindingRequest(group, { type: 'workspace', groupJid: 'web:main' }),
+    ).toThrow();
+    expect(() =>
+      buildImBindingRequest(group, {
+        type: 'session',
+        groupJid: 'web:main',
+        sessionId: 'main',
+      }),
+    ).toThrow();
+  });
+
+  test('changing activation never changes binding dimension or widens the audience', () => {
+    const group = makeGroup({
+      conversation_kind: 'group',
+      audience_mode: 'owner_only',
+    });
+    for (const activationMode of ['always', 'when_mentioned', 'disabled']) {
+      const request = buildImBindingRequest(
+        group,
+        { type: 'session', groupJid: 'web:a', sessionId: 's-a' },
+        { activationMode, force: true },
+      );
+      expect(request.url).toBe('/api/groups/web%3Aa/sessions/s-a/im-binding');
+      expect(request.body).toMatchObject({
+        force: true,
+        audience_mode: 'owner_only',
+        activation_mode: activationMode,
+      });
+    }
+  });
+
+  test('ordinary groups on main remain valid while old mention thread-map mounts need correction', () => {
+    const group = makeGroup({
+      conversation_kind: 'group',
+      bound_main_jid: 'web:a',
+      binding_mode: 'single_context',
+    });
+    expect(hasBindingPolicyMismatch(group)).toBe(false);
+    expect(
+      isBoundToImDestination(group, {
+        type: 'session',
+        groupJid: 'web:a',
+        sessionId: 'main',
+      }),
+    ).toBe(true);
+    expect(
+      isBoundToImDestination(group, { type: 'workspace', groupJid: 'web:a' }),
+    ).toBe(false);
+    expect(
+      hasBindingPolicyMismatch({ ...group, routing_mode: 'thread_map' }),
+    ).toBe(true);
+    expect(
+      hasBindingPolicyMismatch({ ...group, bound_agent_id: 'named' }),
+    ).toBe(false);
+  });
+
+  test('a workspace binding does not claim its child sessions, and topic mounts are distinct from main', () => {
+    const group = makeGroup({
+      conversation_kind: 'group',
+      bound_workspace_jid: 'web:a',
+      bound_session_id: 's-a',
+    });
+    expect(
+      isBoundToImDestination(group, { type: 'workspace', groupJid: 'web:a' }),
+    ).toBe(false);
+    expect(
+      isBoundToImDestination(group, {
+        type: 'session',
+        groupJid: 'web:a',
+        sessionId: 'main',
+      }),
+    ).toBe(false);
+    expect(
+      isBoundToImDestination(group, {
+        type: 'session',
+        groupJid: 'web:a',
+        sessionId: 's-a',
+      }),
+    ).toBe(true);
+    const topic = makeGroup({
+      conversation_kind: 'topic',
+      bound_workspace_jid: 'web:a',
+      routing_mode: 'thread_map',
+    });
+    expect(
+      isBoundToImDestination(topic, { type: 'workspace', groupJid: 'web:a' }),
+    ).toBe(true);
+    expect(
+      isBoundToImDestination(topic, {
+        type: 'session',
+        groupJid: 'web:a',
+        sessionId: 'main',
+      }),
+    ).toBe(false);
+    expect(
+      hasBindingPolicyMismatch({ ...topic, bound_session_id: 's-a' }),
+    ).toBe(true);
   });
 });

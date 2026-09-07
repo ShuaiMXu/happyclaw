@@ -94,4 +94,19 @@ describe('frontend identity ownership', () => {
       'imageUrl={user?.avatar_url}',
     );
   });
+
+  test('hydrates and renders public branding before and immediately after auth', () => {
+    const login = read('web/src/pages/LoginPage.tsx');
+    const auth = read('web/src/stores/auth.ts');
+    const registerStart = auth.indexOf('register: async (payload) =>');
+    const logoutStart = auth.indexOf('logout: async () =>', registerStart);
+    const register = auth.slice(registerStart, logoutStart);
+
+    expect(login).toContain('void fetchAppearance()');
+    expect(login).toContain("appearance?.appName.trim() || 'HappyClaw'");
+    expect(login).toContain('appearance?.brandIconUrl');
+    expect(login).toContain('src={brandIconUrl}');
+    expect(login).toContain('{appName}');
+    expect(register).toContain('await get().fetchAppearance()');
+  });
 });

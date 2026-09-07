@@ -1,0 +1,58 @@
+import { defaultSchema } from 'rehype-sanitize';
+
+/** Preserve highlight classes and KaTeX's MathML accessibility layer. */
+export const markdownSanitizeSchema = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    code: [...(defaultSchema.attributes?.code || []), 'class', 'className'],
+    span: [
+      ...(defaultSchema.attributes?.span || []),
+      'class',
+      'className',
+      'style',
+      'aria-hidden',
+    ],
+    div: [
+      ...(defaultSchema.attributes?.div || []),
+      'class',
+      'className',
+      'style',
+    ],
+    img: ['src', 'alt', 'width', 'height', 'loading', 'longDesc', 'title'],
+    math: ['xmlns', 'display'],
+    annotation: ['encoding'],
+  },
+  tagNames: [
+    ...(defaultSchema.tagNames || []),
+    'math',
+    'semantics',
+    'mrow',
+    'mi',
+    'mn',
+    'mo',
+    'msup',
+    'msub',
+    'mfrac',
+    'mover',
+    'munder',
+    'msqrt',
+    'mroot',
+    'mtable',
+    'mtr',
+    'mtd',
+    'mtext',
+    'mspace',
+    'mstyle',
+    'menclose',
+    'annotation',
+    'msubsup',
+    'munderover',
+    'mpadded',
+    'mphantom',
+  ],
+  protocols: {
+    ...defaultSchema.protocols,
+    src: [...(defaultSchema.protocols?.src || []), 'data'],
+  },
+};

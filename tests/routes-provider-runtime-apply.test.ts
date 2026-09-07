@@ -124,14 +124,6 @@ async function deleteProvider(providerId: string): Promise<Response> {
   });
 }
 
-async function setDefaultProvider(providerId: string): Promise<Response> {
-  return app.request('/api/config/claude/default', {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ providerId }),
-  });
-}
-
 beforeAll(() => {
   fs.mkdirSync(path.join(tmpDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDir, 'groups'), { recursive: true });
@@ -158,7 +150,7 @@ afterAll(() => {
 });
 
 describe('provider runtime apply is a lossless configuration mutation', () => {
-  test('sets the system default model configuration through HTTP', async () => {
+  test('lists independent model switches without a default-model API', async () => {
     bindDeps(
       {},
       {
@@ -169,29 +161,32 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       },
     );
     const initial = runtimeConfig.createProvider({
-      name: unique('initial-default'),
+      name: unique('initial-model'),
       type: 'official',
       anthropicApiKey: 'initial-key',
       enabled: true,
     });
     const replacement = runtimeConfig.createProvider({
-      name: unique('replacement-default'),
+      name: unique('disabled-model'),
       type: 'third_party',
       anthropicBaseUrl: 'https://replacement.example.test',
       anthropicAuthToken: 'replacement-token',
       anthropicModel: 'replacement-model',
-      enabled: true,
+      enabled: false,
     });
-    expect(runtimeConfig.getDefaultProviderId()).toBe(initial.id);
-
-    const response = await setDefaultProvider(replacement.id);
+    const response = await app.request('/api/config/claude/providers');
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
-      defaultProviderId: replacement.id,
-      provider: { id: replacement.id, anthropicModel: 'replacement-model' },
-      applied: { success: true, persisted: true },
-    });
-    expect(runtimeConfig.getDefaultProviderId()).toBe(replacement.id);
+    const body = await response.json();
+    expect(body).not.toHaveProperty('defaultProviderId');
+    expect(body.providers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: initial.id, enabled: true }),
+        expect.objectContaining({ id: replacement.id, enabled: false }),
+      ]),
+    );
+    expect(
+      await app.request('/api/config/claude/default', { method: 'PUT' }),
+    ).toHaveProperty('status', 404);
   });
 
   test('allows disabling an Agent model but still blocks deleting it', async () => {
@@ -210,13 +205,12 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       anthropicApiKey: 'target-key',
       enabled: true,
     });
-    const fallback = runtimeConfig.createProvider({
+    runtimeConfig.createProvider({
       name: unique('agent-model-fallback'),
       type: 'official',
       anthropicApiKey: 'fallback-key',
       enabled: true,
     });
-    runtimeConfig.setDefaultProvider(fallback.id);
     const profile = db.createAgentProfile({
       ownerUserId: 'provider-runtime-admin',
       name: unique('bound-agent'),
@@ -508,13 +502,12 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       anthropicApiKey: 'target-key',
       enabled: true,
     });
-    const fallback = runtimeConfig.createProvider({
+    runtimeConfig.createProvider({
       name: unique('toggle-fallback'),
       type: 'official',
       anthropicApiKey: 'fallback-key',
       enabled: true,
     });
-    runtimeConfig.setDefaultProvider(fallback.id);
 
     const firstResponse = await setProviderEnabled(target.id, false);
     expect(firstResponse.status).toBe(503);
@@ -566,13 +559,12 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       anthropicModel: 'old-model',
       enabled: true,
     });
-    const fallback = runtimeConfig.createProvider({
+    runtimeConfig.createProvider({
       name: unique('disabled-repair-fallback'),
       type: 'official',
       anthropicApiKey: 'fallback-key',
       enabled: true,
     });
-    runtimeConfig.setDefaultProvider(fallback.id);
     db.setSession(folder, unique('disabled-repair-initial-session'));
     db.setSessionProviderId(folder, '', target.id);
 
@@ -630,13 +622,12 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
       anthropicModel: 'old-model',
       enabled: true,
     });
-    const fallback = runtimeConfig.createProvider({
+    runtimeConfig.createProvider({
       name: unique('delete-fallback'),
       type: 'official',
       anthropicApiKey: 'fallback-key',
       enabled: true,
     });
-    runtimeConfig.setDefaultProvider(fallback.id);
     db.setSession(folder, unique('delete-initial-session'));
     db.setSessionProviderId(folder, '', target.id);
 

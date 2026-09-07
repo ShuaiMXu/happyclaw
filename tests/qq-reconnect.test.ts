@@ -25,9 +25,9 @@ describe('isTransientError', () => {
     expect(
       isTransientError(new Error('getaddrinfo EAI_AGAIN api.sgroup.qq.com')),
     ).toBe(true);
-    expect(
-      isTransientError(new Error('connect ECONNRESET 1.2.3.4:443')),
-    ).toBe(true);
+    expect(isTransientError(new Error('connect ECONNRESET 1.2.3.4:443'))).toBe(
+      true,
+    );
   });
 
   test('returns false for application errors', () => {
@@ -102,7 +102,16 @@ describe('classifyCloseCode', () => {
 
   test('boundaries around 4900–4913 fall back to normal', () => {
     expect(classifyCloseCode(4899)).toEqual({ kind: 'normal' });
-    expect(classifyCloseCode(4914)).toEqual({ kind: 'normal' });
+    expect(classifyCloseCode(4916)).toEqual({ kind: 'normal' });
+  });
+
+  test('4914 / 4915 → intents-rejected', () => {
+    // The gateway refuses the IDENTIFY itself, so a plain reconnect would
+    // replay the same rejected intents forever. 4914 used to be asserted as
+    // `normal` above precisely because nothing ever requested an optional
+    // intent; requesting INTERACTION makes the distinction load-bearing.
+    expect(classifyCloseCode(4914)).toEqual({ kind: 'intents-rejected' });
+    expect(classifyCloseCode(4915)).toEqual({ kind: 'intents-rejected' });
   });
 
   test('common WebSocket codes are normal', () => {
@@ -136,7 +145,11 @@ describe('regression: 2026-05-15 DNS outage', () => {
   test('the production EAI_AGAIN error is recognized as transient', () => {
     const err: NodeJS.ErrnoException = Object.assign(
       new Error('getaddrinfo EAI_AGAIN api.sgroup.qq.com'),
-      { code: 'EAI_AGAIN', syscall: 'getaddrinfo', hostname: 'api.sgroup.qq.com' },
+      {
+        code: 'EAI_AGAIN',
+        syscall: 'getaddrinfo',
+        hostname: 'api.sgroup.qq.com',
+      },
     );
     expect(isTransientError(err)).toBe(true);
   });

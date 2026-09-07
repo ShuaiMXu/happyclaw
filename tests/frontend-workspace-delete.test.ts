@@ -50,7 +50,7 @@ describe('workspace deletion confirmation', () => {
     expect(message).toContain('仍绑定 2 个消息渠道');
     expect(message).toContain('• 飞书调研群');
     expect(message).toContain('• QQ 账单群');
-    expect(message).toContain('恢复到对应 Bot 的默认工作区');
+    expect(message).toContain('解除这些渠道的绑定');
     expect(message).toContain('此操作无法撤销');
   });
 

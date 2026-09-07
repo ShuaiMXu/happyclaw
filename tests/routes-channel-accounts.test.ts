@@ -67,6 +67,25 @@ async function createTelegram(name: string) {
 }
 
 describe('channel account routes', () => {
+  test('reports connected providers from first-class channel accounts', async () => {
+    process.env.CHANNEL_TEST_USER = 'owner-a';
+    const created = await createTelegram(`Status ${Date.now()}`);
+    db.updateChannelAccountStatus(created.body.account.id, 'connected');
+
+    const response = await routes.request('/status');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      telegram: true,
+      feishu: false,
+      qq: false,
+      wechat: false,
+      wecom: false,
+      dingtalk: false,
+      discord: false,
+      whatsapp: false,
+    });
+  });
+
   test('CRUD never returns credentials or secret_ref and enforces owner ACL', async () => {
     process.env.CHANNEL_TEST_USER = 'owner-a';
     const created = await createTelegram(`Bot ${Date.now()}`);

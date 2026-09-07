@@ -72,4 +72,40 @@ describe('per-user home workspace isolation', () => {
     expect(db.getUserHomeGroup('admin-two')?.jid).toBe(secondAdminJid);
     expect(db.ensureUserHomeGroup('admin-two', 'admin')).toBe(secondAdminJid);
   });
+
+  test('creates the on-disk workspace directory for a new member home', () => {
+    db.initDatabase();
+
+    const jid = db.ensureUserHomeGroup('member-two', 'member', 'member-two');
+    const group = db.getRegisteredGroup(jid);
+    expect(group).toBeDefined();
+
+    const logsDir = path.join(groupsDir, group!.folder, 'logs');
+    expect(fs.existsSync(logsDir)).toBe(true);
+  });
+
+  test('self-heals a missing workspace directory on repeat calls', () => {
+    db.initDatabase();
+
+    const jid = db.ensureUserHomeGroup(
+      'member-three',
+      'member',
+      'member-three',
+    );
+    const group = db.getRegisteredGroup(jid);
+    expect(group).toBeDefined();
+
+    const groupDir = path.join(groupsDir, group!.folder);
+    fs.rmSync(groupDir, { recursive: true, force: true });
+    expect(fs.existsSync(groupDir)).toBe(false);
+
+    // existing-group branch (early return) must also repair the directory
+    const jidAgain = db.ensureUserHomeGroup(
+      'member-three',
+      'member',
+      'member-three',
+    );
+    expect(jidAgain).toBe(jid);
+    expect(fs.existsSync(path.join(groupDir, 'logs'))).toBe(true);
+  });
 });

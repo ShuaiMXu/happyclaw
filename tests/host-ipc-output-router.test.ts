@@ -281,6 +281,59 @@ describe('host IPC primary output routing', () => {
     expect(coordinator.attemptedFinalText).toBe('准确的完整总结正文');
   });
 
+  test('rejects a second different Proactive final before provider delivery', async () => {
+    const activeTurnOutputs = new ActiveTurnOutputRegistry();
+    const scope = channelTurnScope('workspace', 'conversation-agent');
+    activeTurnOutputs.bind(scope, 'turn-1', {
+      onProgress: () => true,
+      onFinalCandidate: () => true,
+    });
+    const sendImWithRetry = vi.fn(async () => true);
+
+    expect(
+      routeHostIpcOutput(
+        {
+          sourceGroup: 'workspace',
+          agentId: 'conversation-agent',
+          inputTurnId: 'turn-1',
+          text: '第一份 final',
+          deliveryRole: 'final',
+          authorized: true,
+          scheduledTask: false,
+          interactionMode: 'proactive',
+        },
+        activeTurnOutputs,
+      ),
+    ).toMatchObject({
+      path: 'separate_provider',
+      attemptedFinalRecorded: true,
+    });
+
+    const second = routeHostIpcOutput(
+      {
+        sourceGroup: 'workspace',
+        agentId: 'conversation-agent',
+        inputTurnId: 'turn-1',
+        text: '第二份不同 final',
+        deliveryRole: 'final',
+        authorized: true,
+        scheduledTask: false,
+        interactionMode: 'proactive',
+      },
+      activeTurnOutputs,
+    );
+    if (second.path === 'separate_provider') await sendImWithRetry();
+
+    expect(second).toEqual({
+      path: 'rejected',
+      delivered: false,
+      staged: false,
+      deliveryRole: 'final',
+      reason: 'conflicting_final',
+    });
+    expect(sendImWithRetry).not.toHaveBeenCalled();
+  });
+
   test('wires both host execution paths to the live visible answer for interruption persistence', () => {
     const main = fs.readFileSync(
       path.join(process.cwd(), 'src/index.ts'),

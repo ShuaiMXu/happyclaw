@@ -36,16 +36,7 @@ afterAll(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-/**
- * An auto-resolved defaultProviderId must not disable the balancing pool.
- *
- * resolveDefaultProviderId() falls back to the first enabled provider, so every
- * installation has a default. If that counted as a pin, a multi-account pool
- * would send every session to the same provider — and, because the pinned path
- * skips the health check, keep sending them there after that account hit its
- * limit.
- */
-describe('default model configuration vs. balancing pool', () => {
+describe('automatic enabled-model pool', () => {
   const created: string[] = [];
 
   beforeAll(() => {
@@ -60,10 +51,6 @@ describe('default model configuration vs. balancing pool', () => {
         }).id,
       );
     }
-  });
-
-  test('a default is still auto-resolved for display and single-provider use', () => {
-    expect(runtimeConfig.getDefaultProviderId()).toBe(created[0]);
   });
 
   test('rotates across enabled providers when no Agent pinned a configuration', () => {
@@ -107,6 +94,59 @@ describe('default model configuration vs. balancing pool', () => {
     expect(second).not.toBeNull();
     expect(second!.profileId).not.toBe(first!.profileId);
     expect(second!.resetSession).toBe(true);
+  });
+
+  test.each(['round-robin', 'weighted-round-robin'] as const)(
+    'transient replay stays on its first provider under %s',
+    (strategy) => {
+      runtimeConfig.saveBalancingConfig({ strategy });
+      const first = trySelectPoolProvider(
+        `transient-${strategy}-first`,
+        null,
+        null,
+      )!;
+      const replay = trySelectPoolProvider(
+        `transient-${strategy}-replay`,
+        null,
+        null,
+        first.profileId,
+      )!;
+      expect(replay.profileId).toBe(first.profileId);
+      expect(providerPool.getHealthStatus(first.profileId).healthy).toBe(true);
+    },
+  );
+
+  test('transient replay pin is ignored after health or model-tier eligibility changes', () => {
+    runtimeConfig.saveBalancingConfig({ strategy: 'round-robin' });
+    const unhealthy = trySelectPoolProvider(
+      'transient-ineligible-health-first',
+      null,
+      null,
+    )!;
+    providerPool.reportFailure(unhealthy.profileId, true);
+    const healthFallback = trySelectPoolProvider(
+      'transient-ineligible-health-replay',
+      null,
+      null,
+      unhealthy.profileId,
+    )!;
+    expect(healthFallback.profileId).not.toBe(unhealthy.profileId);
+    providerPool.resetHealth(unhealthy.profileId);
+
+    const modelWall = trySelectPoolProvider(
+      'transient-ineligible-tier-first',
+      null,
+      null,
+    )!;
+    providerPool.reportModelFailure(modelWall.profileId, 'claude-fable-5');
+    const tierFallback = trySelectPoolProvider(
+      'transient-ineligible-tier-replay',
+      null,
+      null,
+      modelWall.profileId,
+    )!;
+    expect(tierFallback.profileId).not.toBe(modelWall.profileId);
+    providerPool.resetModelQuarantine(modelWall.profileId);
   });
 
   test('an explicit Agent model configuration still pins selection', () => {

@@ -8,6 +8,7 @@ import { extractErrorMessage } from '../utils/error';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
+import { withBasePath } from '../utils/url';
 
 interface RegisterStatus {
   allowRegistration: boolean;
@@ -29,9 +30,12 @@ export function LoginPage() {
   const initialized = useAuthStore((state) => state.initialized);
   const checkStatus = useAuthStore((state) => state.checkStatus);
   const appearance = useAuthStore((state) => state.appearance);
-  const brandIconSrc =
-    appearance?.brandIconUrl || `${import.meta.env.BASE_URL}icons/icon-192.png`;
-  const brandName = appearance?.appName || 'SoftopiaAI';
+  const fetchAppearance = useAuthStore((state) => state.fetchAppearance);
+
+  const appName = appearance?.appName.trim() || 'SoftopiaAI';
+  const brandIconUrl = withBasePath(
+    appearance?.brandIconUrl || '/icons/icon-192.png',
+  );
 
   // Login fields
   const [loginUsername, setLoginUsername] = useState('');
@@ -50,6 +54,14 @@ export function LoginPage() {
       navigate('/setup', { replace: true });
     }
   }, [initialized, checkStatus, navigate]);
+
+  useEffect(() => {
+    void fetchAppearance();
+  }, [fetchAppearance]);
+
+  useEffect(() => {
+    document.title = appName;
+  }, [appName]);
 
   const [regStatus, setRegStatus] = useState<RegisterStatus>({
     allowRegistration: true,
@@ -160,13 +172,13 @@ export function LoginPage() {
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl overflow-hidden">
             <img
-              src={brandIconSrc}
-              alt={brandName}
+              src={brandIconUrl}
+              alt={appName}
               className="w-full h-full object-cover"
             />
           </div>
           <span className="text-lg font-semibold text-foreground tracking-tight">
-            {brandName}
+            {appName}
           </span>
         </div>
         <div className="flex items-center gap-2">
@@ -238,8 +250,8 @@ export function LoginPage() {
                 <div className="flex justify-center mb-4 lg:mb-5">
                   <div className="w-12 h-12 lg:w-14 lg:h-14 rounded-2xl overflow-hidden shadow-lg">
                     <img
-                      src={brandIconSrc}
-                      alt={brandName}
+                      src={brandIconUrl}
+                      alt={appName}
                       className="w-full h-full object-cover"
                     />
                   </div>
@@ -250,7 +262,7 @@ export function LoginPage() {
                 </h2>
                 <p className="text-muted-foreground text-xs lg:text-sm text-center mb-5 lg:mb-6">
                   {tab === 'login'
-                    ? `登录以继续使用 ${brandName}`
+                    ? `登录以继续使用 ${appName}`
                     : regStatus.requireInviteCode
                       ? '需要邀请码才能注册'
                       : '创建你的账户'}

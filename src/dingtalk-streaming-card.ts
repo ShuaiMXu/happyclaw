@@ -15,6 +15,12 @@
 
 import https from 'node:https';
 import { logger } from './logger.js';
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
+import {
+  classifyImSendFailure,
+  ImDeliveryPhaseError,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -46,6 +52,8 @@ type StreamingState =
   | 'idle'
   | 'creating'
   | 'streaming'
+  | 'completing'
+  | 'aborting'
   | 'completed'
   | 'aborted'
   | 'error';
@@ -85,7 +93,12 @@ async function getAccessToken(
           try {
             const data = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
             if (data.errcode !== 0) {
-              reject(new Error(`DingTalk token error: ${data.errmsg}`));
+              reject(
+                new ImDeliveryPhaseError(
+                  'rejected',
+                  `DingTalk token error: ${data.errmsg}`,
+                ),
+              );
               return;
             }
             const expiresIn = Number(data.expires_in) || 7200;
@@ -110,6 +123,20 @@ async function getAccessToken(
 
 interface ApiResponse {
   [key: string]: unknown;
+}
+
+function dingTalkCardApiError(message: string, status?: number): Error {
+  const definitiveRejection =
+    status === undefined ||
+    status < 400 ||
+    (status >= 400 &&
+      status < 500 &&
+      status !== 408 &&
+      status !== 425 &&
+      status !== 429);
+  return definitiveRejection
+    ? new ImDeliveryPhaseError('rejected', message)
+    : new Error(message);
 }
 
 async function apiRequest(
@@ -163,14 +190,15 @@ async function apiRequest(
                 },
                 errMsg,
               );
-              reject(new Error(errMsg));
+              reject(dingTalkCardApiError(errMsg, res.statusCode));
               return;
             }
 
             if (res.statusCode && res.statusCode >= 400) {
               reject(
-                new Error(
+                dingTalkCardApiError(
                   `DingTalk Card API ${label} HTTP failed (${res.statusCode}): ${data.message || text}`,
+                  res.statusCode,
                 ),
               );
               return;
@@ -188,8 +216,9 @@ async function apiRequest(
           } catch {
             if (res.statusCode && res.statusCode >= 400) {
               reject(
-                new Error(
+                dingTalkCardApiError(
                   `DingTalk Card API ${label} HTTP failed (${res.statusCode}): ${text}`,
+                  res.statusCode,
                 ),
               );
             } else {
@@ -270,19 +299,21 @@ export class DingTalkStreamingCardController {
   // Card state
   private cardInstanceId: string | null = null;
   private inputingStarted = false;
+  private cardCreationError: unknown;
   private accumulatedText = '';
 
   // Throttle
   private lastUpdateTime = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
-  private pendingFlush: (() => Promise<void>) | null = null;
+  private currentFlushPromise: Promise<void> | null = null;
+  private flushPending = false;
 
-  // Fallback: sendMessage callback when card fails
-  private fallbackSend: ((text: string) => Promise<void>) | null;
-  private fallbackUsed = false;
+  private terminalDeliveryError: unknown;
 
   // Auxiliary flush throttle (separate from text flush)
   private auxFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private currentAuxFlushPromise: Promise<void> | null = null;
+  private auxFlushPending = false;
   private lastAuxFlushTime = 0;
   private static readonly AUX_FLUSH_INTERVAL = 1500; // ms
 
@@ -300,6 +331,7 @@ export class DingTalkStreamingCardController {
     }
   >();
   private recentEvents: Array<string> = [];
+  private lastPushedContent: string | null = null;
 
   // Display config
   private static readonly MAX_THINKING_CHARS = 500;
@@ -318,21 +350,23 @@ export class DingTalkStreamingCardController {
     this.config = config;
     this.target = target;
     this.onCardCreated = opts?.onCardCreated;
-    this.fallbackSend = opts?.fallbackSend ?? null;
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────
 
   isActive(): boolean {
     return (
-      this.state === 'idle' ||
-      this.state === 'creating' ||
-      this.state === 'streaming'
+      this.acceptsStreamingUpdates() ||
+      ((this.state === 'error' || this.state === 'aborted') &&
+        this.terminalDeliveryError !== undefined &&
+        classifyImSendFailure(this.terminalDeliveryError) === 'uncertain')
     );
   }
 
   append(text: string): void {
-    if (!this.isActive()) return;
+    // `isActive()` also exposes sticky uncertain provider evidence to the
+    // host finalizer. It must not make the failed card writable again.
+    if (!this.acceptsStreamingUpdates()) return;
     this.accumulatedText = text; // Full replacement (same as Feishu pattern)
     this.thinkingText = ''; // Clear reasoning once real text arrives (align with Feishu)
     this.thinking = false; // No longer in active thinking phase
@@ -340,9 +374,27 @@ export class DingTalkStreamingCardController {
   }
 
   async complete(finalText: string): Promise<void> {
-    if (this.state === 'completed' || this.state === 'aborted') return;
-    this.accumulatedText = finalText;
+    if (this.terminalDeliveryError !== undefined) {
+      throw this.terminalDeliveryError;
+    }
+    if (
+      this.state === 'completed' ||
+      this.state === 'aborted' ||
+      this.state === 'completing' ||
+      this.state === 'aborting'
+    )
+      return;
+    this.state = 'completing';
     this.clearFlushTimer();
+    if (this.currentFlushPromise)
+      await this.currentFlushPromise.catch(() => {});
+    if (this.currentAuxFlushPromise)
+      await this.currentAuxFlushPromise.catch(() => {});
+    if (this.terminalDeliveryError !== undefined) {
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
+    }
+    this.accumulatedText = finalText;
 
     // If there's no text at all, skip card creation entirely
     if (!finalText.trim()) {
@@ -369,21 +421,20 @@ export class DingTalkStreamingCardController {
         { err: err.message },
         'DingTalk AI Card ensureCard failed in complete()',
       );
-      // Card creation failed — use fallback
-      await this.tryFallback(finalText);
-      this.state = 'completed';
-      return;
+      throw this.terminalizeDeliveryFailure(err);
     }
 
     if (!this.cardInstanceId) {
       // Card creation didn't produce an instance (e.g. state was 'error')
       logger.warn(
         { state: this.state },
-        'DingTalk AI Card complete(): no cardInstanceId after ensureCard, using fallback',
+        'DingTalk AI Card complete(): no cardInstanceId after ensureCard',
       );
-      await this.tryFallback(finalText);
-      this.state = 'completed';
-      return;
+      const creationError =
+        this.terminalDeliveryError ??
+        this.cardCreationError ??
+        preAcceptImDeliveryError('DingTalk streaming card was not created');
+      throw this.terminalizeDeliveryFailure(creationError);
     }
 
     try {
@@ -404,14 +455,33 @@ export class DingTalkStreamingCardController {
         { err: err.message, cardId: this.cardInstanceId },
         'DingTalk AI Card finalize failed, degrading',
       );
-      await this.tryFallback(finalText);
-      this.state = 'error';
+      throw this.terminalizeDeliveryFailure(err);
     }
   }
 
   async abort(reason?: string): Promise<void> {
-    if (this.state === 'completed' || this.state === 'aborted') return;
+    if (this.terminalDeliveryError !== undefined) {
+      throw this.terminalDeliveryError;
+    }
+    if (
+      this.state === 'completed' ||
+      this.state === 'aborted' ||
+      this.state === 'completing' ||
+      this.state === 'aborting'
+    )
+      return;
+    this.state = 'aborting';
     this.clearFlushTimer();
+    if (this.currentFlushPromise)
+      await this.currentFlushPromise.catch(() => {});
+    if (this.currentAuxFlushPromise)
+      await this.currentAuxFlushPromise.catch(() => {});
+    if (this.cardCreationPromise)
+      await this.cardCreationPromise.catch(() => {});
+    if (this.terminalDeliveryError !== undefined) {
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
+    }
 
     const displayText = this.accumulatedText
       ? this.accumulatedText + `\n\n> ⚠️ 已中断: ${reason ?? '用户取消'}`
@@ -430,6 +500,7 @@ export class DingTalkStreamingCardController {
         { err: err.message },
         'DingTalk AI Card abort update failed',
       );
+      throw this.terminalizeDeliveryFailure(err);
     }
     this.state = 'aborted';
   }
@@ -631,7 +702,15 @@ export class DingTalkStreamingCardController {
 
   /** Schedule auxiliary-only flush (throttled) */
   private scheduleAuxFlush(): void {
-    if (this.auxFlushTimer) return;
+    if (!this.acceptsStreamingUpdates()) return;
+    this.auxFlushPending = true;
+    if (
+      this.auxFlushTimer ||
+      this.currentAuxFlushPromise ||
+      this.flushTimer ||
+      this.currentFlushPromise
+    )
+      return;
     const elapsed = Date.now() - this.lastAuxFlushTime;
     const delay = Math.max(
       0,
@@ -639,13 +718,29 @@ export class DingTalkStreamingCardController {
     );
     this.auxFlushTimer = setTimeout(() => {
       this.auxFlushTimer = null;
+      if (!this.acceptsStreamingUpdates()) {
+        this.auxFlushPending = false;
+        return;
+      }
+      if (this.currentFlushPromise || this.currentAuxFlushPromise) return;
+      this.auxFlushPending = false;
       this.lastAuxFlushTime = Date.now();
       // Push combined content (aux prefix + main text)
       const content =
         this.buildAuxPrefix() + ensureTableBlankLines(this.accumulatedText);
-      this.pushStreamingContent(content, false).catch((err: any) => {
-        logger.debug({ err: err.message }, 'DingTalk aux flush failed');
-      });
+      this.currentAuxFlushPromise = this.pushStreamingContent(content, false)
+        .catch((err: any) => {
+          this.terminalizeDeliveryFailure(err);
+          logger.debug({ err: err.message }, 'DingTalk aux flush failed');
+        })
+        .finally(() => {
+          this.currentAuxFlushPromise = null;
+          if (this.flushPending && this.acceptsStreamingUpdates()) {
+            this.scheduleFlush();
+          } else if (this.auxFlushPending && this.acceptsStreamingUpdates()) {
+            this.scheduleAuxFlush();
+          }
+        });
     }, delay);
   }
 
@@ -659,6 +754,10 @@ export class DingTalkStreamingCardController {
 
   getAllMessageIds(): string[] {
     return this.cardInstanceId ? [this.cardInstanceId] : [];
+  }
+
+  getAcknowledgedProviderOutputCount(): number {
+    return this.cardInstanceId ? 1 : 0;
   }
 
   // ─── Internal: card creation ────────────────────────────────
@@ -681,30 +780,43 @@ export class DingTalkStreamingCardController {
     // before calling ensureCard(), which would cause us to return early.
     // Instead, the cardCreationPromise guard above prevents double-creation.
 
-    this.state = 'creating';
+    if (this.state !== 'completing' && this.state !== 'aborting') {
+      this.state = 'creating';
+    }
     this.cardCreationPromise = (async () => {
       try {
         const cardId = `card_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
         // 1. Create card instance
-        const createResp = await apiRequest(
-          this.config,
-          'POST',
-          '/v1.0/card/instances',
-          {
-            cardTemplateId: AI_CARD_TEMPLATE_ID,
-            outTrackId: cardId,
-            cardData: {
-              cardParamMap: {
-                config: JSON.stringify({ autoLayout: true }),
+        let createResp: ApiResponse;
+        try {
+          createResp = await apiRequest(
+            this.config,
+            'POST',
+            '/v1.0/card/instances',
+            {
+              cardTemplateId: AI_CARD_TEMPLATE_ID,
+              outTrackId: cardId,
+              cardData: {
+                cardParamMap: {
+                  config: JSON.stringify({ autoLayout: true }),
+                },
               },
+              callbackType: 'STREAM',
+              imGroupOpenSpaceModel: { supportForward: true },
+              imRobotOpenSpaceModel: { supportForward: true },
             },
-            callbackType: 'STREAM',
-            imGroupOpenSpaceModel: { supportForward: true },
-            imRobotOpenSpaceModel: { supportForward: true },
-          },
-          'card-create',
-        );
+            'card-create',
+          );
+        } catch (error) {
+          // Creating an undelivered card resource cannot produce a visible IM
+          // presentation. Static delivery remains safe even when its resource
+          // ACK was lost.
+          throw preAcceptImDeliveryError(
+            'DingTalk card resource creation failed before visible delivery',
+            error,
+          );
+        }
         logger.info({ cardId, createResp }, 'DingTalk AI Card create response');
 
         // 2. Deliver to target
@@ -726,15 +838,17 @@ export class DingTalkStreamingCardController {
         );
 
         this.cardInstanceId = cardId;
-        this.state = 'streaming';
+        this.cardCreationError = undefined;
+        if (this.state === 'creating') this.state = 'streaming';
+        this.onCardCreated?.(cardId);
         logger.info({ cardId }, 'DingTalk AI Card created and delivered');
       } catch (err: any) {
+        this.cardCreationError = err;
+        this.terminalizeDeliveryFailure(err);
         logger.warn(
           { err: err.message },
-          'DingTalk AI Card creation failed, degrading to plain message',
+          'DingTalk AI Card creation failed; preserving delivery evidence for the host',
         );
-        this.state = 'error';
-        // Don't throw — caller will use fallback on next flush
       } finally {
         this.cardCreationPromise = null;
       }
@@ -750,33 +864,58 @@ export class DingTalkStreamingCardController {
   // ─── Internal: streaming ────────────────────────────────────
 
   private scheduleFlush(): void {
-    if (this.flushTimer) return;
+    if (!this.acceptsStreamingUpdates()) return;
+    this.flushPending = true;
+    if (
+      this.flushTimer ||
+      this.currentFlushPromise ||
+      this.auxFlushTimer ||
+      this.currentAuxFlushPromise
+    )
+      return;
 
     const elapsed = Date.now() - this.lastUpdateTime;
     const delay = Math.max(0, STREAM_UPDATE_INTERVAL - elapsed);
 
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      this.doFlush().catch((err: any) => {
-        logger.debug({ err: err.message }, 'DingTalk AI Card flush failed');
-      });
+      if (this.currentFlushPromise || this.currentAuxFlushPromise) return;
+      this.flushPending = false;
+      this.currentFlushPromise = this.doFlush()
+        .catch((err: any) => {
+          this.terminalizeDeliveryFailure(err);
+          logger.debug({ err: err.message }, 'DingTalk AI Card flush failed');
+        })
+        .finally(() => {
+          this.currentFlushPromise = null;
+          if (this.flushPending && this.acceptsStreamingUpdates()) {
+            this.scheduleFlush();
+          } else if (this.auxFlushPending && this.acceptsStreamingUpdates()) {
+            this.scheduleAuxFlush();
+          }
+        });
     }, delay);
   }
 
   private async doFlush(): Promise<void> {
+    if (!this.acceptsStreamingUpdates()) return;
     if (!this.accumulatedText.trim()) return;
 
-    // If card creation failed, use fallback
+    // Let the host choose the one durable static fallback.
     if (this.state === 'error') {
-      await this.tryFallback(this.accumulatedText);
-      return;
+      const creationError =
+        this.cardCreationError ??
+        preAcceptImDeliveryError('DingTalk streaming card was not created');
+      throw this.terminalizeDeliveryFailure(creationError);
     }
 
     await this.ensureCard();
 
     if (!this.cardInstanceId) {
-      await this.tryFallback(this.accumulatedText);
-      return;
+      const creationError =
+        this.cardCreationError ??
+        preAcceptImDeliveryError('DingTalk streaming card was not created');
+      throw this.terminalizeDeliveryFailure(creationError);
     }
 
     const content =
@@ -796,11 +935,31 @@ export class DingTalkStreamingCardController {
     }
   }
 
+  private acceptsStreamingUpdates(): boolean {
+    return (
+      this.state === 'idle' ||
+      this.state === 'creating' ||
+      this.state === 'streaming'
+    );
+  }
+
+  private terminalizeDeliveryFailure(error: unknown): unknown {
+    const deliveryError =
+      this.cardInstanceId && !(error instanceof PartialChannelDeliveryError)
+        ? new PartialChannelDeliveryError(1, 2, error)
+        : error;
+    this.terminalDeliveryError ??= deliveryError;
+    this.state = 'aborted';
+    this.clearFlushTimer();
+    return this.terminalDeliveryError;
+  }
+
   private async pushStreamingContent(
     content: string,
     isFinal: boolean,
   ): Promise<void> {
     if (!this.cardInstanceId) return;
+    if (!isFinal && content === this.lastPushedContent) return;
 
     // First stream call: switch to INPUTING
     if (!this.inputingStarted) {
@@ -845,6 +1004,7 @@ export class DingTalkStreamingCardController {
       },
       'card-streaming',
     );
+    this.lastPushedContent = content;
   }
 
   private async updateFlowStatus(
@@ -876,15 +1036,5 @@ export class DingTalkStreamingCardController {
       { cardId: this.cardInstanceId, flowStatus, resp },
       'DingTalk AI Card updateFlowStatus response',
     );
-  }
-
-  private async tryFallback(text: string): Promise<void> {
-    if (this.fallbackUsed || !this.fallbackSend) return;
-    this.fallbackUsed = true;
-    try {
-      await this.fallbackSend(text);
-    } catch (err: any) {
-      logger.warn({ err: err.message }, 'DingTalk fallback send also failed');
-    }
   }
 }

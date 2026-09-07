@@ -119,6 +119,43 @@ describe('active channel outbox scope', () => {
     expect(registry.unbind('workspace', topicB)).toBe(true);
   });
 
+  it('late text and media keep the source of their exact input after another channel arrives', () => {
+    const registry = new ActiveChannelOutboxScopeRegistry();
+    const first = registry.bind('shared', {
+      ...base,
+      turnRunId: 'private-run',
+      inputTurnId: 'private-input',
+      owner: 'owner',
+    });
+    registry.bind('shared', {
+      ...base,
+      sourceJid: 'feishu:group-b#account:bot-a',
+      chatId: 'group-b',
+      rootId: null,
+      threadId: null,
+      turnRunId: 'group-run',
+      inputTurnId: 'group-input',
+      owner: 'owner',
+    });
+    expect(registry.resolveInputScope('shared', 'private-input')).toEqual(
+      first,
+    );
+    expect(registry.resolveInputScope('shared', 'group-input')?.chatId).toBe(
+      'group-b',
+    );
+    expect(registry.resolveInputScope('shared', 'web-input')).toBeNull();
+    expect(registry.resolveInputScope('shared', '')).toBeNull();
+    registry.bind('shared', {
+      ...base,
+      sourceJid: 'feishu:other',
+      chatId: 'other',
+      turnRunId: 'mirror',
+      inputTurnId: 'private-input',
+      owner: 'owner',
+    });
+    expect(registry.resolveInputScope('shared', 'private-input')).toBeNull();
+  });
+
   it('creates stable distinct ordinals and deterministic synthetic receipts', () => {
     const body = stableChannelOutboxOrdinal('request-1:text');
     const attachment = stableChannelOutboxOrdinal('request-1:image:0');

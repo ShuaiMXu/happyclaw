@@ -5,6 +5,27 @@ set -e
 # owner-root/group-node bridge is ready; no mode grants access to "other".
 umask 0077
 
+now_ms() {
+  date +%s%3N
+}
+
+HAPPYCLAW_ENTRYPOINT_STARTED_MS="$(now_ms)"
+export HAPPYCLAW_ENTRYPOINT_STARTED_MS
+happyclaw_startup_metric() {
+  local phase="$1" current elapsed
+  current="$(now_ms)"
+  elapsed=$((current - HAPPYCLAW_ENTRYPOINT_STARTED_MS))
+  printf '[happyclaw:startup] phase=%s elapsed_ms=%s\n' \
+    "$phase" "$elapsed" >&2
+}
+
+# Read this root-owned launch contract before sourcing the per-session env
+# file. Workspace configuration may not switch production into hot-compile
+# mode; developers opt in explicitly with docker -e.
+HAPPYCLAW_TRUSTED_AGENT_RUNNER_MODE="${HAPPYCLAW_AGENT_RUNNER_MODE:-image}"
+HAPPYCLAW_TRUSTED_REQUIRE_BUNDLED_CLAUDE="${HAPPYCLAW_REQUIRE_BUNDLED_CLAUDE:-1}"
+happyclaw_startup_metric entrypoint_start
+
 # This root-owned helper accepts no runtime-configurable path.
 # shellcheck source=session-permissions.sh
 source /app/session-permissions.sh
@@ -25,6 +46,11 @@ runuser -u node -- env HOME=/home/node /usr/bin/git \
 # Source ordinary runtime variables while locally shadowing every root-control
 # variable, including stale values persisted before the host-side denylist.
 happyclaw_source_runtime_env
+HAPPYCLAW_AGENT_RUNNER_MODE="$HAPPYCLAW_TRUSTED_AGENT_RUNNER_MODE"
+HAPPYCLAW_REQUIRE_BUNDLED_CLAUDE="$HAPPYCLAW_TRUSTED_REQUIRE_BUNDLED_CLAUDE"
+export HAPPYCLAW_AGENT_RUNNER_MODE
+export HAPPYCLAW_REQUIRE_BUNDLED_CLAUDE
+unset HAPPYCLAW_TRUSTED_AGENT_RUNNER_MODE HAPPYCLAW_TRUSTED_REQUIRE_BUNDLED_CLAUDE
 
 # Prepend agent-runner 的本地 node_modules/.bin 到 PATH。
 # agent-runner/package.json 声明了 @anthropic-ai/claude-code 依赖，npm install
@@ -79,32 +105,71 @@ if [ -d /workspace/effective-skills ]; then
 fi
 happyclaw_prepare_generated_path skills
 
-# Compile TypeScript (agent-runner source may be hot-mounted from host). The
-# image build leaves /app/dist/.tsbuildinfo behind; disable incremental mode so
-# changing only outDir cannot incorrectly reuse that cache and emit no files.
-cd /app && npx tsc --outDir /tmp/dist --incremental false 2>&1 >&2
-happyclaw_prepare_generated_path dist
-ln -s /app/node_modules /tmp/dist/node_modules
-/usr/local/bin/node /app/session-prompts-copy.mjs
+# Production executes an immutable build that cannot be shadowed by the
+# backwards-compatible /app/src and /app/prompts host mounts. Development hot
+# reload remains available, but only through an explicit root launch option.
+case "$HAPPYCLAW_AGENT_RUNNER_MODE" in
+  image)
+    AGENT_RUNNER_ENTRY=/opt/happyclaw-agent/dist/index.js
+    if [ ! -f "$AGENT_RUNNER_ENTRY" ] || \
+      [ ! -f /opt/happyclaw-agent/prompts/security-rules.md ]; then
+      echo "Immutable Agent runner artifact is incomplete" >&2
+      exit 1
+    fi
+    ;;
+  development)
+    if [ ! -d /app/src ] || [ ! -d /app/prompts ]; then
+      echo "Development Agent runner mode requires /app/src and /app/prompts mounts" >&2
+      exit 1
+    fi
+    happyclaw_startup_metric runner_compile_start
+    cd /app && npx tsc --outDir /tmp/dist --incremental false 2>&1 >&2
+    happyclaw_prepare_generated_path dist
+    ln -s /app/node_modules /tmp/dist/node_modules
+    /usr/local/bin/node /app/session-prompts-copy.mjs
+    AGENT_RUNNER_ENTRY=/tmp/dist/index.js
+    happyclaw_startup_metric runner_compile_done
+    ;;
+  *)
+    echo "HAPPYCLAW_AGENT_RUNNER_MODE must be image or development" >&2
+    exit 1
+    ;;
+esac
+export AGENT_RUNNER_ENTRY
+happyclaw_startup_metric runner_artifact_ready
 
 # Fix permissions on exit: Claude Code creates some files with mode 0600
 # (e.g. settings.json), which the host backend (agent user) cannot read.
-# The trap runs as root after the node process exits. It also stops the managed
-# Chromium process so no browser child survives a cancelled run.
-CHROMIUM_PID=
+# The trap runs as root after the node process exits. It also stops a lazily
+# started managed Chromium process so no browser child survives cancellation.
+CHROMIUM_PID_FILE=/tmp/happyclaw-chromium.pid
+happyclaw_is_managed_chromium() {
+  local pid="$1" expected_uid actual_uid
+  [ -r "/proc/$pid/status" ] && [ -r "/proc/$pid/cmdline" ] || return 1
+  expected_uid="$(id -u node)"
+  actual_uid="$(awk '/^Uid:/{print $2; exit}' "/proc/$pid/status")"
+  [ "$actual_uid" = "$expected_uid" ] || return 1
+  tr '\0' '\n' < "/proc/$pid/cmdline" | grep -Fxq -- \
+    '--user-data-dir=/tmp/happyclaw-chromium-profile'
+}
 cleanup() {
-  local cleanup_status=0
+  local cleanup_status=0 chromium_pid=
   happyclaw_stop_session_permission_watcher || cleanup_status=$?
-  if [ -n "$CHROMIUM_PID" ] && kill -0 "$CHROMIUM_PID" 2>/dev/null; then
-    kill "$CHROMIUM_PID" 2>/dev/null || true
+  if [ -f "$CHROMIUM_PID_FILE" ]; then
+    read -r chromium_pid < "$CHROMIUM_PID_FILE" || chromium_pid=
+  fi
+  if [[ "$chromium_pid" =~ ^[1-9][0-9]*$ ]] && \
+    kill -0 "$chromium_pid" 2>/dev/null && \
+    happyclaw_is_managed_chromium "$chromium_pid"; then
+    kill "$chromium_pid" 2>/dev/null || true
     for ((attempt = 0; attempt < 20; attempt++)); do
-      kill -0 "$CHROMIUM_PID" 2>/dev/null || break
+      kill -0 "$chromium_pid" 2>/dev/null || break
       sleep 0.1
     done
-    if kill -0 "$CHROMIUM_PID" 2>/dev/null; then
-      kill -KILL "$CHROMIUM_PID" 2>/dev/null || true
+    if kill -0 "$chromium_pid" 2>/dev/null; then
+      kill -KILL "$chromium_pid" 2>/dev/null || true
     fi
-    wait "$CHROMIUM_PID" 2>/dev/null || true
+    wait "$chromium_pid" 2>/dev/null || true
   fi
   return "$cleanup_status"
 }
@@ -117,57 +182,155 @@ if [ "$HAPPYCLAW_INTERNAL_IDENTITY_MODE" = rootless ]; then
   umask 0007
 fi
 
-# Start one deterministic browser for this task container. Binding to loopback
-# keeps the raw Chrome DevTools Protocol private to the container; a future Web
-# browser panel must proxy the authenticated agent-browser dashboard/stream,
-# never publish this port directly.
+# Install a root-owned PATH wrapper. It starts one deterministic browser on the
+# first agent-browser invocation, then delegates to the real target-architecture
+# CLI. Binding to loopback keeps raw CDP private to the container.
 HAPPYCLAW_CHROMIUM_CDP_HOST="${HAPPYCLAW_CHROMIUM_CDP_HOST:-127.0.0.1}"
 HAPPYCLAW_CHROMIUM_CDP_PORT="${HAPPYCLAW_CHROMIUM_CDP_PORT:-9222}"
-CHROMIUM_PROFILE_DIR=/tmp/happyclaw-chromium-profile
-CHROMIUM_LOG=/tmp/happyclaw-chromium.log
-mkdir -p "$CHROMIUM_PROFILE_DIR"
-happyclaw_prepare_generated_path chromium
-
-# agent-browser reads this value when its daemon starts, so it attaches to the
-# managed browser instead of creating another Chromium with a random CDP port.
 export AGENT_BROWSER_CDP="$HAPPYCLAW_CHROMIUM_CDP_PORT"
+export HAPPYCLAW_CHROMIUM_CDP_HOST HAPPYCLAW_CHROMIUM_CDP_PORT
 
-HOME=/home/node setpriv --reuid=node --regid=node --init-groups -- \
-  "${AGENT_BROWSER_EXECUTABLE_PATH:-/usr/bin/chromium}" \
-  --headless=new \
-  --no-sandbox \
-  --disable-dev-shm-usage \
-  --no-first-run \
-  --no-default-browser-check \
-  --remote-debugging-address="$HAPPYCLAW_CHROMIUM_CDP_HOST" \
-  --remote-debugging-port="$HAPPYCLAW_CHROMIUM_CDP_PORT" \
-  --user-data-dir="$CHROMIUM_PROFILE_DIR" \
-  about:blank >"$CHROMIUM_LOG" 2>&1 &
-CHROMIUM_PID=$!
+AGENT_BROWSER_WRAPPER=/app/node_modules/.bin/agent-browser
+# Replace npm's ordinary symlink, never its package target. This makes both
+# PATH lookup and callers using the conventional absolute .bin path lazy-safe.
+rm -f "$AGENT_BROWSER_WRAPPER"
+cat > "$AGENT_BROWSER_WRAPPER" <<'LAZY_AGENT_BROWSER'
+#!/bin/bash
+set -euo pipefail
 
-CHROMIUM_READY=false
-for ((attempt = 0; attempt < 100; attempt++)); do
-  if curl --noproxy '*' -fsS \
-    "http://127.0.0.1:${HAPPYCLAW_CHROMIUM_CDP_PORT}/json/version" \
-    >/dev/null 2>&1; then
-    CHROMIUM_READY=true
-    break
+HOST="${HAPPYCLAW_CHROMIUM_CDP_HOST:-127.0.0.1}"
+PORT="${HAPPYCLAW_CHROMIUM_CDP_PORT:-9222}"
+ENDPOINT="http://${HOST}:${PORT}/json/version"
+PID_FILE=/tmp/happyclaw-chromium.pid
+LOCK_DIR=/tmp/happyclaw-chromium-start.lock
+PROFILE_DIR=/tmp/happyclaw-chromium-profile
+CHROMIUM_LOG=/tmp/happyclaw-chromium.log
+STARTED_MS="$(date +%s%3N)"
+
+metric() {
+  local phase="$1" now container_elapsed browser_elapsed
+  now="$(date +%s%3N)"
+  browser_elapsed=$((now - STARTED_MS))
+  if [[ "${HAPPYCLAW_ENTRYPOINT_STARTED_MS:-}" =~ ^[0-9]+$ ]]; then
+    container_elapsed=$((now - HAPPYCLAW_ENTRYPOINT_STARTED_MS))
+  else
+    container_elapsed=-1
   fi
-  if ! kill -0 "$CHROMIUM_PID" 2>/dev/null; then
-    break
-  fi
-  sleep 0.1
-done
+  printf '[happyclaw:startup] phase=%s elapsed_ms=%s browser_elapsed_ms=%s\n' \
+    "$phase" "$container_elapsed" "$browser_elapsed" >&2
+}
 
-if [ "$CHROMIUM_READY" != true ]; then
-  echo "Chromium failed to listen on container-local CDP port ${HAPPYCLAW_CHROMIUM_CDP_PORT}" >&2
-  cat "$CHROMIUM_LOG" >&2 2>/dev/null || true
+ready() {
+  curl --noproxy '*' -fsS "$ENDPOINT" >/dev/null 2>&1
+}
+
+ensure_browser() {
+  local owns_lock=false chromium_pid=
+  cleanup_owned_start() {
+    if [ "$owns_lock" = true ]; then
+      if [[ "$chromium_pid" =~ ^[1-9][0-9]*$ ]] && \
+        kill -0 "$chromium_pid" 2>/dev/null; then
+        kill "$chromium_pid" 2>/dev/null || true
+        wait "$chromium_pid" 2>/dev/null || true
+      fi
+      rm -f "$PID_FILE"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      owns_lock=false
+    fi
+  }
+  trap cleanup_owned_start EXIT
+  trap 'cleanup_owned_start; exit 143' TERM
+  trap 'cleanup_owned_start; exit 130' INT
+  if ready; then
+    trap - EXIT INT TERM
+    metric chromium_reused
+    return
+  fi
+
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      owns_lock=true
+      break
+    fi
+    if ready; then
+      trap - EXIT INT TERM
+      metric chromium_reused
+      return
+    fi
+    sleep 0.1
+  done
+  if [ "$owns_lock" != true ]; then
+    # Chromium itself has a 10s readiness deadline below. A lock still present
+    # after 20s cannot belong to a healthy starter, so recover the empty stale
+    # directory once before failing closed.
+    if rmdir "$LOCK_DIR" 2>/dev/null && mkdir "$LOCK_DIR" 2>/dev/null; then
+      owns_lock=true
+    else
+      echo "Timed out waiting for the managed Chromium startup lock" >&2
+      exit 1
+    fi
+  fi
+
+  if ready; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    owns_lock=false
+    trap - EXIT INT TERM
+    metric chromium_reused
+    return
+  fi
+
+  mkdir -p "$PROFILE_DIR"
+  metric chromium_start
+  HOME=/home/node "${AGENT_BROWSER_EXECUTABLE_PATH:-/usr/bin/chromium}" \
+    --headless=new \
+    --no-sandbox \
+    --disable-dev-shm-usage \
+    --no-first-run \
+    --no-default-browser-check \
+    --remote-debugging-address="$HOST" \
+    --remote-debugging-port="$PORT" \
+    --user-data-dir="$PROFILE_DIR" \
+    about:blank >"$CHROMIUM_LOG" 2>&1 &
+  chromium_pid=$!
+  printf '%s\n' "$chromium_pid" > "$PID_FILE"
+
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    if ready; then
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      owns_lock=false
+      trap - EXIT INT TERM
+      metric chromium_ready
+      return
+    fi
+    if ! kill -0 "$chromium_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  kill "$chromium_pid" 2>/dev/null || true
+  wait "$chromium_pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  owns_lock=false
+  trap - EXIT INT TERM
+  echo "Chromium failed to listen on container-local CDP port ${PORT}" >&2
   exit 1
-fi
+}
+
+ensure_browser
+exec /usr/local/bin/node \
+  /app/node_modules/agent-browser/bin/agent-browser.js "$@"
+LAZY_AGENT_BROWSER
+chmod 0555 "$AGENT_BROWSER_WRAPPER"
+export PATH="/app/node_modules/.bin:$PATH"
+happyclaw_startup_metric browser_deferred
 
 # Buffer stdin to file (container requires EOF to flush stdin pipe)
 cat > /tmp/input.json
 chmod 644 /tmp/input.json
+happyclaw_startup_metric input_buffered
 
 # Drop privileges and execute agent-runner as node user
-runuser -u node -- node /tmp/dist/index.js < /tmp/input.json
+happyclaw_startup_metric runner_exec
+runuser -u node -- node "$AGENT_RUNNER_ENTRY" < /tmp/input.json

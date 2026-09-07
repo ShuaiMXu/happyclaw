@@ -5,6 +5,7 @@ import {
   buildNativeThreadWorkspaceUpdate,
   buildRestoreDefaultChannelMountUpdate,
   buildSessionMountUpdate,
+  normalizeChannelBindingPolicy,
   buildWorkspaceMountUpdate,
   hasRemainingThreadMapMount,
   hasSessionMountConflict,
@@ -163,12 +164,13 @@ describe('resolveChannelMountTarget', () => {
 });
 
 describe('channel binding product contract', () => {
-  test('every channel exposes workspace binding capability', () => {
+  test('only native-topic providers expose workspace binding capability', () => {
     expect(
-      Object.values(IM_CHANNEL_CAPABILITIES).every(
-        (capability) => capability.can_bind_workspace,
-      ),
-    ).toBe(true);
+      Object.values(IM_CHANNEL_CAPABILITIES)
+        .filter((capability) => capability.can_bind_workspace)
+        .map((capability) => capability.channel_type)
+        .sort(),
+    ).toEqual(['feishu', 'telegram']);
   });
 
   test('only transports with a real inbound gate advertise activation modes', () => {
@@ -228,7 +230,7 @@ describe('channel binding product contract', () => {
     ).toBe(false);
   });
 
-  test('Feishu ordinary groups use thread mapping only for mention activation', () => {
+  test('Feishu ordinary groups never use thread mapping for mention activation', () => {
     const ordinary: RegisteredGroup = {
       ...makeWorkspace('Ordinary group', 'ordinary'),
       feishu_chat_mode: 'group',
@@ -241,14 +243,14 @@ describe('channel binding product contract', () => {
         ...ordinary,
         activation_mode: 'when_mentioned',
       }),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       isNativeContextContainer('feishu:ordinary', {
         ...ordinary,
         activation_mode: 'auto',
         require_mention: true,
       }),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       isNativeContextContainer('feishu:direct', {
         ...ordinary,
@@ -537,5 +539,59 @@ describe('channel binding product contract', () => {
       conversation_source: 'feishu_thread',
       conversation_nav_mode: 'vertical_threads',
     });
+  });
+});
+
+describe('legacy binding policy reconciliation', () => {
+  test('ordinary group mention flags become one main session without changing the chosen workspace', () => {
+    const group: RegisteredGroup = {
+      ...makeWorkspace('Group', 'home'),
+      target_main_jid: 'web:chosen',
+      binding_mode: 'thread_map',
+      feishu_chat_mode: 'group',
+      feishu_group_message_type: 'chat',
+      native_context_type: 'thread',
+      activation_mode: 'when_mentioned',
+      reply_policy: 'mirror',
+    };
+    const updated = normalizeChannelBindingPolicy('feishu:ordinary', group);
+    expect(updated).toMatchObject({
+      target_main_jid: 'web:chosen',
+      binding_mode: 'single_context',
+      native_context_type: 'none',
+      activation_mode: 'when_mentioned',
+      reply_policy: 'source_only',
+    });
+    expect(normalizeChannelBindingPolicy('feishu:ordinary', updated)).toBe(
+      updated,
+    );
+    expect(group.binding_mode).toBe('thread_map');
+  });
+  test('a topic workspace keeps its destination and maps each topic, but an unbound topic stays unbound', () => {
+    const group: RegisteredGroup = {
+      ...makeWorkspace('Topics', 'home'),
+      feishu_chat_mode: 'topic',
+      target_main_jid: 'web:chosen',
+      binding_mode: 'single_context',
+    };
+    expect(normalizeChannelBindingPolicy('feishu:topics', group)).toMatchObject(
+      { target_main_jid: 'web:chosen', binding_mode: 'thread_map' },
+    );
+    const unbound = normalizeChannelBindingPolicy('feishu:topics', {
+      ...group,
+      target_main_jid: undefined,
+    });
+    expect(unbound.target_main_jid).toBeUndefined();
+    expect(unbound.target_agent_id).toBeUndefined();
+  });
+  test('does not remount an incompatible topic session or erase its history target', () => {
+    const group: RegisteredGroup = {
+      ...makeWorkspace('Topics', 'home'),
+      feishu_chat_mode: 'topic',
+      target_agent_id: 'existing-session',
+    };
+    expect(
+      normalizeChannelBindingPolicy('feishu:topics', group).target_agent_id,
+    ).toBe('existing-session');
   });
 });

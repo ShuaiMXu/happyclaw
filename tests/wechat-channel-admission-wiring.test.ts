@@ -4,6 +4,9 @@ import type { WeChatConnectOpts } from '../src/wechat.js';
 
 const capture = vi.hoisted(() => ({
   connectOpts: null as WeChatConnectOpts | null,
+  sendMessage: vi.fn(),
+  sendImage: vi.fn(),
+  sendFile: vi.fn(),
 }));
 
 vi.mock('../src/wechat.js', () => ({
@@ -12,9 +15,9 @@ vi.mock('../src/wechat.js', () => ({
       capture.connectOpts = opts;
     },
     async disconnect() {},
-    async sendMessage() {},
-    async sendImage() {},
-    async sendFile() {},
+    sendMessage: capture.sendMessage,
+    sendImage: capture.sendImage,
+    sendFile: capture.sendFile,
     async sendTyping() {},
     isRunning: () => true,
     isConnected: () => true,
@@ -28,6 +31,9 @@ const { IMConnectionManager } = await import('../src/im-manager.js');
 describe('WeChat admission and lifecycle wiring', () => {
   beforeEach(() => {
     capture.connectOpts = null;
+    capture.sendMessage.mockReset();
+    capture.sendImage.mockReset();
+    capture.sendFile.mockReset();
   });
 
   test('adapter forwards authorization, pairing, and connection state callbacks', async () => {
@@ -52,6 +58,68 @@ describe('WeChat admission and lifecycle wiring', () => {
     expect(capture.connectOpts?.onPairAttempt).toBe(onPairAttempt);
     expect(capture.connectOpts?.onConnectionStateChange).toBe(
       onConnectionStateChange,
+    );
+  });
+
+  test('adapter never acknowledges outbound work without a live connector', async () => {
+    const channel = createWeChatChannel({
+      botToken: 'token',
+      ilinkBotId: 'bot',
+    });
+
+    await expect(channel.sendMessage('peer', 'hello')).rejects.toThrow(
+      'not connected',
+    );
+    await expect(
+      channel.sendImage?.('peer', Buffer.from('image'), 'image/png'),
+    ).rejects.toThrow('not connected');
+    await expect(
+      channel.sendFile?.('peer', '/tmp/file', 'file.txt'),
+    ).rejects.toThrow('not connected');
+  });
+
+  test('adapter forwards the stable durable delivery identity', async () => {
+    const channel = createWeChatChannel({
+      botToken: 'token',
+      ilinkBotId: 'bot',
+    });
+    await channel.connect({ onNewChat: vi.fn() });
+    await channel.sendMessage('peer', 'hello', [], {
+      deliveryId: 'turn-1:reply-0',
+      chunkIndex: 3,
+      physicalOutput: true,
+    });
+    expect(capture.sendMessage).toHaveBeenCalledWith('peer', 'hello', [], {
+      deliveryId: 'turn-1:reply-0',
+      chunkIndex: 3,
+      physicalOutput: true,
+    });
+    await channel.sendImage?.(
+      'peer',
+      Buffer.from('image'),
+      'image/png',
+      undefined,
+      'image.png',
+      { deliveryId: 'image-row', chunkIndex: 0, physicalOutput: true },
+    );
+    expect(capture.sendImage).toHaveBeenCalledWith(
+      'peer',
+      Buffer.from('image'),
+      'image/png',
+      undefined,
+      'image.png',
+      { deliveryId: 'image-row', chunkIndex: 0, physicalOutput: true },
+    );
+    await channel.sendFile?.('peer', '/tmp/report', 'report.txt', {
+      deliveryId: 'file-row',
+      chunkIndex: 0,
+      physicalOutput: true,
+    });
+    expect(capture.sendFile).toHaveBeenCalledWith(
+      'peer',
+      '/tmp/report',
+      'report.txt',
+      { deliveryId: 'file-row', chunkIndex: 0, physicalOutput: true },
     );
   });
 

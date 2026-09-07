@@ -61,9 +61,24 @@ else
   )
 fi
 
-# -i keeps stdin open while detached. The production entrypoint starts Chromium
-# first and then waits for the task JSON on stdin, giving the probe a stable
-# window without bypassing any real startup behavior.
+runner_preflight="$({
+  printf '%s' '{"prompt":"image preflight","groupFolder":"smoke","chatJid":"web:smoke","isMain":false}' |
+    docker run --rm --interactive \
+      "${smoke_identity_args[@]}" \
+      --env HAPPYCLAW_IMAGE_PREFLIGHT=1 \
+      --tmpfs /home/node/.claude:rw,nosuid,nodev,noexec \
+      --tmpfs /workspace/ipc:rw,nosuid,nodev,noexec \
+      --tmpfs /workspace/group:rw,nosuid,nodev \
+      --tmpfs /workspace/extra:rw,nosuid,nodev \
+      "$IMAGE_REF"
+} 2>&1)"
+printf '%s\n' "$runner_preflight"
+grep -q 'IMAGE_RUNNER_PREFLIGHT_OK' <<<"$runner_preflight"
+grep -q 'phase=runner_exec' <<<"$runner_preflight"
+
+# -i keeps stdin open while detached. The production entrypoint validates the
+# immutable Agent artifact, installs the lazy browser wrapper, and then waits
+# for task JSON on stdin. The smoke invokes that real wrapper explicitly.
 docker run --detach --interactive \
   --name "$SMOKE_CONTAINER_NAME" \
   "${smoke_identity_args[@]}" \
@@ -76,29 +91,57 @@ docker run --detach --interactive \
 for ((attempt = 1; attempt <= SMOKE_TIMEOUT_SECONDS; attempt++)); do
   if ! docker inspect --format '{{.State.Running}}' "$SMOKE_CONTAINER_NAME" |
     grep -qx true; then
-    echo "Container exited before Chromium became ready" >&2
+    echo "Container exited before the immutable runner became ready" >&2
     docker logs "$SMOKE_CONTAINER_NAME" >&2 || true
     exit 1
   fi
 
-  if response="$(
-    docker exec "$SMOKE_CONTAINER_NAME" \
-      curl --noproxy '*' -fsS http://127.0.0.1:9222/json/version 2>/dev/null
-  )"; then
-    if jq -e '
-      type == "object" and
-      (.Browser | type == "string" and length > 0) and
-      (.webSocketDebuggerUrl | type == "string" and startswith("ws://"))
-    ' <<<"$response" >/dev/null; then
-      printf '%s\n' "$response" | jq .
-      echo "Chromium CDP HTTP smoke test passed for $IMAGE_REF"
-      exit 0
-    fi
+  if docker logs "$SMOKE_CONTAINER_NAME" 2>&1 |
+    grep -q 'phase=browser_deferred'; then
+    break
   fi
 
+  if [ "$attempt" -eq "$SMOKE_TIMEOUT_SECONDS" ]; then
+    echo "Timed out waiting for immutable runner readiness" >&2
+    docker logs "$SMOKE_CONTAINER_NAME" >&2 || true
+    exit 1
+  fi
   sleep 1
 done
 
-echo "Timed out waiting for Chromium CDP HTTP endpoint" >&2
-docker logs "$SMOKE_CONTAINER_NAME" >&2 || true
-exit 1
+docker exec "$SMOKE_CONTAINER_NAME" \
+  test -f /opt/happyclaw-agent/dist/index.js
+docker exec "$SMOKE_CONTAINER_NAME" \
+  test ! -e /tmp/dist/index.js
+docker exec "$SMOKE_CONTAINER_NAME" \
+  /app/node_modules/.bin/claude --version
+docker exec --user node "$SMOKE_CONTAINER_NAME" \
+  env HOME=/home/node node \
+  /opt/happyclaw-agent/smoke/image-sdk-query-smoke.mjs
+
+# Chromium must consume no resources before a browser tool is actually used.
+if docker exec "$SMOKE_CONTAINER_NAME" \
+  curl --noproxy '*' -fsS http://127.0.0.1:9222/json/version \
+  >/dev/null 2>&1; then
+  echo "Chromium started eagerly instead of waiting for agent-browser" >&2
+  exit 1
+fi
+
+browser_output="$(
+  docker exec --user node "$SMOKE_CONTAINER_NAME" \
+    env HOME=/home/node /app/node_modules/.bin/agent-browser open about:blank 2>&1
+)"
+printf '%s\n' "$browser_output"
+grep -q 'phase=chromium_ready' <<<"$browser_output"
+
+response="$(
+  docker exec "$SMOKE_CONTAINER_NAME" \
+    curl --noproxy '*' -fsS http://127.0.0.1:9222/json/version
+)"
+jq -e '
+  type == "object" and
+  (.Browser | type == "string" and length > 0) and
+  (.webSocketDebuggerUrl | type == "string" and startswith("ws://"))
+' <<<"$response" >/dev/null
+printf '%s\n' "$response" | jq .
+echo "Immutable runner and lazy Chromium smoke test passed for $IMAGE_REF"

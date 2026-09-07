@@ -1,6 +1,6 @@
 import { useState, useRef, DragEvent } from 'react';
-import { Upload, FolderUp } from 'lucide-react';
-import { useFileStore } from '../../stores/files';
+import { Upload, FolderUp, X } from 'lucide-react';
+import { formatUploadRetryStatus, useFileStore } from '../../stores/files';
 
 interface FileUploadZoneProps {
   groupJid: string;
@@ -10,7 +10,8 @@ export function FileUploadZone({ groupJid }: FileUploadZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
-  const { uploadFiles, uploading, uploadProgress } = useFileStore();
+  const { uploadFiles, cancelUpload, uploading, uploadProgress } =
+    useFileStore();
 
   const handleDragOver = (e: DragEvent) => {
     e.preventDefault();
@@ -53,8 +54,13 @@ export function FileUploadZone({ groupJid }: FileUploadZoneProps) {
 
   const progressPercent =
     uploadProgress && uploadProgress.totalBytes > 0
-      ? Math.round((uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100)
+      ? Math.round(
+          (uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100,
+        )
       : 0;
+  const retryStatus = uploadProgress
+    ? formatUploadRetryStatus(uploadProgress)
+    : null;
 
   return (
     <div className="space-y-2">
@@ -64,10 +70,8 @@ export function FileUploadZone({ groupJid }: FileUploadZoneProps) {
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
         className={`relative border-2 border-dashed rounded-lg p-3 transition-all ${
-          isDragging
-            ? 'border-primary bg-brand-50'
-            : 'border-border'
-        } ${uploading ? 'pointer-events-none' : ''}`}
+          isDragging ? 'border-primary bg-brand-50' : 'border-border'
+        }`}
       >
         {/* Hidden inputs */}
         <input
@@ -92,8 +96,15 @@ export function FileUploadZone({ groupJid }: FileUploadZoneProps) {
           /* Upload progress */
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs text-muted-foreground">
-              <span className="truncate max-w-[60%]">{uploadProgress.currentFile || '完成'}</span>
-              <span>{uploadProgress.completed}/{uploadProgress.total} 个文件</span>
+              <span className="truncate max-w-[60%]">
+                {uploadProgress.currentFile || '完成'}
+                {retryStatus ? (
+                  <span data-upload-retry-status>（{retryStatus}）</span>
+                ) : null}
+              </span>
+              <span>
+                {uploadProgress.completed}/{uploadProgress.total} 个文件
+              </span>
             </div>
             <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
               <div
@@ -101,7 +112,20 @@ export function FileUploadZone({ groupJid }: FileUploadZoneProps) {
                 style={{ width: `${progressPercent}%` }}
               />
             </div>
-            <p className="text-[11px] text-muted-foreground text-center">{progressPercent}%</p>
+            <div className="flex items-center justify-center gap-2">
+              <p className="text-[11px] text-muted-foreground">
+                {progressPercent}%
+              </p>
+              <button
+                type="button"
+                data-upload-cancel
+                onClick={cancelUpload}
+                className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+              >
+                <X className="w-3 h-3" />
+                取消
+              </button>
+            </div>
           </div>
         ) : (
           /* Idle state */

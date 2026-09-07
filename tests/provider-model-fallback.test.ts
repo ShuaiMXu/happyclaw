@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  classifyProviderAssistantError,
   classifyProviderLimitNotice,
   classifyProviderRateLimitType,
   decideProviderLimitAction,
-  isAccountProviderAssistantError,
   isProviderLimitNotice,
   ProviderFallbackModelState,
   ProviderFallbackTurnLedger,
@@ -143,14 +143,60 @@ describe('provider model fallback lifecycle', () => {
   });
 
   test('fails fast on synthetic assistant provider errors without a Result', () => {
-    expect(isAccountProviderAssistantError('rate_limit')).toBe(true);
-    expect(isAccountProviderAssistantError('billing_error')).toBe(true);
-    expect(isAccountProviderAssistantError('authentication_failed')).toBe(true);
-    expect(isAccountProviderAssistantError('overloaded')).toBe(true);
-    expect(isAccountProviderAssistantError('server_error')).toBe(true);
-    expect(isAccountProviderAssistantError('invalid_request')).toBe(false);
-    expect(isAccountProviderAssistantError('max_output_tokens')).toBe(false);
-    expect(isAccountProviderAssistantError(undefined)).toBe(false);
+    // Every recognized error still terminates the attempt; only the class,
+    // and therefore the disposition, differs.
+    for (const error of [
+      'rate_limit',
+      'billing_error',
+      'authentication_failed',
+      'oauth_org_not_allowed',
+      'account_on_hold',
+      'overloaded',
+      'server_error',
+      'unknown',
+      'max_output_tokens',
+      'invalid_request',
+      'model_not_found',
+    ] as const) {
+      expect(classifyProviderAssistantError(error)).toBeDefined();
+    }
+    expect(classifyProviderAssistantError(undefined)).toBeUndefined();
+  });
+
+  test('only a verdict on the profile is classified as an account failure', () => {
+    expect(classifyProviderAssistantError('authentication_failed')).toBe(
+      'account',
+    );
+    expect(classifyProviderAssistantError('oauth_org_not_allowed')).toBe(
+      'account',
+    );
+    expect(classifyProviderAssistantError('account_on_hold')).toBe('account');
+    expect(classifyProviderAssistantError('billing_error')).toBe('account');
+    // A bare rate_limit carries no rateLimitType, so it fails safe as
+    // account-wide — matching classifyProviderRateLimitType's unknown default.
+    expect(classifyProviderAssistantError('rate_limit')).toBe('account');
+  });
+
+  test('upstream noise never becomes an account verdict', () => {
+    // A 529 from the edge and a 5xx from the server say nothing about this
+    // account's quota. Classifying them as `account` is what quarantined the
+    // only profile of a single-account install and retired the user's input.
+    expect(classifyProviderAssistantError('overloaded')).toBe('transient');
+    expect(classifyProviderAssistantError('server_error')).toBe('transient');
+    expect(classifyProviderAssistantError('unknown')).toBe('transient');
+    expect(classifyProviderAssistantError('max_output_tokens')).toBe(
+      'transient',
+    );
+    expect(classifyProviderAssistantError('future_sdk_error' as never)).toBe(
+      'transient',
+    );
+  });
+
+  test('an unservable model name is a config failure, not a quota one', () => {
+    // Every account would be asked for the same model, so quarantining on this
+    // would drain the whole pool over one bad model name.
+    expect(classifyProviderAssistantError('model_not_found')).toBe('config');
+    expect(classifyProviderAssistantError('invalid_request')).toBe('config');
   });
 
   test('structured rejection wins over text and preserves model-only errors without fallback', () => {

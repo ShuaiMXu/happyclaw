@@ -30,6 +30,16 @@ describe('SteeringTransitionRegistry', () => {
     expect(registry.shouldSuppressOutput('web:chat', 'old-turn')).toBe(false);
   });
 
+  it('consumes runner closed as a clean steer terminal', () => {
+    const registry = new SteeringTransitionRegistry();
+    registry.mark('web:chat');
+
+    expect(registry.consumeRunnerClose('web:chat', 'old-turn')).toBe(true);
+    expect(registry.shouldSuppressOutput('web:chat', 'old-turn')).toBe(true);
+    expect(registry.shouldSuppressOutput('web:chat', 'new-turn')).toBe(false);
+    expect(registry.consumeRunnerClose('web:other', 'old-turn')).toBe(false);
+  });
+
   it('expires abandoned transition state', () => {
     vi.useFakeTimers();
     const registry = new SteeringTransitionRegistry(1_000);

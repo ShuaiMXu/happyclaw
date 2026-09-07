@@ -19,8 +19,10 @@ import type {
   FeishuCapabilityResult,
 } from './feishu-capability.js';
 import {
+  definitiveFeishuPreAcceptanceFailure,
   definitiveFeishuHttpRejection,
   DefinitiveFeishuCapabilityError,
+  withFeishuPreAcceptanceRetry,
 } from './feishu-capability.js';
 
 export interface DeliverFeishuCapabilityMutationInput extends ChannelRouteSnapshot {
@@ -82,12 +84,13 @@ export async function deliverFeishuCapabilityMutation(
       mode: 'single',
       send: async () => {
         try {
-          providerResult = await input.execute();
+          providerResult = await withFeishuPreAcceptanceRetry(input.execute);
         } catch (error) {
           const rejection =
             error instanceof DefinitiveFeishuCapabilityError
               ? error
-              : definitiveFeishuHttpRejection(error);
+              : (definitiveFeishuPreAcceptanceFailure(error) ??
+                definitiveFeishuHttpRejection(error));
           if (rejection) {
             const retryAt =
               rejection.retryAfterMs === undefined

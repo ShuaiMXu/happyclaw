@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 
@@ -64,6 +64,8 @@ function seedRunner(q: GroupQueue, jid: string, opts: SeedOpts = {}) {
     drainSentinelWritten: false,
     hasIpcInjectedMessages: opts.hasIpcInjectedMessages ?? false,
     ipcOwedSinceAt: opts.ipcOwedSinceAt ?? null,
+    pendingIpcDeliveries: new Map(),
+    acknowledgedIpcDeliveryIds: new Set(),
   });
 }
 
@@ -352,6 +354,168 @@ describe('#618: IPC-injected follow-ups are visible to stuck recovery', () => {
       lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
     });
 
+    expect(q.getStuckPendingGroups(IDLE_THRESHOLD_MS)).toHaveLength(0);
+  });
+  test('internal-continue idle does not wipe unpaid IPC debt', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    const owedAt = Date.now() - IDLE_THRESHOLD_MS - 1000;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: owedAt,
+      lastActivityAt: owedAt,
+    });
+    const receipt = {
+      deliveryId: 'pending-delivery',
+      chatJid: jid,
+      cursor: { timestamp: '2026-08-27T00:00:00.000Z', id: 'message-1' },
+    };
+    (getState(q, jid).pendingIpcDeliveries as Map<string, typeof receipt>).set(
+      receipt.deliveryId,
+      receipt,
+    );
+
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+
+    expect(getState(q, jid).queryInFlight).toBe(true);
+    expect(getState(q, jid).ipcOwedSinceAt).toBe(owedAt);
+    const stuck = q.getStuckPendingGroups(IDLE_THRESHOLD_MS);
+    expect(stuck).toHaveLength(1);
+    expect(stuck[0].reason).toBe('ipc_injected');
+
+    q.setIpcDeliveryCommitEligibilityChecker(() => true);
+    q.acknowledgeIpcDeliveries(jid, [receipt], () => {});
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(false);
+  });
+
+  test('disk IPC preserves continue debt even before receipt bookkeeping exists', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    const owedAt = Date.now() - IDLE_THRESHOLD_MS - 1000;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      ipcOwedSinceAt: owedAt,
+      lastActivityAt: owedAt,
+    });
+    const inputDir = path.join(ipcDir, 'input');
+    fs.mkdirSync(inputDir, { recursive: true });
+    fs.writeFileSync(path.join(inputDir, 'pending.json'), '{}');
+
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(true);
+
+    fs.unlinkSync(path.join(inputDir, 'pending.json'));
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(false);
+  });
+
+  test('runner claim files preserve IPC debt after a crash', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+      lastActivityAt: Date.now() - IDLE_THRESHOLD_MS - 1000,
+    });
+    const inputDir = path.join(ipcDir, 'input');
+    fs.mkdirSync(inputDir, { recursive: true });
+    const claim = path.join(
+      inputDir,
+      'pending.json.happyclaw-claimed-123-1-test',
+    );
+    fs.writeFileSync(claim, '{}');
+
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(true);
+
+    fs.unlinkSync(claim);
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+    expect(getState(q, jid).queryInFlight).toBe(false);
+  });
+
+  test('unacknowledged recovery removes the Runner claim before DB replay', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, { groupFolder: folder, queryInFlight: true });
+    const receipt = {
+      deliveryId: 'delivery-claim',
+      chatJid: jid,
+      cursor: {
+        timestamp: '2026-08-31T00:00:00.000Z',
+        id: 'message-claim',
+        sequence: 42,
+      },
+    };
+    const state = getState(q, jid);
+    (state.pendingIpcDeliveries as Map<string, typeof receipt>).set(
+      receipt.deliveryId,
+      receipt,
+    );
+    const inputDir = path.join(ipcDir, 'input');
+    fs.mkdirSync(inputDir, { recursive: true });
+    const claim = path.join(
+      inputDir,
+      'pending.json.happyclaw-claimed-123-1-test',
+    );
+    fs.writeFileSync(
+      claim,
+      JSON.stringify({ type: 'message', text: 'pending', receipt }),
+    );
+    const rewind = vi.fn();
+    q.setOnUnacknowledgedIpcDeliveries(rewind);
+
+    (
+      q as unknown as {
+        recoverUnacknowledgedIpcDeliveries: (
+          groupJid: string,
+          groupState: Record<string, unknown>,
+        ) => void;
+      }
+    ).recoverUnacknowledgedIpcDeliveries(jid, state);
+
+    expect(fs.existsSync(claim)).toBe(false);
+    expect(rewind).toHaveBeenCalledWith(jid, [receipt]);
+  });
+
+  test('internal-continue preserve hint still closes a query with no real IPC debt', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: null,
+      lastActivityAt: Date.now() - 1000,
+    });
+
+    q.markRunnerQueryIdle(jid, { preserveIpcDebt: true });
+
+    expect(getState(q, jid).queryInFlight).toBe(false);
+    expect(getState(q, jid).queryId).toBeNull();
+    expect(q.getStuckPendingGroups(IDLE_THRESHOLD_MS)).toHaveLength(0);
+  });
+
+  test('ordinary query idle still clears IPC debt', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, {
+      groupFolder: folder,
+      queryInFlight: true,
+      hasIpcInjectedMessages: true,
+      ipcOwedSinceAt: Date.now() - 1000,
+      lastActivityAt: Date.now() - 1000,
+    });
+
+    q.markRunnerQueryIdle(jid);
+
+    expect(getState(q, jid).queryInFlight).toBe(false);
+    expect(getState(q, jid).ipcOwedSinceAt).toBeNull();
     expect(q.getStuckPendingGroups(IDLE_THRESHOLD_MS)).toHaveLength(0);
   });
 });

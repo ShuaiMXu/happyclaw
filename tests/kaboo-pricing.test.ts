@@ -22,6 +22,28 @@ describe('Kaboo-aligned model pricing', () => {
     });
   });
 
+  test('prices Claude Fable 5.1 with its reduced cache-read rate', () => {
+    const pricing = matchKabooModelPricing('claude-fable-5-1-20260901');
+    expect(pricing).toMatchObject({
+      pattern: 'claude-fable-5-1%',
+      inputPricePerMTok: 10,
+      outputPricePerMTok: 50,
+      cacheReadPricePerMTok: 0.25,
+      cacheCreationPricePerMTok: 12.5,
+      reasoningPricePerMTok: 50,
+    });
+
+    expect(
+      estimateKabooModelCostCents('claude-fable-5-1', {
+        inputTokens: 1_000_000,
+        outputTokens: 1_000_000,
+        cacheReadInputTokens: 1_000_000,
+        cacheCreationInputTokens: 1_000_000,
+        reasoningTokens: 1_000_000,
+      }),
+    ).toBe(12_275);
+  });
+
   test('prices all five token categories and rounds to cents once', () => {
     expect(
       estimateKabooModelCostCents('claude-opus-4-5', {

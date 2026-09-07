@@ -24,11 +24,7 @@ import type {
   PermissionTemplateKey,
   AuthEventType,
 } from '../types.js';
-import {
-  lastActiveCache,
-  invalidateUserSessions,
-  getWebDeps,
-} from '../web-context.js';
+import { invalidateUserSessions, getWebDeps } from '../web-context.js';
 import { imManager } from '../im-manager.js';
 import {
   listUsers,

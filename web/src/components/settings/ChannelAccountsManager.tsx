@@ -815,7 +815,7 @@ function AccountConnectionDialog({
           <DialogTitle>{providerLabel(account.provider)}连接</DialogTitle>
           <DialogDescription>
             管理“{account.name}
-            ”的认证和协议设置。默认工作区与具体会话绑定不在这里修改。
+            ”的认证和协议设置。渠道会话的绑定目标请在绑定管理中选择。
           </DialogDescription>
         </DialogHeader>
 
@@ -1040,16 +1040,18 @@ function AccountRoutingFields({
         />
       </div>
       <div>
-        <Label htmlFor={`${idPrefix}-workspace`}>未绑定会话的默认去向</Label>
+        <Label htmlFor={`${idPrefix}-workspace`}>
+          工作区偏好（不自动绑定）
+        </Label>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          只作为兜底规则；具体群聊和私聊仍可在“已接入会话”中单独绑定。
+          此设置不会绑定渠道或触发回复。请到“已接入会话”明确绑定；未绑定的渠道不响应消息。
         </p>
         <Select value={defaultWorkspace} onValueChange={onWorkspaceChange}>
           <SelectTrigger id={`${idPrefix}-workspace`} className="mt-2">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="none">进入个人主页</SelectItem>
+            <SelectItem value="none">不指定工作区</SelectItem>
             {workspaces.map((workspace) => (
               <SelectItem key={workspace.jid} value={workspace.jid}>
                 {workspace.name}
@@ -1169,8 +1171,8 @@ function defaultTargetLabel(
   workspaces: WorkspaceOption[],
 ) {
   if (account.default_workspace_jid)
-    return `默认去向：${workspaces.find((item) => item.jid === account.default_workspace_jid)?.name ?? '已删除工作区'}`;
-  return '默认去向：个人主页';
+    return `工作区偏好：${workspaces.find((item) => item.jid === account.default_workspace_jid)?.name ?? '已删除工作区'}`;
+  return '未设置工作区偏好；渠道需单独绑定';
 }
 
 function getApiMessage(error: unknown, fallback: string) {

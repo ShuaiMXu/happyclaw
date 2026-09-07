@@ -14,13 +14,15 @@
  * preserving code fence state across splits.
  */
 
-import type {
-  TextChannel,
-  DMChannel,
-  NewsChannel,
-  Message,
-} from 'discord.js';
+import type { TextChannel, DMChannel, NewsChannel, Message } from 'discord.js';
 import { logger } from './logger.js';
+import { PartialChannelDeliveryError } from './im-delivery-progress.js';
+import {
+  classifyImSendFailure,
+  explicitImDeliveryPhase,
+  ImDeliveryPhaseError,
+  preAcceptImDeliveryError,
+} from './im-send-retry-policy.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -31,10 +33,35 @@ const MAX_TOOLS_DISPLAY = 5;
 const MAX_TOOL_SUMMARY_CHARS = 60;
 const MAX_RECENT_EVENTS = 5;
 
+function discordMessageCreateError(error: unknown): unknown {
+  if (explicitImDeliveryPhase(error) !== undefined) return error;
+  const status = Number(
+    (error as { status?: unknown; httpStatus?: unknown } | null)?.status ??
+      (error as { httpStatus?: unknown } | null)?.httpStatus,
+  );
+  if (
+    Number.isInteger(status) &&
+    status >= 400 &&
+    status < 500 &&
+    status !== 408 &&
+    status !== 425 &&
+    status !== 429
+  ) {
+    return new ImDeliveryPhaseError(
+      'rejected',
+      `Discord message create was rejected with HTTP ${status}`,
+      { cause: error },
+    );
+  }
+  return error;
+}
+
 type StreamingState =
   | 'idle'
   | 'creating'
   | 'streaming'
+  | 'completing'
+  | 'aborting'
   | 'completed'
   | 'aborted'
   | 'error';
@@ -45,7 +72,6 @@ export class DiscordStreamingEditController {
   private state: StreamingState = 'idle';
   private channel: TextChannel | DMChannel | NewsChannel;
   private onCardCreated?: (messageId: string) => void;
-  private fallbackSend: ((text: string) => Promise<void>) | null;
 
   // Message state — we may need multiple messages if text exceeds 2000 chars
   private messages: Message[] = [];
@@ -54,9 +80,13 @@ export class DiscordStreamingEditController {
   // Throttle
   private lastUpdateTime = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private currentFlushPromise: Promise<void> | null = null;
+  private flushPending = false;
 
   // Auxiliary flush throttle
   private auxFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private currentAuxFlushPromise: Promise<void> | null = null;
+  private auxFlushPending = false;
   private lastAuxFlushTime = 0;
   private static readonly AUX_FLUSH_INTERVAL = 1500; // ms
 
@@ -75,10 +105,10 @@ export class DiscordStreamingEditController {
   >();
   private recentEvents: string[] = [];
 
-  // Fallback flag
-  private fallbackUsed = false;
+  private terminalDeliveryError: unknown;
   // Creation guard
   private messageCreationPromise: Promise<void> | null = null;
+  private messageCreationError: unknown;
   // 上次已推送到 Discord 的完整 content（含 aux prefix），用于跳过 no-op edit，
   // 避免在文本/工具状态未变化时仍占用 Discord 的 5/5s edit 配额。
   private lastPushedContent: string | null = null;
@@ -92,21 +122,21 @@ export class DiscordStreamingEditController {
   ) {
     this.channel = channel;
     this.onCardCreated = opts?.onCardCreated;
-    this.fallbackSend = opts?.fallbackSend ?? null;
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────
 
   isActive(): boolean {
     return (
-      this.state === 'idle' ||
-      this.state === 'creating' ||
-      this.state === 'streaming'
+      this.acceptsStreamingUpdates() ||
+      ((this.state === 'error' || this.state === 'aborted') &&
+        this.terminalDeliveryError !== undefined &&
+        classifyImSendFailure(this.terminalDeliveryError) === 'uncertain')
     );
   }
 
   append(text: string): void {
-    if (!this.isActive()) return;
+    if (!this.acceptsStreamingUpdates()) return;
     this.accumulatedText = text; // Full replacement (same as DingTalk pattern)
     this.thinkingText = ''; // Clear reasoning once real text arrives
     this.thinking = false; // No longer in active thinking phase
@@ -114,9 +144,27 @@ export class DiscordStreamingEditController {
   }
 
   async complete(finalText: string): Promise<void> {
-    if (this.state === 'completed' || this.state === 'aborted') return;
-    this.accumulatedText = finalText;
+    if (this.terminalDeliveryError !== undefined) {
+      throw this.terminalDeliveryError;
+    }
+    if (
+      this.state === 'completed' ||
+      this.state === 'aborted' ||
+      this.state === 'completing' ||
+      this.state === 'aborting'
+    )
+      return;
+    this.state = 'completing';
     this.clearFlushTimer();
+    if (this.currentFlushPromise)
+      await this.currentFlushPromise.catch(() => {});
+    if (this.currentAuxFlushPromise)
+      await this.currentAuxFlushPromise.catch(() => {});
+    if (this.terminalDeliveryError !== undefined) {
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
+    }
+    this.accumulatedText = finalText;
 
     // If there's no text at all, skip message creation entirely
     if (!finalText.trim()) {
@@ -141,19 +189,19 @@ export class DiscordStreamingEditController {
         { err: err.message },
         'Discord ensureMessage failed in complete()',
       );
-      await this.tryFallback(finalText);
-      this.state = 'completed';
-      return;
+      throw this.terminalizeDeliveryFailure(err);
     }
 
     if (this.messages.length === 0) {
       logger.warn(
         { state: this.state },
-        'Discord complete(): no messages after ensureMessage, using fallback',
+        'Discord complete(): no messages after ensureMessage',
       );
-      await this.tryFallback(finalText);
-      this.state = 'completed';
-      return;
+      const creationError =
+        this.terminalDeliveryError ??
+        this.messageCreationError ??
+        preAcceptImDeliveryError('Discord streaming message was not created');
+      throw this.terminalizeDeliveryFailure(creationError);
     }
 
     try {
@@ -173,18 +221,36 @@ export class DiscordStreamingEditController {
         { err: err.message },
         'Discord streaming edit finalize failed, degrading',
       );
-      await this.tryFallback(finalText);
-      this.state = 'error';
+      throw this.terminalizeDeliveryFailure(err);
     }
   }
 
   async abort(reason?: string): Promise<void> {
-    if (this.state === 'completed' || this.state === 'aborted') return;
+    if (this.terminalDeliveryError !== undefined) {
+      throw this.terminalDeliveryError;
+    }
+    if (
+      this.state === 'completed' ||
+      this.state === 'aborted' ||
+      this.state === 'completing' ||
+      this.state === 'aborting'
+    )
+      return;
+    this.state = 'aborting';
     this.clearFlushTimer();
+    if (this.currentFlushPromise)
+      await this.currentFlushPromise.catch(() => {});
+    if (this.currentAuxFlushPromise)
+      await this.currentAuxFlushPromise.catch(() => {});
+    if (this.messageCreationPromise)
+      await this.messageCreationPromise.catch(() => {});
+    if (this.terminalDeliveryError !== undefined) {
+      this.state = 'aborted';
+      throw this.terminalDeliveryError;
+    }
 
     const displayText = this.accumulatedText
-      ? this.accumulatedText +
-        `\n\n> ⚠️ 已中断: ${reason ?? '用户取消'}`
+      ? this.accumulatedText + `\n\n> ⚠️ 已中断: ${reason ?? '用户取消'}`
       : `⚠️ 已中断: ${reason ?? '用户取消'}`;
 
     if (this.messages.length === 0) {
@@ -194,15 +260,14 @@ export class DiscordStreamingEditController {
 
     try {
       const lastMsg = this.messages[this.messages.length - 1];
-      const truncated = displayText.slice(
-        -(DISCORD_MSG_LIMIT),
-      );
+      const truncated = displayText.slice(-DISCORD_MSG_LIMIT);
       await lastMsg.edit(truncated);
     } catch (err: any) {
       logger.debug(
         { err: err.message },
         'Discord streaming edit abort update failed',
       );
+      throw this.terminalizeDeliveryFailure(err);
     }
     this.state = 'aborted';
   }
@@ -308,6 +373,10 @@ export class DiscordStreamingEditController {
     return this.messages.map((m) => m.id);
   }
 
+  getAcknowledgedProviderOutputCount(): number {
+    return this.messages.length;
+  }
+
   // ─── Auxiliary Build ────────────────────────────────────────
 
   /**
@@ -361,11 +430,7 @@ export class DiscordStreamingEditController {
     if (display.length > 0) {
       const lines = display.map((d) => {
         const icon =
-          d.status === 'running'
-            ? '🔄'
-            : d.status === 'complete'
-              ? '✅'
-              : '❌';
+          d.status === 'running' ? '🔄' : d.status === 'complete' ? '✅' : '❌';
         const summary = d.summary
           ? `  ${d.summary.length > MAX_TOOL_SUMMARY_CHARS ? d.summary.slice(0, MAX_TOOL_SUMMARY_CHARS) + '...' : d.summary}`
           : '';
@@ -404,7 +469,15 @@ export class DiscordStreamingEditController {
 
   /** Schedule auxiliary-only flush (throttled) */
   private scheduleAuxFlush(): void {
-    if (this.auxFlushTimer) return;
+    if (!this.acceptsStreamingUpdates()) return;
+    this.auxFlushPending = true;
+    if (
+      this.auxFlushTimer ||
+      this.currentAuxFlushPromise ||
+      this.flushTimer ||
+      this.currentFlushPromise
+    )
+      return;
     const elapsed = Date.now() - this.lastAuxFlushTime;
     const delay = Math.max(
       0,
@@ -412,14 +485,28 @@ export class DiscordStreamingEditController {
     );
     this.auxFlushTimer = setTimeout(() => {
       this.auxFlushTimer = null;
-      // Guard: don't flush after complete/abort
-      if (this.state === 'completed' || this.state === 'aborted') return;
+      if (!this.acceptsStreamingUpdates()) {
+        this.auxFlushPending = false;
+        return;
+      }
+      if (this.currentFlushPromise || this.currentAuxFlushPromise) return;
+      this.auxFlushPending = false;
       this.lastAuxFlushTime = Date.now();
       // Push combined content (aux prefix + main text)
       const content = this.buildAuxPrefix() + this.accumulatedText;
-      this.editLastMessage(content).catch((err: any) => {
-        logger.debug({ err: err.message }, 'Discord aux flush failed');
-      });
+      this.currentAuxFlushPromise = this.editLastMessage(content)
+        .catch((err: any) => {
+          this.terminalizeDeliveryFailure(err);
+          logger.debug({ err: err.message }, 'Discord aux flush failed');
+        })
+        .finally(() => {
+          this.currentAuxFlushPromise = null;
+          if (this.flushPending && this.acceptsStreamingUpdates()) {
+            this.scheduleFlush();
+          } else if (this.auxFlushPending && this.acceptsStreamingUpdates()) {
+            this.scheduleAuxFlush();
+          }
+        });
     }, delay);
   }
 
@@ -434,19 +521,24 @@ export class DiscordStreamingEditController {
       return;
     }
 
-    this.state = 'creating';
+    if (this.state !== 'completing' && this.state !== 'aborting') {
+      this.state = 'creating';
+    }
     this.messageCreationPromise = (async () => {
       try {
         const msg = await this.channel.send('💭 思考中...');
         this.messages.push(msg);
-        this.state = 'streaming';
+        this.messageCreationError = undefined;
+        if (this.state === 'creating') this.state = 'streaming';
         if (this.onCardCreated) this.onCardCreated(msg.id);
       } catch (err: any) {
+        const creationError = discordMessageCreateError(err);
+        this.messageCreationError = creationError;
+        this.terminalizeDeliveryFailure(creationError);
         logger.warn(
           { err: err.message },
           'Discord initial message creation failed',
         );
-        this.state = 'error';
       } finally {
         this.messageCreationPromise = null;
       }
@@ -462,38 +554,66 @@ export class DiscordStreamingEditController {
   // ─── Internal: streaming ────────────────────────────────────
 
   private scheduleFlush(): void {
-    if (this.flushTimer) return;
+    if (!this.acceptsStreamingUpdates()) return;
+    this.flushPending = true;
+    if (
+      this.flushTimer ||
+      this.currentFlushPromise ||
+      this.auxFlushTimer ||
+      this.currentAuxFlushPromise
+    )
+      return;
 
     const elapsed = Date.now() - this.lastUpdateTime;
     const delay = Math.max(0, STREAM_UPDATE_INTERVAL - elapsed);
 
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      this.doFlush().catch((err: any) => {
-        logger.debug({ err: err.message }, 'Discord streaming edit flush failed');
-      });
+      if (this.currentFlushPromise || this.currentAuxFlushPromise) return;
+      this.flushPending = false;
+      this.currentFlushPromise = this.doFlush()
+        .catch((err: any) => {
+          this.terminalizeDeliveryFailure(err);
+          logger.debug(
+            { err: err.message },
+            'Discord streaming edit flush failed',
+          );
+        })
+        .finally(() => {
+          this.currentFlushPromise = null;
+          if (this.flushPending && this.acceptsStreamingUpdates()) {
+            this.scheduleFlush();
+          } else if (this.auxFlushPending && this.acceptsStreamingUpdates()) {
+            this.scheduleAuxFlush();
+          }
+        });
     }, delay);
   }
 
   private async doFlush(): Promise<void> {
-    // Guard: don't flush after complete/abort (race with in-flight timer callbacks)
-    if (this.state === 'completed' || this.state === 'aborted') return;
+    if (!this.acceptsStreamingUpdates()) return;
 
     if (!this.accumulatedText.trim() && !this.thinking && !this.systemStatus) {
       return;
     }
 
-    // If message creation failed, use fallback
+    // Let the host choose the one durable static fallback. The controller
+    // cannot know whether a failed creation request was accepted before its
+    // ACK was lost.
     if (this.state === 'error') {
-      await this.tryFallback(this.accumulatedText);
-      return;
+      const creationError =
+        this.messageCreationError ??
+        preAcceptImDeliveryError('Discord streaming message was not created');
+      throw this.terminalizeDeliveryFailure(creationError);
     }
 
     await this.ensureMessage();
 
     if (this.messages.length === 0) {
-      await this.tryFallback(this.accumulatedText);
-      return;
+      const creationError =
+        this.messageCreationError ??
+        preAcceptImDeliveryError('Discord streaming message was not created');
+      throw this.terminalizeDeliveryFailure(creationError);
     }
 
     const content = this.buildAuxPrefix() + this.accumulatedText;
@@ -501,8 +621,7 @@ export class DiscordStreamingEditController {
     // During streaming, if content exceeds limit, truncate from the beginning
     // (full split only happens on complete())
     if (content.length > DISCORD_MSG_LIMIT) {
-      const truncated =
-        '...' + content.slice(-(DISCORD_MSG_LIMIT - 3));
+      const truncated = '...' + content.slice(-(DISCORD_MSG_LIMIT - 3));
       await this.editLastMessage(truncated);
     } else {
       await this.editLastMessage(content);
@@ -520,6 +639,31 @@ export class DiscordStreamingEditController {
       clearTimeout(this.auxFlushTimer);
       this.auxFlushTimer = null;
     }
+  }
+
+  private acceptsStreamingUpdates(): boolean {
+    return (
+      (this.state === 'idle' ||
+        this.state === 'creating' ||
+        this.state === 'streaming') &&
+      this.terminalDeliveryError === undefined
+    );
+  }
+
+  private terminalizeDeliveryFailure(error: unknown): unknown {
+    const deliveryError =
+      this.messages.length > 0 &&
+      !(error instanceof PartialChannelDeliveryError)
+        ? new PartialChannelDeliveryError(
+            this.messages.length,
+            this.messages.length + 1,
+            error,
+          )
+        : error;
+    this.terminalDeliveryError ??= deliveryError;
+    this.state = 'aborted';
+    this.clearFlushTimer();
+    return this.terminalDeliveryError;
   }
 
   /**
@@ -550,24 +694,28 @@ export class DiscordStreamingEditController {
   private async splitAndSend(fullContent: string): Promise<void> {
     const chunks = splitWithCodeFences(fullContent, DISCORD_MSG_LIMIT);
     let firstError: Error | null = null;
+    let acknowledgedOutputs = 0;
 
     for (let i = 0; i < chunks.length; i++) {
       if (i < this.messages.length) {
         // Edit existing message
         try {
           await this.messages[i].edit(chunks[i]);
+          acknowledgedOutputs += 1;
         } catch (err: any) {
           logger.warn(
             { err: err.message, index: i },
             'Discord message edit failed during split',
           );
           if (!firstError) firstError = err;
+          break;
         }
       } else {
         // Send new continuation message
         try {
           const msg = await this.channel.send(chunks[i]);
           this.messages.push(msg);
+          acknowledgedOutputs += 1;
         } catch (err: any) {
           logger.warn(
             { err: err.message, index: i },
@@ -579,17 +727,17 @@ export class DiscordStreamingEditController {
       }
     }
 
-    // Propagate the first error so complete() can fallback
-    if (firstError) throw firstError;
-  }
-
-  private async tryFallback(text: string): Promise<void> {
-    if (this.fallbackUsed || !this.fallbackSend) return;
-    this.fallbackUsed = true;
-    try {
-      await this.fallbackSend(text);
-    } catch (err: any) {
-      logger.warn({ err: err.message }, 'Discord fallback send also failed');
+    // Propagate the first error. Once any final mutation has an ACK, an
+    // all-text fallback would duplicate that prefix and must be fenced.
+    if (firstError) {
+      if (acknowledgedOutputs > 0) {
+        throw new PartialChannelDeliveryError(
+          acknowledgedOutputs,
+          chunks.length,
+          firstError,
+        );
+      }
+      throw firstError;
     }
   }
 }

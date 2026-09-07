@@ -14,20 +14,17 @@ import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
 import {
   type WebDeps,
   type Variables,
-  type WsClientInfo,
   setWebDeps,
   getWebDeps,
   wsClients,
   lastActiveCache,
   LAST_ACTIVE_DEBOUNCE_MS,
-  parseCookie,
   isHostExecutionGroup,
   hasHostExecutionPermission,
-  canAccessGroup,
-  canModifyGroup,
   getCachedSessionWithUser,
   invalidateSessionCache,
 } from './web-context.js';
+import { canAccessGroup, canModifyGroup } from './group-acl.js';
 
 // Schemas
 import {
@@ -79,6 +76,7 @@ import {
   getRegisteredGroup,
   getChannelMount,
   getJidsByFolder,
+  getMessageCursor,
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
@@ -101,7 +99,6 @@ import type {
   NewMessage,
   FollowUpMode,
   FollowUpTransition,
-  QueuedFollowUp,
   WsMessageOut,
   WsMessageIn,
   AuthUser,
@@ -124,6 +121,10 @@ import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js'
 import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
 import { renderIndexHtml, renderManifest } from './index-html-template.js';
+import {
+  createWebSocketHeartbeat,
+  startWebSocketHeartbeat,
+} from './ws-heartbeat.js';
 import { recordRunContextSnapshot } from './run-context-snapshot.js';
 import { RunStreamFence } from './run-stream-fence.js';
 import {
@@ -400,6 +401,7 @@ app.post('/api/messages', authMiddleware, async (c) => {
     success: true,
     messageId: result.messageId,
     timestamp: result.timestamp,
+    ingestSequence: result.ingestSequence,
     disposition: result.disposition,
     runId: result.runId,
   });
@@ -515,6 +517,7 @@ async function handleWebUserMessage(
       ok: true;
       messageId: string;
       timestamp: string;
+      ingestSequence?: number;
       disposition: 'started' | 'queued' | 'steered';
       runId?: string;
     }
@@ -586,6 +589,10 @@ async function handleWebUserMessage(
         : undefined,
     },
   );
+  const messageCursor = getMessageCursor(chatJid, messageId) ?? {
+    timestamp,
+    id: messageId,
+  };
 
   broadcastNewMessage(chatJid, {
     id: messageId,
@@ -650,7 +657,13 @@ async function handleWebUserMessage(
           id: messageId,
         });
         deps.advanceGlobalCursor({ timestamp, id: messageId });
-        return { ok: true, messageId, timestamp, disposition: 'started' };
+        return {
+          ok: true,
+          messageId,
+          timestamp,
+          ingestSequence: messageCursor.sequence,
+          disposition: 'started',
+        };
       }
     }
   }
@@ -668,6 +681,7 @@ async function handleWebUserMessage(
         ok: true,
         messageId,
         timestamp,
+        ingestSequence: messageCursor.sequence,
         disposition: steerResult?.ok ? 'steered' : 'queued',
         runId: activeRunId!,
       };
@@ -676,6 +690,7 @@ async function handleWebUserMessage(
       ok: true,
       messageId,
       timestamp,
+      ingestSequence: messageCursor.sequence,
       disposition: 'queued',
       runId: activeRunId,
     };
@@ -756,6 +771,7 @@ async function handleWebUserMessage(
           ok: true,
           messageId,
           timestamp,
+          ingestSequence: messageCursor.sequence,
           disposition: activeRunId ? 'steered' : 'started',
           runId: activeRunId ?? undefined,
         };
@@ -832,8 +848,8 @@ async function handleWebUserMessage(
     undefined,
     {
       chatJid,
-      coveredCursors: [{ timestamp, id: messageId }],
-      cursor: { timestamp, id: messageId },
+      coveredCursors: [messageCursor],
+      cursor: messageCursor,
     },
     undefined,
     (receipt) => preAdmitRoute?.(group.folder, null, receipt) ?? false,
@@ -874,6 +890,7 @@ async function handleWebUserMessage(
     ok: true,
     messageId,
     timestamp,
+    ingestSequence: messageCursor.sequence,
     disposition: activeRunId ? 'steered' : 'started',
     runId: activeRunId ?? startedRunId ?? undefined,
   };
@@ -912,6 +929,7 @@ async function handleAgentConversationMessage(
       ok: true;
       messageId: string;
       timestamp: string;
+      ingestSequence?: number;
       disposition: 'started' | 'queued' | 'steered';
       runId?: string;
     }
@@ -988,6 +1006,10 @@ async function handleAgentConversationMessage(
         : undefined,
     },
   );
+  const agentMessageCursor = getMessageCursor(virtualChatJid, messageId) ?? {
+    timestamp,
+    id: messageId,
+  };
   updateAgentContextInfo(agentId, { last_active_at: timestamp });
 
   // Auto-title: show a quick placeholder derived from the first user message.
@@ -1040,6 +1062,7 @@ async function handleAgentConversationMessage(
         ok: true,
         messageId,
         timestamp,
+        ingestSequence: agentMessageCursor.sequence,
         disposition: steerResult?.ok ? 'steered' : 'queued',
         runId: activeRunId!,
       };
@@ -1048,6 +1071,7 @@ async function handleAgentConversationMessage(
       ok: true,
       messageId,
       timestamp,
+      ingestSequence: agentMessageCursor.sequence,
       disposition: 'queued',
       runId: activeRunId,
     };
@@ -1122,6 +1146,7 @@ async function handleAgentConversationMessage(
             ok: true,
             messageId,
             timestamp,
+            ingestSequence: agentMessageCursor.sequence,
             disposition: activeRunId ? 'steered' : 'started',
             runId: activeRunId ?? undefined,
           };
@@ -1199,8 +1224,8 @@ async function handleAgentConversationMessage(
     undefined,
     {
       chatJid: virtualChatJid,
-      coveredCursors: [{ timestamp, id: messageId }],
-      cursor: { timestamp, id: messageId },
+      coveredCursors: [agentMessageCursor],
+      cursor: agentMessageCursor,
     },
     undefined,
     (receipt) =>
@@ -1208,10 +1233,7 @@ async function handleAgentConversationMessage(
     { feishuCliAccountId: requiredFeishuCliAccountId },
   );
   if (agentSendResult === 'sent') {
-    deps.advanceNextPullCursorOnly(virtualChatJid, {
-      timestamp,
-      id: messageId,
-    });
+    deps.advanceNextPullCursorOnly(virtualChatJid, agentMessageCursor);
   }
   if (agentSendResult === 'no_active') {
     if (eagerExpandAgentActive && agentSendContent !== content) {
@@ -1247,6 +1269,7 @@ async function handleAgentConversationMessage(
     ok: true,
     messageId,
     timestamp,
+    ingestSequence: agentMessageCursor.sequence,
     disposition: activeRunId ? 'steered' : 'started',
     runId: activeRunId ?? startedRunId ?? undefined,
   };
@@ -1438,6 +1461,30 @@ function setupWebSocket(server: any): WebSocketServer {
     maxPayload: 8 * 1024 * 1024,
   });
 
+  // 心跳：保活反代/NAT 会掐掉的空闲 upgraded 连接，并回收 TCP 半开的死连接。
+  // 取值与完整背景见 src/ws-heartbeat.ts。
+  // 注意：此前死连接是靠反代的读超时（nginx 默认 60s）兜底回收的——调大
+  // proxy_read_timeout 必须在心跳上线之后做，否则死连接会堆积到新的超时时长。
+  const heartbeat = createWebSocketHeartbeat();
+  startWebSocketHeartbeat(wss, heartbeat, (result) => {
+    for (const failure of result.failures) {
+      const context = { operation: failure.operation, err: failure.error };
+      if (failure.operation === 'terminate') {
+        logger.error(context, 'WebSocket heartbeat operation failed');
+      } else {
+        logger.warn(context, 'WebSocket heartbeat operation failed');
+      }
+    }
+
+    const { terminated } = result;
+    if (terminated > 0) {
+      logger.info(
+        { terminated, maxMissedPongs: heartbeat.maxMissedPongs },
+        'WebSocket heartbeat timeout, terminated dead connections',
+      );
+    }
+  });
+
   server.on('upgrade', (request: any, socket: any, head: any) => {
     const { pathname } = new URL(request.url, `http://${request.headers.host}`);
 
@@ -1549,6 +1596,8 @@ function setupWebSocket(server: any): WebSocketServer {
   wss.on('connection', (ws, request: any) => {
     const sessionId = request?.__happyclawSessionId as string | undefined;
     logger.info('WebSocket client connected');
+    // 心跳状态：浏览器由协议栈自动回 pong，前端无需改动。
+    heartbeat.track(ws);
     const connSession = sessionId
       ? getCachedSessionWithUser(sessionId)
       : undefined;
@@ -2338,6 +2387,18 @@ export function broadcastNewMessage(
   agentId?: string,
   source?: string,
 ): void {
+  // WS delivery must use the same durable host-assigned position as REST
+  // pagination. Hydrate persisted rows centrally so billing, plugin and
+  // system producers cannot accidentally omit the sequence. Ephemeral
+  // messages have no matching row and retain the legacy optional field.
+  const persistedCursor =
+    msg.ingest_sequence === undefined
+      ? getMessageCursor(msg.chat_jid, msg.id)
+      : null;
+  const sequencedMessage =
+    persistedCursor?.sequence !== undefined
+      ? { ...msg, ingest_sequence: persistedCursor.sequence }
+      : msg;
   // For virtual JIDs like "web:xxx#agent:yyy", extract base JID and agentId
   let baseChatJid = chatJid;
   let effectiveAgentId = agentId;
@@ -2351,11 +2412,38 @@ export function broadcastNewMessage(
   const wsMsg: WsMessageOut = {
     type: 'new_message',
     chatJid: jid,
-    message: { ...msg, is_from_me: msg.is_from_me ?? false },
+    message: {
+      ...sequencedMessage,
+      is_from_me: sequencedMessage.is_from_me ?? false,
+    },
     ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
     ...(source ? { source } : {}),
   };
   safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
+}
+
+/** Broadcast one committed message-row deletion by its full composite key. */
+export function broadcastMessageDeleted(
+  messageChatJid: string,
+  messageId: string,
+): void {
+  const markerIndex = messageChatJid.indexOf('#agent:');
+  const baseChatJid =
+    markerIndex >= 0 ? messageChatJid.slice(0, markerIndex) : messageChatJid;
+  const agentId =
+    markerIndex >= 0
+      ? messageChatJid.slice(markerIndex + '#agent:'.length)
+      : undefined;
+  const jid = normalizeHomeJid(baseChatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
+  const wsMsg: WsMessageOut = {
+    type: 'message_deleted',
+    chatJid: jid,
+    messageChatJid,
+    messageId,
+    ...(agentId ? { agentId } : {}),
+  };
+  safeBroadcast(wsMsg, isHostGroupJid(jid), allowedUserIds);
 }
 
 export function broadcastFollowUpUpdate(
@@ -2674,7 +2762,12 @@ function updateSnapshotTask(
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (patch?.status === 'failed' || patch?.status === 'killed')
+    else if (
+      patch?.status === 'failed' ||
+      patch?.status === 'killed' ||
+      patch?.status === 'stopped' ||
+      patch?.status === 'aborted'
+    )
       task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
     task.latestSummary =
@@ -3317,6 +3410,10 @@ let wss: WebSocketServer | null = null;
  * needs only `queue.stopGroup` / `getSessions` / `setLastAgentTimestamp`.
  */
 export function createAppForTest(webDeps: WebDeps): typeof app {
+  webDeps.broadcastNewMessage = broadcastNewMessage;
+  webDeps.broadcastMessageDeleted = broadcastMessageDeleted;
+  webDeps.broadcastAgentStatus = broadcastAgentStatus;
+  webDeps.broadcastAgentRemoved = broadcastAgentRemoved;
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);
@@ -3329,6 +3426,10 @@ export function createAppForTest(webDeps: WebDeps): typeof app {
 }
 
 export function startWebServer(webDeps: WebDeps): void {
+  webDeps.broadcastNewMessage = broadcastNewMessage;
+  webDeps.broadcastMessageDeleted = broadcastMessageDeleted;
+  webDeps.broadcastAgentStatus = broadcastAgentStatus;
+  webDeps.broadcastAgentRemoved = broadcastAgentRemoved;
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);
