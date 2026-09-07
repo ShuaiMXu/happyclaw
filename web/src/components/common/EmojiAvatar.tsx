@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { cn } from '@/lib/utils';
+import { getFluentEmojiSrc, isFluentEmojiCode } from '@/data/fluent-emoji';
 
 export interface EmojiAvatarProps {
   emoji?: string | null;
@@ -55,6 +56,18 @@ export function EmojiAvatar({
         className={cn(base, 'object-cover')}
         onError={() => setImgFailed(true)}
       />
+    );
+  }
+
+  if (emoji && isFluentEmojiCode(emoji)) {
+    return (
+      <div className={base} style={{ backgroundColor: color || '#ff6600' }}>
+        <img
+          src={getFluentEmojiSrc(emoji)}
+          alt=""
+          className="h-[80%] w-[80%] object-contain"
+        />
+      </div>
     );
   }
 

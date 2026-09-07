@@ -23,6 +23,7 @@ import {
 } from '../file-manager.js';
 import { checkStorageLimit, isBillingEnabled } from '../billing.js';
 import { MAX_FILE_SIZE_MB, DATA_DIR } from '../config.js';
+import { fileChunkUploadBodyLimit } from '../http-upload-policy.js';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -516,6 +517,297 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
   } catch (error) {
     logger.error({ err: error }, `Failed to upload files for ${jid}`);
     return c.json({ error: 'Failed to upload files' }, 500);
+  }
+});
+
+// ─── 分片上传（大文件）───────────────────────────────────────────
+//
+// 单次 multipart 请求上传整个文件在慢速/不稳定网络下容易撞上请求超时——
+// 一次几十上百 MB 的传输只要中途抖一下就要从头重来，进度条也只能"上传前/
+// 上传后"两态跳变，用户体感是长时间卡住。改成固定大小分片（前端 4MB 一片，
+// 见 web/src/stores/files.ts CHUNK_SIZE）后：
+// - 每个分片都是独立的小请求，超时窗口固定且很短，不随文件总大小增长；
+// - 单个分片失败只重试这一片（前端做退避重试），不用整份重传；
+// - 每片写盘成功即可推进进度，条形图能连续走动而不是长时间静止。
+// 分片临时存放在工作区文件树之外（DATA_DIR/upload-tmp/{folder}/{uploadId}/），
+// 避免半成品文件被文件面板列出，也避免被挂进容器。全部分片到齐后按序拼接、
+// 校验总大小、走与单文件上传相同的路径校验和 O_NOFOLLOW 写入，再清理临时目录。
+const UPLOAD_TMP_ROOT = path.join(DATA_DIR, 'upload-tmp');
+const UPLOAD_ID_RE = /^[a-zA-Z0-9_-]{8,100}$/;
+const CHUNK_UPLOAD_STALE_MS = 6 * 60 * 60 * 1000; // 6 小时未完成视为废弃
+const MAX_CHUNK_COUNT = 20_000; // 4MB × 20000 ≈ 78GB，远高于 MAX_FILE_SIZE 上限，只做兜底
+const MIN_CHUNK_BYTES = 64 * 1024; // 分片数/总大小合理性校验的下限假设
+
+interface ChunkUploadManifest {
+  fileName: string;
+  targetPath: string;
+  fileSize: number;
+  totalChunks: number;
+}
+
+function chunkUploadDir(groupFolder: string, uploadId: string): string {
+  return path.join(UPLOAD_TMP_ROOT, groupFolder, uploadId);
+}
+
+function chunkManifestPath(dir: string): string {
+  return path.join(dir, '.manifest.json');
+}
+
+/** 清理该工作区下超过 CHUNK_UPLOAD_STALE_MS 未完成的分片临时目录（尽力而为，不阻塞主流程）。 */
+function sweepStaleChunkUploads(groupFolder: string): void {
+  const groupDir = path.join(UPLOAD_TMP_ROOT, groupFolder);
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(groupDir, { withFileTypes: true });
+  } catch {
+    return; // 目录不存在，无需清理
+  }
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(groupDir, entry.name);
+    try {
+      const stat = fs.statSync(dir);
+      if (now - stat.mtimeMs > CHUNK_UPLOAD_STALE_MS) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } catch {
+      // 忽略单个目录的清理失败，不影响其他目录和本次上传
+    }
+  }
+}
+
+// POST /api/groups/:jid/files/chunk - 上传大文件的一个分片，全部到齐后自动拼接
+fileRoutes.post(
+  '/:jid/files/chunk',
+  authMiddleware,
+  fileChunkUploadBodyLimit,
+  async (c) => {
+    const jid = c.req.param('jid');
+
+    const group = getRegisteredGroup(jid);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    const authUser = c.get('user') as AuthUser;
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+      return c.json(
+        { error: 'Insufficient permissions for host execution mode' },
+        403,
+      );
+    }
+
+    const rootOverride = getFileRootOverride(group);
+
+    try {
+      const body = await c.req.parseBody();
+      const uploadId = typeof body.uploadId === 'string' ? body.uploadId : '';
+      const fileName = typeof body.fileName === 'string' ? body.fileName : '';
+      const targetPath = (typeof body.path === 'string' ? body.path : '') || '';
+      const chunkIndex = Number(body.chunkIndex);
+      const totalChunks = Number(body.totalChunks);
+      const fileSize = Number(body.fileSize);
+      const chunk = body.chunk;
+
+      if (!UPLOAD_ID_RE.test(uploadId)) {
+        return c.json({ error: 'Invalid uploadId' }, 400);
+      }
+      if (!(chunk instanceof File)) {
+        return c.json({ error: 'No chunk provided' }, 400);
+      }
+      if (
+        !Number.isInteger(chunkIndex) ||
+        !Number.isInteger(totalChunks) ||
+        chunkIndex < 0 ||
+        totalChunks <= 0 ||
+        chunkIndex >= totalChunks ||
+        totalChunks > MAX_CHUNK_COUNT
+      ) {
+        return c.json({ error: 'Invalid chunk index/count' }, 400);
+      }
+      if (!Number.isInteger(fileSize) || fileSize <= 0) {
+        return c.json({ error: 'Invalid file size' }, 400);
+      }
+      if (fileSize > MAX_FILE_SIZE) {
+        return c.json(
+          {
+            error: `File ${fileName} exceeds maximum size of ${MAX_FILE_SIZE_MB}MB`,
+          },
+          400,
+        );
+      }
+      // 分片数和声明的总大小要大致匹配，防止用一堆几十字节的"分片"硬撑出
+      // 上万次小文件写入（fileSize 很小但 totalChunks 很大的伪造场景）。
+      if (totalChunks > Math.ceil(fileSize / MIN_CHUNK_BYTES) + 1) {
+        return c.json({ error: 'Invalid chunk index/count' }, 400);
+      }
+      if (!fileName || fileName.includes('..') || fileName.startsWith('/')) {
+        return c.json({ error: `Invalid file name: ${fileName}` }, 400);
+      }
+      const fullRelativePath = path.join(targetPath, fileName);
+      if (isSystemPath(targetPath) || isSystemPath(fullRelativePath)) {
+        return c.json({ error: 'Cannot upload to system path' }, 403);
+      }
+      // 提前校验最终落盘路径，分片阶段就能拒绝非法路径，不必等拼接时才发现
+      validateAndResolvePath(group.folder, fullRelativePath, rootOverride);
+
+      const dir = chunkUploadDir(group.folder, uploadId);
+      const manifestFile = chunkManifestPath(dir);
+
+      if (chunkIndex === 0) {
+        // Billing: 用声明的总大小做上传前预检查（与单文件上传路径一致的信任模型，
+        // 拼接完成后仍会校验实际落盘大小与声明大小一致，防止绕过）。
+        if (isBillingEnabled() && group.created_by) {
+          const currentUsage = getGroupStorageUsage(group.folder, rootOverride);
+          const storageCheck = checkStorageLimit(
+            group.created_by,
+            authUser.role,
+            currentUsage,
+            fileSize,
+          );
+          if (!storageCheck.allowed) {
+            return c.json({ error: storageCheck.reason }, 403);
+          }
+        }
+        sweepStaleChunkUploads(group.folder);
+        fs.mkdirSync(dir, { recursive: true });
+        const manifest: ChunkUploadManifest = {
+          fileName,
+          targetPath,
+          fileSize,
+          totalChunks,
+        };
+        fs.writeFileSync(manifestFile, JSON.stringify(manifest));
+      } else {
+        let manifest: ChunkUploadManifest;
+        try {
+          manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf-8'));
+        } catch {
+          return c.json(
+            { error: 'Upload session not found, please restart the upload' },
+            410,
+          );
+        }
+        if (
+          manifest.fileName !== fileName ||
+          manifest.targetPath !== targetPath ||
+          manifest.fileSize !== fileSize ||
+          manifest.totalChunks !== totalChunks
+        ) {
+          return c.json({ error: 'Chunk metadata mismatch' }, 400);
+        }
+      }
+
+      const chunkBuffer = Buffer.from(await chunk.arrayBuffer());
+      fs.writeFileSync(path.join(dir, `${chunkIndex}.part`), chunkBuffer);
+
+      const receivedParts = fs
+        .readdirSync(dir)
+        .filter((name) => name.endsWith('.part'));
+      if (receivedParts.length < totalChunks) {
+        return c.json({
+          success: true,
+          completed: false,
+          received: receivedParts.length,
+        });
+      }
+
+      // 全部分片到齐：按序拼接到最终文件
+      const targetFilePath = validateAndResolvePath(
+        group.folder,
+        fullRelativePath,
+        rootOverride,
+      );
+      const targetDir = path.dirname(targetFilePath);
+      if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
+      }
+
+      const noFollowFlag = (fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+      const flags =
+        noFollowFlag !== undefined
+          ? fs.constants.O_WRONLY |
+            fs.constants.O_CREAT |
+            fs.constants.O_TRUNC |
+            noFollowFlag
+          : fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC;
+
+      let assembledSize = 0;
+      let fd: number | null = null;
+      try {
+        fd = fs.openSync(targetFilePath, flags, 0o644);
+        for (let i = 0; i < totalChunks; i++) {
+          const partPath = path.join(dir, `${i}.part`);
+          const partBuffer = fs.readFileSync(partPath);
+          fs.writeSync(fd, partBuffer);
+          assembledSize += partBuffer.length;
+        }
+      } finally {
+        if (fd !== null) {
+          try {
+            fs.closeSync(fd);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+
+      fs.rmSync(dir, { recursive: true, force: true });
+
+      if (assembledSize !== fileSize) {
+        // 拼接结果和声明大小对不上（分片丢失/损坏），删除半成品，让前端整份重传
+        try {
+          fs.unlinkSync(targetFilePath);
+        } catch {
+          /* ignore */
+        }
+        return c.json(
+          { error: 'Assembled file size mismatch, please retry the upload' },
+          500,
+        );
+      }
+
+      invalidateGroupStorageUsage(group.folder, rootOverride);
+      return c.json({ success: true, completed: true, files: [fileName] });
+    } catch (error) {
+      logger.error({ err: error }, `Failed to upload file chunk for ${jid}`);
+      return c.json({ error: 'Failed to upload file chunk' }, 500);
+    }
+  },
+);
+
+// DELETE /api/groups/:jid/files/chunk/:uploadId - 取消分片上传，释放临时目录
+fileRoutes.delete('/:jid/files/chunk/:uploadId', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
+  const uploadId = c.req.param('uploadId');
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  if (!UPLOAD_ID_RE.test(uploadId)) {
+    return c.json({ error: 'Invalid uploadId' }, 400);
+  }
+
+  try {
+    fs.rmSync(chunkUploadDir(group.folder, uploadId), {
+      recursive: true,
+      force: true,
+    });
+    return c.json({ success: true });
+  } catch (error) {
+    logger.error({ err: error }, `Failed to cancel chunk upload for ${jid}`);
+    return c.json({ error: 'Failed to cancel chunk upload' }, 500);
   }
 });
 

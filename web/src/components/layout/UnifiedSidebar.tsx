@@ -252,7 +252,7 @@ export function UnifiedSidebar({
           </button>
 
           <div className="mt-[5px] flex flex-col items-center gap-1">
-            {navItems.map(({ path, icon: Icon, label }) => {
+            {navItems.map(({ path, icon: Icon, label, description }) => {
               const isChatItem = path === '/chat';
               const isActive = location.pathname.startsWith(path);
               const baseClass =
@@ -289,12 +289,19 @@ export function UnifiedSidebar({
                       </NavLink>
                     )}
                   </TooltipTrigger>
-                  <TooltipContent side="right">
-                    {isChatItem && isChatRoute
-                      ? collapsed
-                        ? '展开智能体工作台'
-                        : '收起智能体工作台'
-                      : label}
+                  <TooltipContent side="right" className="max-w-[200px]">
+                    {isChatItem && isChatRoute ? (
+                      collapsed ? '展开智能体工作台' : '收起智能体工作台'
+                    ) : (
+                      <div className="flex flex-col gap-0.5 py-0.5">
+                        <span className="font-medium">{label}</span>
+                        {description && (
+                          <span className="text-[11px] font-normal leading-snug text-background/70">
+                            {description}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </TooltipContent>
                 </Tooltip>
               );

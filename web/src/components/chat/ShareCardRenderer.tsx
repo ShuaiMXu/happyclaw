@@ -213,7 +213,7 @@ export const ShareCardRenderer = forwardRef<
           style={{ width: 16, height: 16, borderRadius: 3 }}
         />
         <span style={{ fontSize: 12, color: '#94a3b8' }}>
-          SoftopiaAI · 技术支持来自 HappyClaw
+          SoftopiaAI · TECH SUPPORT : HAPPYCLAW
         </span>
       </div>
     </div>

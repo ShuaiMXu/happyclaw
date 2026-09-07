@@ -729,6 +729,7 @@ function GenericTextPreview({
   const [loadError, setLoadError] = useState(false);
   const overlayRef = useRef<HTMLDivElement>(null);
   const contentScrollRef = useRef<HTMLDivElement>(null);
+  const preRef = useRef<HTMLPreElement>(null);
 
   useScrollIsolation(overlayRef);
   useEffect(() => {
@@ -751,6 +752,39 @@ function GenericTextPreview({
     };
   }, [groupJid, file.path, getFileContent]);
 
+  // 弹窗默认没有可聚焦元素时，Radix 会把焦点落在整个 Dialog 容器上——这时按
+  // Ctrl/Cmd+A 走浏览器默认行为会全选整个页面（弹窗前后的内容都会被框进去），
+  // 而不是只选中预览的正文。这里在弹窗挂载期间监听 keydown，把全选范围收窄到
+  // <pre> 正文节点；弹窗关闭（组件卸载）时监听器自动移除，不影响其他地方。
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const isSelectAll =
+        (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a';
+      if (!isSelectAll || !preRef.current) return;
+      e.preventDefault();
+      const selection = window.getSelection();
+      if (!selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(preRef.current);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  const handleCopyContent = () => {
+    copyToClipboard(content)
+      .then(() => showToast('已复制', '文件内容已复制到剪贴板'))
+      .catch((err) => {
+        console.error('Copy failed:', err);
+        showToast(
+          '复制失败',
+          err instanceof Error ? err.message : '无法写入剪贴板',
+        );
+      });
+  };
+
   return (
     <PreviewDialog
       ref={overlayRef}
@@ -768,13 +802,24 @@ function GenericTextPreview({
               {file.name}
             </span>
           </div>
-          <button
-            onClick={onClose}
-            className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
-            aria-label="关闭预览"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-1 flex-shrink-0">
+            <button
+              onClick={handleCopyContent}
+              disabled={loading || loadError || !content}
+              className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              aria-label="复制文件内容"
+              title="复制全部内容"
+            >
+              <Copy className="w-4 h-4" />
+            </button>
+            <button
+              onClick={onClose}
+              className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
+              aria-label="关闭预览"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Content */}
@@ -794,7 +839,10 @@ function GenericTextPreview({
                 <p className="text-sm">此文件类型不支持预览</p>
               </div>
             ) : (
-              <pre className="text-sm text-foreground whitespace-pre-wrap break-all font-mono">
+              <pre
+                ref={preRef}
+                className="text-sm text-foreground whitespace-pre-wrap break-all font-mono"
+              >
                 {content}
               </pre>
             )}
@@ -804,7 +852,7 @@ function GenericTextPreview({
 
         {/* Footer hint */}
         <div className="px-4 py-2 border-t border-border text-xs text-muted-foreground flex-shrink-0">
-          Esc 关闭
+          Ctrl/Cmd+A 只选中正文 · Esc 关闭
         </div>
       </div>
     </PreviewDialog>

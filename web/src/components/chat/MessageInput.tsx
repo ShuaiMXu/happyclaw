@@ -150,6 +150,10 @@ export function MessageInput({
   const { mode: displayMode } = useDisplayMode();
   const isCompact = displayMode === 'compact';
   const isMobile = useMediaQuery('(max-width: 1023px)');
+  const isMac =
+    typeof navigator !== 'undefined' &&
+    /Mac|iPhone|iPad/.test(navigator.userAgent);
+  const sendShortcutLabel = isMac ? '⌘Enter' : 'Ctrl+Enter';
 
   // iOS keyboard adaptation
   useKeyboardHeight();
@@ -259,24 +263,21 @@ export function MessageInput({
   const composingRef = useRef(false);
   const compositionEndTimeRef = useRef(0);
 
+  // 发送只认 Ctrl/Cmd+Enter（Mac 用 Cmd），单独 Enter 一律交给 textarea 默认行为换行——
+  // 避免打字打到一半误触回车就把消息发出去，浪费一次不完整的对话轮次。
+  // 叠加 Shift 时临时切换"排队/引导"这一次的后续消息行为，语义不变。
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (composingRef.current || e.nativeEvent.isComposing) return;
-    if (
-      e.key === 'Enter' &&
-      e.shiftKey &&
-      (e.metaKey || e.ctrlKey) &&
-      !isMobile
-    ) {
-      if (Date.now() - compositionEndTimeRef.current < 100) return;
-      e.preventDefault();
+    if (isMobile) return;
+    if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return;
+
+    if (Date.now() - compositionEndTimeRef.current < 100) return;
+    e.preventDefault();
+    if (e.shiftKey) {
       void handleSend(
         isRunning ? alternateFollowUpMode(followUpMode) : undefined,
       );
-      return;
-    }
-    if (e.key === 'Enter' && !e.shiftKey && !isMobile) {
-      if (Date.now() - compositionEndTimeRef.current < 100) return;
-      e.preventDefault();
+    } else {
       handleSend();
     }
   };
@@ -1187,7 +1188,11 @@ export function MessageInput({
                 compositionEndTimeRef.current = Date.now();
               }}
               onPaste={handlePaste}
-              placeholder="输入消息..."
+              placeholder={
+                isMobile
+                  ? '输入消息...'
+                  : `输入消息...（${sendShortcutLabel} 发送）`
+              }
               disabled={disabled}
               className="w-full text-base leading-6 resize-none focus:outline-none placeholder:text-muted-foreground disabled:opacity-50 disabled:cursor-not-allowed bg-transparent"
               rows={1}
@@ -1260,7 +1265,13 @@ export function MessageInput({
                   ? disabled || stopping
                   : !canSend || disabled || sending
               }
-              title={showStop ? '停止当前运行' : '发送消息'}
+              title={
+                showStop
+                  ? '停止当前运行'
+                  : isMobile
+                    ? '发送消息'
+                    : `发送消息（${sendShortcutLabel}）`
+              }
               aria-label={showStop ? '停止当前运行' : '发送消息'}
               className={`w-10 h-10 rounded-full flex items-center justify-center transition-all cursor-pointer active:scale-90 ${
                 showStop && !disabled && !stopping

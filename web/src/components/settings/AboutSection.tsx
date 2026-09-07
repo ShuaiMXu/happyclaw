@@ -1,12 +1,5 @@
 import { useState } from 'react';
-import {
-  Github,
-  ExternalLink,
-  Heart,
-  Code2,
-  Lightbulb,
-  Bug,
-} from 'lucide-react';
+import { ExternalLink, Heart, Lightbulb, Bug } from 'lucide-react';
 import { BugReportDialog } from '@/components/common/BugReportDialog';
 import { Button } from '@/components/ui/button';
 
@@ -27,28 +20,12 @@ export function AboutSection() {
           版本 1.0.0 · MIT License
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
-          技术支持来自 HappyClaw
+          TECH SUPPORT : HAPPYCLAW
         </p>
       </div>
 
-      {/* 开源地址 & 作者 & 报告问题 */}
+      {/* 报告问题 */}
       <div className="space-y-3">
-        <div className="flex items-center gap-3">
-          <Github className="w-4 h-4 text-muted-foreground shrink-0" />
-          <a
-            href="https://github.com/riba2534/happyclaw"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-sm text-primary hover:text-primary/80 inline-flex items-center gap-1"
-          >
-            riba2534/happyclaw
-            <ExternalLink className="w-3 h-3" />
-          </a>
-        </div>
-        <div className="flex items-center gap-3">
-          <Code2 className="w-4 h-4 text-muted-foreground shrink-0" />
-          <span className="text-sm text-foreground">作者：riba2534</span>
-        </div>
         <div className="flex items-center gap-3">
           <Bug className="w-4 h-4 text-muted-foreground shrink-0" />
           <Button
