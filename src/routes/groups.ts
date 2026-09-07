@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { z } from 'zod';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
@@ -2345,7 +2346,7 @@ groupRoutes.post('/:jid/generate-image', authMiddleware, async (c) => {
       { attachments },
     );
 
-    broadcastNewMessage(jid, {
+    projectWebNewMessage(jid, {
       id: requestMessageId,
       chat_jid: jid,
       sender: `web:${authUser.id}`,
@@ -2354,7 +2355,7 @@ groupRoutes.post('/:jid/generate-image', authMiddleware, async (c) => {
       timestamp,
       is_from_me: false,
     });
-    broadcastNewMessage(jid, {
+    projectWebNewMessage(jid, {
       id: imageMessageId,
       chat_jid: jid,
       sender: '__image_generation__',

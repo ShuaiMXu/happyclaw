@@ -31,7 +31,6 @@ interface ProviderOption {
   name: string;
   model: string;
   enabled: boolean;
-  isDefault: boolean;
 }
 
 interface ImageGenerationOptions {
@@ -236,7 +235,6 @@ export function WorkspaceInteractionModeDialog({
                   <SelectItem key={p.id} value={p.id}>
                     {p.name}
                     {p.model ? ` · ${p.model}` : ''}
-                    {p.isDefault ? '（默认）' : ''}
                   </SelectItem>
                 ))}
                 {disabledLocked && (

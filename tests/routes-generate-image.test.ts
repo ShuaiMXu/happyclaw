@@ -111,6 +111,10 @@ beforeAll(() => {
   db.initDatabase();
   webContext.setWebDeps({
     getRegisteredGroups: () => ({}),
+    // The route projects new messages through web-context's WebDeps
+    // indirection (not a direct web.js import, per the reverse-import ban
+    // in tests/channel-registry-lazy-loading.test.ts), so this needs a stub.
+    broadcastNewMessage: () => {},
   } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 });
 

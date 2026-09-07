@@ -1154,97 +1154,19 @@ configRoutes.get(
 // 开放（工作区所有者不一定是管理员，但需要看到可锁定的模型清单）。
 configRoutes.get('/claude/providers/options', authMiddleware, (c) => {
   try {
-    const defaultProviderId = getDefaultProviderId();
     return c.json({
       providers: getProviders().map((p) => ({
         id: p.id,
         name: p.name,
         model: p.anthropicModel,
         enabled: p.enabled,
-        isDefault: p.id === defaultProviderId,
       })),
-      defaultProviderId,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to list provider options');
     return c.json({ error: 'Failed to list provider options' }, 500);
   }
 });
-
-// ─── PUT /claude/default — 设置所有继承型 Agent 使用的默认模型配置 ─────
-configRoutes.put(
-  '/claude/default',
-  authMiddleware,
-  systemConfigMiddleware,
-  async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const providerId =
-      typeof body.providerId === 'string' ? body.providerId.trim() : '';
-    if (!providerId) {
-      return c.json({ error: 'providerId (string) is required' }, 400);
-    }
-    const actor = (c.get('user') as AuthUser).username;
-
-    try {
-      return await withClaudeConfigMutationLock(async () => {
-        const previousProviderId = getDefaultProviderId();
-        if (previousProviderId === providerId) {
-          const provider = getProviders().find(
-            (item) => item.id === providerId,
-          );
-          if (!provider) throw new Error('未找到指定模型配置');
-          return c.json({
-            provider: toPublicProvider(provider),
-            defaultProviderId: provider.id,
-            applied: {
-              success: true,
-              stoppedCount: 0,
-              failedCount: 0,
-              persisted: true,
-            },
-          });
-        }
-        const mutation = await mutateClaudeConfigForAllGroups(
-          actor,
-          {
-            trigger: 'default_model_update',
-            previousProviderId,
-            providerId,
-          },
-          () => {
-            const provider = setDefaultProvider(providerId);
-            appendClaudeConfigAuditBestEffort(actor, 'set_default_model', [
-              `id:${provider.id}`,
-            ]);
-            return provider;
-          },
-        );
-        if (!mutation.applied.success) {
-          return c.json(
-            {
-              error: mutation.applied.error,
-              applied: mutation.applied,
-              ...(mutation.value
-                ? { provider: toPublicProvider(mutation.value) }
-                : {}),
-            },
-            503,
-          );
-        }
-        return c.json({
-          provider: toPublicProvider(mutation.value!),
-          defaultProviderId: mutation.value!.id,
-          applied: mutation.applied,
-        });
-      });
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to set default model';
-      logger.warn({ err, providerId }, 'Failed to set default model');
-      return c.json({ error: message }, 400);
-    }
-  },
-);
 
 // ─── POST /claude/providers — 创建供应商 ─────
 configRoutes.post(

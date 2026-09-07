@@ -18,7 +18,6 @@ const mocks = vi.hoisted(() => ({
     anthropicBaseUrl?: string;
   },
   boundId: undefined as string | undefined,
-  defaultProviderId: null as string | null,
   workspaceLock: null as string | null,
   strategy: 'failover' as 'round-robin' | 'weighted-round-robin' | 'failover',
 }));
@@ -34,8 +33,10 @@ vi.mock('../src/runtime-config.js', async () => {
   return {
     ...actual,
     getEnabledProviders: () => mocks.enabledProviders,
+    // resolveWorkspaceLockedModelConfigId checks the lock against the full
+    // provider list (not just enabled ones), so the Workspace-lock scenarios
+    // below need this mocked too.
     getProviders: () => mocks.enabledProviders,
-    getDefaultProviderId: () => mocks.defaultProviderId,
     getContainerEnvConfig: () => mocks.envOverride,
     getBalancingConfig: () => ({
       strategy: mocks.strategy,
@@ -73,7 +74,6 @@ beforeEach(() => {
   mocks.enabledProviders = [];
   mocks.envOverride = {};
   mocks.boundId = undefined;
-  mocks.defaultProviderId = null;
   mocks.workspaceLock = null;
   // Stickiness is a property of the failover strategy. The round-robin
   // strategies rotate on every request, so they are asserted separately.
@@ -179,16 +179,12 @@ describe('willClearSessionOnProviderSwitch', () => {
     expect(willClearSessionOnProviderSwitch('grp', null)).toBe(true);
   });
 
-  test('an auto-resolved default does not force a switch off a healthy binding', () => {
+  test('multiple enabled configurations remain an automatic pool', () => {
     setProviders('A', 'B');
     mocks.boundId = 'A';
-    mocks.defaultProviderId = 'B';
 
-    // The default is auto-resolved for every install (first enabled provider),
-    // so treating it as a pin would clear sessions — and disable the balancing
-    // pool — everywhere. With multiple enabled providers and no Agent-level
-    // modelConfigId, selection goes through the pool, which keeps a healthy
-    // sticky binding (see resolvePinnedModelConfigId).
+    // With no Agent-level modelConfigId, selection goes through the pool, which
+    // keeps a healthy sticky binding under failover.
     expect(willClearSessionOnProviderSwitch('grp', null)).toBe(false);
 
     // The pool still switches away — and clears — once the binding is unhealthy.
