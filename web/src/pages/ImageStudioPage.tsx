@@ -551,6 +551,50 @@ export function ImageStudioPage() {
     setLightboxPan({ x: 0, y: 0 });
     setLightbox(entry);
   }, []);
+  // Step to the previous/next image in gallery order (`images` is sorted
+  // newest-first) without leaving the lightbox — same reset-on-open
+  // behavior as openLightbox above (fresh zoom/pan, re-fetch original-size
+  // metadata for the new entry via the effect below keyed on `lightbox`).
+  const goToLightboxOffset = useCallback(
+    (offset: number) => {
+      if (!lightbox) return;
+      const idx = images.findIndex(
+        (img) => img.messageId === lightbox.messageId,
+      );
+      if (idx === -1) return;
+      const nextIdx = idx + offset;
+      if (nextIdx < 0 || nextIdx >= images.length) return;
+      openLightbox(images[nextIdx]);
+    },
+    [lightbox, images, openLightbox],
+  );
+  const goToNextLightboxImage = useCallback(
+    () => goToLightboxOffset(1),
+    [goToLightboxOffset],
+  );
+  const goToPrevLightboxImage = useCallback(
+    () => goToLightboxOffset(-1),
+    [goToLightboxOffset],
+  );
+  // Keyboard nav: → next / ← previous / Esc close. Only wired up while the
+  // lightbox is actually open, so it doesn't steal arrow keys anywhere else
+  // on the page (e.g. moving the caret in the prompt textarea).
+  useEffect(() => {
+    if (!lightbox) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        goToNextLightboxImage();
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        goToPrevLightboxImage();
+      } else if (e.key === 'Escape') {
+        setLightbox(null);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [lightbox, goToNextLightboxImage, goToPrevLightboxImage]);
   // Dragging is only meaningful once zoomed in; reset pan whenever zoom
   // returns to the fitted (1x) view so the image re-centers.
   useEffect(() => {
@@ -627,8 +671,17 @@ export function ImageStudioPage() {
     return Math.hypot(dx, dy);
   }
 
+  // Swipe-to-navigate (previous/next image) only makes sense at the fitted
+  // (1x) zoom level — once zoomed in, a horizontal drag is already spoken
+  // for by panning above. Tracked separately from touchGestureRef since
+  // it's resolved at release (a flick threshold), not followed live like
+  // pinch/pan.
+  const SWIPE_THRESHOLD_PX = 60;
+  const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
+
   const handleLightboxTouchStart = useCallback(
     (e: React.TouchEvent) => {
+      swipeStartRef.current = null;
       if (e.touches.length === 2) {
         touchGestureRef.current = {
           mode: 'pinch',
@@ -649,6 +702,11 @@ export function ImageStudioPage() {
           startPanX: lightboxPan.x,
           startPanY: lightboxPan.y,
         };
+      } else if (e.touches.length === 1) {
+        swipeStartRef.current = {
+          x: e.touches[0].clientX,
+          y: e.touches[0].clientY,
+        };
       }
     },
     [lightboxZoom, lightboxPan],
@@ -658,6 +716,7 @@ export function ImageStudioPage() {
     const gesture = touchGestureRef.current;
     if (gesture.mode === 'pinch' && e.touches.length === 2) {
       e.preventDefault();
+      swipeStartRef.current = null;
       const distance = touchDistance(e.touches);
       if (gesture.startDistance > 0) {
         const scale = distance / gesture.startDistance;
@@ -667,6 +726,7 @@ export function ImageStudioPage() {
       }
     } else if (gesture.mode === 'pan' && e.touches.length === 1) {
       e.preventDefault();
+      swipeStartRef.current = null;
       setLightboxPan({
         x: gesture.startPanX + (e.touches[0].clientX - gesture.startX),
         y: gesture.startPanY + (e.touches[0].clientY - gesture.startY),
@@ -676,6 +736,27 @@ export function ImageStudioPage() {
 
   const handleLightboxTouchEnd = useCallback(
     (e: React.TouchEvent) => {
+      // Resolve a pending swipe (armed in touchStart, untouched by any
+      // pinch/pan move above) once the finger lifts — a fast-enough
+      // horizontal flick, more horizontal than vertical, steps to the
+      // previous/next image.
+      const swipeStart = swipeStartRef.current;
+      swipeStartRef.current = null;
+      if (swipeStart && e.touches.length === 0) {
+        const touch = e.changedTouches[0];
+        if (touch) {
+          const dx = touch.clientX - swipeStart.x;
+          const dy = touch.clientY - swipeStart.y;
+          if (
+            Math.abs(dx) >= SWIPE_THRESHOLD_PX &&
+            Math.abs(dx) > Math.abs(dy) * 1.5
+          ) {
+            if (dx < 0) goToNextLightboxImage();
+            else goToPrevLightboxImage();
+          }
+        }
+      }
+
       if (e.touches.length === 0) {
         touchGestureRef.current.mode = 'none';
         return;
@@ -697,7 +778,7 @@ export function ImageStudioPage() {
             : { ...touchGestureRef.current, mode: 'none' };
       }
     },
-    [lightboxZoom, lightboxPan],
+    [lightboxZoom, lightboxPan, goToNextLightboxImage, goToPrevLightboxImage],
   );
 
   // Original-file metadata (byte size + pixel dimensions) shown next to
@@ -892,6 +973,33 @@ export function ImageStudioPage() {
     },
     [references.length],
   );
+
+  // Paste an image straight from the clipboard (Ctrl/Cmd+V) as a reference —
+  // no need to save it to disk first and use the file picker. Goes through
+  // the same addReferenceFiles pipeline (format/size validation, HEIC
+  // conversion, aspect-ratio auto-detect), just fed a clipboard File instead
+  // of one from an <input>. Only acts when the clipboard actually contains
+  // image data — plain text paste anywhere else on the page (the prompt
+  // textarea, a reference note) is untouched and keeps working normally.
+  useEffect(() => {
+    if (!selectedJid) return;
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const imageFiles: File[] = [];
+      for (const item of Array.from(items)) {
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) imageFiles.push(file);
+        }
+      }
+      if (imageFiles.length === 0) return;
+      e.preventDefault();
+      void addReferenceFiles(imageFiles);
+    };
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [selectedJid, addReferenceFiles]);
 
   const addReferenceFromGalleryImage = useCallback(
     async (jid: string, entry: GeneratedImageEntry) => {
@@ -1224,7 +1332,7 @@ export function ImageStudioPage() {
                         </span>
                       </span>
                       <span className="hidden text-xs text-muted-foreground sm:inline">
-                        图生图模式：可为每张参考图单独填写要参考的内容；也可把下方已生成的图片或电脑里的图片文件拖到这里
+                        图生图模式：可为每张参考图单独填写要参考的内容；也可把下方已生成的图片或电脑里的图片文件拖到这里，或直接粘贴剪贴板里的图片
                       </span>
                     </div>
                     <div className="flex flex-wrap gap-3">
