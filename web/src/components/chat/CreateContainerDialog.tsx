@@ -368,15 +368,18 @@ export function CreateContainerDialog({
             >
               工作区名称
             </label>
+            {/* No onKeyDown-Enter-submits here on purpose — same reason as
+                RenameDialog.tsx: an IME's Enter-to-confirm-a-character was
+                also submitting this dialog, so composing e.g. Chinese text
+                would land a single letter and trigger "创建" at once.
+                Submitting the new workspace always requires an explicit
+                click on the create button now. */}
             <Input
               id="workspace-name"
               value={name}
               onChange={(e) => {
                 setName(e.target.value);
                 clearSubmissionErrors();
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleConfirm();
               }}
               placeholder="输入这个智能体工作区的名称"
               autoFocus={isDesktop}

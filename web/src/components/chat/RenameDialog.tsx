@@ -19,7 +19,12 @@ interface RenameDialogProps {
   onClose: () => void;
 }
 
-export function RenameDialog({ open, jid, currentName, onClose }: RenameDialogProps) {
+export function RenameDialog({
+  open,
+  jid,
+  currentName,
+  onClose,
+}: RenameDialogProps) {
   const [name, setName] = useState(currentName);
   const [loading, setLoading] = useState(false);
   const renameFlow = useChatStore((s) => s.renameFlow);
@@ -50,10 +55,15 @@ export function RenameDialog({ open, jid, currentName, onClose }: RenameDialogPr
 
         <div>
           <Label className="mb-2">工作区名称</Label>
+          {/* No onKeyDown-Enter-submits here on purpose: with an IME (e.g.
+              拼音输入法), the Enter that confirms a composed character was
+              also firing this dialog's submit, so a single letter would
+              both land in the field AND trigger "确认" at once. Enter is
+              left to the input/IME's own native behavior; submitting
+              always requires an explicit click on the 确认 button. */}
           <Input
             value={name}
             onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleConfirm(); }}
             placeholder="输入新名称"
             autoFocus
           />
