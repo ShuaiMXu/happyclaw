@@ -197,7 +197,7 @@ export function WorkspaceInteractionModeDialog({
         if (!nextOpen && !saving) onClose();
       }}
     >
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="flex max-h-[85dvh] flex-col overflow-hidden sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>工作区设置</DialogTitle>
           <DialogDescription>
@@ -205,7 +205,9 @@ export function WorkspaceInteractionModeDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-5">
+        {/* 正文可滚动，页头/页脚固定——生图能力这块加进来后，内容在手机端
+            经常超出屏幕高度，之前整个浮层不滚动，按钮会被顶到屏幕外点不到。 */}
+        <div className="-mx-4 min-h-0 flex-1 space-y-5 overflow-y-auto px-4">
           <div className="space-y-2">
             <h3 className="text-sm font-medium text-foreground">回复模式</h3>
             <InteractionModeSelector
@@ -213,7 +215,7 @@ export function WorkspaceInteractionModeDialog({
               onChange={setDraftMode}
               name="workspace-interaction-mode"
               disabled={saving}
-              description="同一模式会应用到该工作区的 Web、飞书和所有已绑定渠道；渠道只负责选择流式卡片、普通消息或消息气泡等具体呈现。"
+              description="应用到该工作区所有已绑定渠道；渠道只影响具体呈现方式。"
             />
           </div>
 
@@ -257,7 +259,7 @@ export function WorkspaceInteractionModeDialog({
             )}
             {!optionsLoading && (
               <p className="text-xs leading-5 text-muted-foreground">
-                不锁定时，该工作区按系统默认在多个模型间按需调配；锁定后，工作区的所有对话都经过所选模型。
+                不锁定按系统默认调配；锁定后固定使用所选模型。
               </p>
             )}
           </div>
@@ -269,7 +271,7 @@ export function WorkspaceInteractionModeDialog({
                   生图能力
                 </h3>
                 <p className="text-xs leading-5 text-muted-foreground">
-                  开启后，本工作区的对话可以直接生成图片，无需单独安装 Skill。
+                  开启后可直接生图，无需安装 Skill。
                 </p>
               </div>
               <Switch
@@ -289,7 +291,7 @@ export function WorkspaceInteractionModeDialog({
               </p>
             ) : !imageGenOptions.configured ? (
               <p className="text-xs text-amber-600 dark:text-amber-500">
-                管理员尚未配置生图后端，暂时无法开启；请联系管理员在系统设置中配置。
+                管理员尚未配置生图后端，暂时无法开启。
               </p>
             ) : null}
             {draftImageGenEnabled && (
@@ -315,14 +317,13 @@ export function WorkspaceInteractionModeDialog({
               </Select>
             )}
           </div>
+
+          <p className="rounded-md bg-muted/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
+            切换会安全重启工作区运行时（身份/Skills/记忆/绑定不受影响），运行中的任务会先停止。
+          </p>
         </div>
 
-        <p className="rounded-md bg-muted/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
-          切换会安全重启该工作区的智能体
-          运行时；身份、Skills、记忆与渠道绑定保持不变。正在运行的任务会先停止，后续消息按新设置处理。
-        </p>
-
-        <DialogFooter>
+        <DialogFooter className="flex-row flex-wrap justify-end gap-2">
           <Button
             type="button"
             variant="outline"

@@ -15,6 +15,7 @@ import {
   validateAndResolvePath,
   deleteFile,
   createDirectory,
+  moveEntry,
   isSystemPath,
   isEditLockedPath,
   MAX_FILE_SIZE,
@@ -1440,6 +1441,161 @@ fileRoutes.delete('/:jid/files/:path', authMiddleware, (c) => {
       ? msg
       : 'Failed to delete file';
     return c.json({ error: publicMsg }, 400);
+  }
+});
+
+// 批量操作（多选删除/移动）每次请求最多处理这么多项，避免一次同步循环
+// 卡住事件循环太久，也顺便挡掉异常大的请求体。
+const MAX_BATCH_ITEMS = 500;
+
+// POST /api/groups/:jid/files/batch-delete - 批量删除文件/目录。
+// 每一项独立走跟单文件删除相同的校验（deleteFile 内部已经过 TOCTOU 安全的
+// safeDeleteWorkspaceEntry），一项失败不影响其余项继续执行，最终返回
+// 成功/失败明细，前端据此告诉用户哪些没删掉、为什么。
+fileRoutes.post('/:jid/files/batch-delete', authMiddleware, async (c) => {
+  const jid = c.req.param('jid');
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const paths = Array.isArray(body?.paths) ? body.paths : null;
+    if (!paths || paths.length === 0) {
+      return c.json({ error: 'paths is required' }, 400);
+    }
+    if (paths.length > MAX_BATCH_ITEMS) {
+      return c.json(
+        { error: `Cannot delete more than ${MAX_BATCH_ITEMS} items at once` },
+        400,
+      );
+    }
+
+    const rootOverride = getFileRootOverride(group);
+    const safeMessages = [
+      'Cannot delete system path',
+      'Cannot delete root directory',
+      'File or directory not found',
+      'Path traversal detected',
+      'Symlink traversal detected',
+    ];
+
+    const deleted: string[] = [];
+    const failed: { path: string; error: string }[] = [];
+    for (const p of paths) {
+      if (typeof p !== 'string' || !p) {
+        failed.push({ path: String(p), error: 'Invalid path' });
+        continue;
+      }
+      try {
+        deleteFile(group.folder, p, rootOverride);
+        deleted.push(p);
+      } catch (error) {
+        const msg = (error as Error).message;
+        failed.push({
+          path: p,
+          error: safeMessages.includes(msg) ? msg : 'Failed to delete file',
+        });
+      }
+    }
+
+    if (deleted.length > 0) {
+      invalidateGroupStorageUsage(group.folder, rootOverride);
+    }
+
+    return c.json({ success: failed.length === 0, deleted, failed });
+  } catch (error) {
+    logger.error({ err: error }, `Failed to batch delete files for ${jid}`);
+    return c.json({ error: 'Failed to delete files' }, 500);
+  }
+});
+
+// POST /api/groups/:jid/files/move - 批量把文件/目录移动到工作区内的另一个
+// 已存在目录下（保留原名）；每一项独立校验和执行，语义同 batch-delete。
+fileRoutes.post('/:jid/files/move', authMiddleware, async (c) => {
+  const jid = c.req.param('jid');
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const paths = Array.isArray(body?.paths) ? body.paths : null;
+    const destination =
+      typeof body?.destination === 'string' ? body.destination : '';
+    if (!paths || paths.length === 0) {
+      return c.json({ error: 'paths is required' }, 400);
+    }
+    if (paths.length > MAX_BATCH_ITEMS) {
+      return c.json(
+        { error: `Cannot move more than ${MAX_BATCH_ITEMS} items at once` },
+        400,
+      );
+    }
+
+    const rootOverride = getFileRootOverride(group);
+    const safeMessages = [
+      'Cannot move root directory',
+      'Cannot move system path',
+      'Cannot move into system path',
+      'Cannot move a folder into itself',
+      'File or directory not found',
+      'Destination folder not found',
+      'Destination already exists',
+      'Path traversal detected',
+      'Symlink traversal detected',
+      'Refusing to move a symbolic link',
+    ];
+
+    const moved: string[] = [];
+    const failed: { path: string; error: string }[] = [];
+    for (const p of paths) {
+      if (typeof p !== 'string' || !p) {
+        failed.push({ path: String(p), error: 'Invalid path' });
+        continue;
+      }
+      try {
+        moveEntry(group.folder, p, destination, rootOverride);
+        moved.push(p);
+      } catch (error) {
+        const msg = (error as Error).message;
+        failed.push({
+          path: p,
+          error: safeMessages.includes(msg) ? msg : 'Failed to move file',
+        });
+      }
+    }
+
+    return c.json({ success: failed.length === 0, moved, failed });
+  } catch (error) {
+    logger.error({ err: error }, `Failed to move files for ${jid}`);
+    return c.json({ error: 'Failed to move files' }, 500);
   }
 });
 

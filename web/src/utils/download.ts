@@ -93,6 +93,62 @@ export async function downloadFromUrl(
   triggerBlobDownload(blob, filename);
 }
 
+/** `loaded`/`total` in bytes; `total` is null when the server doesn't send Content-Length. */
+export type DownloadProgressCallback = (
+  loaded: number,
+  total: number | null,
+) => void;
+
+/**
+ * Like `downloadFromUrl`, but streams the response body so the caller can
+ * report byte-level progress — `fetch().blob()` only resolves once the whole
+ * response has arrived, giving no feedback for large files. Falls back to a
+ * single `onProgress(0, null)` call and a plain blob download on browsers/
+ * responses without a readable stream body (e.g. very old browsers or an
+ * opaque proxy that strips it) so the download still completes either way.
+ */
+export async function downloadFromUrlWithProgress(
+  url: string,
+  filename: string,
+  onProgress?: DownloadProgressCallback,
+): Promise<void> {
+  const fullUrl = url.startsWith('http') ? url : withBasePath(url);
+  const res = await fetch(fullUrl, { credentials: 'include' });
+  if (!res.ok) {
+    throw new DownloadError(res.status, await readDownloadErrorMessage(res));
+  }
+
+  const totalHeader = res.headers.get('content-length');
+  const total = totalHeader ? Number(totalHeader) : null;
+
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    onProgress?.(0, null);
+    const blob = await res.blob();
+    triggerBlobDownload(blob, filename);
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+  onProgress?.(0, total);
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      loaded += value.byteLength;
+      onProgress?.(loaded, total);
+    }
+  }
+
+  const blob = new Blob(chunks as BlobPart[], {
+    type: res.headers.get('content-type') || 'application/octet-stream',
+  });
+  triggerBlobDownload(blob, filename);
+}
+
 /**
  * Save a Blob via the native share sheet when available, falling back to
  * the synthetic `<a download>` blob click otherwise.

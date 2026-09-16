@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Copy, FileText, ImageDown, Trash2 } from 'lucide-react';
+import { Copy, FileText, ImageDown, Loader2, Trash2 } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 
 interface MessageContextMenuProps {
@@ -22,6 +22,8 @@ export function MessageContextMenu({
 }: MessageContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     const menu = menuRef.current;
@@ -75,10 +77,22 @@ export function MessageContextMenu({
       setConfirmDelete(true);
       return;
     }
-    if (chatJid && messageId) {
-      await useChatStore.getState().deleteMessage(chatJid, messageId);
+    if (!chatJid || !messageId || deleting) return;
+
+    setDeleting(true);
+    setDeleteError(null);
+    // deleteMessage 内部已经在失败时 toast 一次；这里额外在菜单里留一条常驻
+    // 文案并保持菜单打开，避免 toast 一闪而过、用户以为"删除没反应"就是本次
+    // 反馈要解决的问题——之前无论成败都立刻 onClose()，看起来跟"卡住不动"
+    // 没有区别。失败最常见的原因是权限：非 admin 只能删自己发的消息，AI
+    // 回复只有 admin 能删（见 src/routes/groups.ts 的 DELETE /messages 路由）。
+    const ok = await useChatStore.getState().deleteMessage(chatJid, messageId);
+    if (ok) {
+      onClose();
+      return;
     }
-    onClose();
+    setDeleting(false);
+    setDeleteError('删除失败，可能没有权限删除这条消息');
   };
 
   return createPortal(
@@ -122,23 +136,37 @@ export function MessageContextMenu({
         {chatJid && messageId && (
           <>
             <div className="mx-3 my-0.5 border-t border-border" />
-            {confirmDelete && (
+            {confirmDelete && !deleteError && (
               <p className="max-w-[240px] px-4 py-1.5 text-xs leading-relaxed text-muted-foreground">
                 仅删除持久聊天记录，不会撤回正在处理的模型输入。
               </p>
             )}
+            {deleteError && (
+              <p className="max-w-[240px] px-4 py-1.5 text-xs leading-relaxed text-red-500">
+                {deleteError}
+              </p>
+            )}
             <button
               onClick={handleDelete}
-              className={`group/item w-full flex items-center gap-3 mx-1 px-3 py-2.5 text-sm rounded-lg transition-colors ${
+              disabled={deleting}
+              className={`group/item w-full flex items-center gap-3 mx-1 px-3 py-2.5 text-sm rounded-lg transition-colors disabled:cursor-wait ${
                 confirmDelete
                   ? 'text-red-400 bg-red-500/20 hover:bg-red-500/30'
                   : 'text-red-400 hover:bg-foreground/10 hover:text-red-500 active:bg-foreground/15'
               }`}
             >
-              <Trash2
-                className={`w-4 h-4 transition-colors ${confirmDelete ? '' : 'group-hover/item:text-red-500'}`}
-              />
-              {confirmDelete ? '确认删除记录' : '删除聊天记录'}
+              {deleting ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Trash2
+                  className={`w-4 h-4 transition-colors ${confirmDelete ? '' : 'group-hover/item:text-red-500'}`}
+                />
+              )}
+              {deleting
+                ? '正在删除…'
+                : confirmDelete
+                  ? '确认删除记录'
+                  : '删除聊天记录'}
             </button>
           </>
         )}

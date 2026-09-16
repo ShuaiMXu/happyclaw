@@ -168,6 +168,13 @@ export interface FileEntry {
   absolutePath?: string;
 }
 
+/** 批量删除/移动的结果：一项失败不影响其它项，前端据此告诉用户哪些没成功。 */
+export interface BatchFileOpResult {
+  success: boolean;
+  succeeded: string[];
+  failed: { path: string; error: string }[];
+}
+
 export interface UploadProgress {
   total: number;
   completed: number;
@@ -214,6 +221,15 @@ interface FileState {
   ) => Promise<boolean>;
   cancelUpload: () => void;
   deleteFile: (jid: string, filePath: string) => Promise<boolean>;
+  batchDeleteFiles: (
+    jid: string,
+    paths: string[],
+  ) => Promise<BatchFileOpResult>;
+  moveFiles: (
+    jid: string,
+    paths: string[],
+    destination: string,
+  ) => Promise<BatchFileOpResult>;
   createDirectory: (
     jid: string,
     parentPath: string,
@@ -479,6 +495,63 @@ export const useFileStore = create<FileState>((set, get) => ({
       console.error('Failed to delete file:', err);
       set({ error: msg });
       return false;
+    }
+  },
+
+  batchDeleteFiles: async (jid: string, paths: string[]) => {
+    try {
+      const data = await api.post<{
+        success: boolean;
+        deleted: string[];
+        failed: { path: string; error: string }[];
+      }>(`/api/groups/${encodeURIComponent(jid)}/files/batch-delete`, {
+        paths,
+      });
+      const currentPath = get().currentPath[jid] || '';
+      await get().loadFiles(jid, currentPath);
+      return {
+        success: data.success,
+        succeeded: data.deleted,
+        failed: data.failed,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to delete files';
+      console.error('Failed to batch delete files:', err);
+      set({ error: msg });
+      return {
+        success: false,
+        succeeded: [],
+        failed: paths.map((path) => ({ path, error: msg })),
+      };
+    }
+  },
+
+  moveFiles: async (jid: string, paths: string[], destination: string) => {
+    try {
+      const data = await api.post<{
+        success: boolean;
+        moved: string[];
+        failed: { path: string; error: string }[];
+      }>(`/api/groups/${encodeURIComponent(jid)}/files/move`, {
+        paths,
+        destination,
+      });
+      const currentPath = get().currentPath[jid] || '';
+      await get().loadFiles(jid, currentPath);
+      return {
+        success: data.success,
+        succeeded: data.moved,
+        failed: data.failed,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to move files';
+      console.error('Failed to move files:', err);
+      set({ error: msg });
+      return {
+        success: false,
+        succeeded: [],
+        failed: paths.map((path) => ({ path, error: msg })),
+      };
     }
   },
 

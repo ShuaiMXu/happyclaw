@@ -61,9 +61,10 @@ const SAFE_WORKSPACE_FS_HELPER = path.resolve(
 );
 
 interface SafeWorkspaceMutationRequest {
-  operation: 'write_file' | 'mkdir' | 'delete';
+  operation: 'write_file' | 'mkdir' | 'delete' | 'move';
   root: string;
   path: string;
+  destinationPath?: string;
   dataBase64?: string;
   mustExist?: boolean;
   createParents?: boolean;
@@ -109,6 +110,33 @@ function runSafeWorkspaceMutation(request: SafeWorkspaceMutationRequest): void {
       if (info.isSymbolicLink()) throw new Error('Symlink traversal detected');
       if (info.isDirectory()) fs.rmSync(target, { recursive: true });
       else fs.unlinkSync(target);
+      return;
+    }
+    if (request.operation === 'move') {
+      if (typeof request.destinationPath !== 'string') {
+        throw new Error('Destination path is required');
+      }
+      const destTarget = path.resolve(
+        root,
+        path.normalize(request.destinationPath),
+      );
+      const destRelative = path.relative(root, destTarget);
+      if (destRelative.startsWith('..') || path.isAbsolute(destRelative)) {
+        throw new Error('Path traversal detected');
+      }
+      if (!fs.existsSync(target)) {
+        throw new Error('File or directory not found');
+      }
+      verifyInsideRoot(target);
+      const srcInfo = fs.lstatSync(target);
+      if (srcInfo.isSymbolicLink()) {
+        throw new Error('Refusing to move a symbolic link');
+      }
+      if (fs.existsSync(destTarget)) {
+        throw new Error('Destination already exists');
+      }
+      verifyInsideRoot(path.dirname(destTarget));
+      fs.renameSync(target, destTarget);
       return;
     }
     const parent = path.dirname(target);
@@ -212,6 +240,20 @@ export function safeCreateWorkspaceDirectory(
     operation: 'mkdir',
     root: fs.realpathSync(getFileRoot(folder, rootOverride)),
     path: relativePath,
+  });
+}
+
+export function safeMoveWorkspaceEntry(
+  folder: string,
+  relativePath: string,
+  destinationRelativePath: string,
+  rootOverride?: string,
+): void {
+  runSafeWorkspaceMutation({
+    operation: 'move',
+    root: fs.realpathSync(getFileRoot(folder, rootOverride)),
+    path: relativePath,
+    destinationPath: destinationRelativePath,
   });
 }
 
@@ -443,6 +485,79 @@ export function deleteFile(
   }
 
   safeDeleteWorkspaceEntry(folder, relativePath, rootOverride);
+}
+
+/**
+ * 把文件或目录移动到工作区内的另一个目录下（保留原名）。
+ * @param folder 会话流文件夹名
+ * @param relativePath 待移动条目的相对路径
+ * @param destinationDir 目标目录的相对路径（必须已存在）
+ * @param rootOverride 可选的自定义根目录（绝对路径）
+ * @throws 源路径非法/不存在、目标目录非法/不存在、目标已存在同名条目，
+ *         或把目录移进自身/自身子目录时抛出异常
+ */
+export function moveEntry(
+  folder: string,
+  relativePath: string,
+  destinationDir: string,
+  rootOverride?: string,
+): void {
+  if (!relativePath || relativePath === '.' || relativePath === '/') {
+    throw new Error('Cannot move root directory');
+  }
+  if (isSystemPath(relativePath)) {
+    throw new Error('Cannot move system path');
+  }
+
+  const root = getFileRoot(folder, rootOverride);
+  const sourceAbsolute = validateAndResolvePath(
+    folder,
+    relativePath,
+    rootOverride,
+  );
+  if (path.resolve(sourceAbsolute) === path.resolve(root)) {
+    throw new Error('Cannot move root directory');
+  }
+  if (!fs.existsSync(sourceAbsolute)) {
+    throw new Error('File or directory not found');
+  }
+
+  const destinationName = path.basename(relativePath);
+  const destinationRelative = path.join(destinationDir, destinationName);
+  if (isSystemPath(destinationDir) || isSystemPath(destinationRelative)) {
+    throw new Error('Cannot move into system path');
+  }
+
+  // 禁止把目录（或其祖先路径）移进自己的子目录——用字符串前缀 + 路径分隔符
+  // 比较，避免 "foo" 误判成 "foobar" 的父级。
+  const normalizedSource = path.normalize(relativePath);
+  const normalizedDestDir = path.normalize(destinationDir);
+  if ((normalizedDestDir + path.sep).startsWith(normalizedSource + path.sep)) {
+    throw new Error('Cannot move a folder into itself');
+  }
+
+  const destinationDirAbsolute = validateAndResolvePath(
+    folder,
+    destinationDir,
+    rootOverride,
+  );
+  if (
+    !fs.existsSync(destinationDirAbsolute) ||
+    !fs.statSync(destinationDirAbsolute).isDirectory()
+  ) {
+    throw new Error('Destination folder not found');
+  }
+
+  const destinationAbsolute = validateAndResolvePath(
+    folder,
+    destinationRelative,
+    rootOverride,
+  );
+  if (fs.existsSync(destinationAbsolute)) {
+    throw new Error('Destination already exists');
+  }
+
+  safeMoveWorkspaceEntry(folder, relativePath, destinationRelative, rootOverride);
 }
 
 /**

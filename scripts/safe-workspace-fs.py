@@ -149,6 +149,38 @@ def delete_directory_contents(directory_fd: int) -> None:
             os.unlink(name, dir_fd=directory_fd)
 
 
+def move_entry(root_fd: int, request: dict[str, object]) -> None:
+    src_parts = relative_parts(request.get("path"))
+    dest_parts = relative_parts(request.get("destinationPath"))
+
+    src_parent_fd, src_leaf = open_parent(root_fd, src_parts, False)
+    try:
+        src_info = os.stat(src_leaf, dir_fd=src_parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(src_info.st_mode):
+            fail("Refusing to move a symbolic link")
+
+        dest_parent_fd, dest_leaf = open_parent(root_fd, dest_parts, False)
+        try:
+            try:
+                os.stat(dest_leaf, dir_fd=dest_parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                fail("Destination already exists")
+            os.rename(
+                src_leaf,
+                dest_leaf,
+                src_dir_fd=src_parent_fd,
+                dst_dir_fd=dest_parent_fd,
+            )
+            os.fsync(dest_parent_fd)
+        finally:
+            os.close(dest_parent_fd)
+        os.fsync(src_parent_fd)
+    finally:
+        os.close(src_parent_fd)
+
+
 def delete_entry(root_fd: int, request: dict[str, object]) -> None:
     parts = relative_parts(request.get("path"))
     parent_fd, leaf = open_parent(root_fd, parts, False)
@@ -185,6 +217,8 @@ def main() -> None:
                 make_directory(root_fd, request)
             elif operation == "delete":
                 delete_entry(root_fd, request)
+            elif operation == "move":
+                move_entry(root_fd, request)
             else:
                 fail("Unsupported workspace mutation")
         finally:
