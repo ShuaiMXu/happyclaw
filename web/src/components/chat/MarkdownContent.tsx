@@ -3,6 +3,8 @@ import ReactMarkdown from 'react-markdown';
 import { Check, Copy } from 'lucide-react';
 import { PreviewDialog } from './PreviewDialog';
 import { resolveMarkdownImageSrc } from '../../utils/markdownImageSrc';
+import { useFileStore } from '../../stores/files';
+import { looksLikeWorkspaceFilePath } from '../../utils/fileKind';
 
 const MermaidDiagram = lazy(() =>
   import('./MermaidDiagram').then((module) => ({
@@ -136,10 +138,12 @@ function CodeBlock({
   className,
   children,
   variant = 'chat',
+  groupJid,
   ...props
 }: React.ComponentPropsWithoutRef<'code'> & {
   className?: string;
   variant?: 'chat' | 'docs';
+  groupJid?: string;
 }) {
   const [copied, setCopied] = useState(false);
   const match = /language-(\w+)/.exec(className || '');
@@ -191,15 +195,32 @@ function CodeBlock({
     );
   }
 
+  const inlineClassName =
+    variant === 'chat'
+      ? 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-[0.9em] leading-relaxed font-mono break-all'
+      : 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-sm font-mono break-all';
+
+  // 看起来像工作区文件路径的行内代码：点击等同于在项目文件面板里点开同名
+  // 文件——能预览的类型直接打开对应预览，压缩包等直接下载，找不到时提示。
+  if (groupJid && looksLikeWorkspaceFilePath(codeString)) {
+    return (
+      <button
+        type="button"
+        className={`${inlineClassName} cursor-pointer underline decoration-dotted underline-offset-2 hover:opacity-80`}
+        title="点击在项目文件中打开"
+        onClick={() =>
+          void useFileStore
+            .getState()
+            .openWorkspaceFileByAgentPath(groupJid, codeString)
+        }
+      >
+        {children}
+      </button>
+    );
+  }
+
   return (
-    <code
-      className={
-        variant === 'chat'
-          ? 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-[0.9em] leading-relaxed font-mono break-all'
-          : 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-sm font-mono break-all'
-      }
-      {...props}
-    >
+    <code className={inlineClassName} {...props}>
       {children}
     </code>
   );
@@ -233,7 +254,9 @@ export function MarkdownContent({
           >['rehypePlugins']
         }
         components={{
-          code: (props) => <CodeBlock {...props} variant={variant} />,
+          code: (props) => (
+            <CodeBlock {...props} variant={variant} groupJid={groupJid} />
+          ),
           img: ({ src, alt }) => (
             <MarkdownImage
               src={src ? resolveMarkdownImageSrc(src, groupJid) : undefined}

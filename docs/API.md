@@ -166,14 +166,22 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 ## 文件
 
 - `GET|POST /api/groups/:jid/files`
+- `GET /api/groups/:jid/files/resolve`
 - `POST /api/groups/:jid/files/open-directory`
 - `GET /api/groups/:jid/files/download/:path`
 - `GET /api/groups/:jid/files/preview/:path`
 - `GET|PUT /api/groups/:jid/files/content/:path`
 - `DELETE /api/groups/:jid/files/:path`
+- `POST /api/groups/:jid/files/batch-delete`
+- `POST /api/groups/:jid/files/move`
 - `POST /api/groups/:jid/directories`
 
 路径必须位于目标工作区允许范围内；系统目录、路径穿越和不安全符号链接会被拒绝。
+
+`files/resolve` 接受查询参数 `?path=`，把 Agent 视角下的路径（容器内
+`/workspace/group/...` 绝对路径、宿主机 `customCwd` 绝对路径，或工作区相对
+路径/裸文件名）解析成对应的文件条目，字段与 `GET /files` 列表一致。用于聊天
+消息里提到的文件路径可以直接定位到项目文件面板的同名文件，而不用手动查找。
 
 `files/preview` 支持可选查询参数 `?thumb=1`：仅对静态光栅图片（PNG/JPEG/WebP）
 返回按最长边 1024px 重编码的 webp 缩略图，缓存在 `data/image-thumbnails/{folder}/`

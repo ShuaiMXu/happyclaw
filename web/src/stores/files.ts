@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { api, apiFetch, computeUploadTimeoutMs } from '../api/client';
 import { showToast } from '../utils/toast';
+import { downloadFromUrlWithProgress } from '../utils/download';
+import { classifyFileKind } from '../utils/fileKind';
 
 /**
  * 上传重试。慢速或不稳定链路上单次上传失败非常常见（反代读请求体超时 → 408，
@@ -205,6 +207,12 @@ export function formatUploadRetryStatus(
   return null;
 }
 
+/** 待 FilePanel 消费的"打开这个文件"请求；见 openWorkspaceFileByAgentPath。 */
+export interface PendingFileOpen {
+  file: FileEntry;
+  token: number;
+}
+
 interface FileState {
   files: Record<string, FileEntry[]>;
   currentPath: Record<string, string>;
@@ -212,6 +220,7 @@ interface FileState {
   uploading: boolean;
   uploadProgress: UploadProgress | null;
   error: string | null;
+  pendingFileOpen: Record<string, PendingFileOpen | undefined>;
 
   loadFiles: (jid: string, path?: string) => Promise<void>;
   uploadFiles: (
@@ -242,6 +251,17 @@ interface FileState {
     filePath: string,
     content: string,
   ) => Promise<boolean>;
+  /**
+   * 把聊天消息里提到的一个路径（Agent 视角的绝对路径或相对路径）解析成工作区
+   * 文件，等同于用户在项目文件面板里点开了同名文件：能直接预览的类型交给
+   * FilePanel（通过 pendingFileOpen 通知它打开对应预览），不能预览的类型
+   * （压缩包等）直接触发下载。找不到匹配文件时提示用户。
+   */
+  openWorkspaceFileByAgentPath: (
+    jid: string,
+    agentPath: string,
+  ) => Promise<void>;
+  clearPendingFileOpen: (jid: string) => void;
 }
 
 export function toBase64Url(str: string): string {
@@ -260,6 +280,7 @@ export const useFileStore = create<FileState>((set, get) => ({
   uploading: false,
   uploadProgress: null,
   error: null,
+  pendingFileOpen: {},
 
   cancelUpload: () => activeUploadController?.abort(),
 
@@ -608,5 +629,44 @@ export const useFileStore = create<FileState>((set, get) => ({
       set({ error: msg });
       return false;
     }
+  },
+
+  openWorkspaceFileByAgentPath: async (jid: string, agentPath: string) => {
+    try {
+      const params = new URLSearchParams({ path: agentPath });
+      const data = await api.get<{ file: FileEntry }>(
+        `/api/groups/${encodeURIComponent(jid)}/files/resolve?${params}`,
+      );
+      const { file } = data;
+
+      if (file.type === 'file' && classifyFileKind(file.name) === 'download') {
+        const encoded = toBase64Url(file.path);
+        const url = `/api/groups/${encodeURIComponent(jid)}/files/download/${encoded}`;
+        await downloadFromUrlWithProgress(url, file.name);
+        return;
+      }
+
+      set((s) => ({
+        pendingFileOpen: {
+          ...s.pendingFileOpen,
+          [jid]: { file, token: Date.now() + Math.random() },
+        },
+      }));
+    } catch (err) {
+      console.error('Failed to resolve workspace file path:', err);
+      showToast(
+        '未找到文件',
+        err instanceof Error ? err.message : '无法在项目文件中定位该路径',
+      );
+    }
+  },
+
+  clearPendingFileOpen: (jid: string) => {
+    set((s) => {
+      if (!(jid in s.pendingFileOpen)) return s;
+      const next = { ...s.pendingFileOpen };
+      delete next[jid];
+      return { pendingFileOpen: next };
+    });
   },
 }));

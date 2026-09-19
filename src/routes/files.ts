@@ -313,6 +313,41 @@ function getAgentAbsolutePath(
     : '/workspace/group';
 }
 
+/**
+ * Reverse of getAgentAbsolutePath(): turns a path exactly as the agent would
+ * write it (container mode: `/workspace/group/...`; host mode: an absolute
+ * path rooted at customCwd/data/groups/{folder}) — or an already
+ * workspace-relative path, such as a bare filename — into the
+ * workspace-relative path the rest of the file APIs expect. Returns null
+ * when the path clearly points outside this workspace's root.
+ */
+function resolveAgentPathToRelative(
+  group: RegisteredGroup,
+  rawPath: string,
+): string | null {
+  const trimmed = rawPath.trim();
+  if (!trimmed) return null;
+
+  if (group.executionMode === 'host') {
+    const base = getFileRoot(group.folder, getFileRootOverride(group));
+    if (!path.isAbsolute(trimmed)) {
+      return trimmed.replace(/^\.\//, '');
+    }
+    const rel = path.relative(base, trimmed);
+    if (!rel || rel === '.') return '';
+    if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    return rel.split(path.sep).join('/');
+  }
+
+  const prefix = '/workspace/group';
+  if (trimmed === prefix) return '';
+  if (trimmed.startsWith(`${prefix}/`)) {
+    return trimmed.slice(prefix.length + 1);
+  }
+  if (path.posix.isAbsolute(trimmed)) return null;
+  return trimmed.replace(/^\.\//, '');
+}
+
 function buildAttachmentContentDisposition(fileName: string): string {
   const sanitized = fileName.replace(/["\\\r\n]/g, '_');
   const asciiFallback = sanitized.replace(/[^\x20-\x7E]/g, '_') || 'download';
@@ -421,6 +456,71 @@ fileRoutes.get('/:jid/files', authMiddleware, (c) => {
   } catch (error) {
     logger.error({ err: error }, `Failed to list files for ${jid}`);
     return c.json({ error: 'Failed to list files' }, 500);
+  }
+});
+
+// GET /api/groups/:jid/files/resolve?path= - 把 Agent 视角下的路径解析成文件条目
+//
+// 聊天消息里经常会直接提到某个文件的路径（容器内 /workspace/group/... 绝对
+// 路径，宿主机模式下 customCwd 绝对路径，或者干脆是相对路径/裸文件名）。这个
+// 接口把这类路径解析回工作区相对路径并复用 listFiles，返回跟 GET /files 列表
+// 里完全一致的字段（isSystem/editable/absolutePath 等由同一份逻辑计算），
+// 让前端可以直接把聊天里提到的文件路径当成项目文件面板里的同名文件打开。
+fileRoutes.get('/:jid/files/resolve', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
+  const rawPath = c.req.query('path') || '';
+
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
+
+  const relativePath = resolveAgentPathToRelative(group, rawPath);
+  if (relativePath === null) {
+    return c.json({ error: 'Path is outside the workspace' }, 400);
+  }
+
+  try {
+    const rootOverride = getFileRootOverride(group);
+    const absoluteTarget = validateAndResolvePath(
+      group.folder,
+      relativePath,
+      rootOverride,
+    );
+
+    if (!fs.existsSync(absoluteTarget)) {
+      return c.json({ error: 'File not found' }, 404);
+    }
+    if (fs.lstatSync(absoluteTarget).isSymbolicLink()) {
+      return c.json({ error: 'File not found' }, 404);
+    }
+
+    const parentRelative = path.posix.dirname(relativePath);
+    const dirRelative = parentRelative === '.' ? '' : parentRelative;
+    const targetName = path.posix.basename(relativePath);
+    const result = listFiles(group.folder, dirRelative, rootOverride);
+    const match = result.files.find((entry) => entry.name === targetName);
+    if (!match) {
+      return c.json({ error: 'File not found' }, 404);
+    }
+
+    return c.json({
+      file: { ...match, absolutePath: getAgentAbsolutePath(group, match.path) },
+    });
+  } catch (error) {
+    logger.error({ err: error }, `Failed to resolve file path for ${jid}`);
+    return c.json({ error: 'Failed to resolve file path' }, 500);
   }
 });
 

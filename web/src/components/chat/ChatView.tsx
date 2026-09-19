@@ -15,6 +15,7 @@ import {
   type QueuedFollowUp,
 } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
+import { useFileStore } from '../../stores/files';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
 import { FilePanel } from './FilePanel';
@@ -98,6 +99,20 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const [contextPanelView, setContextPanelView] = useState<'files' | 'env'>(
     'files',
   );
+
+  // 聊天消息里点击文件路径（见 MarkdownContent 的 CodeBlock）会往
+  // useFileStore.pendingFileOpen 里写一条待打开请求；这里负责把上下文面板
+  // 切到"项目文件"并展开，FilePanel 自己再去消费这条请求、定位到对应文件。
+  const pendingFileOpen = useFileStore((s) => s.pendingFileOpen[groupJid]);
+  useEffect(() => {
+    if (!pendingFileOpen) return;
+    setContextPanelView('files');
+    if (window.matchMedia('(min-width: 1024px)').matches) {
+      setPanelOpen(true);
+    } else {
+      setMobileContextOpen(true);
+    }
+  }, [pendingFileOpen]);
 
   // The nav rows eat ~11rem of an 80dvh sheet — a third of the file list on a
   // 390x844 viewport. Fold them into a single icon bar once the pane scrolls

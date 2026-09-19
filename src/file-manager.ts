@@ -557,7 +557,12 @@ export function moveEntry(
     throw new Error('Destination already exists');
   }
 
-  safeMoveWorkspaceEntry(folder, relativePath, destinationRelative, rootOverride);
+  safeMoveWorkspaceEntry(
+    folder,
+    relativePath,
+    destinationRelative,
+    rootOverride,
+  );
 }
 
 /**

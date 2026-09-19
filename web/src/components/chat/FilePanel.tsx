@@ -37,6 +37,16 @@ import { downloadFromUrlWithProgress } from '../../utils/download';
 import { showToast } from '../../utils/toast';
 import { copyToClipboard } from '../../utils/clipboard';
 import {
+  IMAGE_EXTENSIONS,
+  TEXT_EXTENSIONS,
+  CODE_EXTENSIONS,
+  ARCHIVE_EXTENSIONS,
+  VIDEO_EXTENSIONS,
+  AUDIO_EXTENSIONS,
+  getFileExt,
+  classifyFileKind,
+} from '../../utils/fileKind';
+import {
   Dialog,
   DialogContent,
   DialogHeader,
@@ -60,85 +70,6 @@ interface FilePanelProps {
   onClose?: () => void;
 }
 
-// ─── File type constants ─────────────────────────────────────────
-
-const IMAGE_EXTENSIONS = new Set([
-  'png',
-  'jpg',
-  'jpeg',
-  'gif',
-  'svg',
-  'webp',
-  'bmp',
-  'ico',
-]);
-
-const TEXT_EXTENSIONS = new Set([
-  'txt',
-  'md',
-  'json',
-  'js',
-  'ts',
-  'jsx',
-  'tsx',
-  'css',
-  'html',
-  'xml',
-  'py',
-  'go',
-  'rs',
-  'java',
-  'c',
-  'cpp',
-  'h',
-  'sh',
-  'yaml',
-  'yml',
-  'toml',
-  'ini',
-  'conf',
-  'log',
-  'csv',
-  'svg',
-]);
-
-const CODE_EXTENSIONS = new Set([
-  'js',
-  'ts',
-  'jsx',
-  'tsx',
-  'py',
-  'go',
-  'rs',
-  'java',
-  'c',
-  'cpp',
-  'h',
-  'sh',
-  'css',
-  'html',
-  'xml',
-  'yaml',
-  'yml',
-  'toml',
-]);
-
-const ARCHIVE_EXTENSIONS = new Set([
-  'zip',
-  'tar',
-  'gz',
-  '7z',
-  'rar',
-  'bz2',
-  'xz',
-]);
-
-const PDF_EXTENSIONS = new Set(['pdf']);
-
-const VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'avi', 'mkv']);
-
-const AUDIO_EXTENSIONS = new Set(['mp3', 'wav', 'ogg', 'aac', 'm4a', 'flac']);
-
 // ─── File icon component ────────────────────────────────────────
 
 function FileIcon({ name }: { name: string }) {
@@ -160,10 +91,6 @@ function FileIcon({ name }: { name: string }) {
   if (TEXT_EXTENSIONS.has(ext))
     return <FileText className="w-4 h-4 text-muted-foreground" />;
   return <File className="w-4 h-4 text-muted-foreground" />;
-}
-
-function getFileExt(name: string): string {
-  return name.split('.').pop()?.toLowerCase() || '';
 }
 
 /** 黑名单扩展名/文件名模式：不显示预览/编辑按钮 */
@@ -885,7 +812,9 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     moveFiles,
     createDirectory,
     navigateTo,
+    clearPendingFileOpen,
   } = useFileStore();
+  const pendingFileOpen = useFileStore((s) => s.pendingFileOpen[groupJid]);
 
   const [createDirModal, setCreateDirModal] = useState(false);
   const [newDirName, setNewDirName] = useState('');
@@ -950,6 +879,38 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     }
   }, [isStreaming, groupJid, currentDir, loadFiles]);
 
+  // 响应"点击聊天消息里的文件路径"发来的打开请求（见
+  // useFileStore.openWorkspaceFileByAgentPath）：切到文件所在目录并直接用
+  // 已经拿到的 FileEntry 打开对应预览，不需要等目录列表加载完再去里面找。
+  useEffect(() => {
+    if (!pendingFileOpen) return;
+    const { file } = pendingFileOpen;
+    if (file.type === 'directory') {
+      navigateTo(groupJid, file.path);
+    } else {
+      const lastSlash = file.path.lastIndexOf('/');
+      navigateTo(
+        groupJid,
+        lastSlash === -1 ? '' : file.path.slice(0, lastSlash),
+      );
+      const kind = classifyFileKind(file.name);
+      if (kind === 'image') {
+        setPreview({ kind: 'image', file });
+      } else if (kind === 'pdf') {
+        setPreview({ kind: 'pdf', file });
+      } else if (kind === 'video') {
+        setPreview({ kind: 'video', file });
+      } else if (kind === 'audio') {
+        setPreview({ kind: 'audio', file });
+      } else if (getFileExt(file.name) === 'md' && isEntryEditable(file)) {
+        setPreview({ kind: 'markdown', file });
+      } else {
+        setPreview({ kind: 'text', file });
+      }
+    }
+    clearPendingFileOpen(groupJid);
+  }, [pendingFileOpen, groupJid, navigateTo, clearPendingFileOpen]);
+
   const sortedFiles = useMemo(() => {
     return [...fileList].sort((a, b) => {
       if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
@@ -1003,6 +964,44 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     }
   };
 
+  const handleDownload = useCallback(
+    (item: FileEntry) => {
+      setDownloadingPaths((prev) => {
+        if (prev[item.path] !== undefined) return prev; // 正在下载，忽略重复点击
+        return { ...prev, [item.path]: null };
+      });
+
+      const encoded = toBase64Url(item.path);
+      const url = `/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`;
+
+      downloadFromUrlWithProgress(url, item.name, (loaded, total) => {
+        setDownloadingPaths((prev) => ({
+          ...prev,
+          [item.path]: total ? Math.round((loaded / total) * 100) : null,
+        }));
+      })
+        .catch((err) => {
+          console.error('Download failed:', err);
+          showToast(
+            '下载失败',
+            err instanceof Error ? err.message : '文件下载出错，请重试',
+          );
+        })
+        .finally(() => {
+          setDownloadingPaths((prev) => {
+            if (!(item.path in prev)) return prev;
+            const next = { ...prev };
+            delete next[item.path];
+            return next;
+          });
+        });
+    },
+    [groupJid],
+  );
+
+  // 与 classifyFileKind 对应：能预览的类型进对应的 overlay，压缩包和其他
+  // 无法预览的类型直接下载——此前压缩包会掉进最后的 text 分支，打开一个只会
+  // 显示"此文件类型不支持预览"的空预览，体验上跟没反应差不多。
   const handleItemClick = useCallback(
     (item: FileEntry) => {
       if (selectionMode) {
@@ -1014,54 +1013,26 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
         return;
       }
 
-      const ext = getFileExt(item.name);
+      const kind = classifyFileKind(item.name);
 
-      if (IMAGE_EXTENSIONS.has(ext)) {
+      if (kind === 'download') {
+        handleDownload(item);
+      } else if (kind === 'image') {
         setPreview({ kind: 'image', file: item });
-      } else if (PDF_EXTENSIONS.has(ext)) {
+      } else if (kind === 'pdf') {
         setPreview({ kind: 'pdf', file: item });
-      } else if (VIDEO_EXTENSIONS.has(ext)) {
+      } else if (kind === 'video') {
         setPreview({ kind: 'video', file: item });
-      } else if (AUDIO_EXTENSIONS.has(ext)) {
+      } else if (kind === 'audio') {
         setPreview({ kind: 'audio', file: item });
-      } else if (ext === 'md' && isEntryEditable(item)) {
+      } else if (getFileExt(item.name) === 'md' && isEntryEditable(item)) {
         setPreview({ kind: 'markdown', file: item });
       } else {
         setPreview({ kind: 'text', file: item });
       }
     },
-    [groupJid, navigateTo, selectionMode],
+    [groupJid, navigateTo, selectionMode, handleDownload],
   );
-
-  const handleDownload = (item: FileEntry) => {
-    if (downloadingPaths[item.path] !== undefined) return; // 正在下载，忽略重复点击
-
-    const encoded = toBase64Url(item.path);
-    const url = `/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`;
-    setDownloadingPaths((prev) => ({ ...prev, [item.path]: null }));
-
-    downloadFromUrlWithProgress(url, item.name, (loaded, total) => {
-      setDownloadingPaths((prev) => ({
-        ...prev,
-        [item.path]: total ? Math.round((loaded / total) * 100) : null,
-      }));
-    })
-      .catch((err) => {
-        console.error('Download failed:', err);
-        showToast(
-          '下载失败',
-          err instanceof Error ? err.message : '文件下载出错，请重试',
-        );
-      })
-      .finally(() => {
-        setDownloadingPaths((prev) => {
-          if (!(item.path in prev)) return prev;
-          const next = { ...prev };
-          delete next[item.path];
-          return next;
-        });
-      });
-  };
 
   const handleCopyPath = (item: FileEntry) => {
     const target = item.absolutePath || item.path;

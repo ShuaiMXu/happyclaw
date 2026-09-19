@@ -293,7 +293,11 @@ export function UnifiedSidebar({
                   </TooltipTrigger>
                   <TooltipContent side="right" className="max-w-[200px]">
                     {isChatItem && isChatRoute ? (
-                      collapsed ? '展开智能体工作台' : '收起智能体工作台'
+                      collapsed ? (
+                        '展开智能体工作台'
+                      ) : (
+                        '收起智能体工作台'
+                      )
                     ) : (
                       <div className="flex flex-col gap-0.5 py-0.5">
                         <span className="font-medium">{label}</span>
