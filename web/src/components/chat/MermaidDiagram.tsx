@@ -62,7 +62,26 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [previewZoom, setPreviewZoom] = useState(1);
+  const [previewPan, setPreviewPan] = useState({ x: 0, y: 0 });
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const previewTouchRef = useRef<{
+    mode: 'none' | 'pinch' | 'pan';
+    startDistance: number;
+    startZoom: number;
+    startX: number;
+    startY: number;
+    startPanX: number;
+    startPanY: number;
+  }>({
+    mode: 'none',
+    startDistance: 0,
+    startZoom: 1,
+    startX: 0,
+    startY: 0,
+    startPanX: 0,
+    startPanY: 0,
+  });
   const codeRef = useRef(code);
   codeRef.current = code;
 
@@ -123,6 +142,91 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const resetPreviewTransform = () => {
+    setPreviewZoom(1);
+    setPreviewPan({ x: 0, y: 0 });
+  };
+
+  const openPreview = () => {
+    resetPreviewTransform();
+    setExpanded(true);
+  };
+
+  const touchDistance = (touches: React.TouchList) => {
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.hypot(dx, dy);
+  };
+
+  // 手机上的页面缩放会被全局禁用，因此预览自身处理双指缩放；放大后单指拖动。
+  const handlePreviewTouchStart = (event: React.TouchEvent) => {
+    if (event.touches.length === 2) {
+      previewTouchRef.current = {
+        mode: 'pinch',
+        startDistance: touchDistance(event.touches),
+        startZoom: previewZoom,
+        startX: 0,
+        startY: 0,
+        startPanX: previewPan.x,
+        startPanY: previewPan.y,
+      };
+    } else if (event.touches.length === 1 && previewZoom > 1) {
+      previewTouchRef.current = {
+        mode: 'pan',
+        startDistance: 0,
+        startZoom: previewZoom,
+        startX: event.touches[0].clientX,
+        startY: event.touches[0].clientY,
+        startPanX: previewPan.x,
+        startPanY: previewPan.y,
+      };
+    }
+  };
+
+  const handlePreviewTouchMove = (event: React.TouchEvent) => {
+    const gesture = previewTouchRef.current;
+    if (gesture.mode === 'pinch' && event.touches.length === 2) {
+      event.preventDefault();
+      const distance = touchDistance(event.touches);
+      if (gesture.startDistance > 0) {
+        const zoom = Math.min(
+          4,
+          Math.max(1, gesture.startZoom * (distance / gesture.startDistance)),
+        );
+        setPreviewZoom(zoom);
+        if (zoom === 1) setPreviewPan({ x: 0, y: 0 });
+      }
+    } else if (gesture.mode === 'pan' && event.touches.length === 1) {
+      event.preventDefault();
+      setPreviewPan({
+        x: gesture.startPanX + (event.touches[0].clientX - gesture.startX),
+        y: gesture.startPanY + (event.touches[0].clientY - gesture.startY),
+      });
+    }
+  };
+
+  const handlePreviewTouchEnd = (event: React.TouchEvent) => {
+    if (event.touches.length === 0) {
+      previewTouchRef.current.mode = 'none';
+    } else if (
+      event.touches.length === 1 &&
+      previewTouchRef.current.mode === 'pinch'
+    ) {
+      previewTouchRef.current =
+        previewZoom > 1
+          ? {
+              mode: 'pan',
+              startDistance: 0,
+              startZoom: previewZoom,
+              startX: event.touches[0].clientX,
+              startY: event.touches[0].clientY,
+              startPanX: previewPan.x,
+              startPanY: previewPan.y,
+            }
+          : { ...previewTouchRef.current, mode: 'none' };
+    }
+  };
+
   if (loading) {
     return (
       <div className="my-4 rounded-lg bg-muted border border-border p-8 flex items-center justify-center">
@@ -172,7 +276,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
       <div className="relative group my-4">
         <div className="absolute right-2 top-2 opacity-70 lg:opacity-0 lg:group-hover:opacity-100 transition-opacity z-10 flex gap-1">
           <button
-            onClick={() => setExpanded(true)}
+            onClick={openPreview}
             className="p-2 rounded-lg bg-muted hover:bg-muted/80 text-foreground text-xs flex items-center gap-1"
             title="放大查看"
           >
@@ -197,7 +301,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
         </div>
         <div
           className="bg-card rounded-lg border border-border p-4 overflow-x-auto flex justify-center cursor-pointer [&>svg]:!max-w-full [&>svg]:!h-auto"
-          onClick={() => setExpanded(true)}
+          onClick={openPreview}
           dangerouslySetInnerHTML={{ __html: svg! }}
         />
       </div>
@@ -216,10 +320,27 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
           >
             <X size={16} />
           </button>
-          <div
-            className="w-full h-full overflow-auto flex items-center justify-center [touch-action:pan-x_pan-y_pinch-zoom] [&>svg]:!w-[90vw] [&>svg]:!max-w-none [&>svg]:!h-auto [&>svg]:!max-h-[90vh]"
-            dangerouslySetInnerHTML={{ __html: svg! }}
-          />
+          <div className="relative h-full w-full overflow-hidden">
+            <div
+              className="flex h-full w-full touch-none items-center justify-center will-change-transform [&>svg]:!h-auto [&>svg]:!max-h-[90vh] [&>svg]:!max-w-none [&>svg]:!w-[90vw]"
+              style={{
+                transform: `translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`,
+              }}
+              onTouchStart={handlePreviewTouchStart}
+              onTouchMove={handlePreviewTouchMove}
+              onTouchEnd={handlePreviewTouchEnd}
+              onTouchCancel={handlePreviewTouchEnd}
+              dangerouslySetInnerHTML={{ __html: svg! }}
+            />
+            {previewZoom > 1 && (
+              <button
+                onClick={resetPreviewTransform}
+                className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1.5 text-xs text-white transition-colors hover:bg-black"
+              >
+                恢复原始大小
+              </button>
+            )}
+          </div>
         </PreviewDialog>
       )}
     </>
