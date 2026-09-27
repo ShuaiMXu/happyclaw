@@ -340,7 +340,7 @@ agentProfileRoutes.post(
     if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
     if (profile.is_default) {
       return c.json(
-        { error: 'Configure the main HappyClaw avatar in system settings' },
+        { error: 'Configure the main SoftopiaAI avatar in system settings' },
         400,
       );
     }
@@ -383,7 +383,7 @@ agentProfileRoutes.delete('/:id/avatar', authMiddleware, (c) => {
   if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
   if (profile.is_default) {
     return c.json(
-      { error: 'Configure the main HappyClaw avatar in system settings' },
+      { error: 'Configure the main SoftopiaAI avatar in system settings' },
       400,
     );
   }
@@ -773,7 +773,7 @@ agentProfileRoutes.delete('/:id', authMiddleware, async (c) => {
       return c.json({ error: '智能体配置不存在' }, 404);
     }
     if (result === 'is_default') {
-      return c.json({ error: '不能删除内置的 HappyClaw 智能体' }, 400);
+      return c.json({ error: '不能删除内置的 SoftopiaAI 智能体' }, 400);
     }
     if (result === 'has_workspaces') {
       return c.json(

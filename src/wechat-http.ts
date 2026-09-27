@@ -41,7 +41,7 @@ export function createWeChatHttpDispatcher(bypassProxy: boolean): Dispatcher {
   if (bypassProxy) return new Agent();
   if (!configuredWeChatHttpProxy()) {
     throw new Error(
-      '微信账号已配置为使用 HTTP(S) 代理，但 HappyClaw 启动环境中未设置 HTTPS_PROXY 或 HTTP_PROXY',
+      '微信账号已配置为使用 HTTP(S) 代理，但 SoftopiaAI 启动环境中未设置 HTTPS_PROXY 或 HTTP_PROXY',
     );
   }
   return new EnvHttpProxyAgent({ noProxy: '' });

@@ -375,7 +375,7 @@ bugReportRoutes.post('/generate', authMiddleware, async (c) => {
   const queueStatus = deps?.queue.getStatus();
 
   const systemInfo: Record<string, string> = {
-    HappyClaw版本: getVersion(),
+    SoftopiaAI版本: getVersion(),
     'Node.js': process.version,
     操作系统: `${os.platform()} ${os.release()}`,
     架构: os.arch(),
@@ -463,7 +463,7 @@ bugReportRoutes.post('/submit', authMiddleware, async (c) => {
   const { title, body } = parseResult.data;
 
   // Append submitter info
-  const fullBody = `${body}\n\n---\n> Submitted via HappyClaw by ${user.display_name || user.username}`;
+  const fullBody = `${body}\n\n---\n> Submitted via SoftopiaAI by ${user.display_name || user.username}`;
 
   // Try gh CLI first
   const caps = await checkCapabilities();

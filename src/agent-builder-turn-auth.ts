@@ -47,7 +47,7 @@ export function getAgentBuilderRuntimeRejection(input: {
     return 'Agent Builder is only available to ordinary main-Agent conversations';
   }
   if (!input.sourceProfileIsDefault) {
-    return 'Only the main HappyClaw may use Agent Builder';
+    return 'Only the built-in main agent may use Agent Builder';
   }
   return null;
 }

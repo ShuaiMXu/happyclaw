@@ -40,7 +40,7 @@ export function buildRecentConversationHistoryContext(
   const maxLen = opts.maxMessageLength ?? 700;
   const historyLines = historyMsgs.map((m) => {
     const role = m.is_from_me ? 'assistant' : 'user';
-    const sender = m.is_from_me ? 'HappyClaw' : m.sender_name;
+    const sender = m.is_from_me ? 'SoftopiaAI' : m.sender_name;
     const truncated =
       m.content.length > maxLen ? m.content.slice(0, maxLen) + '…' : m.content;
     // Strip lone (unpaired) surrogates while preserving valid surrogate pairs
@@ -66,7 +66,7 @@ export function buildRecentConversationHistoryContext(
     context:
       '<system_context>\n' +
       opts.intro +
-      '\n重要：这些只是 HappyClaw 持久化的历史聊天记录，用来在新模型/新 session 中恢复上下文。回答当前用户消息时，请优先依据当前消息和当前文件状态；如果历史与当前问题无关，请直接忽略。\n\n' +
+      '\n重要：这些只是 SoftopiaAI 持久化的历史聊天记录，用来在新模型/新 session 中恢复上下文。回答当前用户消息时，请优先依据当前消息和当前文件状态；如果历史与当前问题无关，请直接忽略。\n\n' +
       historyLines.join('\n') +
       '\n</system_context>\n\n',
   };

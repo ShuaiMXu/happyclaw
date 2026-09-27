@@ -3077,9 +3077,9 @@ async function sendImWithRetry(
 const CHANNEL_MANUAL_RECONCILIATION_NOTICE =
   '刚才的回复可能没有完整送达。为避免重复消息，系统未自动重发；如内容不完整，重新发送问题即可。';
 const CHANNEL_DEFINITIVE_REJECTION_NOTICE =
-  '刚才的回复未能送达当前渠道，完整内容已保存在 HappyClaw Web。你可以前往 Web 查看，或稍后重新发送问题。';
+  '刚才的回复未能送达当前渠道，完整内容已保存在 SoftopiaAI Web。你可以前往 Web 查看，或稍后重新发送问题。';
 const CHANNEL_PARTIAL_REJECTION_NOTICE =
-  '刚才的回复仅部分送达当前渠道，完整内容已保存在 HappyClaw Web。为避免重复消息，系统未自动重发。';
+  '刚才的回复仅部分送达当前渠道，完整内容已保存在 SoftopiaAI Web。为避免重复消息，系统未自动重发。';
 
 /**
  * Surface a crash-after-delivery fence to the exact native route. The notice
@@ -4206,7 +4206,7 @@ function handleUnbindCommand(chatJid: string): string {
   if (!unbindImGroup(chatJid, 'IM slash command unbind')) {
     return '解绑失败，请稍后重试。';
   }
-  return '已解绑。后续消息不会触发回复，请在 HappyClaw 中重新绑定后使用。';
+  return '已解绑。后续消息不会触发回复，请在 SoftopiaAI 中重新绑定后使用。';
 }
 
 function isAdminHostOnlyOwner(ownerId: string | null | undefined): boolean {
@@ -6232,7 +6232,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         limit: 30,
         maxMessageLength: 700,
         intro:
-          '检测到当前 workspace 切换或更新了顶层 AgentProfile 身份提示词，底层模型 session 已重置。以下是 HappyClaw 保存的最近对话记录，供你在新身份下延续上下文。',
+          '检测到当前 workspace 切换或更新了顶层 AgentProfile 身份提示词，底层模型 session 已重置。以下是 SoftopiaAI 保存的最近对话记录，供你在新身份下延续上下文。',
       },
     );
     if (historyContext) {
@@ -6262,7 +6262,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         limit: 30,
         maxMessageLength: 700,
         intro:
-          '检测到本次因切换 provider 需要使用新的底层模型 session。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。',
+          '检测到本次因切换 provider 需要使用新的底层模型 session。以下是 SoftopiaAI 保存的最近对话记录，供你延续上下文。',
       },
     );
     if (historyContext) {
@@ -11201,10 +11201,10 @@ function startIpcWatcher(): void {
                             (partialFailure
                               ? `The native channel accepted ${partialFailure.deliveredOutputs}/${partialFailure.totalOutputs} physical outputs before definitively rejecting the tail: ${messageDeliveryFailure.error.message}. `
                               : `The native channel definitively did not accept this message: ${messageDeliveryFailure.error.message}. `) +
-                            'The complete answer will remain available in HappyClaw Web; do not retry or rewrite it solely for this channel failure.';
+                            'The complete answer will remain available in SoftopiaAI Web; do not retry or rewrite it solely for this channel failure.';
                         } else if (!messageDelivered && partialFailure) {
                           messageDeliveryUncertain = true;
-                          messageDeliveryError = `Message delivery is partial: ${partialFailure.deliveredOutputs}/${partialFailure.totalOutputs} physical outputs were acknowledged before the tail was fenced as ${partialFailure.status}. Do not retry; the complete answer remains available in HappyClaw Web.`;
+                          messageDeliveryError = `Message delivery is partial: ${partialFailure.deliveredOutputs}/${partialFailure.totalOutputs} physical outputs were acknowledged before the tail was fenced as ${partialFailure.status}. Do not retry; the complete answer remains available in SoftopiaAI Web.`;
                         }
                       }
                     }
@@ -15112,8 +15112,8 @@ async function processAgentConversation(
         limit: 30,
         maxMessageLength: 700,
         intro: resetForAgentProfile
-          ? '检测到当前 workspace 切换或更新了顶层 AgentProfile 身份提示词，当前 agent 的底层模型 session 已重置。以下是 HappyClaw 保存的最近对话记录，供你在新身份下延续上下文。'
-          : '检测到当前 agent 的底层模型 session 是新的（可能因为切换 provider/model 或恢复失败）。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。',
+          ? '检测到当前 workspace 切换或更新了顶层 AgentProfile 身份提示词，当前 agent 的底层模型 session 已重置。以下是 SoftopiaAI 保存的最近对话记录，供你在新身份下延续上下文。'
+          : '检测到当前 agent 的底层模型 session 是新的（可能因为切换 provider/model 或恢复失败）。以下是 SoftopiaAI 保存的最近对话记录，供你延续上下文。',
       },
     );
     if (historyContext) {

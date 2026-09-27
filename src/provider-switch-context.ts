@@ -14,7 +14,7 @@ export interface ProviderSwitchInput {
 }
 
 const PROVIDER_SWITCH_HISTORY_INTRO =
-  '检测到本次因切换 provider 需要使用新的底层模型 session。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。';
+  '检测到本次因切换 provider 需要使用新的底层模型 session。以下是 SoftopiaAI 保存的最近对话记录，供你延续上下文。';
 
 export interface ProviderSwitchSelection {
   profileId: string;

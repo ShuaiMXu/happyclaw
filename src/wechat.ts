@@ -675,19 +675,19 @@ export function weChatConnectionErrorMessage(
 ): string {
   switch (code) {
     case 'connect_timeout':
-      return '连接微信服务超时，HappyClaw 正在自动重试';
+      return '连接微信服务超时，SoftopiaAI 正在自动重试';
     case 'request_timeout':
-      return '微信长轮询暂时无响应，HappyClaw 正在自动重试';
+      return '微信长轮询暂时无响应，SoftopiaAI 正在自动重试';
     case 'connection_reset':
-      return '微信连接在 TLS 建立前被中断，HappyClaw 正在自动重试';
+      return '微信连接在 TLS 建立前被中断，SoftopiaAI 正在自动重试';
     case 'tls_error':
-      return '微信服务 TLS 连接失败，HappyClaw 正在自动重试';
+      return '微信服务 TLS 连接失败，SoftopiaAI 正在自动重试';
     case 'api_error':
-      return '微信服务返回异常，HappyClaw 正在自动重试';
+      return '微信服务返回异常，SoftopiaAI 正在自动重试';
     case 'network_error':
-      return '暂时无法访问微信服务，HappyClaw 正在自动重试';
+      return '暂时无法访问微信服务，SoftopiaAI 正在自动重试';
     default:
-      return '微信连接暂时异常，HappyClaw 正在自动重试';
+      return '微信连接暂时异常，SoftopiaAI 正在自动重试';
   }
 }
 

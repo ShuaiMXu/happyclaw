@@ -1664,7 +1664,7 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
       return c.json(
         {
           error:
-            'Home Workspace 始终属于内置 HappyClaw，不能迁移到自定义智能体',
+            'Home Workspace 始终属于内置平台智能体，不能迁移到自定义智能体',
           code: 'HOME_WORKSPACE_AGENT_IMMUTABLE',
         },
         409,

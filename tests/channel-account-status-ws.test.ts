@@ -93,7 +93,7 @@ describe('account-scoped channel status WebSocket event', () => {
 
     broadcastChannelAccountStatus('ws-owner', 'wechat-account-a', {
       transportStatus: 'reconnecting',
-      lastError: '连接微信服务超时，HappyClaw 正在自动重试',
+      lastError: '连接微信服务超时，SoftopiaAI 正在自动重试',
       errorCode: 'connect_timeout',
       consecutiveFailures: 2,
       nextRetryMs: 6000,

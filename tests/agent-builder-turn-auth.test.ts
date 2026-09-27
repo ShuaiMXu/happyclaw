@@ -339,7 +339,7 @@ describe('Agent Builder runtime eligibility', () => {
         ...base,
         sourceProfileIsDefault: false,
       }),
-    ).toMatch(/main HappyClaw/);
+    ).toMatch(/built-in main agent/);
     expect(
       getAgentBuilderRuntimeRejection({
         ...base,

@@ -19,9 +19,6 @@ export function AboutSection() {
         <p className="mt-1 text-xs text-muted-foreground">
           版本 1.0.0 · MIT License
         </p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          TECH SUPPORT : HAPPYCLAW
-        </p>
       </div>
 
       {/* 报告问题 */}
@@ -80,8 +77,8 @@ export function AboutSection() {
               <ExternalLink className="w-3 h-3" />
             </a>
             <p className="mt-1 leading-relaxed">
-              自托管个人智能体产品方向的重要参考。HappyClaw 选择复用 Claude
-              Agent SDK，并在此基础上构建工作区、渠道与多智能体管理能力。
+              自托管个人智能体产品方向的重要参考。SoftopiaAI 复用 Claude Agent
+              SDK，并在此基础上构建工作区、渠道与多智能体管理能力。
             </p>
           </div>
         </div>

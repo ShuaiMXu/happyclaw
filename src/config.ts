@@ -4,7 +4,8 @@ import crypto from 'crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
-export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'HappyClaw';
+export const ASSISTANT_NAME =
+  process.env.ASSISTANT_NAME?.trim() || 'SoftopiaAI';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 // Conversation/spawn sessions with no activity for this long are archived to
