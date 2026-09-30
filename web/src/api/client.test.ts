@@ -1,7 +1,11 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { apiFetch, postJsonWithUploadProgress } from './client';
+import {
+  apiFetch,
+  postFormDataWithUploadProgress,
+  postJsonWithUploadProgress,
+} from './client';
 
 const originalFetch = globalThis.fetch;
 
@@ -47,6 +51,7 @@ class MockXmlHttpRequest {
   readonly open = vi.fn();
   readonly setRequestHeader = vi.fn();
   readonly send = vi.fn();
+  readonly abort = vi.fn();
 
   constructor() {
     MockXmlHttpRequest.latest = this;
@@ -253,5 +258,56 @@ describe('postJsonWithUploadProgress', () => {
       message: 'Attachment too large',
       body: { error: 'Attachment too large' },
     });
+  });
+
+  test('uploads staged images as multipart without overriding its boundary', async () => {
+    vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
+    const formData = new FormData();
+    formData.append('file', new File(['image'], 'photo.png', { type: 'image/png' }));
+    const progress = vi.fn();
+
+    const pending = postFormDataWithUploadProgress<{ attachment: string }>(
+      '/api/groups/web%3Ag1/chat-attachments',
+      formData,
+      { onProgress: progress, timeoutMs: 30_000 },
+    );
+    const request = MockXmlHttpRequest.latest!;
+    expect(request.open).toHaveBeenCalledWith(
+      'POST',
+      '/api/groups/web%3Ag1/chat-attachments',
+      true,
+    );
+    expect(request.setRequestHeader).not.toHaveBeenCalled();
+    expect(request.send).toHaveBeenCalledWith(formData);
+
+    request.upload.onprogress?.({
+      loaded: 40,
+      total: 100,
+      lengthComputable: true,
+    } as ProgressEvent);
+    expect(progress).toHaveBeenCalledWith({ loaded: 40, total: 100 });
+
+    request.status = 201;
+    request.responseText = '{"attachment":"staged"}';
+    request.onload?.();
+    await expect(pending).resolves.toEqual({ attachment: 'staged' });
+  });
+
+  test('rejects an already-aborted caller signal without waiting for XHR events', async () => {
+    vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
+    const controller = new AbortController();
+    controller.abort();
+
+    const pending = postFormDataWithUploadProgress(
+      '/api/groups/web%3Ag1/chat-attachments',
+      new FormData(),
+      { signal: controller.signal },
+    );
+
+    await expect(pending).rejects.toEqual({
+      status: 499,
+      message: 'Request cancelled',
+    });
+    expect(MockXmlHttpRequest.latest!.send).not.toHaveBeenCalled();
   });
 });

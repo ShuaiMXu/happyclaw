@@ -3166,6 +3166,22 @@ export function storeMessageDirect(
 }
 
 /**
+ * Whether a durable message references one server-issued staged chat image.
+ * Attachment paths are generated UUIDs and the schema restricts their character
+ * set, so using the exact JSON key/value fragment avoids broad wildcard matches.
+ */
+export function isChatAttachmentPathReferenced(attachmentPath: string): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 FROM messages
+       WHERE attachments LIKE ?
+       LIMIT 1`,
+    )
+    .get(`%\"path\":\"${attachmentPath}\"%`);
+  return !!row;
+}
+
+/**
  * Overwrite the `attachments` JSON column for a single message row.
  *
  * Used by the plugin-command expander to persist the expanded-prompt

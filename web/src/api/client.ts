@@ -214,6 +214,98 @@ export function postJsonWithUploadProgress<T>(
   });
 }
 
+interface FormDataUploadOptions {
+  onProgress?: (progress: JsonUploadProgress) => void;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/** Upload multipart data with native browser byte progress. */
+export function postFormDataWithUploadProgress<T>(
+  path: string,
+  body: FormData,
+  options: FormDataUploadOptions = {},
+): Promise<T> {
+  const requestPath = /^https?:\/\//i.test(path)
+    ? path
+    : withBasePath(path.startsWith('/') ? path : `/${path}`);
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+    const settle = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener('abort', abortFromCaller);
+      callback();
+    };
+    const abortFromCaller = () => xhr.abort();
+
+    xhr.open('POST', requestPath, true);
+    xhr.withCredentials = true;
+    xhr.timeout = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
+    xhr.upload.onprogress = (event) => {
+      options.onProgress?.({
+        loaded: event.loaded,
+        ...(event.lengthComputable ? { total: event.total } : {}),
+      });
+    };
+    xhr.onerror = () =>
+      settle(() => reject({ status: 0, message: 'Network error' } as ApiError));
+    xhr.ontimeout = () =>
+      settle(() =>
+        reject({ status: 408, message: 'Request timeout' } as ApiError),
+      );
+    xhr.onabort = () =>
+      settle(() =>
+        reject({ status: 499, message: 'Request cancelled' } as ApiError),
+      );
+    xhr.onload = () =>
+      settle(() => {
+        const parsed = parseXhrJson(xhr.responseText);
+        const responseBody =
+          typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : {};
+        if (xhr.status === 401) {
+          const currentPath = stripBasePath(window.location.pathname);
+          if (!currentPath.startsWith('/login')) replaceInApp('/login');
+        }
+        if (
+          xhr.status === 403 &&
+          responseBody.code === 'PASSWORD_CHANGE_REQUIRED'
+        ) {
+          const currentPath = stripBasePath(window.location.pathname);
+          if (!currentPath.startsWith('/settings')) replaceInApp('/settings');
+        }
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject({
+            status: xhr.status,
+            message:
+              (typeof responseBody.error === 'string' && responseBody.error) ||
+              xhr.statusText ||
+              'Request failed',
+            body: responseBody,
+          } as ApiError);
+          return;
+        }
+        resolve(parsed as T);
+      });
+
+    if (options.signal?.aborted) {
+      // abort() before send() is not guaranteed to emit an XHR abort event.
+      // Settle directly so callers never retain a permanently-uploading card.
+      settle(() =>
+        reject({ status: 499, message: 'Request cancelled' } as ApiError),
+      );
+      return;
+    }
+    options.signal?.addEventListener('abort', abortFromCaller, { once: true });
+    // Do not set Content-Type: the browser must supply its multipart boundary.
+    xhr.send(body);
+  });
+}
+
 export const api = {
   get: <T>(path: string) => apiFetch<T>(path),
   post: <T>(path: string, body?: unknown, timeoutMs?: number) =>

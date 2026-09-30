@@ -12,6 +12,7 @@ import { toast } from 'sonner';
 import {
   useChatStore,
   type FollowUpMode,
+  type MessageImageAttachment,
   type MessageUploadProgress,
   type QueuedFollowUp,
 } from '../../stores/chat';
@@ -584,7 +585,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
 
   const handleSend = async (
     content: string,
-    attachments?: Array<{ data: string; mimeType: string }>,
+    attachments?: MessageImageAttachment[],
     followUpBehavior?: FollowUpMode,
     onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => {
@@ -620,7 +621,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
 
   const handleActiveAgentSend = async (
     content: string,
-    attachments?: Array<{ data: string; mimeType: string }>,
+    attachments?: MessageImageAttachment[],
     followUpBehavior?: FollowUpMode,
     onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => {

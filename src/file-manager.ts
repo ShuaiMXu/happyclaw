@@ -678,5 +678,11 @@ export function removeFlowArtifacts(folder: string): void {
     recursive: true,
     force: true,
   });
+  // Chat-image bytes live outside runner mounts, so remove their private store
+  // explicitly when a workspace is deleted.
+  fs.rmSync(path.join(DATA_DIR, 'chat-attachments', folder), {
+    recursive: true,
+    force: true,
+  });
   deleteContainerEnvConfig(folder);
 }

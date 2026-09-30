@@ -175,8 +175,23 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 - `POST /api/groups/:jid/files/batch-delete`
 - `POST /api/groups/:jid/files/move`
 - `POST /api/groups/:jid/directories`
+- `POST /api/groups/:jid/chat-attachments`
+- `DELETE /api/groups/:jid/chat-attachments/:fileName`
 
 路径必须位于目标工作区允许范围内；系统目录、路径穿越和不安全符号链接会被拒绝。
+
+`POST /chat-attachments` 接受一个 `multipart/form-data` 的 `file` 字段，用于在 Web
+聊天编辑器中先暂存图片、再发送消息。接口仅接受不超过 5 MB 的受支持图片，并以文件
+内容检测 MIME 类型，不信任客户端声明；服务端使用随机 UUID 文件名保存至应用专用的
+附件存储区，并返回 `chat-attachments/staged/` 命名空间中可作为消息 `attachments` 的
+`path` 使用的图片引用。该存储区不挂载到 Agent 的工作目录，普通工作区文件操作也不能
+修改或删除其中的图片。浏览器应使用原生上传进度事件展示该请求的实际传输进度，而不是在
+发送消息时重新上传 Base64 内容。
+
+`DELETE /chat-attachments/:fileName` 仅删除上述接口生成、尚未提交的暂存图片；`:fileName`
+必须是服务端生成的 UUID 图片文件名。消息已发送后，引用会保留，以支持聊天历史、队列
+和恢复场景中的图片读取；服务端会在后续上传时清理超过 24 小时、且未被消息引用的遗留
+暂存图片。
 
 `files/resolve` 接受查询参数 `?path=`，把 Agent 视角下的路径（容器内
 `/workspace/group/...` 绝对路径、宿主机 `customCwd` 绝对路径，或工作区相对

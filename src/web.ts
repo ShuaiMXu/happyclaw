@@ -508,7 +508,13 @@ app.post('/api/follow-ups/:messageId/action', authMiddleware, async (c) => {
 async function handleWebUserMessage(
   chatJid: string,
   content: string,
-  attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
+  attachments?: Array<{
+    type: 'image';
+    data?: string;
+    path?: string;
+    mimeType?: string;
+    name?: string;
+  }>,
   userId = 'web-user',
   displayName = 'Web',
   followUpBehavior: FollowUpMode = 'queue',
@@ -523,7 +529,7 @@ async function handleWebUserMessage(
     }
   | {
       ok: false;
-      status: 404 | 500;
+      status: 400 | 404 | 500;
       error: string;
     }
 > {
@@ -558,6 +564,24 @@ async function handleWebUserMessage(
       );
     },
   });
+  let images: Array<{ data: string; mimeType: string }> | undefined;
+  try {
+    images = toAgentImages(
+      normalizedAttachments,
+      { folder: group.folder },
+      {
+        onMimeMismatch: ({ declaredMime, detectedMime }) => {
+          logger.warn(
+            { chatJid, messageId, declaredMime, detectedMime },
+            'Staged web attachment MIME mismatch detected, using detected MIME',
+          );
+        },
+      },
+    );
+  } catch (err) {
+    logger.warn({ err, chatJid, messageId }, 'Web staged attachment rejected');
+    return { ok: false, status: 400, error: '图片附件已失效，请重新添加' };
+  }
   const attachmentsStr =
     normalizedAttachments.length > 0
       ? JSON.stringify(normalizedAttachments)
@@ -826,7 +850,6 @@ async function handleWebUserMessage(
   // the reply route is dynamically updated via activeRouteUpdaters so we no
   // longer need to kill and restart the process (#99).
   let pipedToActive = false;
-  const images = toAgentImages(normalizedAttachments);
   const updateRoute = deps.updateReplyRoute;
   const preAdmitRoute = deps.preAdmitReplyRoute;
   const sendResult = deps.queue.sendMessage(
@@ -922,7 +945,13 @@ async function handleAgentConversationMessage(
   content: string,
   userId: string,
   displayName: string,
-  attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
+  attachments?: Array<{
+    type: 'image';
+    data?: string;
+    path?: string;
+    mimeType?: string;
+    name?: string;
+  }>,
   followUpBehavior: FollowUpMode = 'queue',
 ): Promise<
   | {
@@ -933,7 +962,7 @@ async function handleAgentConversationMessage(
       disposition: 'started' | 'queued' | 'steered';
       runId?: string;
     }
-  | { ok: false; status: 404 | 500; error: string }
+  | { ok: false; status: 400 | 404 | 500; error: string }
 > {
   if (!deps) {
     return { ok: false, status: 500, error: 'Server not initialized' };
@@ -974,6 +1003,28 @@ async function handleAgentConversationMessage(
       );
     },
   });
+  let agentImages: Array<{ data: string; mimeType: string }> | undefined;
+  try {
+    if (!parentGroup) throw new Error('Parent workspace not found');
+    agentImages = toAgentImages(
+      normalizedAttachments,
+      { folder: parentGroup.folder },
+      {
+        onMimeMismatch: ({ declaredMime, detectedMime }) => {
+          logger.warn(
+            { chatJid, messageId, agentId, declaredMime, detectedMime },
+            'Staged agent attachment MIME mismatch detected, using detected MIME',
+          );
+        },
+      },
+    );
+  } catch (err) {
+    logger.warn(
+      { err, chatJid, messageId, agentId },
+      'Agent staged attachment rejected',
+    );
+    return { ok: false, status: 400, error: '图片附件已失效，请重新添加' };
+  }
   const attachmentsStr =
     normalizedAttachments.length > 0
       ? JSON.stringify(normalizedAttachments)
@@ -1195,7 +1246,6 @@ async function handleAgentConversationMessage(
   ]);
 
   // Try to pipe into running agent process
-  const agentImages = toAgentImages(normalizedAttachments);
   const finalizeHeld = deps.finalizeHeldCard;
   const updateRoute = deps.updateReplyRoute;
   const preAdmitRoute = deps.preAdmitReplyRoute;

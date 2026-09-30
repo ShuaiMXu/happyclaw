@@ -26,7 +26,19 @@ import {
 } from '../file-manager.js';
 import { checkStorageLimit, isBillingEnabled } from '../billing.js';
 import { MAX_FILE_SIZE_MB, DATA_DIR } from '../config.js';
-import { fileChunkUploadBodyLimit } from '../http-upload-policy.js';
+import {
+  CHAT_ATTACHMENT_MAX_FILE_BYTES,
+  chatAttachmentUploadBodyLimit,
+  fileChunkUploadBodyLimit,
+} from '../http-upload-policy.js';
+import { detectImageMimeTypeStrict } from '../image-detector.js';
+import {
+  getStagedChatAttachmentStoragePath,
+  getStagedChatAttachmentStorageUsage,
+  isStagedChatAttachmentPath,
+  readStagedChatAttachment,
+  writeStagedChatAttachment,
+} from '../message-attachments.js';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -687,6 +699,216 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
   }
 });
 
+const STAGED_CHAT_ATTACHMENT_DIRECTORY = 'chat-attachments/staged';
+const STAGED_CHAT_ATTACHMENT_FILE_RE =
+  /^[0-9a-f-]{36}\.(?:png|jpe?g|gif|webp|tiff|avif|bmp)$/i;
+const STAGED_CHAT_ATTACHMENT_STALE_MS = 24 * 60 * 60 * 1000;
+const IMAGE_EXTENSION_BY_MIME: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/tiff': 'tiff',
+  'image/avif': 'avif',
+  'image/bmp': 'bmp',
+};
+
+function stagedChatAttachmentPath(mimeType: string): string {
+  const extension = IMAGE_EXTENSION_BY_MIME[mimeType];
+  if (!extension) throw new Error('Unsupported image type');
+  return path.posix.join(
+    STAGED_CHAT_ATTACHMENT_DIRECTORY,
+    `${crypto.randomUUID()}.${extension}`,
+  );
+}
+
+function pruneExpiredChatAttachments(folder: string): number {
+  const now = Date.now();
+  let deleted = 0;
+  const probePath = getStagedChatAttachmentStoragePath(
+    folder,
+    `${STAGED_CHAT_ATTACHMENT_DIRECTORY}/00000000-0000-4000-8000-000000000000.png`,
+  );
+  const storageDir = path.dirname(probePath);
+  try {
+    for (const entry of fs.readdirSync(storageDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !STAGED_CHAT_ATTACHMENT_FILE_RE.test(entry.name)) {
+        continue;
+      }
+      const attachmentPath = path.posix.join(
+        STAGED_CHAT_ATTACHMENT_DIRECTORY,
+        entry.name,
+      );
+      const stat = fs.statSync(path.join(storageDir, entry.name));
+      if (
+        now - stat.mtimeMs >= STAGED_CHAT_ATTACHMENT_STALE_MS &&
+        !isChatAttachmentPathReferenced(attachmentPath)
+      ) {
+        fs.unlinkSync(path.join(storageDir, entry.name));
+        deleted++;
+      }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return deleted;
+}
+
+/** Remove expired, unreferenced staged images even when no new upload arrives. */
+export function cleanupExpiredChatAttachments(): number {
+  const folders = new Set(
+    Object.values(getAllRegisteredGroups()).map((group) => group.folder),
+  );
+  let deleted = 0;
+  for (const folder of folders) {
+    deleted += pruneExpiredChatAttachments(folder);
+  }
+  return deleted;
+}
+
+// POST /api/groups/:jid/chat-attachments - immediately stage one chat image.
+// The endpoint deliberately does not accept a destination path: only a generated
+// reference in the application-owned namespace can later be attached to a chat.
+fileRoutes.post(
+  '/:jid/chat-attachments',
+  authMiddleware,
+  chatAttachmentUploadBodyLimit,
+  async (c) => {
+    const jid = c.req.param('jid');
+    const group = getRegisteredGroup(jid);
+    if (!group) return c.json({ error: 'Group not found' }, 404);
+
+    const authUser = c.get('user') as AuthUser;
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+      return c.json(
+        { error: 'Insufficient permissions for host execution mode' },
+        403,
+      );
+    }
+
+    const rootOverride = getFileRootOverride(group);
+    const workspaceRoot = path.resolve(getFileRoot(group.folder, rootOverride));
+    if (!fs.existsSync(workspaceRoot)) {
+      return c.json(
+        { error: 'Workspace directory not initialized yet. Please try again.' },
+        409,
+      );
+    }
+
+    try {
+      const body = await c.req.parseBody();
+      const file = body.file;
+      if (!(file instanceof File)) {
+        return c.json({ error: 'No image provided' }, 400);
+      }
+      if (file.size <= 0 || file.size > CHAT_ATTACHMENT_MAX_FILE_BYTES) {
+        return c.json({ error: 'Image exceeds maximum size of 5MB' }, 400);
+      }
+
+      const bytes = Buffer.from(await file.arrayBuffer());
+      const mimeType = detectImageMimeTypeStrict(bytes);
+      if (!mimeType || !IMAGE_EXTENSION_BY_MIME[mimeType]) {
+        return c.json({ error: 'Unsupported or invalid image file' }, 400);
+      }
+
+      return await withUploadMutationLock(workspaceRoot, async () => {
+        pruneExpiredChatAttachments(group.folder);
+        if (isBillingEnabled() && group.created_by) {
+          const currentUsage =
+            getGroupStorageUsage(group.folder, rootOverride) +
+            getStagedChatAttachmentStorageUsage(group.folder);
+          const storageCheck = checkStorageLimit(
+            group.created_by,
+            authUser.role,
+            currentUsage,
+            bytes.length,
+          );
+          if (!storageCheck.allowed) {
+            return c.json({ error: storageCheck.reason }, 403);
+          }
+        }
+
+        const relativePath = stagedChatAttachmentPath(mimeType);
+        writeStagedChatAttachment(group.folder, relativePath, bytes);
+        invalidateGroupStorageUsage(group.folder, rootOverride);
+        return c.json(
+          {
+            attachment: {
+              type: 'image' as const,
+              path: relativePath,
+              mimeType,
+              name: file.name.slice(0, 255) || path.basename(relativePath),
+            },
+          },
+          201,
+        );
+      });
+    } catch (error) {
+      logger.error({ err: error, jid }, 'Failed to stage chat attachment');
+      return c.json({ error: 'Failed to upload image' }, 500);
+    }
+  },
+);
+
+// DELETE /api/groups/:jid/chat-attachments/:fileName - discard an unsent stage.
+fileRoutes.delete('/:jid/chat-attachments/:fileName', authMiddleware, async (c) => {
+  const jid = c.req.param('jid');
+  const fileName = c.req.param('fileName');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
+  if (!STAGED_CHAT_ATTACHMENT_FILE_RE.test(fileName)) {
+    return c.json({ error: 'Attachment not found' }, 404);
+  }
+
+  const rootOverride = getFileRootOverride(group);
+  const workspaceRoot = path.resolve(getFileRoot(group.folder, rootOverride));
+  const relativePath = path.posix.join(
+    STAGED_CHAT_ATTACHMENT_DIRECTORY,
+    fileName,
+  );
+  try {
+    return await withUploadMutationLock(workspaceRoot, async () => {
+      // A successful message may have been persisted even when the browser lost
+      // its response. Durable references must never be removed by best-effort
+      // composer cleanup or by another workspace member who knows the UUID.
+      if (isChatAttachmentPathReferenced(relativePath)) {
+        return c.json({ error: 'Attachment has already been sent' }, 409);
+      }
+      const absolutePath = getStagedChatAttachmentStoragePath(
+        group.folder,
+        relativePath,
+      );
+      const stat = fs.lstatSync(absolutePath);
+      if (stat.isSymbolicLink() || !stat.isFile()) {
+        return c.json({ error: 'Attachment not found' }, 404);
+      }
+      fs.unlinkSync(absolutePath);
+      invalidateGroupStorageUsage(group.folder, rootOverride);
+      return c.body(null, 204);
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return c.json({ error: 'Attachment not found' }, 404);
+    }
+    logger.error({ err: error, jid, relativePath }, 'Failed to discard chat attachment');
+    return c.json({ error: 'Failed to discard image' }, 500);
+  }
+});
+
 // ─── 分片上传（大文件）───────────────────────────────────────────
 //
 // 单次 multipart 请求上传整个文件在慢速/不稳定网络下容易撞上请求超时——
@@ -1167,6 +1389,33 @@ fileRoutes.get('/:jid/files/preview/:path', authMiddleware, async (c) => {
     const relativePath = Buffer.from(encodedPath, 'base64url').toString(
       'utf-8',
     );
+    if (isStagedChatAttachmentPath(String(relativePath))) {
+      try {
+        const { bytes, mimeType } = readStagedChatAttachment(
+          { type: 'image', path: relativePath, mimeType: 'image/jpeg' },
+          { folder: group.folder },
+        );
+        return new Response(bytes, {
+          headers: {
+            'Content-Type': mimeType,
+            'Content-Length': String(bytes.length),
+            'Cache-Control': 'private, max-age=31536000, immutable',
+            'Content-Security-Policy': "default-src 'none'; sandbox",
+            'X-Content-Type-Options': 'nosniff',
+          },
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          return c.json({ error: 'File not found' }, 404);
+        }
+        logger.warn(
+          { err: error, jid, relativePath },
+          'Chat attachment preview rejected',
+        );
+        return c.json({ error: 'File not found' }, 404);
+      }
+    }
+
     const absolutePath = validateAndResolvePath(
       group.folder,
       relativePath,

@@ -572,7 +572,10 @@ import {
   stripAgentInternalTags,
   stripVirtualJidSuffix,
 } from './utils.js';
-import { normalizeImageAttachment } from './message-attachments.js';
+import {
+  normalizeImageAttachment,
+  toAgentImages,
+} from './message-attachments.js';
 import {
   startWebServer,
   broadcastToWebClients,
@@ -591,6 +594,7 @@ import {
   clearStreamingSnapshot,
   broadcastFollowUpUpdate,
 } from './web.js';
+import { cleanupExpiredChatAttachments } from './routes/files.js';
 import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
 import { sdkQuery } from './sdk-query.js';
@@ -5752,6 +5756,14 @@ export function collectMessageImages(
 ): Array<{ data: string; mimeType: string }> {
   const images: Array<{ data: string; mimeType: string }> = [];
   const knownMessageIds = options.knownMessageIds ?? new Set<string>();
+  const baseChatJid = chatJid.includes('#agent:')
+    ? chatJid.slice(0, chatJid.indexOf('#agent:'))
+    : chatJid;
+  const attachmentGroup =
+    registeredGroups[baseChatJid] ?? getRegisteredGroup(baseChatJid);
+  const attachmentStorage = attachmentGroup
+    ? { folder: attachmentGroup.folder }
+    : undefined;
   for (const msg of messages) {
     if (!msg.attachments) continue;
     try {
@@ -5772,7 +5784,28 @@ export function collectMessageImages(
           },
         });
         if (!item) continue;
-        images.push({ data: item.data, mimeType: item.mimeType });
+        try {
+          images.push(
+            ...(toAgentImages([item], attachmentStorage, {
+              onMimeMismatch: ({ declaredMime, detectedMime }) => {
+                logger.warn(
+                  {
+                    chatJid,
+                    messageId: msg.id,
+                    declaredMime,
+                    detectedMime,
+                  },
+                  'Persisted attachment MIME mismatch detected, using detected MIME',
+                );
+              },
+            }) ?? []),
+          );
+        } catch (err) {
+          logger.warn(
+            { err, chatJid, messageId: msg.id },
+            'Failed to hydrate persisted image attachment',
+          );
+        }
       }
     } catch (err) {
       logger.warn(
@@ -21678,6 +21711,19 @@ async function main(): Promise<void> {
   };
   setTimeout(runChannelReliabilityCleanup, 5 * 60 * 1000);
   setInterval(runChannelReliabilityCleanup, 24 * 60 * 60 * 1000);
+
+  const runChatAttachmentCleanup = (): void => {
+    try {
+      const deleted = cleanupExpiredChatAttachments();
+      if (deleted > 0) {
+        logger.info({ deleted }, 'Cleaned expired staged chat attachments');
+      }
+    } catch (err) {
+      logger.error({ err }, 'Failed to clean expired staged chat attachments');
+    }
+  };
+  setTimeout(runChatAttachmentCleanup, 5 * 60 * 1000);
+  setInterval(runChatAttachmentCleanup, 24 * 60 * 60 * 1000);
 
   await ensureDockerRunning();
 

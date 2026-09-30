@@ -3,6 +3,7 @@ import { bodyLimit } from 'hono/body-limit';
 export const AVATAR_MAX_FILE_BYTES = 3 * 1024 * 1024;
 export const SKILL_ARCHIVE_MAX_FILE_BYTES = 10 * 1024 * 1024;
 export const BRAND_ASSET_MAX_FILE_BYTES = 3 * 1024 * 1024;
+export const CHAT_ATTACHMENT_MAX_FILE_BYTES = 5 * 1024 * 1024;
 // 前端分片上传固定用 4MB 一片（见 web/src/stores/files.ts CHUNK_SIZE），这里放宽到
 // 6MB 只是给 multipart 编码开销留余量，不是允许更大的分片。
 export const FILE_CHUNK_MAX_BYTES = 6 * 1024 * 1024;
@@ -27,6 +28,9 @@ export const skillArchiveUploadBodyLimit = createUploadBodyLimit(
 );
 export const brandAssetUploadBodyLimit = createUploadBodyLimit(
   BRAND_ASSET_MAX_FILE_BYTES,
+);
+export const chatAttachmentUploadBodyLimit = createUploadBodyLimit(
+  CHAT_ATTACHMENT_MAX_FILE_BYTES,
 );
 export const fileChunkUploadBodyLimit =
   createUploadBodyLimit(FILE_CHUNK_MAX_BYTES);

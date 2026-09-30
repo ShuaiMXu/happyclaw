@@ -222,18 +222,37 @@ export const TaskCreateSchema = z
 // 单张图片附件上限 5MB（base64 编码后约 6.67MB）
 const MAX_IMAGE_BASE64_LENGTH = (5 * 1024 * 1024 * 4) / 3; // ~6.67M chars
 
-export const MessageAttachmentSchema = z.object({
-  type: z.literal('image'),
-  data: z.string().min(1).max(MAX_IMAGE_BASE64_LENGTH),
-  mimeType: z
-    .string()
-    .regex(/^image\//)
-    // 实际 image MIME 都是 image/png, image/jpeg, image/svg+xml 这种 ≤30 字符；
-    // 加 cap 防止 mimeType: 'image/' + 'a'.repeat(N) 配合 attachments.max(10)
-    // 做请求体放大攻击。
-    .max(128)
-    .optional(),
-});
+const ImageMimeTypeSchema = z
+  .string()
+  .regex(/^image\//)
+  // 实际 image MIME 都是 image/png, image/jpeg, image/svg+xml 这种 ≤30 字符；
+  // 加 cap 防止 mimeType: 'image/' + 'a'.repeat(N) 配合 attachments.max(10)
+  // 做请求体放大攻击。
+  .max(128)
+  .optional();
+
+const StagedChatAttachmentPathSchema = z
+  .string()
+  .regex(
+    /^chat-attachments\/staged\/[0-9a-f-]{36}\.(?:png|jpe?g|gif|webp|tiff|avif|bmp)$/i,
+  );
+
+// Images may be either legacy inline Base64, or a server-issued staged upload
+// reference. The latter intentionally accepts only the controlled namespace;
+// clients cannot attach an arbitrary workspace file by supplying its path.
+export const MessageAttachmentSchema = z.union([
+  z.object({
+    type: z.literal('image'),
+    data: z.string().min(1).max(MAX_IMAGE_BASE64_LENGTH),
+    mimeType: ImageMimeTypeSchema,
+  }),
+  z.object({
+    type: z.literal('image'),
+    path: StagedChatAttachmentPathSchema,
+    mimeType: ImageMimeTypeSchema,
+    name: z.string().trim().min(1).max(255).optional(),
+  }),
+]);
 
 // 单条消息文本上限 64 KB：覆盖正常超长粘贴 / 长 prompt（远超普通 IM 的 4-5KB
 // 限制），但又远低于 WS frame 上限和 attachments 上限，配合 ws maxPayload 8MiB

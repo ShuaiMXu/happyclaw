@@ -47,6 +47,10 @@ export interface MessageUploadProgress {
   total?: number;
 }
 
+export type MessageImageAttachment =
+  | { data: string; mimeType: string }
+  | { path: string; mimeType: string; name: string };
+
 export interface Message {
   id: string;
   chat_jid: string;
@@ -411,7 +415,7 @@ interface ChatState {
   sendMessage: (
     jid: string,
     content: string,
-    attachments?: Array<{ data: string; mimeType: string }>,
+    attachments?: MessageImageAttachment[],
     followUpBehavior?: FollowUpMode,
     onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => Promise<boolean>;
@@ -516,7 +520,7 @@ interface ChatState {
     jid: string,
     agentId: string,
     content: string,
-    attachments?: Array<{ data: string; mimeType: string }>,
+    attachments?: MessageImageAttachment[],
     followUpBehavior?: FollowUpMode,
     onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => Promise<boolean>;
@@ -1948,7 +1952,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sendMessage: async (
     jid: string,
     content: string,
-    attachments?: Array<{ data: string; mimeType: string }>,
+    attachments?: MessageImageAttachment[],
     followUpBehavior: FollowUpMode = 'queue',
     onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => {
@@ -1961,7 +1965,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const body: {
         chatJid: string;
         content: string;
-        attachments?: Array<{ type: 'image'; data: string; mimeType: string }>;
+        attachments?: Array<{ type: 'image' } & MessageImageAttachment>;
         followUpBehavior: FollowUpMode;
       } = { chatJid: jid, content, followUpBehavior };
       if (attachments && attachments.length > 0) {
