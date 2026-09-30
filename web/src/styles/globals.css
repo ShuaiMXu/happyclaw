@@ -1239,11 +1239,33 @@ pre code.hljs {
   box-shadow: var(--glass-shadow), var(--glass-inner-shadow);
 }
 
+/* Image attachment completion: reveal the true image from the centre, then
+   settle back to its original scale so completion has a clear visual endpoint. */
+@keyframes image-attachment-reveal {
+  0% {
+    clip-path: circle(0% at 50% 50%);
+    transform: scale(0.9);
+  }
+  65% {
+    clip-path: circle(90% at 50% 50%);
+    transform: scale(1.1);
+  }
+  100% {
+    clip-path: circle(150% at 50% 50%);
+    transform: scale(1);
+  }
+}
+
+.image-attachment-reveal {
+  animation: image-attachment-reveal 480ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
   .landing-gradient-bg,
   .landing-aurora-blob,
-  .landing-gradient-text {
+  .landing-gradient-text,
+  .image-attachment-reveal {
     animation: none !important;
   }
 }

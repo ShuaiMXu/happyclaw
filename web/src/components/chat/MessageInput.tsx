@@ -49,11 +49,16 @@ interface PendingFile {
   label: string;
 }
 
+type PendingImageStatus = 'processing' | 'revealing' | 'ready';
+
 interface PendingImage {
+  id: string;
   name: string;
-  data: string; // base64 data
+  data: string | null; // base64 data becomes available after local processing
   mimeType: string;
   preview: string; // object URL for preview
+  progress: number;
+  status: PendingImageStatus;
 }
 
 /** 单张图片大小上限 5MB */
@@ -133,6 +138,7 @@ export function MessageInput({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const nextPendingImageIdRef = useRef(0);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
@@ -291,6 +297,10 @@ export function MessageInput({
 
     if (!trimmed && !hasPending && !hasImages) return;
     if (disabled || sending) return;
+    if (pendingImages.some((img) => img.data === null)) {
+      setSendError('图片正在添加，请完成后再发送');
+      return;
+    }
 
     setSending(true);
     setSendError(null);
@@ -304,7 +314,10 @@ export function MessageInput({
       message = message ? `${prefix}\n\n${message}` : prefix;
     }
     const attachments = hasImages
-      ? pendingImages.map((img) => ({ data: img.data, mimeType: img.mimeType }))
+      ? pendingImages.map((img) => ({
+          data: img.data!,
+          mimeType: img.mimeType,
+        }))
       : undefined;
 
     let ok = false;
@@ -448,6 +461,88 @@ export function MessageInput({
     if (!isRunning) setStopping(false);
   }, [isRunning]);
 
+  const updatePendingImage = (
+    id: string,
+    update: (image: PendingImage) => PendingImage,
+  ) => {
+    setPendingImages((images) =>
+      images.map((image) => (image.id === id ? update(image) : image)),
+    );
+  };
+
+  const readFileAsBase64 = (
+    file: File,
+    onProgress: (progress: number) => void,
+  ): Promise<string> => {
+    if (file.size > MAX_IMAGE_SIZE_BYTES) {
+      return Promise.reject(
+        new Error(
+          `图片 ${file.name} 超过 5MB 限制 (${(file.size / 1024 / 1024).toFixed(1)}MB)`,
+        ),
+      );
+    }
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onprogress = (event) => {
+        const total = event.total || file.size;
+        if (!total) return;
+        // Keep the processing mask visible until FileReader has fully completed.
+        onProgress(Math.min(99, Math.round((event.loaded / total) * 100)));
+      };
+      reader.onload = () => {
+        const result = reader.result as string;
+        // Remove data URL prefix (e.g., "data:image/png;base64,")
+        const base64 = result.split(',')[1];
+        onProgress(100);
+        resolve(base64);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const addPendingImage = async (file: File, name = file.name) => {
+    if (file.size > MAX_IMAGE_SIZE_BYTES) {
+      throw new Error(
+        `图片 ${name} 超过 5MB 限制 (${(file.size / 1024 / 1024).toFixed(1)}MB)`,
+      );
+    }
+
+    const id = `pending-image-${nextPendingImageIdRef.current++}`;
+    const preview = URL.createObjectURL(file);
+    setPendingImages((images) => [
+      ...images,
+      {
+        id,
+        name,
+        data: null,
+        mimeType: file.type,
+        preview,
+        progress: 0,
+        status: 'processing',
+      },
+    ]);
+
+    try {
+      const data = await readFileAsBase64(file, (progress) => {
+        updatePendingImage(id, (image) => ({ ...image, progress }));
+      });
+      updatePendingImage(id, (image) => ({
+        ...image,
+        data,
+        progress: 100,
+        status: 'revealing',
+      }));
+      window.setTimeout(() => {
+        updatePendingImage(id, (image) => ({ ...image, status: 'ready' }));
+      }, 480);
+    } catch (error) {
+      URL.revokeObjectURL(preview);
+      setPendingImages((images) => images.filter((image) => image.id !== id));
+      throw error;
+    }
+  };
+
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!groupJid) return;
     const fileList = e.target.files;
@@ -466,24 +561,9 @@ export function MessageInput({
         }
       });
 
-      // Process image files
-      if (imageFiles.length > 0) {
-        const newImages: PendingImage[] = [];
-        for (const file of imageFiles) {
-          try {
-            const base64 = await readFileAsBase64(file);
-            newImages.push({
-              name: file.name,
-              data: base64,
-              mimeType: file.type,
-              preview: URL.createObjectURL(file),
-            });
-          } catch {
-            // Skip failed images
-          }
-        }
-        setPendingImages((prev) => [...prev, ...newImages]);
-      }
+      await Promise.all(
+        imageFiles.map((file) => addPendingImage(file).catch(() => undefined)),
+      );
 
       // Upload regular files to workspace
       if (regularFiles.length > 0) {
@@ -503,50 +583,16 @@ export function MessageInput({
   const handleImageSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = e.target.files;
     if (fileList && fileList.length > 0) {
-      const files = Array.from(fileList);
+      const files = Array.from(fileList).filter((file) =>
+        file.type.startsWith('image/'),
+      );
       setShowActions(false);
-
-      const newImages: PendingImage[] = [];
-      for (const file of files) {
-        if (file.type.startsWith('image/')) {
-          try {
-            const base64 = await readFileAsBase64(file);
-            newImages.push({
-              name: file.name,
-              data: base64,
-              mimeType: file.type,
-              preview: URL.createObjectURL(file),
-            });
-          } catch {
-            // Skip failed images
-          }
-        }
-      }
-      setPendingImages((prev) => [...prev, ...newImages]);
+      await Promise.all(
+        files.map((file) => addPendingImage(file).catch(() => undefined)),
+      );
 
       if (imageInputRef.current) imageInputRef.current.value = '';
     }
-  };
-
-  const readFileAsBase64 = (file: File): Promise<string> => {
-    if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      return Promise.reject(
-        new Error(
-          `图片 ${file.name} 超过 5MB 限制 (${(file.size / 1024 / 1024).toFixed(1)}MB)`,
-        ),
-      );
-    }
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = reader.result as string;
-        // Remove data URL prefix (e.g., "data:image/png;base64,")
-        const base64 = result.split(',')[1];
-        resolve(base64);
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
   };
 
   const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -582,26 +628,16 @@ export function MessageInput({
       el.setSelectionRange(pastePlan.selectionStart, pastePlan.selectionEnd);
     });
 
-    const newImages: PendingImage[] = [];
-    for (const item of imageItems) {
-      const file = item.getAsFile();
-      if (!file) continue;
-      try {
-        const base64 = await readFileAsBase64(file);
-        newImages.push({
-          name: file.name || `pasted-${Date.now()}.png`,
-          data: base64,
-          mimeType: file.type,
-          preview: URL.createObjectURL(file),
-        });
-      } catch {
-        // Skip failed images
-      }
-    }
-
-    if (newImages.length > 0) {
-      setPendingImages((prev) => [...prev, ...newImages]);
-    }
+    await Promise.all(
+      imageItems.map((item, index) => {
+        const file = item.getAsFile();
+        if (!file) return Promise.resolve();
+        return addPendingImage(
+          file,
+          file.name || `pasted-${Date.now()}-${index + 1}.png`,
+        ).catch(() => undefined);
+      }),
+    );
   };
 
   // --- Drag and drop helpers ---
@@ -755,29 +791,19 @@ export function MessageInput({
         }
       });
 
-      // Process images inline (same as handleImageSelect)
+      // Process images inline (same as handleImageSelect). Each preview appears
+      // immediately and reports FileReader progress while its attachment is built.
       if (imageFiles.length > 0) {
-        const newImages: PendingImage[] = [];
-        for (const file of imageFiles) {
-          try {
-            const base64 = await readFileAsBase64(file);
-            newImages.push({
-              name: file.name,
-              data: base64,
-              mimeType: file.type,
-              preview: URL.createObjectURL(file),
-            });
-          } catch (err) {
-            console.warn('跳过图片:', err instanceof Error ? err.message : err);
-          }
-        }
-        // Verify groupJid hasn't changed during async processing (use ref for live value)
-        if (targetGroupJid === groupJidRef.current) {
-          setPendingImages((prev) => [...prev, ...newImages]);
-        } else {
-          // Conversation switched — revoke preview URLs to avoid memory leak
-          newImages.forEach((img) => URL.revokeObjectURL(img.preview));
-        }
+        await Promise.all(
+          imageFiles.map((file) =>
+            addPendingImage(file).catch((err) => {
+              console.warn(
+                '跳过图片:',
+                err instanceof Error ? err.message : err,
+              );
+            }),
+          ),
+        );
       }
 
       // Upload non-image files to workspace (same as handleFileSelect)
@@ -789,7 +815,7 @@ export function MessageInput({
         }
       }
     },
-    [groupJid, disabled, sending, uploading, uploadFiles],
+    [groupJid, disabled, sending, uploading, uploadFiles, addPendingImage],
   );
 
   const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -833,7 +859,8 @@ export function MessageInput({
   const hasContent = content.trim().length > 0;
   const hasPayload =
     hasContent || pendingFiles.length > 0 || pendingImages.length > 0;
-  const canSend = hasPayload && !sending;
+  const hasProcessingImages = pendingImages.some((img) => img.data === null);
+  const canSend = hasPayload && !sending && !hasProcessingImages;
   const showStop = isRunning && !hasPayload && !sending && !!onStop;
 
   const progressPercent =
@@ -1084,7 +1111,9 @@ export function MessageInput({
               <div className="flex items-center gap-1 mb-1.5">
                 <ImageIcon className="w-3 h-3 text-muted-foreground" />
                 <span className="text-[11px] text-muted-foreground">
-                  已添加 {pendingImages.length} 张图片
+                  {hasProcessingImages
+                    ? `正在上传 ${pendingImages.filter((img) => img.data === null).length} 张图片`
+                    : `已添加 ${pendingImages.length} 张图片`}
                 </span>
                 <button
                   onClick={clearPendingImages}
@@ -1095,16 +1124,45 @@ export function MessageInput({
               </div>
               <div className="flex flex-wrap gap-2 pb-1.5">
                 {pendingImages.map((img, i) => (
-                  <div key={i} className="relative group">
-                    <img
-                      src={img.preview}
-                      alt={img.name}
-                      className="w-16 h-16 object-cover rounded-lg border border-border"
-                    />
+                  <div
+                    key={img.id}
+                    className="relative group w-16 h-16 overflow-visible"
+                  >
+                    <div className="relative w-16 h-16 overflow-hidden rounded-lg border border-border bg-black">
+                      <img
+                        src={img.preview}
+                        alt={img.name}
+                        className="w-full h-full object-cover"
+                      />
+                      {img.status === 'processing' && (
+                        <>
+                          <div
+                            className="absolute inset-0 pointer-events-none"
+                            style={{
+                              background: `conic-gradient(from -90deg, transparent 0% ${img.progress}%, rgb(0 0 0 / 70%) ${img.progress}% 100%)`,
+                            }}
+                          />
+                          <span className="absolute inset-0 flex items-center justify-center text-xs font-semibold tabular-nums text-white [text-shadow:0_1px_3px_rgb(0_0_0_/_90%)]">
+                            {img.progress}%
+                          </span>
+                        </>
+                      )}
+                      {img.status === 'revealing' && (
+                        <>
+                          <div className="absolute inset-0 bg-black" />
+                          <img
+                            src={img.preview}
+                            alt=""
+                            aria-hidden="true"
+                            className="image-attachment-reveal absolute inset-0 w-full h-full object-cover"
+                          />
+                        </>
+                      )}
+                    </div>
                     <button
                       onClick={() => removePendingImage(i)}
-                      className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-foreground/70 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer hover:bg-foreground/90"
-                      aria-label="移除图片"
+                      className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-foreground/70 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer hover:bg-foreground/90 focus-visible:opacity-100"
+                      aria-label={`移除图片：${img.name}`}
                     >
                       <X className="w-3 h-3" />
                     </button>
