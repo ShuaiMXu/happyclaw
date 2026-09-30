@@ -63,12 +63,17 @@ export async function apiFetch<T>(
     }
 
     if (res.status === 401) {
+      const body = await res.json().catch(() => ({}));
       // Avoid redirect loop if already on the login page
       const currentPath = stripBasePath(window.location.pathname);
       if (!currentPath.startsWith('/login')) {
         replaceInApp('/login');
       }
-      throw new Error('Unauthorized');
+      throw {
+        status: res.status,
+        message: body.error || res.statusText,
+        body,
+      } as ApiError;
     }
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));

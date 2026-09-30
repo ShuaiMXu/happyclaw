@@ -10,6 +10,24 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe('apiFetch authentication errors', () => {
+  test('preserves a 401 response so the login page can show a helpful message', async () => {
+    window.history.replaceState({}, '', '/login');
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Invalid credentials' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    ) as typeof fetch;
+
+    await expect(apiFetch('/api/auth/login')).rejects.toEqual({
+      status: 401,
+      message: 'Invalid credentials',
+      body: { error: 'Invalid credentials' },
+    });
+  });
+});
+
 describe('apiFetch cancellation', () => {
   test('调用方 AbortSignal 会中断底层 fetch，并与请求超时区分', async () => {
     globalThis.fetch = vi.fn((_input, init) => {
