@@ -32,6 +32,7 @@ import {
   useChatStore,
   type FollowUpMode,
   type FollowUpQueueAction,
+  type MessageUploadProgress,
   type QueuedFollowUp,
 } from '../../stores/chat';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
@@ -49,7 +50,7 @@ interface PendingFile {
   label: string;
 }
 
-type PendingImageStatus = 'processing' | 'revealing' | 'ready';
+type PendingImageStatus = 'processing' | 'uploading' | 'revealing' | 'ready';
 
 interface PendingImage {
   id: string;
@@ -74,6 +75,7 @@ interface MessageInputProps {
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
     followUpBehavior?: FollowUpMode,
+    onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => Promise<boolean> | boolean;
   groupJid?: string;
   disabled?: boolean;
@@ -319,6 +321,30 @@ export function MessageInput({
           mimeType: img.mimeType,
         }))
       : undefined;
+    const imageIdsToSend = new Set(pendingImages.map((image) => image.id));
+
+    const updateImageUploadProgress = (progress: MessageUploadProgress) => {
+      const percent = progress.total
+        ? Math.min(100, Math.round((progress.loaded / progress.total) * 100))
+        : Math.min(99, Math.max(1, Math.round(progress.loaded / 1024)));
+      setPendingImages((images) =>
+        images.map((image) =>
+          image.data && imageIdsToSend.has(image.id)
+            ? { ...image, progress: percent, status: 'uploading' }
+            : image,
+        ),
+      );
+    };
+
+    if (hasImages) {
+      setPendingImages((images) =>
+        images.map((image) =>
+          image.data && imageIdsToSend.has(image.id)
+            ? { ...image, progress: 0, status: 'uploading' }
+            : image,
+        ),
+      );
+    }
 
     let ok = false;
     try {
@@ -326,6 +352,7 @@ export function MessageInput({
         message,
         attachments,
         modeOverride ?? (isRunning ? followUpMode : undefined),
+        hasImages ? updateImageUploadProgress : undefined,
       );
     } catch {
       ok = false;
@@ -341,11 +368,34 @@ export function MessageInput({
       }
       if (hasPending) setPendingFiles([]);
       if (hasImages) {
+        // Keep the completed attachment visible long enough for the requested
+        // center-out reveal, then release its preview URL as usual.
+        setPendingImages((images) =>
+          images.map((image) =>
+            imageIdsToSend.has(image.id)
+              ? { ...image, progress: 100, status: 'revealing' }
+              : image,
+          ),
+        );
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 480);
+        });
         pendingImages.forEach((img) => URL.revokeObjectURL(img.preview));
-        setPendingImages([]);
+        setPendingImages((images) =>
+          images.filter((image) => !imageIdsToSend.has(image.id)),
+        );
       }
     } else {
       // 失败：保留输入、保留附件；同步保存草稿，刷新/崩溃也能恢复。
+      if (hasImages) {
+        setPendingImages((images) =>
+          images.map((image) =>
+            imageIdsToSend.has(image.id) && image.status === 'uploading'
+              ? { ...image, progress: 100, status: 'ready' }
+              : image,
+          ),
+        );
+      }
       if (groupJid && trimmed) saveDraft(groupJid, trimmed);
       setSendError('发送失败，输入已保留，请重试');
       setTimeout(() => setSendError(null), 4000);
@@ -531,11 +581,8 @@ export function MessageInput({
         ...image,
         data,
         progress: 100,
-        status: 'revealing',
+        status: 'ready',
       }));
-      window.setTimeout(() => {
-        updatePendingImage(id, (image) => ({ ...image, status: 'ready' }));
-      }, 480);
     } catch (error) {
       URL.revokeObjectURL(preview);
       setPendingImages((images) => images.filter((image) => image.id !== id));
@@ -860,6 +907,9 @@ export function MessageInput({
   const hasPayload =
     hasContent || pendingFiles.length > 0 || pendingImages.length > 0;
   const hasProcessingImages = pendingImages.some((img) => img.data === null);
+  const hasUploadingImages = pendingImages.some(
+    (img) => img.status === 'uploading',
+  );
   const canSend = hasPayload && !sending && !hasProcessingImages;
   const showStop = isRunning && !hasPayload && !sending && !!onStop;
 
@@ -1111,9 +1161,11 @@ export function MessageInput({
               <div className="flex items-center gap-1 mb-1.5">
                 <ImageIcon className="w-3 h-3 text-muted-foreground" />
                 <span className="text-[11px] text-muted-foreground">
-                  {hasProcessingImages
-                    ? `正在上传 ${pendingImages.filter((img) => img.data === null).length} 张图片`
-                    : `已添加 ${pendingImages.length} 张图片`}
+                  {hasUploadingImages
+                    ? `正在上传 ${pendingImages.length} 张图片`
+                    : hasProcessingImages
+                      ? `正在准备 ${pendingImages.filter((img) => img.data === null).length} 张图片`
+                      : `已添加 ${pendingImages.length} 张图片`}
                 </span>
                 <button
                   onClick={clearPendingImages}
@@ -1134,7 +1186,8 @@ export function MessageInput({
                         alt={img.name}
                         className="w-full h-full object-cover"
                       />
-                      {img.status === 'processing' && (
+                      {(img.status === 'processing' ||
+                        img.status === 'uploading') && (
                         <>
                           <div
                             className="absolute inset-0 pointer-events-none"

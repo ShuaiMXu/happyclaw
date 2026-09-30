@@ -42,6 +42,11 @@ import { extractErrorMessage } from '../utils/error';
 
 export type { GroupInfo, AgentInfo };
 
+export interface MessageUploadProgress {
+  loaded: number;
+  total?: number;
+}
+
 export interface Message {
   id: string;
   chat_jid: string;
@@ -408,6 +413,7 @@ interface ChatState {
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
     followUpBehavior?: FollowUpMode,
+    onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => Promise<boolean>;
   loadFollowUps: (chatJid: string) => Promise<void>;
   handleFollowUpUpdate: (
@@ -512,6 +518,7 @@ interface ChatState {
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
     followUpBehavior?: FollowUpMode,
+    onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => Promise<boolean>;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
   // Runner state sync
@@ -1943,6 +1950,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
     followUpBehavior: FollowUpMode = 'queue',
+    onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => {
     try {
       // streaming 状态由以下 3 条路径正确清理，sendMessage 不应无条件清空：
@@ -1980,7 +1988,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ): d is ClearedResponse =>
         d.success === true && 'cleared' in d && d.cleared === true;
 
-      const data = await api.post<MessageCreateResponse>('/api/messages', body);
+      const data = body.attachments
+        ? await api.postWithUploadProgress<MessageCreateResponse>(
+            '/api/messages',
+            body,
+            onUploadProgress ?? (() => undefined),
+          )
+        : await api.post<MessageCreateResponse>('/api/messages', body);
       if (!data.success) {
         // Server returned non-success payload — surface as a send failure so caller can retain input.
         const msg = '服务器返回失败，请重试';
@@ -3977,6 +3991,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     content,
     attachments?,
     followUpBehavior = 'queue',
+    onUploadProgress?,
   ) => {
     const normalizedAttachments =
       attachments && attachments.length > 0
@@ -3987,19 +4002,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // main chat. WebSocket remains the push channel for the stored message
       // and stream events; a successful return now means the server really
       // persisted and classified this message as started/queued/steered.
-      const data = await api.post<{
-        success: true;
-        messageId: string;
-        timestamp: string;
-        disposition: 'started' | 'queued' | 'steered';
-        runId?: string;
-      }>('/api/messages', {
+      const body = {
         chatJid: jid,
         agentId,
         content,
         attachments: normalizedAttachments,
         followUpBehavior,
-      });
+      };
+      const data = normalizedAttachments
+        ? await api.postWithUploadProgress<{
+            success: true;
+            messageId: string;
+            timestamp: string;
+            disposition: 'started' | 'queued' | 'steered';
+            runId?: string;
+          }>('/api/messages', body, onUploadProgress ?? (() => undefined))
+        : await api.post<{
+            success: true;
+            messageId: string;
+            timestamp: string;
+            disposition: 'started' | 'queued' | 'steered';
+            runId?: string;
+          }>('/api/messages', body);
       if (data.disposition === 'started' && data.runId) {
         get().handleRunStarted(`${jid}#agent:${agentId}`, data.runId);
       }

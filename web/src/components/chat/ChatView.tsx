@@ -12,6 +12,7 @@ import { toast } from 'sonner';
 import {
   useChatStore,
   type FollowUpMode,
+  type MessageUploadProgress,
   type QueuedFollowUp,
 } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
@@ -585,12 +586,14 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
     followUpBehavior?: FollowUpMode,
+    onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => {
     const ok = await sendMessage(
       groupJid,
       content,
       attachments,
       followUpBehavior,
+      onUploadProgress,
     );
     // 只有发送成功时才触发滚动；失败时保留当前视图位置，避免用户上下文切换。
     if (ok) setScrollTrigger((n) => n + 1);
@@ -619,6 +622,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
     followUpBehavior?: FollowUpMode,
+    onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => {
     if (!activeAgentTab) return false;
     const ok = await sendAgentMessage(
@@ -627,6 +631,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       content,
       attachments,
       followUpBehavior,
+      onUploadProgress,
     );
     if (ok) setScrollTrigger((value) => value + 1);
     return ok;

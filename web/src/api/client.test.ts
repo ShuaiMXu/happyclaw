@@ -1,12 +1,13 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { apiFetch } from './client';
+import { apiFetch, postJsonWithUploadProgress } from './client';
 
 const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.unstubAllGlobals();
   vi.useRealTimers();
 });
 
@@ -27,6 +28,30 @@ describe('apiFetch authentication errors', () => {
     });
   });
 });
+
+class MockXmlHttpRequest {
+  static latest: MockXmlHttpRequest | undefined;
+
+  upload: { onprogress: ((event: ProgressEvent) => void) | null } = {
+    onprogress: null,
+  };
+  withCredentials = false;
+  timeout = 0;
+  status = 0;
+  statusText = '';
+  responseText = '';
+  onerror: (() => void) | null = null;
+  ontimeout: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  onload: (() => void) | null = null;
+  readonly open = vi.fn();
+  readonly setRequestHeader = vi.fn();
+  readonly send = vi.fn();
+
+  constructor() {
+    MockXmlHttpRequest.latest = this;
+  }
+}
 
 describe('apiFetch cancellation', () => {
   test('调用方 AbortSignal 会中断底层 fetch，并与请求超时区分', async () => {
@@ -173,6 +198,60 @@ describe('apiFetch cancellation', () => {
     await expect(pending).rejects.toEqual({
       status: 499,
       message: 'Request cancelled',
+    });
+  });
+});
+
+describe('postJsonWithUploadProgress', () => {
+  test('reports browser upload bytes and resolves the JSON response', async () => {
+    vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
+
+    const progress = vi.fn();
+    const pending = postJsonWithUploadProgress<{ success: boolean }>(
+      '/api/messages',
+      { content: 'hello' },
+      { onProgress: progress, timeoutMs: 30_000 },
+    );
+    const request = MockXmlHttpRequest.latest!;
+
+    expect(request.open).toHaveBeenCalledWith('POST', '/api/messages', true);
+    expect(request.withCredentials).toBe(true);
+    expect(request.timeout).toBe(30_000);
+    expect(request.setRequestHeader).toHaveBeenCalledWith(
+      'Content-Type',
+      'application/json',
+    );
+    expect(request.send).toHaveBeenCalledWith('{"content":"hello"}');
+
+    request.upload.onprogress?.({
+      loaded: 25,
+      total: 100,
+      lengthComputable: true,
+    } as ProgressEvent);
+    expect(progress).toHaveBeenCalledWith({ loaded: 25, total: 100 });
+
+    request.status = 201;
+    request.responseText = '{"success":true}';
+    request.onload?.();
+    await expect(pending).resolves.toEqual({ success: true });
+  });
+
+  test('preserves failed response details for attachment send retries', async () => {
+    vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
+
+    const pending = postJsonWithUploadProgress('/api/messages', {
+      content: 'hello',
+    });
+    const request = MockXmlHttpRequest.latest!;
+    request.status = 413;
+    request.statusText = 'Payload Too Large';
+    request.responseText = '{"error":"Attachment too large"}';
+    request.onload?.();
+
+    await expect(pending).rejects.toEqual({
+      status: 413,
+      message: 'Attachment too large',
+      body: { error: 'Attachment too large' },
     });
   });
 });

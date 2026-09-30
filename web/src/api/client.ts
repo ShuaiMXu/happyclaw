@@ -119,6 +119,101 @@ export function computeUploadTimeoutMs(bytes: number): number {
   );
 }
 
+export interface JsonUploadProgress {
+  loaded: number;
+  total?: number;
+}
+
+interface JsonUploadOptions {
+  onProgress?: (progress: JsonUploadProgress) => void;
+  timeoutMs?: number;
+}
+
+function parseXhrJson(responseText: string): unknown {
+  if (!responseText) return undefined;
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Send a JSON request with browser-reported request-body progress.
+ *
+ * Fetch intentionally remains the default transport. XHR is used only where a
+ * caller needs actual network upload events, such as chat image attachments.
+ */
+export function postJsonWithUploadProgress<T>(
+  path: string,
+  body: unknown,
+  options: JsonUploadOptions = {},
+): Promise<T> {
+  const requestPath = /^https?:\/\//i.test(path)
+    ? path
+    : withBasePath(path.startsWith('/') ? path : `/${path}`);
+  const payload = JSON.stringify(body);
+  const timeoutMs =
+    options.timeoutMs ??
+    computeUploadTimeoutMs(new TextEncoder().encode(payload).byteLength);
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', requestPath, true);
+    xhr.withCredentials = true;
+    xhr.timeout = timeoutMs;
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.upload.onprogress = (event) => {
+      options.onProgress?.({
+        loaded: event.loaded,
+        ...(event.lengthComputable ? { total: event.total } : {}),
+      });
+    };
+    xhr.onerror = () =>
+      reject({ status: 0, message: 'Network error' } as ApiError);
+    xhr.ontimeout = () =>
+      reject({ status: 408, message: 'Request timeout' } as ApiError);
+    xhr.onabort = () =>
+      reject({ status: 499, message: 'Request cancelled' } as ApiError);
+    xhr.onload = () => {
+      const parsed = parseXhrJson(xhr.responseText);
+      const responseBody =
+        typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : {};
+
+      if (xhr.status === 401) {
+        const currentPath = stripBasePath(window.location.pathname);
+        if (!currentPath.startsWith('/login')) {
+          replaceInApp('/login');
+        }
+      }
+      if (
+        xhr.status === 403 &&
+        responseBody.code === 'PASSWORD_CHANGE_REQUIRED'
+      ) {
+        const currentPath = stripBasePath(window.location.pathname);
+        if (!currentPath.startsWith('/settings')) {
+          replaceInApp('/settings');
+        }
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject({
+          status: xhr.status,
+          message:
+            (typeof responseBody.error === 'string' && responseBody.error) ||
+            xhr.statusText ||
+            'Request failed',
+          body: responseBody,
+        } as ApiError);
+        return;
+      }
+      resolve(parsed as T);
+    };
+    xhr.send(payload);
+  });
+}
+
 export const api = {
   get: <T>(path: string) => apiFetch<T>(path),
   post: <T>(path: string, body?: unknown, timeoutMs?: number) =>
@@ -127,6 +222,11 @@ export const api = {
       body: body ? JSON.stringify(body) : undefined,
       ...(timeoutMs ? { timeoutMs } : {}),
     }),
+  postWithUploadProgress: <T>(
+    path: string,
+    body: unknown,
+    onProgress: (progress: JsonUploadProgress) => void,
+  ) => postJsonWithUploadProgress<T>(path, body, { onProgress }),
   put: <T>(path: string, body?: unknown) =>
     apiFetch<T>(path, {
       method: 'PUT',
