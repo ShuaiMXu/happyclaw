@@ -108,85 +108,104 @@ afterAll(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe('上传存储配额按净增量计费', () => {
-  test('相同大小覆盖及响应丢失后的完整重试均不重复占用配额', async () => {
-    fs.writeFileSync(
-      path.join(workspaceDir, 'large.bin'),
-      Buffer.alloc(900_000),
-    );
-
-    const first = await upload([makeFile('large.bin', 900_000)]);
-    const retryAfterLostResponse = await upload([
-      makeFile('large.bin', 900_000),
-    ]);
+describe('上传同名不覆盖（自动改名）且按新增文件全额计费', () => {
+  test('同名文件重复上传会自动改名保留两份，不做覆盖去重', async () => {
+    // 同名不覆盖之后，"重试同一次上传"不再天然幂等——两次请求会各自落成一个
+    // 独立文件（large.bin / large-1.bin），这是"绝不覆盖已有内容"这条新规则
+    // 带来的已知取舍：网络问题导致的真实重试可能留下一份重复文件，但比起
+    // 悄悄覆盖用户已有内容，这个代价是可接受的。
+    const first = await upload([makeFile('large.bin', 400_000)]);
+    const second = await upload([makeFile('large.bin', 400_000)]);
 
     expect(first.status).toBe(200);
-    expect(retryAfterLostResponse.status).toBe(200);
-    expect(billingMocks.checkStorageLimit).not.toHaveBeenCalled();
+    expect(second.status).toBe(200);
+    expect(billingMocks.checkStorageLimit).toHaveBeenCalledTimes(2);
     expect(fs.statSync(path.join(workspaceDir, 'large.bin')).size).toBe(
-      900_000,
+      400_000,
+    );
+    expect(fs.statSync(path.join(workspaceDir, 'large-1.bin')).size).toBe(
+      400_000,
     );
   });
 
-  test('覆盖变大时只计新旧大小之差', async () => {
+  test('同名文件自动改名后按新文件的完整大小计费，不再按新旧差值计费', async () => {
     fs.writeFileSync(
       path.join(workspaceDir, 'large.bin'),
-      Buffer.alloc(900_000),
+      Buffer.alloc(400_000),
     );
 
-    const response = await upload([makeFile('large.bin', 950_000)]);
+    const response = await upload([makeFile('large.bin', 450_000)]);
 
     expect(response.status).toBe(200);
     expect(billingMocks.checkStorageLimit).toHaveBeenCalledWith(
       'quota-user',
       'member',
-      900_000,
-      50_000,
+      400_000,
+      450_000,
+    );
+    expect(fs.statSync(path.join(workspaceDir, 'large.bin')).size).toBe(
+      400_000,
+    );
+    expect(fs.statSync(path.join(workspaceDir, 'large-1.bin')).size).toBe(
+      450_000,
     );
   });
 
-  test('同批缩小旧文件可抵扣新增文件，只按整批最终净增量计费', async () => {
+  test('同批次里同名文件与全新文件都按各自完整大小计费，互不抵扣', async () => {
     fs.writeFileSync(
       path.join(workspaceDir, 'existing.bin'),
-      Buffer.alloc(900_000),
+      Buffer.alloc(400_000),
     );
 
     const response = await upload([
-      makeFile('existing.bin', 500_000),
-      makeFile('new.bin', 500_000),
+      makeFile('existing.bin', 300_000),
+      makeFile('new.bin', 300_000),
     ]);
 
     expect(response.status).toBe(200);
     expect(billingMocks.checkStorageLimit).toHaveBeenCalledWith(
       'quota-user',
       'member',
-      900_000,
-      100_000,
+      400_000,
+      600_000,
     );
+    expect(fs.statSync(path.join(workspaceDir, 'existing.bin')).size).toBe(
+      400_000,
+    );
+    expect(fs.statSync(path.join(workspaceDir, 'existing-1.bin')).size).toBe(
+      300_000,
+    );
+    expect(fs.statSync(path.join(workspaceDir, 'new.bin')).size).toBe(300_000);
   });
 
-  test('同一批次内的同名文件只按最终值相对原文件计费', async () => {
+  test('同一批次内的同名文件各自改名保留，不会互相覆盖', async () => {
     fs.writeFileSync(
       path.join(workspaceDir, 'same.bin'),
-      Buffer.alloc(900_000),
+      Buffer.alloc(400_000),
     );
 
     const response = await upload([
-      makeFile('same.bin', 950_000),
-      makeFile('same.bin', 910_000),
+      makeFile('same.bin', 300_000),
+      makeFile('same.bin', 300_000),
     ]);
 
     expect(response.status).toBe(200);
     expect(billingMocks.checkStorageLimit).toHaveBeenCalledWith(
       'quota-user',
       'member',
-      900_000,
-      10_000,
+      400_000,
+      600_000,
     );
-    expect(fs.statSync(path.join(workspaceDir, 'same.bin')).size).toBe(910_000);
+    expect(fs.statSync(path.join(workspaceDir, 'same.bin')).size).toBe(400_000);
+    expect(fs.statSync(path.join(workspaceDir, 'same-1.bin')).size).toBe(
+      300_000,
+    );
+    expect(fs.statSync(path.join(workspaceDir, 'same-2.bin')).size).toBe(
+      300_000,
+    );
   });
 
-  test('整批安全校验先于写入，目录目标会拒绝且不留下前面的文件', async () => {
+  test('文件名与已有目录同名时自动改名，不拒绝、不影响目录也不影响批次里其它文件', async () => {
     fs.mkdirSync(path.join(workspaceDir, 'occupied'));
 
     const response = await upload([
@@ -194,22 +213,31 @@ describe('上传存储配额按净增量计费', () => {
       makeFile('occupied', 10),
     ]);
 
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(200);
     expect(
       fs.existsSync(path.join(workspaceDir, 'would-have-been-written.bin')),
-    ).toBe(false);
+    ).toBe(true);
+    expect(fs.statSync(path.join(workspaceDir, 'occupied')).isDirectory()).toBe(
+      true,
+    );
+    expect(fs.statSync(path.join(workspaceDir, 'occupied-1')).isFile()).toBe(
+      true,
+    );
   });
 
-  test('拒绝覆盖 symlink', async () => {
+  test('文件名与已有 symlink 同名时自动改名，不会覆盖或跟随该链接', async () => {
     fs.writeFileSync(path.join(workspaceDir, 'real.bin'), Buffer.alloc(10));
     fs.symlinkSync('real.bin', path.join(workspaceDir, 'linked.bin'));
 
     const response = await upload([makeFile('linked.bin', 10)]);
 
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(200);
     expect(
       fs.lstatSync(path.join(workspaceDir, 'linked.bin')).isSymbolicLink(),
     ).toBe(true);
+    expect(fs.lstatSync(path.join(workspaceDir, 'linked-1.bin')).isFile()).toBe(
+      true,
+    );
   });
 
   test('并发请求串行检查配额，只有一个 600KB 新文件可通过', async () => {

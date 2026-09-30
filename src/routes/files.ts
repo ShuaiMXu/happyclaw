@@ -8,7 +8,11 @@ import {
 import { canAccessGroup } from '../group-acl.js';
 import type { AuthUser } from '../types.js';
 import type { RegisteredGroup } from '../types.js';
-import { getRegisteredGroup } from '../db.js';
+import {
+  getAllRegisteredGroups,
+  getRegisteredGroup,
+  isChatAttachmentPathReferenced,
+} from '../db.js';
 import { logger } from '../logger.js';
 import {
   listFiles,
@@ -189,6 +193,48 @@ function uploadTargetKey(absolutePath: string): string {
   return process.platform === 'darwin' || process.platform === 'win32'
     ? normalized.toLowerCase()
     : normalized;
+}
+
+/** lstat 而非 existsSync：后者会跟随符号链接，指向不存在目标的悬空链接会被
+ *  误判成"空位"，导致仍然写穿一个坏链接。lstat 只看这一级路径本身是否存在
+ *  任何条目（文件/目录/链接），不关心它指向哪里。 */
+function pathIsOccupied(candidatePath: string): boolean {
+  try {
+    fs.lstatSync(candidatePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+/**
+ * 上传/生成的文件如果跟已有条目（文件/目录/符号链接，不管指向什么）同名，
+ * 不覆盖，改成在文件名（扩展名前）追加 -1、-2……直到找到一个没被占用、也没
+ * 在同一批请求里被预定过的路径为止。`reserved` 用于同一批多文件上传内部
+ * 互相撞名的场景——写盘发生在全部校验完之后，此时磁盘上还看不出"已经决定
+ * 要占用"这个名字，必须显式记录。
+ */
+function resolveNonCollidingPath(
+  absolutePath: string,
+  reserved: Set<string>,
+): string {
+  const key = uploadTargetKey(absolutePath);
+  if (!pathIsOccupied(absolutePath) && !reserved.has(key)) {
+    return absolutePath;
+  }
+  const dir = path.dirname(absolutePath);
+  const ext = path.extname(absolutePath);
+  const base = path.basename(absolutePath, ext);
+  let n = 1;
+  let candidate: string;
+  let candidateKey: string;
+  do {
+    candidate = path.join(dir, `${base}-${n}${ext}`);
+    candidateKey = uploadTargetKey(candidate);
+    n += 1;
+  } while (pathIsOccupied(candidate) || reserved.has(candidateKey));
+  return candidate;
 }
 
 // MIME 类型映射（预览和编辑端点共用）
@@ -592,6 +638,10 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
         string,
         { existingSize: number; finalSize: number }
       >();
+      // 同一批多文件上传里，两个文件重名时也要各自落到不同的 -1/-2 路径，
+      // 而不是先到先得覆盖——写盘发生在全部校验完之后，光看磁盘看不出这一批
+      // 里前面的文件"已经决定"要占用哪个名字，所以显式记录。
+      const reservedInBatch = new Set<string>();
 
       for (const file of fileList) {
         if (!(file instanceof File)) continue;
@@ -615,37 +665,28 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
           return c.json({ error: 'Cannot upload to system path' }, 403);
         }
 
-        const absolutePath = validateAndResolvePath(
+        const requestedAbsolutePath = validateAndResolvePath(
           group.folder,
           fullRelativePath,
           rootOverride,
         );
-        let existingSize = 0;
-        try {
-          const stats = fs.lstatSync(absolutePath);
-          if (stats.isSymbolicLink()) {
-            return c.json({ error: 'Cannot overwrite symbolic link' }, 403);
-          }
-          if (!stats.isFile()) {
-            return c.json(
-              { error: `Upload target is not a regular file: ${file.name}` },
-              400,
-            );
-          }
-          existingSize = stats.size;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        }
+        // 同名不覆盖：已经存在（文件/目录/符号链接，无论指向什么）就自动改成
+        // 带 -1/-2 后缀的新文件名，原有内容永远不会被上传顶掉。
+        const finalAbsolutePath = resolveNonCollidingPath(
+          requestedAbsolutePath,
+          reservedInBatch,
+        );
+        const finalKey = uploadTargetKey(finalAbsolutePath);
+        reservedInBatch.add(finalKey);
+        const finalRelativePath = path.relative(
+          workspaceRoot,
+          finalAbsolutePath,
+        );
 
-        uploads.push({ file, relativePath: fullRelativePath });
-        const key = uploadTargetKey(absolutePath);
-        const prior = quotaTargets.get(key);
-        quotaTargets.set(key, {
-          // Repeated names in one multipart batch replace the same original
-          // inode; charge only the size of the final value, never each part.
-          existingSize: prior?.existingSize ?? existingSize,
-          finalSize: file.size,
-        });
+        uploads.push({ file, relativePath: finalRelativePath });
+        // 从不覆盖已有内容，所以配额只按新增文件的完整大小计费，不用再算
+        // "净增量"（旧逻辑覆盖同一路径时只收差值，现在每次都是纯新增）。
+        quotaTargets.set(finalKey, { existingSize: 0, finalSize: file.size });
       }
 
       if (isBillingEnabled() && group.created_by) {
@@ -681,7 +722,9 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
             rootOverride,
           );
           wroteAnyFile = true;
-          uploadedFiles.push(file.name);
+          // 同名自动改名后，返回给前端的是实际落盘的文件名，不是浏览器
+          // 提交的原始文件名，避免用户以为传的是原名结果却被悄悄改了名。
+          uploadedFiles.push(path.basename(relativePath));
         }
       } finally {
         // The batch is not transactional: if a later read/write fails, earlier
@@ -854,60 +897,67 @@ fileRoutes.post(
 );
 
 // DELETE /api/groups/:jid/chat-attachments/:fileName - discard an unsent stage.
-fileRoutes.delete('/:jid/chat-attachments/:fileName', authMiddleware, async (c) => {
-  const jid = c.req.param('jid');
-  const fileName = c.req.param('fileName');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
+fileRoutes.delete(
+  '/:jid/chat-attachments/:fileName',
+  authMiddleware,
+  async (c) => {
+    const jid = c.req.param('jid');
+    const fileName = c.req.param('fileName');
+    const group = getRegisteredGroup(jid);
+    if (!group) return c.json({ error: 'Group not found' }, 404);
 
-  const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
-    return c.json(
-      { error: 'Insufficient permissions for host execution mode' },
-      403,
-    );
-  }
-  if (!STAGED_CHAT_ATTACHMENT_FILE_RE.test(fileName)) {
-    return c.json({ error: 'Attachment not found' }, 404);
-  }
-
-  const rootOverride = getFileRootOverride(group);
-  const workspaceRoot = path.resolve(getFileRoot(group.folder, rootOverride));
-  const relativePath = path.posix.join(
-    STAGED_CHAT_ATTACHMENT_DIRECTORY,
-    fileName,
-  );
-  try {
-    return await withUploadMutationLock(workspaceRoot, async () => {
-      // A successful message may have been persisted even when the browser lost
-      // its response. Durable references must never be removed by best-effort
-      // composer cleanup or by another workspace member who knows the UUID.
-      if (isChatAttachmentPathReferenced(relativePath)) {
-        return c.json({ error: 'Attachment has already been sent' }, 409);
-      }
-      const absolutePath = getStagedChatAttachmentStoragePath(
-        group.folder,
-        relativePath,
+    const authUser = c.get('user') as AuthUser;
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+      return c.json(
+        { error: 'Insufficient permissions for host execution mode' },
+        403,
       );
-      const stat = fs.lstatSync(absolutePath);
-      if (stat.isSymbolicLink() || !stat.isFile()) {
-        return c.json({ error: 'Attachment not found' }, 404);
-      }
-      fs.unlinkSync(absolutePath);
-      invalidateGroupStorageUsage(group.folder, rootOverride);
-      return c.body(null, 204);
-    });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    }
+    if (!STAGED_CHAT_ATTACHMENT_FILE_RE.test(fileName)) {
       return c.json({ error: 'Attachment not found' }, 404);
     }
-    logger.error({ err: error, jid, relativePath }, 'Failed to discard chat attachment');
-    return c.json({ error: 'Failed to discard image' }, 500);
-  }
-});
+
+    const rootOverride = getFileRootOverride(group);
+    const workspaceRoot = path.resolve(getFileRoot(group.folder, rootOverride));
+    const relativePath = path.posix.join(
+      STAGED_CHAT_ATTACHMENT_DIRECTORY,
+      fileName,
+    );
+    try {
+      return await withUploadMutationLock(workspaceRoot, async () => {
+        // A successful message may have been persisted even when the browser lost
+        // its response. Durable references must never be removed by best-effort
+        // composer cleanup or by another workspace member who knows the UUID.
+        if (isChatAttachmentPathReferenced(relativePath)) {
+          return c.json({ error: 'Attachment has already been sent' }, 409);
+        }
+        const absolutePath = getStagedChatAttachmentStoragePath(
+          group.folder,
+          relativePath,
+        );
+        const stat = fs.lstatSync(absolutePath);
+        if (stat.isSymbolicLink() || !stat.isFile()) {
+          return c.json({ error: 'Attachment not found' }, 404);
+        }
+        fs.unlinkSync(absolutePath);
+        invalidateGroupStorageUsage(group.folder, rootOverride);
+        return c.body(null, 204);
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return c.json({ error: 'Attachment not found' }, 404);
+      }
+      logger.error(
+        { err: error, jid, relativePath },
+        'Failed to discard chat attachment',
+      );
+      return c.json({ error: 'Failed to discard image' }, 500);
+    }
+  },
+);
 
 // ─── 分片上传（大文件）───────────────────────────────────────────
 //
@@ -1105,12 +1155,18 @@ fileRoutes.post(
         });
       }
 
-      // 全部分片到齐：按序拼接到最终文件
-      const targetFilePath = validateAndResolvePath(
+      // 全部分片到齐：按序拼接到最终文件。同名不覆盖，跟单文件上传一致，
+      // 拼接前才是真正落盘的时刻，也是判断"名字是否被占用"最准确的时机。
+      const requestedFilePath = validateAndResolvePath(
         group.folder,
         fullRelativePath,
         rootOverride,
       );
+      const targetFilePath = resolveNonCollidingPath(
+        requestedFilePath,
+        new Set(),
+      );
+      const finalFileName = path.basename(targetFilePath);
       const targetDir = path.dirname(targetFilePath);
       if (!fs.existsSync(targetDir)) {
         fs.mkdirSync(targetDir, { recursive: true });
@@ -1161,7 +1217,11 @@ fileRoutes.post(
       }
 
       invalidateGroupStorageUsage(group.folder, rootOverride);
-      return c.json({ success: true, completed: true, files: [fileName] });
+      return c.json({
+        success: true,
+        completed: true,
+        files: [finalFileName],
+      });
     } catch (error) {
       logger.error({ err: error }, `Failed to upload file chunk for ${jid}`);
       return c.json({ error: 'Failed to upload file chunk' }, 500);

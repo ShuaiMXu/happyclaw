@@ -238,7 +238,12 @@ export function MarkdownContent({
     variant === 'chat'
       ? 'text-base leading-[1.65] text-foreground'
       : 'text-sm leading-6 text-foreground';
-  const tableTextClass = variant === 'chat' ? 'text-[0.95em]' : 'text-sm';
+  // 手机屏幕（<640px）下表格字号/行距/字距整体缩小到桌面的一半左右，
+  // 让表格在窄屏里更紧凑；sm 断点及以上恢复原有大小。
+  const tableTextClass =
+    variant === 'chat'
+      ? 'text-[0.475em] leading-tight tracking-tight sm:text-[0.95em] sm:leading-[1.65] sm:tracking-normal'
+      : 'text-[0.4375rem] leading-tight tracking-tight sm:text-sm sm:leading-6 sm:tracking-normal';
 
   return (
     <div className={textSizeClass}>
@@ -295,14 +300,14 @@ export function MarkdownContent({
           ),
           th: ({ children }) => (
             <th
-              className={`px-4 py-2 text-left font-semibold text-foreground border border-border whitespace-nowrap align-top ${tableTextClass}`}
+              className={`px-[0.5ch] py-[0.5ch] text-left font-semibold text-foreground border border-border whitespace-normal break-words align-top ${tableTextClass}`}
             >
               {children}
             </th>
           ),
           td: ({ children }) => (
             <td
-              className={`px-4 py-2 text-foreground border border-border whitespace-nowrap align-top ${tableTextClass}`}
+              className={`px-[0.5ch] py-[0.5ch] text-foreground border border-border whitespace-normal break-words align-top ${tableTextClass}`}
             >
               {children}
             </td>
