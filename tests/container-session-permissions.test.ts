@@ -340,6 +340,43 @@ describe('container proxy boundary', () => {
   });
 });
 
+describe('external capability container boundary', () => {
+  const identity = { mode: 'unknown' } as const;
+
+  test('requires a dedicated network for confined executions', () => {
+    expect(() =>
+      buildContainerArgs(mounts, 'external-test', 'UTC', identity, {
+        addHostGateway: false,
+        externalExecution: true,
+      }),
+    ).toThrow('requires a dedicated Docker network');
+  });
+
+  test('adds the dedicated network and process hardening flags', () => {
+    const args = buildContainerArgs(mounts, 'external-test', 'UTC', identity, {
+      addHostGateway: false,
+      externalExecution: true,
+      networkName: 'happyclaw-external-egress',
+    });
+    expect(args).toEqual(
+      expect.arrayContaining([
+        '--network',
+        'happyclaw-external-egress',
+        '--cap-drop',
+        'ALL',
+        '--security-opt',
+        'no-new-privileges:true',
+        '--pids-limit',
+        '256',
+        '--memory',
+        '2g',
+        '--cpus',
+        '2',
+      ]),
+    );
+  });
+});
+
 describe('entrypoint permission contract', () => {
   const dockerfile = fs.readFileSync(
     path.join(repoRoot, 'container', 'Dockerfile'),

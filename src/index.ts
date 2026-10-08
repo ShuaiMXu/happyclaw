@@ -506,6 +506,10 @@ import {
   scheduledGroupPromptMessageId,
   resolveScheduledTaskIpcRunId,
 } from './task-scheduler.js';
+import {
+  startExternalCapabilityWorker,
+  stopExternalCapabilityWorker,
+} from './external-capability-worker.js';
 import { getMergedTaskRunHistory } from './task-run-history.js';
 import { findDuplicateActiveAgentTask } from './task-definition-fingerprint.js';
 import {
@@ -20908,10 +20912,16 @@ async function main(): Promise<void> {
 
     // Phase 0: stop materializing new occurrences and drain scheduler-owned
     // detached work (script runs, notification retries) that the group queue
-    // does not track. Delivery stays available throughout so those can settle.
-    await stopSchedulerLoop().catch((err) =>
-      logger.warn({ err }, 'Error stopping scheduler loop'),
-    );
+    // does not track. Stop external capability claims before the database drain.
+    // Delivery stays available throughout so those can settle.
+    await Promise.all([
+      stopSchedulerLoop().catch((err) =>
+        logger.warn({ err }, 'Error stopping scheduler loop'),
+      ),
+      stopExternalCapabilityWorker().catch((err) =>
+        logger.warn({ err }, 'Error stopping external capability worker'),
+      ),
+    ]);
 
     try {
       shutdownTerminals();
@@ -22638,6 +22648,7 @@ async function main(): Promise<void> {
   // rewound/discarded and conversation recovery has normalized its cursors.
   // Otherwise an overdue task can race startup recovery with a fresh Runner.
   startSchedulerLoop(schedulerDeps);
+  startExternalCapabilityWorker();
   streamingBuffer.start();
   startMessageLoop();
 

@@ -14,30 +14,32 @@
 
 ## 路由模块
 
-| 前缀                               | 实现                             | 用途                          |
-| ---------------------------------- | -------------------------------- | ----------------------------- |
-| `/api/auth`                        | `src/routes/auth.ts`             | 初始化、登录、账户、设备      |
-| `/api/groups`                      | `src/routes/groups.ts`           | 工作区兼容模型、消息和环境    |
-| `/api/groups`                      | `src/routes/files.ts`            | 工作区文件                    |
-| `/api/groups`                      | `src/routes/agents.ts`           | Runtime Session 与渠道绑定    |
-| `/api/groups`                      | `src/routes/workspace-config.ts` | 项目 Skills/MCP               |
-| `/api/workspaces`                  | `src/routes/workspaces.ts`       | Agent-first 工作区投影        |
-| `/api/agent-profiles`              | `src/routes/agent-profiles.ts`   | 产品级 Agent                  |
-| `/api/channel-accounts`            | `src/routes/channel-accounts.ts` | 多渠道账号                    |
-| `/api/config`                      | `src/routes/config.ts`           | Provider、系统与兼容渠道配置  |
-| `/api/config`                      | `src/routes/brand-assets.ts`     | 品牌资源上传、删除与公开读取  |
-| `/api/tasks`                       | `src/routes/tasks.ts`            | 定时任务和运行                |
-| `/api/memory`                      | `src/routes/memory.ts`           | Workspace Memory v2           |
-| `/api/skills`                      | `src/routes/skills.ts`           | 用户 Skills                   |
-| `/api/mcp-servers`                 | `src/routes/mcp-servers.ts`      | 用户/系统 MCP                 |
-| `/api/plugins`                     | `src/routes/plugins.ts`          | Plugin Catalog 与用户启用状态 |
-| `/api/usage`                       | `src/routes/usage.ts`            | Token 用量                    |
-| `/api/billing`                     | `src/routes/billing.ts`          | 订阅、余额和计费管理          |
-| `/api/admin`                       | `src/routes/admin.ts`            | 用户、邀请和审计              |
-| `/api/bug-report`                  | `src/routes/bug-report.ts`       | 脱敏问题报告                  |
-| `/api/browse`                      | `src/routes/browse.ts`           | Host 目录选择                 |
-| `/api`                             | `src/routes/monitor.ts`          | 健康、状态和 Docker 构建      |
-| `/api/messages`、`/api/follow-ups` | `src/web.ts`                     | 消息发送和 Follow-up          |
+| 前缀                               | 实现                                       | 用途                           |
+| ---------------------------------- | ------------------------------------------ | ------------------------------ |
+| `/api/auth`                        | `src/routes/auth.ts`                       | 初始化、登录、账户、设备       |
+| `/api/groups`                      | `src/routes/groups.ts`                     | 工作区兼容模型、消息和环境     |
+| `/api/groups`                      | `src/routes/files.ts`                      | 工作区文件                     |
+| `/api/groups`                      | `src/routes/agents.ts`                     | Runtime Session 与渠道绑定     |
+| `/api/groups`                      | `src/routes/workspace-config.ts`           | 项目 Skills/MCP                |
+| `/api/workspaces`                  | `src/routes/workspaces.ts`                 | Agent-first 工作区投影         |
+| `/api/agent-profiles`              | `src/routes/agent-profiles.ts`             | 产品级 Agent                   |
+| `/api/channel-accounts`            | `src/routes/channel-accounts.ts`           | 多渠道账号                     |
+| `/api/config`                      | `src/routes/config.ts`                     | Provider、系统与兼容渠道配置   |
+| `/api/config`                      | `src/routes/brand-assets.ts`               | 品牌资源上传、删除与公开读取   |
+| `/api/tasks`                       | `src/routes/tasks.ts`                      | 定时任务和运行                 |
+| `/api/external-capabilities`       | `src/routes/external-capabilities.ts`      | 对外能力控制面、密钥与生命周期 |
+| `/v1/external-capabilities`        | `src/routes/external-capability-invoke.ts` | 服务端数据规整调用面           |
+| `/api/memory`                      | `src/routes/memory.ts`                     | Workspace Memory v2            |
+| `/api/skills`                      | `src/routes/skills.ts`                     | 用户 Skills                    |
+| `/api/mcp-servers`                 | `src/routes/mcp-servers.ts`                | 用户/系统 MCP                  |
+| `/api/plugins`                     | `src/routes/plugins.ts`                    | Plugin Catalog 与用户启用状态  |
+| `/api/usage`                       | `src/routes/usage.ts`                      | Token 用量                     |
+| `/api/billing`                     | `src/routes/billing.ts`                    | 订阅、余额和计费管理           |
+| `/api/admin`                       | `src/routes/admin.ts`                      | 用户、邀请和审计               |
+| `/api/bug-report`                  | `src/routes/bug-report.ts`                 | 脱敏问题报告                   |
+| `/api/browse`                      | `src/routes/browse.ts`                     | Host 目录选择                  |
+| `/api`                             | `src/routes/monitor.ts`                    | 健康、状态和 Docker 构建       |
+| `/api/messages`、`/api/follow-ups` | `src/web.ts`                               | 消息发送和 Follow-up           |
 
 ## 认证
 
@@ -399,6 +401,42 @@ Legacy 渠道 facade 位于 `/api/config/user-im/*`，涵盖飞书、Telegram、
 
 PATCH 修改 `chat_jid` 时会同时更新任务的具体 `delivery_route_jid`。已经物化的 Run
 在 `definition_snapshot` 中冻结原投递路由，不会因后续任务编辑而切换目标。
+
+## 外调能力
+
+控制面（浏览器 Cookie + `manage_external_capabilities` 权限，并且仅限拥有目标
+Workspace 的用户）：
+
+- `GET|PATCH /api/external-capabilities/:slug`
+- `GET /api/external-capabilities/:slug/keys`
+- `POST /api/external-capabilities/:slug/keys`：仅在创建响应中返回一次密钥明文
+- `DELETE /api/external-capabilities/:slug/keys/:keyId`：撤销密钥
+
+数据面只供服务端调用，使用能力范围内的 `Authorization: Bearer ec_...`，不接受
+浏览器 Cookie：
+
+- `POST /v1/external-capabilities/:slug/runs`：`multipart/form-data`，必填
+  `externalTaskId`、`outputSchema` 和 `files`；可携带不透明的 `tenantRef`、
+  `accountRef`、`idempotencyKey`，以及最长 8,000 字符的 `instructions`。
+- `GET /v1/external-capabilities/:slug/runs/:runId`：轮询状态及安全的结果摘要。
+- `DELETE /v1/external-capabilities/:slug/runs/:runId`：取消同一能力密钥创建的未终态任务；已在本机运行的 Container 会立即收到停止请求。
+- `GET /v1/external-capabilities/:slug/runs/:runId/output`：下载完成后的 XLSX 底表。
+
+`outputSchema` 是受限的 JSON 底表定义（1–100 个唯一列键），而不是调用方可注入的
+工作区、工具或执行配置。`instructions` 只作为不可信的本次任务说明，不能覆盖平台维护的
+专业规则、输出限制或安全边界。每个任务及其幂等键均按能力密钥隔离，因此多个平台可以
+使用相同的业务任务编号而互不冲突。
+
+输入文件会先经过大小、数量、文件名和内容类型检测，再存入项目目录之外的私有 Vault。
+Worker 在宿主侧把受限的无宏 XLSX 提取为文本预览、把图片作为模型附件传入；旧版 XLS、宏、嵌入对象和外部链接内容会被拒绝。模型执行不授予文件或其他 SDK 工具，且只能返回受限的结构化行，再由 Worker 生成 XLSX。
+首项“结构化数据规整”能力固定绑定到平台维护的 Container Workspace。除生命周期状态外，宿主机还必须显式设置 `EXTERNAL_CAPABILITY_RELEASE_ENABLED=true` 和预创建、经审核的 `EXTERNAL_CAPABILITY_DOCKER_NETWORK`；默认 `bridge`、`host`、`none` 等网络不会被接受。激活和 Worker 调度还会通过 `docker network inspect` 验证该网络是 local bridge、`Internal=true`、非 ingress/config-only，并带有 `com.happyclaw.external-capability-egress=true` 和 `com.happyclaw.egress-policy=provider-only` 标签。该结构阻止容器直接访问互联网，Provider 必须通过同网络内的受控代理访问；标签只是运维审批声明，不能代替真实出口哨兵测试。发布闸门或专用网络未就绪时不能切换为 `active`、不能受理新任务，Worker 也不会执行任务。外调容器额外启用 capability drop、`no-new-privileges`、PID、内存和 CPU 限制，并受独立的单次处理硬超时以及全局、能力级、Key 级并发限制。该闸门只能在隔离、配额、监控和演练通过后开启。
+
+外调任务、私有输入和结果默认最多保留 24 小时；宿主机可通过
+`EXTERNAL_CAPABILITY_RUN_RETENTION_HOURS` 缩短到 1–24 小时。清理后状态和下载接口返回
+`404`，相同 `externalTaskId` 或 `idempotencyKey` 可重新创建任务，因此幂等保证只覆盖保留期。
+
+当前结果交付的可靠基线为轮询和认证下载。Webhook 回调需要预注册的接收端、签名密钥和
+独立的耐久 Outbox；在该 Outbox 尚未配置前，调用方不应提交任意回调 URL。
 
 ## Skills、MCP 和 Plugins
 

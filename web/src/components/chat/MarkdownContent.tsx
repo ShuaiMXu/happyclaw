@@ -4,7 +4,10 @@ import { Check, Copy } from 'lucide-react';
 import { PreviewDialog } from './PreviewDialog';
 import { resolveMarkdownImageSrc } from '../../utils/markdownImageSrc';
 import { useFileStore } from '../../stores/files';
-import { looksLikeWorkspaceFilePath } from '../../utils/fileKind';
+import {
+  looksLikeWorkspaceFilePath,
+  workspaceFilePathFromMarkdownHref,
+} from '../../utils/fileKind';
 
 const MermaidDiagram = lazy(() =>
   import('./MermaidDiagram').then((module) => ({
@@ -269,16 +272,40 @@ export function MarkdownContent({
               loading={eagerImages ? 'eager' : 'lazy'}
             />
           ),
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-primary hover:text-primary underline break-all"
-            >
-              {children}
-            </a>
-          ),
+          a: ({ href, children }) => {
+            const workspaceFilePath = groupJid
+              ? workspaceFilePathFromMarkdownHref(href)
+              : null;
+            if (workspaceFilePath) {
+              return (
+                <button
+                  type="button"
+                  className="text-primary hover:text-primary underline break-all"
+                  title="点击在项目文件中打开"
+                  onClick={() =>
+                    void useFileStore
+                      .getState()
+                      .openWorkspaceFileByAgentPath(
+                        groupJid!,
+                        workspaceFilePath,
+                      )
+                  }
+                >
+                  {children}
+                </button>
+              );
+            }
+            return (
+              <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-primary hover:text-primary underline break-all"
+              >
+                {children}
+              </a>
+            );
+          },
           table: ({ children }) => (
             <div
               className="my-4 max-w-full overflow-x-auto overflow-y-hidden overscroll-x-contain [-webkit-overflow-scrolling:touch] [touch-action:pan-x_pan-y]"

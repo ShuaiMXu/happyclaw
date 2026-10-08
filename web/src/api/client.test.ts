@@ -263,7 +263,10 @@ describe('postJsonWithUploadProgress', () => {
   test('uploads staged images as multipart without overriding its boundary', async () => {
     vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
     const formData = new FormData();
-    formData.append('file', new File(['image'], 'photo.png', { type: 'image/png' }));
+    formData.append(
+      'file',
+      new File(['image'], 'photo.png', { type: 'image/png' }),
+    );
     const progress = vi.fn();
 
     const pending = postFormDataWithUploadProgress<{ attachment: string }>(

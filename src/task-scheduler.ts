@@ -767,7 +767,18 @@ function finalizeRecurringRun(
   // V2 advances the definition cursor when it materializes an occurrence.
   // Letting the legacy executor advance again would skip or resurrect runs.
   if (preserveDefinitionCursor || activeDurableTaskIds.has(task.id)) return;
-  if (nextRun === null && task.schedule_type !== 'once') {
+
+  // 间隔型任务加一道冷却下限：不早于本次运行结束（此刻）+ TASK_INTERVAL_COOLDOWN_MS。
+  // cron/once 是用户显式配置的具体时间点，不受这条下限影响。
+  let effectiveNextRun = nextRun;
+  if (effectiveNextRun && task.schedule_type === 'interval') {
+    const floor = Date.now() + TASK_INTERVAL_COOLDOWN_MS;
+    if (new Date(effectiveNextRun).getTime() < floor) {
+      effectiveNextRun = new Date(floor).toISOString();
+    }
+  }
+
+  if (effectiveNextRun === null && task.schedule_type !== 'once') {
     logger.error(
       {
         taskId: task.id,
@@ -778,7 +789,7 @@ function finalizeRecurringRun(
     );
     pauseTaskAfterRun(task.id, resultSummary);
   } else {
-    updateTaskAfterRun(task.id, nextRun, resultSummary);
+    updateTaskAfterRun(task.id, effectiveNextRun, resultSummary);
   }
 }
 
@@ -820,6 +831,10 @@ function isTaskStillActive(taskId: string, label?: string): boolean {
 
 const SCHEDULER_RUNNER_ID = `${process.pid}:${randomUUID()}`;
 const MIN_INTERVAL_MS = 60 * 1000;
+// 间隔型任务运行结束后，下一次执行不早于"结束时刻 + 这个冷却时间"，即使算出来
+// 的 next_run 已经到了或已经过了。避免一次运行耗时接近/超过调度间隔时，任务
+// 结束后立刻又被派发下一次，观感上像是不停连轴转、没有喘息空当。
+const TASK_INTERVAL_COOLDOWN_MS = 30 * 1000;
 
 function getTaskLeaseMs(): number {
   const settings = getSystemSettings();

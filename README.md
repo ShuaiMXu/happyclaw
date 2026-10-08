@@ -308,23 +308,29 @@ HappyClaw 优先通过 Web 设置管理配置，不要求用户维护一组庞�
 
 ### 可选环境变量
 
-| 变量                                 | 默认值                            | 说明                                                                               |
-| ------------------------------------ | --------------------------------- | ---------------------------------------------------------------------------------- |
-| `WEB_PORT`                           | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
-| `WEB_SESSION_SECRET`                 | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
-| `CONTAINER_IMAGE`                    | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
-| `CONTAINER_IMAGE_HEADROOM`           | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
-| `CONTAINER_TIMEOUT`                  | `1800000`                         | 容器硬超时，毫秒                                                                   |
-| `IDLE_TIMEOUT`                       | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
-| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                              | IPC 债务强制恢复上限（整数分钟，范围 4–120；非法值回退默认）                       |
-| `ADMIN_HOST_ONLY_MODE`               | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
-| `MAX_CONCURRENT_CONTAINERS`          | `20`                              | 最大并发容器数                                                                     |
-| `MAX_FILE_SIZE_MB`                   | `50`                              | Web 和 IM 入站文件大小上限                                                         |
-| `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
-| `TRUST_PROXY`                        | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
-| `TZ`                                 | 系统时区                          | 日志与定时任务时区                                                                 |
-| `HTTPS_PROXY` / `HTTP_PROXY`         | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
-| `NO_PROXY`                           | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
+| 变量                                         | 默认值                            | 说明                                                                               |
+| -------------------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------- |
+| `WEB_PORT`                                   | `3000`                            | Web、REST API 与 WebSocket 端口                                                    |
+| `WEB_SESSION_SECRET`                         | 自动生成并持久化                  | Web 登录会话签名密钥                                                               |
+| `CONTAINER_IMAGE`                            | `riba2534/happyclaw-agent:latest` | 智能体容器镜像                                                                     |
+| `CONTAINER_IMAGE_HEADROOM`                   | 从 core 标签派生 `-headroom`      | 启用 Headroom MCP 时使用的同版本能力镜像                                           |
+| `CONTAINER_TIMEOUT`                          | `1800000`                         | 容器硬超时，毫秒                                                                   |
+| `IDLE_TIMEOUT`                               | `1800000`                         | 容器空闲保活时间，毫秒                                                             |
+| `STUCK_RUNNER_FORCE_RESTART_MINUTES`         | `10`                              | IPC 债务强制恢复上限（整数分钟，范围 4–120；非法值回退默认）                       |
+| `EXTERNAL_CAPABILITY_VAULT_DIR`              | 未设置                            | 启用外调能力时必填；项目目录之外的私有输入/输出 Vault                              |
+| `EXTERNAL_CAPABILITY_RELEASE_ENABLED`        | `false`                           | 外调生产流量宿主机发布闸门；仅在隔离、配额、监控和演练验收后设为 `true`            |
+| `EXTERNAL_CAPABILITY_DOCKER_NETWORK`         | 未设置                            | 外调容器专用的内部 Docker 网络；需带 provider-only 审批标签并通过真实出口验收      |
+| `EXTERNAL_CAPABILITY_EXECUTION_TIMEOUT_MS`   | `600000`                          | 单次外调处理硬超时（整数 30000–1800000 毫秒）                                      |
+| `EXTERNAL_CAPABILITY_CAPABILITY_CONCURRENCY` | `2`                               | 单项外调能力最大并发（整数 1–100；另受全局和 Key 并发限制）                        |
+| `EXTERNAL_CAPABILITY_RUN_RETENTION_HOURS`    | `24`                              | 外调任务、输入和结果保留小时数（整数 1–24；不能禁用或延长超过 24 小时）            |
+| `ADMIN_HOST_ONLY_MODE`                       | `false`                           | 管理员工作区与任务强制使用宿主机                                                   |
+| `MAX_CONCURRENT_CONTAINERS`                  | `20`                              | 最大并发容器数                                                                     |
+| `MAX_FILE_SIZE_MB`                           | `50`                              | Web 和 IM 入站文件大小上限                                                         |
+| `CORS_ALLOWED_ORIGINS`                       | 仅 localhost                      | 公网部署的 WebSocket Origin 白名单                                                 |
+| `TRUST_PROXY`                                | `false`                           | 位于可信反向代理后时设为 `true`                                                    |
+| `TZ`                                         | 系统时区                          | 日志与定时任务时区                                                                 |
+| `HTTPS_PROXY` / `HTTP_PROXY`                 | 未设置                            | 独立配置 HTTPS/HTTP 出站代理；主进程与每个智能体容器都会使用，也接受对应的小写变量 |
+| `NO_PROXY`                                   | 未设置                            | 独立配置不走代理的地址列表，也接受 `no_proxy`                                      |
 
 Provider 与渠道凭据建议只在 Web 设置中填写。它们使用 AES-256-GCM 加密存储，相关 API 只返回是否已配置，不返回密钥明文。
 

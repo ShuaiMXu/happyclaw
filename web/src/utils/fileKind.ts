@@ -144,3 +144,42 @@ export function looksLikeWorkspaceFilePath(text: string): boolean {
   const base = trimmed.slice(0, trimmed.length - ext.length - 1);
   return base.length > 0;
 }
+
+/**
+ * Turns a Markdown link target into an Agent-visible workspace path only when
+ * it is a plain local file reference. This deliberately excludes URLs and
+ * SPA-relative paths such as /chat/output/report.pdf: opening a workspace file
+ * must always go through the authenticated file API, never a public URL.
+ */
+export function workspaceFilePathFromMarkdownHref(
+  href: string | undefined,
+): string | null {
+  if (!href) return null;
+  const trimmed = href.trim();
+  if (!trimmed || trimmed.length > 900) return null;
+  if (
+    trimmed.startsWith('//') ||
+    /^[a-z][a-z0-9+.-]*:/i.test(trimmed) ||
+    trimmed.includes('?') ||
+    trimmed.includes('#')
+  ) {
+    return null;
+  }
+
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(trimmed);
+  } catch {
+    return null;
+  }
+
+  const normalized = decoded.startsWith('./') ? decoded.slice(2) : decoded;
+  if (
+    normalized.startsWith('/') &&
+    !normalized.startsWith('/workspace/group/')
+  ) {
+    return null;
+  }
+  if (normalized.startsWith('../') || normalized.includes('/../')) return null;
+  return looksLikeWorkspaceFilePath(normalized) ? normalized : null;
+}

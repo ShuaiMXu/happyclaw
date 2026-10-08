@@ -115,9 +115,7 @@ describe('extractSessionHistory', () => {
 
   test('truncates messages longer than RECOVERY_MESSAGE_TRUNCATE characters', () => {
     const longText = 'x'.repeat(RECOVERY_MESSAGE_TRUNCATE + 100);
-    writeTranscript('s2', [
-      { type: 'user', message: { content: longText } },
-    ]);
+    writeTranscript('s2', [{ type: 'user', message: { content: longText } }]);
 
     const result = extractSessionHistory({
       transcriptDir: tmpDir,
@@ -139,9 +137,7 @@ describe('extractSessionHistory', () => {
     const loneLow = '\uDC00';
     const input = `hi ${validEmoji} ${loneHigh} ${loneLow} bye`;
 
-    writeTranscript('s3', [
-      { type: 'user', message: { content: input } },
-    ]);
+    writeTranscript('s3', [{ type: 'user', message: { content: input } }]);
 
     const result = extractSessionHistory({
       transcriptDir: tmpDir,
@@ -237,6 +233,8 @@ describe('LONE_SURROGATE_RE invariant', () => {
     const cleaned = truncated.replace(LONE_SURROGATE_RE, '');
     expect(cleaned).toBe(`${prefix} `);
     // 清洗后再 JSON.stringify 不再产生 lone surrogate escape
-    expect(JSON.stringify(cleaned)).not.toMatch(/\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f])/i);
+    expect(JSON.stringify(cleaned)).not.toMatch(
+      /\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f])/i,
+    );
   });
 });

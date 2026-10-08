@@ -264,7 +264,9 @@ export function postFormDataWithUploadProgress<T>(
       settle(() => {
         const parsed = parseXhrJson(xhr.responseText);
         const responseBody =
-          typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+          typeof parsed === 'object' &&
+          parsed !== null &&
+          !Array.isArray(parsed)
             ? (parsed as Record<string, unknown>)
             : {};
         if (xhr.status === 401) {

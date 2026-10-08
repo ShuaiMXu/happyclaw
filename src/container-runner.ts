@@ -26,6 +26,7 @@ import {
   type ContainerProxyConfig,
 } from './config.js';
 import { logger } from './logger.js';
+import { getExternalCapabilityDockerNetwork } from './external-capability-release-config.js';
 import {
   buildEffectiveMcpManifest,
   loadPluginMcpDefinitions,
@@ -226,6 +227,20 @@ function getContainerClaudeJsonPath(): string {
     );
   }
 
+  return containerJsonPath;
+}
+
+/**
+ * An external execution may not inherit even the stripped shared host identity.
+ * Keep its Claude Code bootstrap inside the per-run runtime root instead.
+ */
+function getExternalContainerClaudeJsonPath(runtimeDirectory: string): string {
+  const containerJsonPath = path.join(runtimeDirectory, 'claude.json');
+  fs.writeFileSync(
+    containerJsonPath,
+    '{"hasCompletedOnboarding":true,"autoUpdates":false}\n',
+    { mode: 0o600 },
+  );
   return containerJsonPath;
 }
 
@@ -529,6 +544,14 @@ export interface ContainerInput {
   contextAudit?: ClaudeContextAudit;
   /** Canonical effective Skill set for SDK selection and run provenance. */
   skillManifest?: { hash: string; selectedSkillIds: string[] };
+  /** Host-only paths for a confined external capability run. */
+  externalExecution?: {
+    inputDirectory: string;
+    outputDirectory: string;
+    runtimeDirectory: string;
+  };
+  /** Explicit SDK tool allow-list for a confined host-owned execution. */
+  allowedTools?: string[];
 }
 
 /**
@@ -1643,18 +1666,26 @@ function prepareVolumeMounts(
     envLines: [],
     addHostGateway: false,
   },
+  externalExecution?: ContainerInput['externalExecution'],
 ): PreparedVolumeMounts {
-  if (group.containerConfigError) {
+  if (externalExecution && resolveAgentRunnerMode() === 'development') {
+    throw new Error(
+      'External capability execution requires HAPPYCLAW_AGENT_RUNNER_MODE=image',
+    );
+  }
+  if (!externalExecution && group.containerConfigError) {
     throw new AdditionalMountValidationError([
       `Persisted container configuration is invalid: ${group.containerConfigError}`,
     ]);
   }
-  const parsedContainerConfig = parseContainerConfig(group.containerConfig);
-  if (parsedContainerConfig.error) {
+  const parsedContainerConfig = externalExecution
+    ? undefined
+    : parseContainerConfig(group.containerConfig);
+  if (parsedContainerConfig?.error) {
     throw new AdditionalMountValidationError([parsedContainerConfig.error]);
   }
   const configuredAdditionalMounts =
-    parsedContainerConfig.config?.additionalMounts;
+    parsedContainerConfig?.config?.additionalMounts;
   if (configuredAdditionalMounts && configuredAdditionalMounts.length > 0) {
     let currentOwner;
     try {
@@ -1675,9 +1706,25 @@ function prepareVolumeMounts(
   let feishuCliBinding: FeishuCliRuntimeBinding | null = null;
   let dockerOauthLaunch: PreparedVolumeMounts['dockerOauthLaunch'] = null;
   const projectRoot = process.cwd();
-  const ownerId = group.created_by;
+  // External executions must not inherit owner-scoped Skills, Plugins, MCP,
+  // Feishu state, additional mounts, or custom workspace environment values.
+  const ownerId = externalExecution ? undefined : group.created_by;
 
-  if (isAdminHome) {
+  if (externalExecution) {
+    // An external caller's documents never enter a normal workspace. The Agent
+    // only sees verified staged inputs read-only and an otherwise empty output
+    // directory as its cwd; it cannot browse tenant or project files.
+    mounts.push({
+      hostPath: externalExecution.inputDirectory,
+      containerPath: '/workspace/input',
+      readonly: true,
+    });
+    mounts.push({
+      hostPath: externalExecution.outputDirectory,
+      containerPath: '/workspace/group',
+      readonly: false,
+    });
+  } else if (isAdminHome) {
     // Admin home gets the entire project root mounted
     mounts.push({
       hostPath: projectRoot,
@@ -1702,23 +1749,27 @@ function prepareVolumeMounts(
 
   // Per-group Claude sessions directory (isolated from other groups)
   // Sub-agents and task sessions get their own session dir under agents/{id}/.claude/
-  const groupSessionsDir = sessionAgentId
-    ? path.join(
-        DATA_DIR,
-        'sessions',
-        group.folder,
-        'agents',
-        sessionAgentId,
-        '.claude',
-      )
-    : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  const groupSessionsDir = externalExecution
+    ? path.join(externalExecution.runtimeDirectory, 'session', '.claude')
+    : sessionAgentId
+      ? path.join(
+          DATA_DIR,
+          'sessions',
+          group.folder,
+          'agents',
+          sessionAgentId,
+          '.claude',
+        )
+      : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   mkdirForContainer(groupSessionsDir);
   const userSkillsPolicy = resolveAgentProfileUserSkillsPolicy(
     ownerId,
     agentProfile,
   );
   const pluginSkills = ownerId ? prepareHostPlugins(ownerId) : [];
-  const runtimeMcpServers = resolveRuntimeMcpServers(group, agentProfile);
+  const runtimeMcpServers = externalExecution
+    ? {}
+    : resolveRuntimeMcpServers(group, agentProfile);
   const claudeContextPlan = buildClaudeContextPlan({
     executionMode: 'container',
     group,
@@ -1765,8 +1816,12 @@ function prepareVolumeMounts(
     /* not found, ok */
   }
 
-  // 挂载精简版 .claude.json（剥离 cachedGrowthBookFeatures），保留 deviceId 一致性
-  const containerJson = getContainerClaudeJsonPath();
+  // External jobs use a fresh per-run bootstrap rather than the shared,
+  // host-derived .claude.json. Normal workspace jobs retain a stripped shared
+  // identity for stable device registration.
+  const containerJson = externalExecution
+    ? getExternalContainerClaudeJsonPath(externalExecution.runtimeDirectory)
+    : getContainerClaudeJsonPath();
   mounts.push({
     hostPath: containerJson,
     containerPath: '/home/node/.claude.json',
@@ -1807,7 +1862,9 @@ function prepareVolumeMounts(
   // authorization, forcing re-auth every IDLE_TIMEOUT (#477). HappyClaw never
   // creates or switches profiles here: the CLI keeps ownership of its native
   // config, while a bound Bot's App credentials are overlaid via env below.
-  if (ownerId) {
+  if (externalExecution) {
+    feishuCliBinding = null;
+  } else if (ownerId) {
     const userFeishuCliDir = path.join(
       DATA_DIR,
       'config',
@@ -1874,11 +1931,13 @@ function prepareVolumeMounts(
   // Sub-agents get their own IPC subdirectory under agents/{agentId}/
   // Isolated tasks get their own IPC subdirectory under tasks-run/{taskRunId}/
   // Keep host IPC roots owner-only; the entrypoint applies the selected bridge.
-  const groupIpcDir = ipcAgentId
-    ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', ipcAgentId)
-    : taskRunId
-      ? path.join(DATA_DIR, 'ipc', group.folder, 'tasks-run', taskRunId)
-      : path.join(DATA_DIR, 'ipc', group.folder);
+  const groupIpcDir = externalExecution
+    ? path.join(externalExecution.runtimeDirectory, 'ipc')
+    : ipcAgentId
+      ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', ipcAgentId)
+      : taskRunId
+        ? path.join(DATA_DIR, 'ipc', group.folder, 'tasks-run', taskRunId)
+        : path.join(DATA_DIR, 'ipc', group.folder);
   mkdirForContainer(groupIpcDir);
   // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
   for (const sub of ['messages', 'tasks', 'input', 'agents'] as const) {
@@ -1898,24 +1957,28 @@ function prepareVolumeMounts(
 
   // Per-container environment file (keeps credentials out of process listings)
   // Global config merged with per-container overrides.
-  const envDir = getContainerRuntimeEnvDir(
-    group.folder,
-    ipcAgentId,
-    taskRunId,
-    feishuCliBinding?.source === 'channel_account'
-      ? feishuCliBinding.accountId
-      : null,
-  );
+  const envDir = externalExecution
+    ? path.join(externalExecution.runtimeDirectory, 'env')
+    : getContainerRuntimeEnvDir(
+        group.folder,
+        ipcAgentId,
+        taskRunId,
+        feishuCliBinding?.source === 'channel_account'
+          ? feishuCliBinding.accountId
+          : null,
+      );
   fs.mkdirSync(envDir, { recursive: true });
   const globalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
   const containerOverride = getContainerEnvConfig(group.folder);
-  const effectiveContainerOverride = resolvedProvider
-    ? { customEnv: containerOverride.customEnv }
-    : containerOverride;
+  const effectiveContainerOverride = externalExecution
+    ? {}
+    : resolvedProvider
+      ? { customEnv: containerOverride.customEnv }
+      : containerOverride;
   const envLines = buildContainerEnvLines(
     globalConfig,
     effectiveContainerOverride,
-    resolvedProvider?.customEnv,
+    externalExecution ? undefined : resolvedProvider?.customEnv,
   );
   const agentEffort = resolveAgentSdkEffort(agentProfile?.runtimePolicy);
   removeProviderEffortEnv(envLines, agentEffort);
@@ -1979,7 +2042,10 @@ function prepareVolumeMounts(
   }
 
   // Write .credentials.json for OAuth credentials (session dir is already mounted)
-  const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
+  const mergedConfig = mergeClaudeEnvConfig(
+    globalConfig,
+    externalExecution ? {} : containerOverride,
+  );
   const clearSessionOAuth =
     !!mergedConfig.anthropicBaseUrl ||
     hasExplicitWorkspaceClaudeAuth(containerOverride);
@@ -2054,25 +2120,27 @@ function prepareVolumeMounts(
     }
   }
 
-  // Per-group persistent extra directory: provides a durable /workspace/extra/ even when
-  // no additionalMounts are configured. User-configured additionalMounts from the allowlist
-  // are mounted as subdirectories (/workspace/extra/{name}) and overlay on top.
-  const extraDir = path.join(DATA_DIR, 'extra', group.folder);
-  mkdirForContainer(extraDir);
-  mounts.push({
-    hostPath: extraDir,
-    containerPath: '/workspace/extra',
-    readonly: false,
-  });
+  if (!externalExecution) {
+    // Per-group persistent extra directory: provides a durable /workspace/extra/ even when
+    // no additionalMounts are configured. User-configured additionalMounts from the allowlist
+    // are mounted as subdirectories (/workspace/extra/{name}) and overlay on top.
+    const extraDir = path.join(DATA_DIR, 'extra', group.folder);
+    mkdirForContainer(extraDir);
+    mounts.push({
+      hostPath: extraDir,
+      containerPath: '/workspace/extra',
+      readonly: false,
+    });
 
-  // Additional mounts validated against external allowlist (tamper-proof from containers)
-  if (configuredAdditionalMounts && configuredAdditionalMounts.length > 0) {
-    const validatedMounts = validateAdditionalMounts(
-      configuredAdditionalMounts,
-      group.name,
-      group.is_home === true,
-    );
-    mounts.push(...validatedMounts);
+    // Additional mounts validated against external allowlist (tamper-proof from containers)
+    if (configuredAdditionalMounts && configuredAdditionalMounts.length > 0) {
+      const validatedMounts = validateAdditionalMounts(
+        configuredAdditionalMounts,
+        group.name,
+        group.is_home === true,
+      );
+      mounts.push(...validatedMounts);
+    }
   }
 
   return {
@@ -2202,6 +2270,8 @@ export interface ResolvedContainerProxyConfig {
 
 export interface ContainerNetworkConfig {
   addHostGateway: boolean;
+  externalExecution?: boolean;
+  networkName?: string;
 }
 
 function defaultContainerProxyConfig(): ContainerProxyConfig {
@@ -2319,6 +2389,27 @@ export function buildContainerArgs(
 
   // Proxy URLs are sourced from the mounted 0600 runtime env file. Only this
   // non-sensitive name-resolution option is allowed into docker argv/logs.
+  if (networkConfig.externalExecution) {
+    if (!networkConfig.networkName) {
+      throw new Error(
+        'External capability execution requires a dedicated Docker network',
+      );
+    }
+    args.push(
+      '--network',
+      networkConfig.networkName,
+      '--cap-drop',
+      'ALL',
+      '--security-opt',
+      'no-new-privileges:true',
+      '--pids-limit',
+      '256',
+      '--memory',
+      '2g',
+      '--cpus',
+      '2',
+    );
+  }
   if (networkConfig.addHostGateway) {
     args.push('--add-host', 'host.docker.internal:host-gateway');
   }
@@ -2453,17 +2544,21 @@ export async function runContainerAgent(
     agentId: input.agentId ?? null,
     taskRunId: input.taskRunId ?? null,
   };
-  const {
-    runnerInstanceId: workspaceMemoryRunnerInstanceId,
-    signingSecret: workspaceMemoryMutationSigningSecret,
-  } = issueWorkspaceMemoryWriteCapability(
-    workspaceMemoryCapabilityScope,
-    input.turnId,
-  );
+  const workspaceMemoryCapability = input.externalExecution
+    ? null
+    : issueWorkspaceMemoryWriteCapability(
+        workspaceMemoryCapabilityScope,
+        input.turnId,
+      );
+  const workspaceMemoryRunnerInstanceId =
+    workspaceMemoryCapability?.runnerInstanceId;
+  const workspaceMemoryMutationSigningSecret =
+    workspaceMemoryCapability?.signingSecret;
   try {
     const isAdminHome = !!input.isAdminHome;
     // Per-user skills: always mount if the group has an owner
-    const shouldMountUserSkills = !!group.created_by;
+    const shouldMountUserSkills =
+      !!group.created_by && !input.externalExecution;
     // Resolve before creating mounts or spawning Docker so Linux loopback
     // configurations fail fast with an actionable error.
     const containerProxy = resolveContainerProxyConfig();
@@ -2481,12 +2576,15 @@ export async function runContainerAgent(
       poolResult?.modelOverride,
       modelSelectionPinned,
       containerProxy,
+      input.externalExecution,
     );
     const mounts = preparedLaunch.mounts;
-    const dockerPlugins = group.created_by
-      ? loadUserPlugins(group.created_by, { runtime: 'docker' })
-      : [];
+    const dockerPlugins =
+      group.created_by && !input.externalExecution
+        ? loadUserPlugins(group.created_by, { runtime: 'docker' })
+        : [];
     const pluginMcpServers =
+      !input.externalExecution &&
       getAgentProfileMcpPolicyMode(input.agentProfile) === 'inherit'
         ? loadPluginMcpDefinitions(preparedLaunch.hostPlugins)
         : {};
@@ -2523,20 +2621,33 @@ export async function runContainerAgent(
       containerName,
       TIMEZONE,
       detectContainerHostIdentity(),
-      { addHostGateway: containerProxy.addHostGateway },
+      {
+        addHostGateway: containerProxy.addHostGateway,
+        externalExecution: Boolean(input.externalExecution),
+        networkName: input.externalExecution
+          ? (getExternalCapabilityDockerNetwork() ?? undefined)
+          : undefined,
+      },
       containerImage,
     );
 
     logger.debug(
-      {
-        group: group.name,
-        containerName,
-        mounts: mounts.map(
-          (m) =>
-            `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
-        ),
-        containerArgs: containerArgs.join(' '),
-      },
+      input.externalExecution
+        ? {
+            group: group.name,
+            containerName,
+            mountCount: mounts.length,
+            sensitiveExecutionData: 'redacted',
+          }
+        : {
+            group: group.name,
+            containerName,
+            mounts: mounts.map(
+              (m) =>
+                `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
+            ),
+            containerArgs: containerArgs.join(' '),
+          },
       'Container mount configuration',
     );
 
@@ -2552,7 +2663,9 @@ export async function runContainerAgent(
       'Spawning container agent',
     );
 
-    const logsDir = path.join(GROUPS_DIR, group.folder, 'logs');
+    const logsDir = input.externalExecution
+      ? path.join(input.externalExecution.runtimeDirectory, 'logs')
+      : path.join(GROUPS_DIR, group.folder, 'logs');
     fs.mkdirSync(logsDir, { recursive: true });
 
     const result = await new Promise<ContainerOutput>((resolve) => {
@@ -2575,8 +2688,11 @@ export async function runContainerAgent(
       });
       // Derive a new input with docker-runtime plugins injected; never mutate
       // the caller's `input` object (queue/log/retry paths reuse the same ref).
+      // Host paths used to build the external sandbox are never disclosed to the
+      // container-side runner.
+      const { externalExecution: _externalExecution, ...runnerInput } = input;
       const dockerInput: ContainerInput = {
-        ...input,
+        ...runnerInput,
         workspaceMemoryMutationSigningSecret,
         workspaceMemoryRunnerInstanceId,
         plugins: dockerPlugins,
@@ -2798,9 +2914,13 @@ export async function runContainerAgent(
         onOutput: handleOutput,
         resetTimeout,
       });
-      attachStderrHandler(container.stderr, stderrState, group.name, {
-        container: group.folder,
-      });
+      attachStderrHandler(
+        container.stderr,
+        stderrState,
+        group.name,
+        { container: group.folder },
+        { redactSensitiveData: Boolean(input.externalExecution) },
+      );
 
       container.on('close', (code, signal) => {
         clearTimeout(timeout);
@@ -2820,6 +2940,7 @@ export async function runContainerAgent(
           resolvePromise: resolve,
           startTime,
           timeoutMs,
+          redactSensitiveData: Boolean(input.externalExecution),
           extraSummaryLines: [
             ``,
             `=== Mounts ===`,
@@ -2906,17 +3027,19 @@ export async function runContainerAgent(
 
     return result;
   } finally {
-    revokeWorkspaceMemoryWriteCapability(
-      workspaceMemoryCapabilityScope,
-      workspaceMemoryRunnerInstanceId,
-    );
-    try {
-      releaseHappyClawOwnerIntroductionLease(workspaceMemoryRunnerInstanceId);
-    } catch (err) {
-      logger.warn(
-        { err, runnerInstanceId: workspaceMemoryRunnerInstanceId },
-        'Failed to release Owner Profile introduction lease',
+    if (workspaceMemoryRunnerInstanceId) {
+      revokeWorkspaceMemoryWriteCapability(
+        workspaceMemoryCapabilityScope,
+        workspaceMemoryRunnerInstanceId,
       );
+      try {
+        releaseHappyClawOwnerIntroductionLease(workspaceMemoryRunnerInstanceId);
+      } catch (err) {
+        logger.warn(
+          { err, runnerInstanceId: workspaceMemoryRunnerInstanceId },
+          'Failed to release Owner Profile introduction lease',
+        );
+      }
     }
     // Guarantee session release even if buildVolumeMounts/spawn throws
     if (selectedProfileId) {

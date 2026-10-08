@@ -203,16 +203,31 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
   } = validation.data;
   const authUser = c.get('user') as AuthUser;
 
-  // Auto-resolve group_folder/chat_jid from user's home group if not provided
+  // Auto-resolve group_folder/chat_jid from user's home group if not provided.
+  //
+  // The web client (CreateTaskForm) only ever sends chat_jid, never
+  // group_folder — that's the normal, expected shape of this request for any
+  // non-home workspace. The old code treated "either field missing" as "use
+  // the home group for whichever field is missing", so a request with only
+  // chat_jid set (pointing at a non-home workspace) got group_folder
+  // silently overwritten with the *home* group's folder — guaranteed to
+  // mismatch against chat_jid's real folder and fail every single time.
+  // Only fall back to the home group when chat_jid itself is missing;
+  // otherwise resolve group_folder from the workspace chat_jid actually
+  // points at.
   let groupFolder = validation.data.group_folder;
   let chatJid = validation.data.chat_jid;
-  if (!groupFolder || !chatJid) {
+  if (!chatJid) {
     const homeGroup = getUserHomeGroup(authUser.id);
     if (!homeGroup) {
       return c.json({ error: 'User has no home group' }, 400);
     }
-    groupFolder = groupFolder || homeGroup.folder;
-    chatJid = chatJid || homeGroup.jid;
+    chatJid = homeGroup.jid;
+    groupFolder = homeGroup.folder;
+  } else if (!groupFolder) {
+    const groupForJid = getRegisteredGroup(chatJid);
+    if (!groupForJid) return c.json({ error: 'Group not found' }, 404);
+    groupFolder = groupForJid.folder;
   }
 
   const group = getRegisteredGroup(chatJid);

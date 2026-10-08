@@ -94,13 +94,12 @@ function resolveImageMimeType(
 }
 
 export function isStagedChatAttachmentPath(value: unknown): value is string {
-  return typeof value === 'string' && STAGED_CHAT_ATTACHMENT_PATH_RE.test(value);
+  return (
+    typeof value === 'string' && STAGED_CHAT_ATTACHMENT_PATH_RE.test(value)
+  );
 }
 
-function attachmentStorageRoot(
-  folder: string,
-  rootOverride?: string,
-): string {
+function attachmentStorageRoot(folder: string, rootOverride?: string): string {
   const baseRoot = path.resolve(rootOverride ?? CHAT_ATTACHMENT_STORAGE_ROOT);
   const root = path.resolve(baseRoot, folder);
   const relative = path.relative(baseRoot, root);
@@ -139,9 +138,12 @@ export function getStagedChatAttachmentStorageUsage(
   try {
     let total = 0;
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isFile() || !STAGED_CHAT_ATTACHMENT_PATH_RE.test(
-        `${STAGED_CHAT_ATTACHMENT_PREFIX}${entry.name}`,
-      )) {
+      if (
+        !entry.isFile() ||
+        !STAGED_CHAT_ATTACHMENT_PATH_RE.test(
+          `${STAGED_CHAT_ATTACHMENT_PREFIX}${entry.name}`,
+        )
+      ) {
         continue;
       }
       total += fs.statSync(path.join(root, entry.name)).size;
@@ -261,7 +263,8 @@ export function readStagedChatAttachment(
       throw new Error('Invalid staged image attachment');
     }
     const detected = detectImageMimeTypeStrict(bytes);
-    if (!detected) throw new Error('Staged attachment is not a supported image');
+    if (!detected)
+      throw new Error('Staged attachment is not a supported image');
     return {
       bytes,
       mimeType: resolveImageMimeType(attachment.mimeType, detected, options),

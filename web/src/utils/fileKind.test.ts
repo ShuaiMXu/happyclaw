@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'vitest';
-import { classifyFileKind, looksLikeWorkspaceFilePath } from './fileKind';
+import {
+  classifyFileKind,
+  looksLikeWorkspaceFilePath,
+  workspaceFilePathFromMarkdownHref,
+} from './fileKind';
 
 describe('classifyFileKind', () => {
   test('classifies known previewable types', () => {
@@ -39,5 +43,37 @@ describe('looksLikeWorkspaceFilePath', () => {
     expect(looksLikeWorkspaceFilePath('$HOME/.bashrc')).toBe(false);
     expect(looksLikeWorkspaceFilePath('')).toBe(false);
     expect(looksLikeWorkspaceFilePath('.md')).toBe(false);
+  });
+});
+
+describe('workspaceFilePathFromMarkdownHref', () => {
+  test('routes a relative Markdown document link through the workspace file API', () => {
+    expect(
+      workspaceFilePathFromMarkdownHref(
+        'output/T2-%E6%B5%99%E6%B1%9F%E6%8A%A5%E4%BB%B7%E4%B8%A4%E9%A1%B5%E8%AF%84%E4%BC%B0%E6%8A%A5%E5%91%8A.pdf',
+      ),
+    ).toBe('output/T2-浙江报价两页评估报告.pdf');
+    expect(workspaceFilePathFromMarkdownHref('./output/report.pdf')).toBe(
+      'output/report.pdf',
+    );
+    expect(
+      workspaceFilePathFromMarkdownHref('/workspace/group/output/report.pdf'),
+    ).toBe('/workspace/group/output/report.pdf');
+  });
+
+  test('keeps external, SPA-relative, malformed, and traversal links as links', () => {
+    expect(
+      workspaceFilePathFromMarkdownHref('https://example.com/report.pdf'),
+    ).toBeNull();
+    expect(
+      workspaceFilePathFromMarkdownHref('/chat/output/report.pdf'),
+    ).toBeNull();
+    expect(
+      workspaceFilePathFromMarkdownHref('../output/report.pdf'),
+    ).toBeNull();
+    expect(workspaceFilePathFromMarkdownHref('output/%E0%A4%A.pdf')).toBeNull();
+    expect(
+      workspaceFilePathFromMarkdownHref('output/report.pdf?download=1'),
+    ).toBeNull();
   });
 });

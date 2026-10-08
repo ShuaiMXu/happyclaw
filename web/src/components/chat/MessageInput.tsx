@@ -44,7 +44,11 @@ import {
   getDefaultFollowUpMode,
 } from '../../lib/follow-up-preferences';
 import { planImageClipboardPaste } from '../../lib/mixed-paste';
-import { api, computeUploadTimeoutMs, postFormDataWithUploadProgress } from '../../api/client';
+import {
+  api,
+  computeUploadTimeoutMs,
+  postFormDataWithUploadProgress,
+} from '../../api/client';
 
 interface PendingFile {
   /** Display name: relative path for folder uploads, file name otherwise */
@@ -358,7 +362,9 @@ export function MessageInput({
 
     if (!trimmed && !hasPending && !hasImages) return;
     if (disabled || sending) return;
-    if (pendingImages.some((img) => !img.attachment || img.status === 'uploading')) {
+    if (
+      pendingImages.some((img) => !img.attachment || img.status === 'uploading')
+    ) {
       setSendError('图片仍在上传，请完成后再发送');
       return;
     }
@@ -561,7 +567,10 @@ export function MessageInput({
     );
   };
 
-  const discardPendingImage = (image: PendingImage, targetGroupJid = groupJid) => {
+  const discardPendingImage = (
+    image: PendingImage,
+    targetGroupJid = groupJid,
+  ) => {
     imageUploadControllersRef.current.get(image.id)?.abort();
     imageUploadControllersRef.current.delete(image.id);
     URL.revokeObjectURL(image.preview);
@@ -608,7 +617,9 @@ export function MessageInput({
       // Let React paint the 0% mask before a localhost upload can finish in the
       // same event turn. Progress values after this point still come solely from
       // XMLHttpRequest.upload byte events.
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve()),
+      );
       if (controller.signal.aborted) return;
 
       const formData = new FormData();
@@ -623,7 +634,10 @@ export function MessageInput({
           signal: controller.signal,
           onProgress: (progress) => {
             const percent = progress.total
-              ? Math.min(100, Math.round((progress.loaded / progress.total) * 100))
+              ? Math.min(
+                  100,
+                  Math.round((progress.loaded / progress.total) * 100),
+                )
               : Math.min(99, Math.max(1, Math.round(progress.loaded / 1024)));
             updatePendingImage(id, (image) => ({
               ...image,
@@ -655,9 +669,7 @@ export function MessageInput({
       const cancelled = controller.signal.aborted;
       setPendingImages((images) =>
         images.map((image) =>
-          image.id === id
-            ? { ...image, status: 'failed' as const }
-            : image,
+          image.id === id ? { ...image, status: 'failed' as const } : image,
         ),
       );
       if (!cancelled) {

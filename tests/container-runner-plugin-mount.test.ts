@@ -1043,6 +1043,149 @@ describe('buildVolumeMounts — AgentProfile runtime policy', () => {
   });
 });
 
+describe('buildVolumeMounts — external execution isolation', () => {
+  test('mounts only per-run storage and excludes workspace-owned capabilities', () => {
+    const root = path.join(tmpDataDir, 'external-runtime');
+    const inputDirectory = path.join(root, 'input');
+    const outputDirectory = path.join(root, 'output');
+    const runtimeDirectory = path.join(root, 'runtime');
+    for (const directory of [
+      inputDirectory,
+      outputDirectory,
+      runtimeDirectory,
+    ]) {
+      fs.mkdirSync(directory, { recursive: true });
+    }
+
+    const mounts = buildVolumeMounts(
+      fakeGroup('external-workspace', USER) as any,
+      false,
+      false,
+      'external-run',
+      undefined,
+      'external-task',
+      undefined,
+      undefined,
+      {
+        id: 'external-capability-worker',
+        name: 'External capability worker',
+        version: 1,
+        identityHash: 'external-capability-worker-v1',
+        identityPrompt: '',
+        includeClaudePreset: false,
+        runtimePolicy: {
+          skills: {
+            mode: 'disabled' as const,
+            ids: [],
+            host: { mode: 'disabled' as const, ids: [] },
+          },
+          mcp: { mode: 'disabled' as const, ids: [] },
+        },
+      },
+      undefined,
+      undefined,
+      false,
+      { envLines: [], addHostGateway: false },
+      { inputDirectory, outputDirectory, runtimeDirectory },
+    );
+
+    expect(mounts).toEqual(
+      expect.arrayContaining([
+        {
+          hostPath: inputDirectory,
+          containerPath: '/workspace/input',
+          readonly: true,
+        },
+        {
+          hostPath: outputDirectory,
+          containerPath: '/workspace/group',
+          readonly: false,
+        },
+      ]),
+    );
+    const paths = mounts.map((mount) => mount.containerPath);
+    expect(paths).not.toContain('/workspace/plugins');
+    expect(paths).not.toContain('/home/node/.feishu-cli');
+    expect(paths).not.toContain('/workspace/extra');
+    expect(paths.some((value) => value.startsWith('/workspace/extra/'))).toBe(
+      false,
+    );
+    expect(
+      paths.some((value) => value.startsWith('/workspace/effective-skills/')),
+    ).toBe(false);
+
+    const claudeMount = mounts.find(
+      (mount) => mount.containerPath === '/home/node/.claude',
+    );
+    const ipcMount = mounts.find(
+      (mount) => mount.containerPath === '/workspace/ipc',
+    );
+    const envMount = mounts.find(
+      (mount) => mount.containerPath === '/workspace/env-dir',
+    );
+    const claudeJsonMount = mounts.find(
+      (mount) => mount.containerPath === '/home/node/.claude.json',
+    );
+    expect(claudeMount?.hostPath.startsWith(runtimeDirectory)).toBe(true);
+    expect(ipcMount?.hostPath.startsWith(runtimeDirectory)).toBe(true);
+    expect(envMount?.hostPath.startsWith(runtimeDirectory)).toBe(true);
+    expect(claudeJsonMount?.hostPath.startsWith(runtimeDirectory)).toBe(true);
+    expect(fs.readFileSync(claudeJsonMount!.hostPath, 'utf8')).toBe(
+      '{"hasCompletedOnboarding":true,"autoUpdates":false}\n',
+    );
+
+    const settings = JSON.parse(
+      fs.readFileSync(
+        path.join(claudeMount!.hostPath, 'settings.json'),
+        'utf8',
+      ),
+    ) as { mcpServers?: Record<string, unknown> };
+    expect(settings.mcpServers ?? {}).toEqual({});
+  });
+
+  test('rejects external execution in development runner mode', () => {
+    const root = path.join(tmpDataDir, 'external-development-runtime');
+    const externalExecution = {
+      inputDirectory: path.join(root, 'input'),
+      outputDirectory: path.join(root, 'output'),
+      runtimeDirectory: path.join(root, 'runtime'),
+    };
+    for (const directory of Object.values(externalExecution)) {
+      fs.mkdirSync(directory, { recursive: true });
+    }
+    const previous = process.env.HAPPYCLAW_AGENT_RUNNER_MODE;
+    process.env.HAPPYCLAW_AGENT_RUNNER_MODE = 'development';
+    try {
+      expect(() =>
+        buildVolumeMounts(
+          fakeGroup('external-workspace', USER) as any,
+          false,
+          false,
+          'external-run',
+          undefined,
+          'external-task',
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          false,
+          { envLines: [], addHostGateway: false },
+          externalExecution,
+        ),
+      ).toThrow(
+        'External capability execution requires HAPPYCLAW_AGENT_RUNNER_MODE=image',
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.HAPPYCLAW_AGENT_RUNNER_MODE;
+      } else {
+        process.env.HAPPYCLAW_AGENT_RUNNER_MODE = previous;
+      }
+    }
+  });
+});
+
 describe('prepareHostPlugins — host-mode pre-spawn materialize', () => {
   test('materializes runtime/ on demand when v2 config exists but tree is missing', () => {
     // Reproduces the bug fixed in this task: v2 config is present but

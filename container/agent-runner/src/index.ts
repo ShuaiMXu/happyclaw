@@ -4385,7 +4385,7 @@ async function main(): Promise<void> {
         workspaceMemoryInstructions,
         resumeAt,
         true,
-        DEFAULT_ALLOWED_TOOLS,
+        containerInput.allowedTools ?? DEFAULT_ALLOWED_TOOLS,
         undefined,
         promptImages,
         undefined,

@@ -5,6 +5,7 @@ import {
   ImagePlus,
   Puzzle,
   BarChart3,
+  Webhook,
   Wallet,
   Settings,
 } from 'lucide-react';
@@ -55,6 +56,13 @@ export const baseNavItems: NavItem[] = [
     icon: BarChart3,
     label: '用量',
     description: '查看已经用掉多少额度',
+    hideOnMobile: true,
+  },
+  {
+    path: '/external-capabilities',
+    icon: Webhook,
+    label: '外调',
+    description: '把 AI 能力变成其他系统可安全调用的服务',
     hideOnMobile: true,
   },
   {

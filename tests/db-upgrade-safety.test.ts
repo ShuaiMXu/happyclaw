@@ -151,7 +151,7 @@ describe('database upgrade safety gate', () => {
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = migrationBackups;
     const backupsBeforeCurrentOnlyRefusal = fs.readdirSync(migrationBackups);
     expect(() => db.initDatabase({ requireCurrentSchema: true })).toThrow(
-      'Database must already be schema v74',
+      'Database must already be schema v76',
     );
     expect(fs.readdirSync(migrationBackups)).toEqual(
       backupsBeforeCurrentOnlyRefusal,
@@ -203,6 +203,10 @@ describe('schema version head', () => {
     // v74: introduces the host-owned monotonic message ingest sequence used by
     // durable consumption and stable Web pagination. See
     // tests/schema-v74-message-ingest-sequence.test.ts.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(74);
+    // v75: introduces platform-owned external capability contracts and durable
+    // external run state. See tests/schema-v75-external-capabilities.test.ts.
+    // v76: scopes external task and idempotency identifiers to the authenticated
+    // integration key. See tests/schema-v76-external-capability-key-scope.test.ts.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(76);
   });
 });

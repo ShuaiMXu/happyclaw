@@ -1,5 +1,9 @@
-import { describe, expect, test } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
+
+import { describe, expect, test, vi } from 'vitest';
 
 import {
   classifyProviderLimitNotice,
@@ -7,10 +11,15 @@ import {
   isProviderFailureResult,
   createStdoutParserState,
   createStderrState,
+  attachStderrHandler,
   attachStdoutHandler,
   handleNonZeroExit,
+  handleSuccessClose,
+  writeRunLog,
 } from '../src/agent-output-parser.js';
+import type { CloseHandlerContext } from '../src/agent-output-parser.js';
 import type { ContainerOutput } from '../src/container-runner.js';
+import { logger } from '../src/logger.js';
 
 describe('isProviderFailureResult — positive (genuine Claude limit notices)', () => {
   test('detects Claude extra-usage exhaustion returned as final text', () => {
@@ -270,6 +279,138 @@ describe('handleNonZeroExit — provider failure lifecycle', () => {
       }
     },
   );
+});
+
+describe('sensitive execution logs', () => {
+  test('redacts external input and output on debug failure paths', () => {
+    const logsDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'sensitive-agent-log-'),
+    );
+    const previousLogLevel = process.env.LOG_LEVEL;
+    process.env.LOG_LEVEL = 'debug';
+    try {
+      const stdoutState = createStdoutParserState();
+      stdoutState.stdout = 'MODEL_OUTPUT_SECRET';
+      const stderrState = createStderrState();
+      stderrState.stderr = 'STDERR_SECRET /private/vault/run/source.xlsx';
+      const resolved: ContainerOutput[] = [];
+      const ctx: CloseHandlerContext = {
+        groupName: 'external-capability',
+        label: 'Container',
+        filePrefix: 'container',
+        identifier: 'external-run',
+        logsDir,
+        input: {
+          prompt: 'CALLER_BUSINESS_SECRET data:image/png;base64,BASE64_SECRET',
+          sessionId: 'external-session',
+          isMain: false,
+        },
+        stdoutState,
+        stderrState,
+        resolvePromise: (output) => resolved.push(output),
+        startTime: Date.now(),
+        timeoutMs: 1_000,
+        redactSensitiveData: true,
+        extraSummaryLines: ['Original filename: customer-secret.xlsx'],
+        extraVerboseLines: [
+          'Host mount: /private/vault/run -> /workspace/input',
+        ],
+      };
+
+      const logFile = writeRunLog(ctx, 1, 10);
+      const log = fs.readFileSync(logFile, 'utf8');
+      expect(fs.statSync(logFile).mode & 0o777).toBe(0o600);
+      expect(log).toContain('Sensitive execution data: REDACTED');
+      expect(log).not.toContain('CALLER_BUSINESS_SECRET');
+      expect(log).not.toContain('BASE64_SECRET');
+      expect(log).not.toContain('MODEL_OUTPUT_SECRET');
+      expect(log).not.toContain('STDERR_SECRET');
+      expect(log).not.toContain('customer-secret.xlsx');
+      expect(log).not.toContain('/private/vault');
+
+      expect(handleNonZeroExit(ctx, 1, null, 10, logFile)).toBe(true);
+      expect(resolved).toMatchObject([
+        {
+          status: 'error',
+          result: null,
+          error: 'Container exited with code 1',
+        },
+      ]);
+      expect(JSON.stringify(resolved)).not.toContain('STDERR_SECRET');
+    } finally {
+      if (previousLogLevel === undefined) delete process.env.LOG_LEVEL;
+      else process.env.LOG_LEVEL = previousLogLevel;
+      fs.rmSync(logsDir, { recursive: true, force: true });
+    }
+  });
+
+  test('does not emit raw stderr or malformed stdout through application logs', () => {
+    const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
+    try {
+      const stderrStream = new PassThrough();
+      const stderrState = createStderrState();
+      attachStderrHandler(
+        stderrStream,
+        stderrState,
+        'external-capability',
+        { container: 'external-capability' },
+        { redactSensitiveData: true },
+      );
+      stderrStream.write(
+        '[agent-runner:warn] STDERR_BUSINESS_SECRET /private/vault/source.xlsx',
+      );
+      stderrStream.end();
+
+      expect(stderrState.stderr).toContain('STDERR_BUSINESS_SECRET');
+      expect(JSON.stringify(debugSpy.mock.calls)).not.toContain(
+        'STDERR_BUSINESS_SECRET',
+      );
+      expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(
+        'STDERR_BUSINESS_SECRET',
+      );
+
+      const stdoutState = createStdoutParserState();
+      stdoutState.stdout = 'MALFORMED_MODEL_SECRET';
+      const resolved: ContainerOutput[] = [];
+      handleSuccessClose(
+        {
+          groupName: 'external-capability',
+          label: 'Container',
+          filePrefix: 'container',
+          identifier: 'external-run',
+          logsDir: '/unused',
+          input: { prompt: 'PROMPT_SECRET', isMain: false },
+          stdoutState,
+          stderrState,
+          resolvePromise: (output) => resolved.push(output),
+          startTime: Date.now(),
+          timeoutMs: 1_000,
+          redactSensitiveData: true,
+        },
+        10,
+      );
+
+      expect(JSON.stringify(errorSpy.mock.calls)).not.toContain(
+        'MALFORMED_MODEL_SECRET',
+      );
+      expect(JSON.stringify(errorSpy.mock.calls)).not.toContain(
+        'STDERR_BUSINESS_SECRET',
+      );
+      expect(resolved).toMatchObject([
+        {
+          status: 'error',
+          result: null,
+          error: 'Failed to parse container output',
+        },
+      ]);
+    } finally {
+      debugSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
 });
 
 describe('attachStdoutHandler — framed output parsing (marker collision)', () => {

@@ -2,6 +2,7 @@ import { Permission, PermissionTemplateKey, UserRole } from './types.js';
 
 export const ALL_PERMISSIONS: Permission[] = [
   'manage_system_config',
+  'manage_external_capabilities',
   'manage_group_env',
   'manage_users',
   'manage_invites',
