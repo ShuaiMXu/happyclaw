@@ -707,6 +707,12 @@ externalCapabilityInvokeRoutes.get('/:slug/runs/:runId', (c) => {
   if (key.capability_slug !== slug) {
     return c.json({ error: 'Run not found', code: 'NOT_FOUND' }, 404);
   }
+  if (!isExternalCapabilityReleaseEnabled()) {
+    return c.json(
+      { error: 'Capability is not available', code: 'CAPABILITY_UNAVAILABLE' },
+      409,
+    );
+  }
   const run = getExternalCapabilityRunById(c.req.param('runId'));
   if (!run || run.capability_slug !== slug || run.key_id !== key.id) {
     return c.json({ error: 'Run not found', code: 'NOT_FOUND' }, 404);
@@ -745,6 +751,15 @@ externalCapabilityInvokeRoutes.get('/:slug/runs/:runId/output', (c) => {
   const key = externalAuth(c);
   if (key instanceof Response) return key;
   const slug = c.req.param('slug');
+  if (key.capability_slug !== slug) {
+    return c.json({ error: 'Output not found', code: 'NOT_FOUND' }, 404);
+  }
+  if (!isExternalCapabilityReleaseEnabled()) {
+    return c.json(
+      { error: 'Capability is not available', code: 'CAPABILITY_UNAVAILABLE' },
+      409,
+    );
+  }
   const run = getExternalCapabilityRunById(c.req.param('runId'));
   if (
     !run ||

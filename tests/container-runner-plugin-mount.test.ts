@@ -215,6 +215,19 @@ describe('buildVolumeMounts — confined external execution', () => {
     fs.mkdirSync(inputDirectory);
     fs.mkdirSync(outputDirectory);
     fs.mkdirSync(runtimeDirectory);
+    const workspaceSkill = path.join(
+      tmpDataDir,
+      'groups',
+      'external-run',
+      '.claude',
+      'skills',
+      'workspace-sentinel',
+    );
+    fs.mkdirSync(workspaceSkill, { recursive: true });
+    fs.writeFileSync(
+      path.join(workspaceSkill, 'SKILL.md'),
+      '# Workspace sentinel\nThis must never enter an external run.',
+    );
 
     const mounts = buildVolumeMounts(
       fakeGroup('external-run', USER) as any,

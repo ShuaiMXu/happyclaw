@@ -95,6 +95,7 @@ const activeExecutionPromises = new Set<Promise<void>>();
 type ExternalContainerExecution = {
   cancelled: boolean;
   timedOut: boolean;
+  shuttingDown: boolean;
   container: ChildProcess | null;
   containerName: string | null;
   terminationPromise: Promise<boolean> | null;
@@ -178,6 +179,7 @@ function stopContainerExecution(
 ): Promise<boolean> {
   execution.cancelled = true;
   if (reason === 'timeout') execution.timedOut = true;
+  if (reason === 'shutdown') execution.shuttingDown = true;
   if (!execution.container || !execution.containerName) {
     return Promise.resolve(true);
   }
@@ -443,7 +445,7 @@ async function prepareSourceMaterial(
   };
 }
 
-function parseAgentRows(
+export function parseExternalCapabilityAgentRows(
   text: string | null,
   columns: Array<{ key: string; name: string }>,
   maxRows: number,
@@ -471,11 +473,14 @@ function parseAgentRows(
     const row: Record<string, string | number | boolean | null> = {};
     for (const [key, cell] of Object.entries(value)) {
       if (!validKeys.has(key)) continue;
-      if (
-        cell === null ||
-        typeof cell === 'number' ||
-        typeof cell === 'boolean'
-      ) {
+      if (cell === null || typeof cell === 'boolean') {
+        row[key] = cell;
+      } else if (typeof cell === 'number') {
+        if (!Number.isFinite(cell)) {
+          throw new Error(
+            'The normalization Agent returned a non-finite numeric value',
+          );
+        }
         row[key] = cell;
       } else if (typeof cell === 'string') {
         row[key] = cell.slice(0, MAX_CELL_LENGTH);
@@ -594,10 +599,12 @@ async function executeClaim(
   const containerExecution: ExternalContainerExecution = {
     cancelled: false,
     timedOut: false,
+    shuttingDown: false,
     container: null,
     containerName: null,
-    stopping: false,
+    terminationPromise: null,
   };
+  activeContainerExecutions.add(containerExecution);
   let unregisterExecution: (() => void) | null = null;
   const heartbeat = setInterval(
     () => {
@@ -611,7 +618,7 @@ async function executeClaim(
           )
         ) {
           leaseOwned = false;
-          stopContainerExecution(containerExecution, 'lease_lost');
+          void stopContainerExecution(containerExecution, 'lease_lost');
         }
       } catch (error) {
         leaseOwned = false;
@@ -640,8 +647,23 @@ async function executeClaim(
       },
     );
   };
+  const settleShutdownInterruption = () => {
+    if (!leaseOwned) return;
+    completeExternalCapabilityRun(
+      claim.id,
+      claim.lease_owner,
+      claim.lease_token,
+      {
+        status: 'failed',
+        error: {
+          code: 'PROCESSING_INTERRUPTED',
+          message: 'The task was interrupted during service shutdown.',
+        },
+      },
+    );
+  };
   const executionTimeout = setTimeout(() => {
-    stopContainerExecution(containerExecution, 'timeout');
+    void stopContainerExecution(containerExecution, 'timeout');
   }, quotaConfig.executionTimeoutMs);
   executionTimeout.unref?.();
   let executionDirectory: string | null = null;
@@ -698,6 +720,28 @@ async function executeClaim(
       );
       return;
     }
+    // Register before crossing the irreversible execution boundary. A durable
+    // cancellation that lands before Docker exists still latches the local flag,
+    // and the worker rechecks it before spawning or writing the prompt.
+    unregisterExecution = registerExternalCapabilityExecution(claim.id, () => {
+      void stopContainerExecution(containerExecution, 'cancelled');
+    });
+    if (containerExecution.cancelled) {
+      if (containerExecution.shuttingDown && leaseOwned) {
+        releaseExternalCapabilityRunForRetry(
+          claim.id,
+          claim.lease_owner,
+          claim.lease_token,
+          new Date().toISOString(),
+          {
+            code: 'CAPABILITY_UNAVAILABLE',
+            message: 'The service is shutting down.',
+          },
+          { countsAsAttempt: false },
+        );
+      }
+      return;
+    }
     if (
       !markExternalCapabilityRunExecutionStarted(
         claim.id,
@@ -706,14 +750,14 @@ async function executeClaim(
       )
     )
       return;
-    unregisterExecution = registerExternalCapabilityExecution(claim.id, () => {
-      stopContainerExecution(containerExecution, 'cancelled');
-    });
     if (containerExecution.timedOut) {
       settleProcessingTimeout();
       return;
     }
-    if (containerExecution.cancelled) return;
+    if (containerExecution.cancelled) {
+      if (containerExecution.shuttingDown) settleShutdownInterruption();
+      return;
+    }
     let terminalOutput: ContainerOutput | null = null;
     const runnerOutput = await runContainerAgent(
       latestGroup,
@@ -780,7 +824,7 @@ async function executeClaim(
         containerExecution.container = container;
         containerExecution.containerName = containerName;
         if (containerExecution.cancelled) {
-          stopContainerExecution(containerExecution, 'cancelled');
+          void stopContainerExecution(containerExecution, 'cancelled');
         }
       },
       async (frame) => {
@@ -798,8 +842,11 @@ async function executeClaim(
       settleProcessingTimeout();
       return;
     }
-    if (containerExecution.cancelled) return;
-    const normalized = parseAgentRows(
+    if (containerExecution.cancelled) {
+      if (containerExecution.shuttingDown) settleShutdownInterruption();
+      return;
+    }
+    const normalized = parseExternalCapabilityAgentRows(
       output.result,
       schema.columns,
       quotaConfig.maxOutputRows,
@@ -863,6 +910,7 @@ async function executeClaim(
     clearTimeout(executionTimeout);
     clearInterval(heartbeat);
     unregisterExecution?.();
+    activeContainerExecutions.delete(containerExecution);
     if (executionDirectory) {
       try {
         fs.rmSync(executionDirectory, { recursive: true, force: true });
@@ -976,6 +1024,22 @@ export async function stopExternalCapabilityWorker(
   running = false;
   if (timer) clearTimeout(timer);
   timer = null;
+  const activeContainers = [...activeContainerExecutions];
+  if (activeContainers.length > 0) {
+    const stopped = await Promise.all(
+      activeContainers.map((execution) =>
+        stopContainerExecution(execution, 'shutdown'),
+      ),
+    );
+    const unverified = stopped.filter((value) => !value).length;
+    if (unverified > 0) {
+      logger.error(
+        { unverified },
+        'External capability worker could not verify all containers stopped',
+      );
+    }
+  }
+
   const pending = [...activeExecutionPromises];
   if (pending.length === 0) return;
 

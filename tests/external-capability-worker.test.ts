@@ -7,6 +7,7 @@ import { describe, expect, test } from 'vitest';
 
 import {
   createExternalCapabilitySpreadsheetPreview,
+  parseExternalCapabilityAgentRows,
   stageExternalCapabilityInputArtifact,
 } from '../src/external-capability-worker.js';
 
@@ -31,6 +32,18 @@ describe('external capability spreadsheet preview', () => {
         Buffer.from('PK\x03\x04broken', 'binary'),
       ),
     ).rejects.toThrow(/could not be parsed/);
+  });
+});
+
+describe('external capability model output validation', () => {
+  test('rejects JSON numeric overflow before generating a workbook', () => {
+    expect(() =>
+      parseExternalCapabilityAgentRows(
+        '{"rows":[{"amount":1e400}],"warnings":[]}',
+        [{ key: 'amount', name: 'Amount' }],
+        100,
+      ),
+    ).toThrow(/non-finite numeric value/);
   });
 });
 

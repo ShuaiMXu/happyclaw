@@ -234,6 +234,28 @@ describe('external capability invoke API', () => {
     });
     expect(JSON.stringify(body)).not.toContain('storageRef');
     expect(JSON.stringify(body)).not.toContain('private-result');
+
+    delete process.env.EXTERNAL_CAPABILITY_RELEASE_ENABLED;
+    try {
+      const closedStatus = await invokeRoutes.request(
+        `/quote-document-process/runs/${runId}`,
+        { headers: { Authorization: `Bearer ${bearer}` } },
+      );
+      expect(closedStatus.status).toBe(409);
+      expect(await closedStatus.json()).toMatchObject({
+        code: 'CAPABILITY_UNAVAILABLE',
+      });
+      const closedOutput = await invokeRoutes.request(
+        `/quote-document-process/runs/${runId}/output`,
+        { headers: { Authorization: `Bearer ${bearer}` } },
+      );
+      expect(closedOutput.status).toBe(409);
+      expect(await closedOutput.json()).toMatchObject({
+        code: 'CAPABILITY_UNAVAILABLE',
+      });
+    } finally {
+      process.env.EXTERNAL_CAPABILITY_RELEASE_ENABLED = 'true';
+    }
   });
 
   test('rejects intake while the host release gate is disabled', async () => {

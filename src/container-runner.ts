@@ -1911,7 +1911,10 @@ function prepareVolumeMounts(
   const workspaceSkillsRoot = groupReal
     ? path.join(groupReal, '.claude', 'skills')
     : null;
-  for (const skill of claudeContextPlan.effectiveSkills.selected) {
+  const mountedSkills = externalExecution
+    ? []
+    : claudeContextPlan.effectiveSkills.selected;
+  for (const skill of mountedSkills) {
     if (skill.source === 'plugin') continue;
     let hostPath = skill.path;
     let realpathOk = true;
