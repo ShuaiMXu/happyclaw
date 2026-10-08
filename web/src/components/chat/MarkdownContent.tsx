@@ -2,7 +2,10 @@ import React, { lazy, Suspense, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Check, Copy } from 'lucide-react';
 import { PreviewDialog } from './PreviewDialog';
-import { resolveMarkdownImageSrc } from '../../utils/markdownImageSrc';
+import {
+  resolveMarkdownImageSrc,
+  resolveMarkdownWorkspaceFileHref,
+} from '../../utils/markdownImageSrc';
 
 const MermaidDiagram = lazy(() =>
   import('./MermaidDiagram').then((module) => ({
@@ -243,7 +246,7 @@ export function MarkdownContent({
           ),
           a: ({ href, children }) => (
             <a
-              href={href}
+              href={resolveMarkdownWorkspaceFileHref(href, groupJid)}
               target="_blank"
               rel="noopener noreferrer"
               className="text-primary hover:text-primary underline break-all"

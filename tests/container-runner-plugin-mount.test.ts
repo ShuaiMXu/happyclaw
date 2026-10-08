@@ -204,6 +204,94 @@ describe('buildVolumeMounts — container proxy secret boundary', () => {
   });
 });
 
+describe('buildVolumeMounts — confined external execution', () => {
+  test('mounts only generated input and output paths, never workspace capability layers', () => {
+    const externalRoot = fs.mkdtempSync(
+      path.join(tmpDataDir, 'external-execution-'),
+    );
+    const inputDirectory = path.join(externalRoot, 'input');
+    const outputDirectory = path.join(externalRoot, 'output');
+    const runtimeDirectory = path.join(externalRoot, 'runtime');
+    fs.mkdirSync(inputDirectory);
+    fs.mkdirSync(outputDirectory);
+    fs.mkdirSync(runtimeDirectory);
+
+    const mounts = buildVolumeMounts(
+      fakeGroup('external-run', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      { envLines: [], addHostGateway: false },
+      { inputDirectory, outputDirectory, runtimeDirectory },
+    );
+
+    expect(mounts).toContainEqual({
+      hostPath: inputDirectory,
+      containerPath: '/workspace/input',
+      readonly: true,
+    });
+    expect(mounts).toContainEqual({
+      hostPath: outputDirectory,
+      containerPath: '/workspace/group',
+      readonly: false,
+    });
+    for (const forbiddenPath of [
+      '/workspace/project',
+      '/workspace/extra',
+      '/workspace/plugins',
+    ]) {
+      expect(
+        mounts.some((mount) => mount.containerPath === forbiddenPath),
+      ).toBe(false);
+    }
+    expect(
+      mounts.some((mount) =>
+        mount.containerPath.startsWith('/workspace/effective-skills/'),
+      ),
+    ).toBe(false);
+  });
+
+  test('uses the dedicated network and hardening flags without a host gateway', () => {
+    const args = buildContainerArgs(
+      [],
+      'external-run',
+      'UTC',
+      { mode: 'unknown' },
+      {
+        addHostGateway: false,
+        externalExecution: true,
+        networkName: 'external-capability-egress',
+      },
+    );
+
+    expect(args).toEqual(
+      expect.arrayContaining([
+        '--network',
+        'external-capability-egress',
+        '--cap-drop',
+        'ALL',
+        '--security-opt',
+        'no-new-privileges:true',
+        '--pids-limit',
+        '256',
+        '--memory',
+        '2g',
+        '--cpus',
+        '2',
+      ]),
+    );
+    expect(args).not.toContain('host.docker.internal:host-gateway');
+  });
+});
+
 describe('buildVolumeMounts — Claude Code plugins runtime mount', () => {
   test('v2 user is materialized and mounted at runtime/', () => {
     seedCatalogSnapshot({

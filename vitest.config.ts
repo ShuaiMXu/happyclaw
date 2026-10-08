@@ -21,6 +21,11 @@ export default defineConfig({
     },
   },
   test: {
+    // The production service exports NODE_ENV=production. Vitest preserves an
+    // existing value, which makes React load its production build and removes
+    // the test-only `act` export. Keep test behavior deterministic regardless
+    // of the shell that launches the suite.
+    env: { NODE_ENV: 'test' },
     exclude: [
       '**/node_modules/**',
       '**/dist/**',

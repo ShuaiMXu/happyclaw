@@ -91,6 +91,11 @@ const CapabilitiesPage = lazy(() =>
     default: m.CapabilitiesPage,
   })),
 );
+const ExternalCapabilitiesPage = lazy(() =>
+  import('./pages/ExternalCapabilitiesPage').then((m) => ({
+    default: m.ExternalCapabilitiesPage,
+  })),
+);
 
 function UsageRouteFallback() {
   return (
@@ -178,6 +183,16 @@ const appRoutes = createRoutesFromElements(
           <Suspense fallback={<AgentProfilesRouteFallback />}>
             <AgentProfilesPage />
           </Suspense>
+        }
+      />
+      <Route
+        path="/external-capabilities"
+        element={
+          <AuthGuard requiredPermission="manage_external_capabilities">
+            <Suspense fallback={null}>
+              <ExternalCapabilitiesPage />
+            </Suspense>
+          </AuthGuard>
         }
       />
       <Route

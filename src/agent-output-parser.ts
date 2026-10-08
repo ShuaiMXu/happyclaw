@@ -374,6 +374,7 @@ export function attachStderrHandler(
   groupName: string,
   /** Log context key: { container: folder } or { host: folder } */
   logContext: Record<string, string>,
+  options: { redactSensitiveData?: boolean } = {},
 ): void {
   stream.on('data', (data) => {
     const chunk = data.toString();
@@ -381,7 +382,10 @@ export function attachStderrHandler(
     // debug-level default; without this they are invisible in production
     // (observed: every workspace-memory snapshot failure was dropped).
     const hasRunnerWarning = chunk.includes('[agent-runner:warn]');
-    if (hasRunnerWarning || logger.isLevelEnabled('debug')) {
+    if (
+      !options.redactSensitiveData &&
+      (hasRunnerWarning || logger.isLevelEnabled('debug'))
+    ) {
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
         if (!line) continue;
@@ -432,6 +436,8 @@ export interface CloseHandlerContext {
   extraSummaryLines?: string[];
   /** Extra log lines for verbose/error section (e.g. Container Args, detailed Mounts) */
   extraVerboseLines?: string[];
+  /** Never persist or emit caller-controlled input/output for sensitive executions. */
+  redactSensitiveData?: boolean;
   /** Custom error enrichment: given stderr, return { result, error } overrides */
   enrichError?: (
     stderr: string,
@@ -463,7 +469,11 @@ export function handleTimeoutClose(
       `${ctx.label === 'Container' ? 'Container' : 'Process ID'}: ${ctx.identifier}`,
       `Duration: ${duration}ms`,
       `Exit Code: ${code}`,
+      ...(ctx.redactSensitiveData
+        ? ['Sensitive execution data: REDACTED']
+        : []),
     ].join('\n'),
+    { mode: 0o600 },
   );
 
   logger.error(
@@ -515,43 +525,58 @@ export function writeRunLog(
   const { stderr, stderrTruncated } = ctx.stderrState;
   const { stdout, stdoutTruncated } = ctx.stdoutState;
 
-  const LOG_TAIL_LIMIT = 4000;
-  const stderrLog =
-    !isVerbose && !isError && stderr.length > LOG_TAIL_LIMIT
-      ? `... (truncated ${stderr.length - LOG_TAIL_LIMIT} chars) ...\n` +
-        stderr.slice(-LOG_TAIL_LIMIT)
-      : stderr;
-  const stdoutLog =
-    !isVerbose && !isError && stdout.length > LOG_TAIL_LIMIT
-      ? `... (truncated ${stdout.length - LOG_TAIL_LIMIT} chars) ...\n` +
-        stdout.slice(-LOG_TAIL_LIMIT)
-      : stdout;
-  logLines.push(
-    `=== Input Summary ===`,
-    `Prompt length: ${ctx.input.prompt.length} chars`,
-    `Session ID: ${ctx.input.sessionId || 'new'}`,
-  );
-  if (ctx.extraSummaryLines) {
-    logLines.push(...ctx.extraSummaryLines);
-  }
-  logLines.push(
-    ``,
-    `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
-    stderrLog,
-    ``,
-    `=== Stdout${stdoutTruncated ? ' (TRUNCATED)' : ''} ===`,
-    stdoutLog,
-  );
+  if (ctx.redactSensitiveData) {
+    logLines.push(
+      `=== Sensitive Execution Summary ===`,
+      `Prompt length: ${ctx.input.prompt.length} chars`,
+      `Stderr length: ${stderr.length} chars`,
+      `Stdout length: ${stdout.length} chars`,
+      `Sensitive execution data: REDACTED`,
+    );
+  } else {
+    const LOG_TAIL_LIMIT = 4000;
+    const stderrLog =
+      !isVerbose && !isError && stderr.length > LOG_TAIL_LIMIT
+        ? `... (truncated ${stderr.length - LOG_TAIL_LIMIT} chars) ...\n` +
+          stderr.slice(-LOG_TAIL_LIMIT)
+        : stderr;
+    const stdoutLog =
+      !isVerbose && !isError && stdout.length > LOG_TAIL_LIMIT
+        ? `... (truncated ${stdout.length - LOG_TAIL_LIMIT} chars) ...\n` +
+          stdout.slice(-LOG_TAIL_LIMIT)
+        : stdout;
+    logLines.push(
+      `=== Input Summary ===`,
+      `Prompt length: ${ctx.input.prompt.length} chars`,
+      `Session ID: ${ctx.input.sessionId || 'new'}`,
+    );
+    if (ctx.extraSummaryLines) {
+      logLines.push(...ctx.extraSummaryLines);
+    }
+    logLines.push(
+      ``,
+      `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
+      stderrLog,
+      ``,
+      `=== Stdout${stdoutTruncated ? ' (TRUNCATED)' : ''} ===`,
+      stdoutLog,
+    );
 
-  if (isVerbose || isError) {
-    logLines.push(``, `=== Input ===`, JSON.stringify(ctx.input, null, 2));
-    if (ctx.extraVerboseLines) {
-      logLines.push(``, ...ctx.extraVerboseLines);
+    if (isVerbose || isError) {
+      logLines.push(``, `=== Input ===`, JSON.stringify(ctx.input, null, 2));
+      if (ctx.extraVerboseLines) {
+        logLines.push(``, ...ctx.extraVerboseLines);
+      }
     }
   }
 
-  fs.writeFileSync(logFile, logLines.join('\n'));
-  logger.debug({ logFile, verbose: isVerbose }, `${ctx.label} log written`);
+  fs.writeFileSync(logFile, logLines.join('\n'), { mode: 0o600 });
+  logger.debug(
+    ctx.redactSensitiveData
+      ? { sensitiveExecutionData: 'redacted', verbose: isVerbose }
+      : { logFile, verbose: isVerbose },
+    `${ctx.label} log written`,
+  );
   return logFile;
 }
 
@@ -676,23 +701,36 @@ export function handleNonZeroExit(
 
   // Build error output
   const { stderr } = ctx.stderrState;
-  const enriched = ctx.enrichError
-    ? ctx.enrichError(stderr, exitLabel)
-    : {
+  const enriched = ctx.redactSensitiveData
+    ? {
         result: null as string | null,
-        error: `${ctx.label} exited with ${exitLabel}: ${stderr.slice(-200)}`,
-      };
+        error: `${ctx.label} exited with ${exitLabel}`,
+      }
+    : ctx.enrichError
+      ? ctx.enrichError(stderr, exitLabel)
+      : {
+          result: null as string | null,
+          error: `${ctx.label} exited with ${exitLabel}: ${stderr.slice(-200)}`,
+        };
 
   logger.error(
-    {
-      group: ctx.groupName,
-      code,
-      signal,
-      duration,
-      stderr,
-      stdout: ctx.stdoutState.stdout,
-      logFile,
-    },
+    ctx.redactSensitiveData
+      ? {
+          group: ctx.groupName,
+          code,
+          signal,
+          duration,
+          sensitiveExecutionData: 'redacted',
+        }
+      : {
+          group: ctx.groupName,
+          code,
+          signal,
+          duration,
+          stderr,
+          stdout: ctx.stdoutState.stdout,
+          logFile,
+        },
     `${ctx.label} exited with error`,
   );
 
@@ -796,19 +834,26 @@ function parseLegacyOutput(ctx: CloseHandlerContext): void {
     ctx.resolvePromise(output);
   } catch (err) {
     logger.error(
-      {
-        group: ctx.groupName,
-        stdout,
-        stderr: ctx.stderrState.stderr,
-        error: err,
-      },
+      ctx.redactSensitiveData
+        ? {
+            group: ctx.groupName,
+            sensitiveExecutionData: 'redacted',
+          }
+        : {
+            group: ctx.groupName,
+            stdout,
+            stderr: ctx.stderrState.stderr,
+            error: err,
+          },
       `Failed to parse ${ctx.filePrefix} output`,
     );
 
     ctx.resolvePromise({
       status: 'error',
       result: null,
-      error: `Failed to parse ${ctx.filePrefix} output: ${err instanceof Error ? err.message : String(err)}`,
+      error: ctx.redactSensitiveData
+        ? `Failed to parse ${ctx.filePrefix} output`
+        : `Failed to parse ${ctx.filePrefix} output: ${err instanceof Error ? err.message : String(err)}`,
     });
   }
 }

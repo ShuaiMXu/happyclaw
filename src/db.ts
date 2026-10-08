@@ -58,6 +58,10 @@ import {
   TaskRunStatus,
   TaskRunTrigger,
   TaskRunLog,
+  ClaimedExternalCapabilityRun,
+  ExternalCapability,
+  ExternalCapabilityKey,
+  ExternalCapabilityRun,
   User,
   UserBalance,
   UserPublic,
@@ -1105,6 +1109,106 @@ export function initDatabase(
     CREATE INDEX IF NOT EXISTS idx_workspace_agent_profiles_profile
       ON workspace_agent_profiles(agent_profile_id);
   `);
+
+  // External capabilities are platform-owned, asynchronous server-to-server
+  // contracts. They deliberately do not reuse scheduled_tasks: an external
+  // caller needs its own input manifest, opaque correlation labels, idempotency
+  // scope, lease and result lifecycle.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS external_capabilities (
+      slug TEXT PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      workspace_jid TEXT NOT NULL,
+      workspace_folder TEXT NOT NULL,
+      execution_mode TEXT NOT NULL DEFAULT 'container'
+        CHECK (execution_mode = 'container'),
+      status TEXT NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft', 'active', 'paused', 'retired')),
+      input_schema_version INTEGER NOT NULL,
+      allowed_mime_types TEXT NOT NULL,
+      max_file_bytes INTEGER NOT NULL,
+      max_files_per_run INTEGER NOT NULL,
+      max_total_bytes INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS external_capability_keys (
+      id TEXT PRIMARY KEY,
+      capability_slug TEXT NOT NULL,
+      label TEXT NOT NULL,
+      key_prefix TEXT NOT NULL,
+      secret_hash TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'revoked')),
+      created_at TEXT NOT NULL,
+      last_used_at TEXT,
+      revoked_at TEXT,
+      FOREIGN KEY (capability_slug) REFERENCES external_capabilities(slug)
+    );
+    CREATE INDEX IF NOT EXISTS idx_external_capability_keys_capability
+      ON external_capability_keys(capability_slug, status);
+
+    CREATE TABLE IF NOT EXISTS external_capability_runs (
+      id TEXT PRIMARY KEY,
+      capability_slug TEXT NOT NULL,
+      key_id TEXT,
+      idempotency_key TEXT,
+      external_task_id TEXT NOT NULL,
+      tenant_ref TEXT,
+      account_ref TEXT,
+      callback_context TEXT,
+      input_manifest TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'retry_wait', 'succeeded', 'failed', 'cancelled')),
+      attempt INTEGER NOT NULL DEFAULT 0,
+      available_at TEXT NOT NULL,
+      lease_owner TEXT,
+      lease_token INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,
+      started_at TEXT,
+      completed_at TEXT,
+      result TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (capability_slug) REFERENCES external_capabilities(slug)
+    );
+    CREATE INDEX IF NOT EXISTS idx_external_capability_runs_due
+      ON external_capability_runs(status, available_at, lease_expires_at);
+  `);
+
+  // The first contract is intentionally seeded as a draft. It cannot receive
+  // external traffic until the isolated runner, immutable input storage and
+  // callback delivery are complete. Keep its target server-owned.
+  const quoteCapabilityNow = new Date().toISOString();
+  db.prepare(
+    `INSERT OR IGNORE INTO external_capabilities (
+      slug, display_name, description, workspace_jid, workspace_folder,
+      execution_mode, status, input_schema_version, allowed_mime_types,
+      max_file_bytes, max_files_per_run, max_total_bytes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'container', 'draft', ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    'quote-document-process',
+    '结构化数据规整',
+    '将图片或 Excel 中的业务数据按调用方提交的受限底表结构规整为标准结果。',
+    'web:6241df8f-b015-472e-9083-6c4ec31eedc1',
+    'flow-munrwfg2-u6u8',
+    1,
+    JSON.stringify([
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ]),
+    20 * 1024 * 1024,
+    10,
+    50 * 1024 * 1024,
+    quoteCapabilityNow,
+    quoteCapabilityNow,
+  );
 
   // Billing tables
   db.exec(`
@@ -2653,6 +2757,47 @@ export function initDatabase(
   if (classifiableDirectMountSchemaVersion < 73) {
     migrateClassifiableDirectWorkspaceMountsToSessions();
   }
+
+  // v75 -> v76: external task and idempotency identifiers belong to the
+  // authenticated integration credential, not the whole capability. This lets
+  // independent platforms use their own natural task IDs without seeing or
+  // conflicting with one another's work.
+  const externalCapabilityKeyScopeSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (externalCapabilityKeyScopeSchemaVersion < 76) {
+    const columns = db
+      .prepare('PRAGMA table_info(external_capability_runs)')
+      .all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === 'key_id')) {
+      db.exec('ALTER TABLE external_capability_runs ADD COLUMN key_id TEXT');
+    }
+    // A v75 run was not associated with an authenticated credential, so it
+    // cannot be safely exposed or resumed after identifiers become key-scoped.
+    // Terminalize it instead of leaving an unclaimable queued/running record.
+    const now = new Date().toISOString();
+    db.prepare(
+      `UPDATE external_capability_runs
+       SET status = 'failed', completed_at = ?, updated_at = ?,
+           error_code = 'CREDENTIAL_SCOPE_MIGRATION_REQUIRED',
+           error_message = 'The task was created before credential-scoped processing and was not resumed.',
+           lease_owner = NULL, lease_expires_at = NULL,
+           lease_token = lease_token + 1
+       WHERE key_id IS NULL AND status IN ('queued', 'running', 'retry_wait')`,
+    ).run(now, now);
+    db.exec(`
+      DROP INDEX IF EXISTS idx_external_capability_runs_idempotency;
+      DROP INDEX IF EXISTS idx_external_capability_runs_external_task;
+    `);
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_external_capability_runs_idempotency
+      ON external_capability_runs(capability_slug, key_id, idempotency_key)
+      WHERE key_id IS NOT NULL AND idempotency_key IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_external_capability_runs_external_task
+      ON external_capability_runs(capability_slug, key_id, external_task_id)
+      WHERE key_id IS NOT NULL;
+  `);
 
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
@@ -4712,6 +4857,948 @@ export function getMessageCursor(
   return row
     ? { timestamp: row.timestamp, id: messageId, sequence: row.sequence }
     : null;
+}
+
+type ExternalCapabilityRow = Omit<
+  ExternalCapability,
+  'allowed_mime_types' | 'execution_mode'
+> & {
+  allowed_mime_types: string;
+  execution_mode: string;
+};
+
+function parseExternalCapabilityRow(
+  row: ExternalCapabilityRow,
+): ExternalCapability {
+  let allowedMimeTypes: string[] = [];
+  try {
+    const parsed = JSON.parse(row.allowed_mime_types);
+    if (Array.isArray(parsed)) {
+      allowedMimeTypes = parsed.filter(
+        (value): value is string => typeof value === 'string',
+      );
+    }
+  } catch {
+    // A malformed capability configuration must fail closed at invocation time.
+    // Keep it visible to operators here so it can be repaired rather than
+    // silently replacing its accepted-input policy.
+  }
+  return {
+    slug: row.slug,
+    display_name: row.display_name,
+    description: row.description,
+    workspace_jid: row.workspace_jid,
+    workspace_folder: row.workspace_folder,
+    execution_mode: 'container',
+    status: ['draft', 'active', 'paused', 'retired'].includes(row.status)
+      ? row.status
+      : 'paused',
+    input_schema_version: row.input_schema_version,
+    allowed_mime_types: allowedMimeTypes,
+    max_file_bytes: row.max_file_bytes,
+    max_files_per_run: row.max_files_per_run,
+    max_total_bytes: row.max_total_bytes,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+/** Read the durable state of platform-owned external integration contracts. */
+export function getExternalCapabilities(): ExternalCapability[] {
+  return (
+    db
+      .prepare('SELECT * FROM external_capabilities ORDER BY slug')
+      .all() as ExternalCapabilityRow[]
+  ).map(parseExternalCapabilityRow);
+}
+
+export function getExternalCapabilityBySlug(
+  slug: string,
+): ExternalCapability | undefined {
+  const row = db
+    .prepare('SELECT * FROM external_capabilities WHERE slug = ?')
+    .get(slug) as ExternalCapabilityRow | undefined;
+  return row ? parseExternalCapabilityRow(row) : undefined;
+}
+
+export function setExternalCapabilityStatus(
+  slug: string,
+  status: ExternalCapability['status'],
+): boolean {
+  return db.transaction(() => {
+    const current = getExternalCapabilityBySlug(slug);
+    if (!current) return false;
+    if (current.status === 'retired' && status !== 'retired') return false;
+    const now = new Date().toISOString();
+    const changed = db
+      .prepare(
+        'UPDATE external_capabilities SET status = ?, updated_at = ? WHERE slug = ?',
+      )
+      .run(status, now, slug);
+    if (changed.changes === 1 && status !== 'active') {
+      // Pause and retirement are admission barriers: work not yet at the
+      // execution boundary must not start after an operator disables a
+      // capability. Already-running work remains observable and is handled by
+      // the explicit cancellation/incident policy.
+      db.prepare(
+        `UPDATE external_capability_runs
+         SET status = 'cancelled', completed_at = ?, updated_at = ?,
+             error_code = 'CAPABILITY_UNAVAILABLE',
+             error_message = 'The capability is no longer accepting queued tasks.',
+             lease_owner = NULL, lease_expires_at = NULL,
+             lease_token = lease_token + 1
+         WHERE capability_slug = ?
+           AND (status IN ('queued', 'retry_wait')
+                OR (status = 'running' AND started_at IS NULL))`,
+      ).run(now, now, slug);
+    }
+    return changed.changes === 1;
+  })();
+}
+
+type ExternalCapabilityKeyRow = ExternalCapabilityKey & { secret_hash: string };
+
+function mapExternalCapabilityKeyRow(
+  row: ExternalCapabilityKeyRow,
+): ExternalCapabilityKey {
+  return {
+    id: row.id,
+    capability_slug: row.capability_slug,
+    label: row.label,
+    key_prefix: row.key_prefix,
+    status: row.status === 'revoked' ? 'revoked' : 'active',
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+    revoked_at: row.revoked_at,
+  };
+}
+
+function hashExternalCapabilitySecret(secret: string): string {
+  return crypto.createHash('sha256').update(secret).digest('hex');
+}
+
+export function createExternalCapabilityKey(input: {
+  capabilitySlug: string;
+  label: string;
+}): { key: ExternalCapabilityKey; secret: string } {
+  const capabilitySlug = input.capabilitySlug.trim();
+  const label = input.label.trim();
+  if (!capabilitySlug || !label || label.length > 120) {
+    throw new Error('A capability key requires a label up to 120 characters');
+  }
+  const capability = getExternalCapabilityBySlug(capabilitySlug);
+  if (!capability) {
+    throw new Error('External capability not found');
+  }
+  if (capability.status === 'paused' || capability.status === 'retired') {
+    throw new Error('External capability is not accepting new keys');
+  }
+  const id = crypto.randomUUID();
+  const keyPrefix = crypto.randomBytes(6).toString('hex');
+  const secret = `ec_${keyPrefix}_${crypto.randomBytes(32).toString('base64url')}`;
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO external_capability_keys (
+      id, capability_slug, label, key_prefix, secret_hash, status, created_at,
+      last_used_at, revoked_at
+    ) VALUES (?, ?, ?, ?, ?, 'active', ?, NULL, NULL)`,
+  ).run(
+    id,
+    capabilitySlug,
+    label,
+    keyPrefix,
+    hashExternalCapabilitySecret(secret),
+    now,
+  );
+  return {
+    key: {
+      id,
+      capability_slug: capabilitySlug,
+      label,
+      key_prefix: keyPrefix,
+      status: 'active',
+      created_at: now,
+      last_used_at: null,
+      revoked_at: null,
+    },
+    secret,
+  };
+}
+
+export function getExternalCapabilityKeys(
+  capabilitySlug: string,
+): ExternalCapabilityKey[] {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM external_capability_keys
+         WHERE capability_slug = ? ORDER BY created_at DESC`,
+      )
+      .all(capabilitySlug) as ExternalCapabilityKeyRow[]
+  ).map(mapExternalCapabilityKeyRow);
+}
+
+export function revokeExternalCapabilityKey(
+  capabilitySlug: string,
+  keyId: string,
+): boolean {
+  return db.transaction(() => {
+    const now = new Date().toISOString();
+    const changed = db
+      .prepare(
+        `UPDATE external_capability_keys
+         SET status = 'revoked', revoked_at = ?
+         WHERE id = ? AND capability_slug = ? AND status = 'active'`,
+      )
+      .run(now, keyId, capabilitySlug);
+    if (changed.changes === 1) {
+      db.prepare(
+        `UPDATE external_capability_runs
+         SET status = 'cancelled', completed_at = ?, updated_at = ?,
+             error_code = 'KEY_REVOKED',
+             error_message = 'The capability key was revoked before processing began.',
+             lease_owner = NULL, lease_expires_at = NULL,
+             lease_token = lease_token + 1
+         WHERE capability_slug = ? AND key_id = ?
+           AND (status IN ('queued', 'retry_wait')
+                OR (status = 'running' AND started_at IS NULL))`,
+      ).run(now, now, capabilitySlug, keyId);
+    }
+    return changed.changes === 1;
+  })();
+}
+
+/** Verify one bearer secret and record its use without ever returning its hash. */
+export function authenticateExternalCapabilityKey(
+  secret: string,
+): ExternalCapabilityKey | undefined {
+  const hash = hashExternalCapabilitySecret(secret);
+  const row = db
+    .prepare(
+      `SELECT * FROM external_capability_keys
+       WHERE secret_hash = ? AND status = 'active'`,
+    )
+    .get(hash) as ExternalCapabilityKeyRow | undefined;
+  if (!row) return undefined;
+  const now = new Date().toISOString();
+  db.prepare(
+    'UPDATE external_capability_keys SET last_used_at = ? WHERE id = ?',
+  ).run(now, row.id);
+  return { ...mapExternalCapabilityKeyRow(row), last_used_at: now };
+}
+
+type ExternalCapabilityRunRow = Omit<
+  ExternalCapabilityRun,
+  'callback_context' | 'input_manifest' | 'result'
+> & {
+  callback_context: string | null;
+  input_manifest: string;
+  result: string | null;
+};
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseExternalRunRecord(
+  value: string | null,
+  fallback: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!value) return fallback;
+  try {
+    const parsed = JSON.parse(value);
+    return isJsonRecord(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function serializeExternalRunRecord(
+  value: Record<string, unknown>,
+  field: string,
+): string {
+  if (!isJsonRecord(value)) {
+    throw new Error(`${field} must be a JSON object`);
+  }
+  const serialized = JSON.stringify(value);
+  if (!serialized || serialized === '{}') {
+    throw new Error(`${field} must not be empty`);
+  }
+  return serialized;
+}
+
+function mapExternalCapabilityRunRow(
+  row: ExternalCapabilityRunRow,
+): ExternalCapabilityRun {
+  const validStatus: ExternalCapabilityRun['status'][] = [
+    'queued',
+    'running',
+    'retry_wait',
+    'succeeded',
+    'failed',
+    'cancelled',
+  ];
+  return {
+    id: row.id,
+    capability_slug: row.capability_slug,
+    key_id: row.key_id,
+    idempotency_key: row.idempotency_key,
+    external_task_id: row.external_task_id,
+    tenant_ref: row.tenant_ref,
+    account_ref: row.account_ref,
+    callback_context: parseExternalRunRecord(row.callback_context, null),
+    // A corrupted manifest must become inert. Future dispatch code must require
+    // the expected file entries rather than treating an empty object as input.
+    input_manifest: parseExternalRunRecord(row.input_manifest, {}) ?? {},
+    status: validStatus.includes(row.status) ? row.status : 'failed',
+    attempt: row.attempt,
+    available_at: row.available_at,
+    lease_owner: row.lease_owner,
+    lease_token: row.lease_token,
+    lease_expires_at: row.lease_expires_at,
+    started_at: row.started_at,
+    completed_at: row.completed_at,
+    result: parseExternalRunRecord(row.result, null),
+    error_code: row.error_code,
+    error_message: row.error_message,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+export interface ExternalCapabilityAdmissionLimits {
+  globalQueueLimit: number;
+  capabilityQueueLimit: number;
+  keyQueueLimit: number;
+  keyRunsPerMinute: number;
+  keyRunsPerDay: number;
+  keyInputBytesPerDay: number;
+  maxInputBytesPerRun: number;
+}
+
+export class ExternalCapabilityQuotaError extends Error {
+  readonly code = 'QUOTA_EXCEEDED';
+
+  constructor(
+    readonly scope:
+      | 'global'
+      | 'capability'
+      | 'key'
+      | 'rate'
+      | 'input'
+      | 'volume',
+  ) {
+    super('External capability quota exceeded');
+    this.name = 'ExternalCapabilityQuotaError';
+  }
+}
+
+export interface CreateExternalCapabilityRunInput {
+  /** Optional server-generated ID, used to allocate a private artifact vault first. */
+  id?: string;
+  capabilitySlug: string;
+  keyId?: string | null;
+  externalTaskId: string;
+  idempotencyKey?: string | null;
+  tenantRef?: string | null;
+  accountRef?: string | null;
+  callbackContext?: Record<string, unknown> | null;
+  inputManifest: Record<string, unknown>;
+  availableAt?: string;
+  admissionLimits?: ExternalCapabilityAdmissionLimits;
+}
+
+export interface CreateExternalCapabilityRunResult {
+  created: boolean;
+  reason?: 'duplicate' | 'conflict';
+  run: ExternalCapabilityRun;
+}
+
+function externalRequestFingerprint(manifest: string): string | null {
+  try {
+    const parsed = JSON.parse(manifest) as unknown;
+    return isJsonRecord(parsed) &&
+      typeof parsed.requestFingerprint === 'string' &&
+      /^[a-f0-9]{64}$/.test(parsed.requestFingerprint)
+      ? parsed.requestFingerprint
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function externalInputManifestBytes(manifest: unknown): number {
+  if (!isJsonRecord(manifest) || !Array.isArray(manifest.artifacts)) return 0;
+  let total = 0;
+  for (const artifact of manifest.artifacts) {
+    if (!isJsonRecord(artifact) || !Number.isSafeInteger(artifact.byteLength)) {
+      return 0;
+    }
+    const byteLength = artifact.byteLength as number;
+    if (byteLength < 0 || total > Number.MAX_SAFE_INTEGER - byteLength)
+      return 0;
+    total += byteLength;
+  }
+  return total;
+}
+
+function externalRunMatchesSubmission(
+  row: ExternalCapabilityRunRow,
+  input: {
+    keyId: string | null;
+    idempotencyKey: string | null;
+    externalTaskId: string;
+    tenantRef: string | null;
+    accountRef: string | null;
+    callbackContext: string | null;
+    manifest: string;
+  },
+): boolean {
+  if (
+    row.key_id !== input.keyId ||
+    row.idempotency_key !== input.idempotencyKey ||
+    row.external_task_id !== input.externalTaskId ||
+    row.tenant_ref !== input.tenantRef ||
+    row.account_ref !== input.accountRef ||
+    row.callback_context !== input.callbackContext
+  ) {
+    return false;
+  }
+  const existingFingerprint = externalRequestFingerprint(row.input_manifest);
+  const submittedFingerprint = externalRequestFingerprint(input.manifest);
+  // Runs created before request fingerprints existed remain comparable only when
+  // their exact immutable manifests match. New HTTP submissions always include
+  // a fingerprint that intentionally excludes random artifact storage IDs.
+  if (!existingFingerprint && !submittedFingerprint) {
+    return row.input_manifest === input.manifest;
+  }
+  return (
+    existingFingerprint !== null && existingFingerprint === submittedFingerprint
+  );
+}
+
+/**
+ * Persist an invocation before any runner work is queued. Both the caller's
+ * task ID and optional idempotency key are durable uniqueness boundaries.
+ */
+export function createExternalCapabilityRun(
+  input: CreateExternalCapabilityRunInput,
+): CreateExternalCapabilityRunResult {
+  const capabilitySlug = input.capabilitySlug.trim();
+  const keyId = input.keyId?.trim() || null;
+  const externalTaskId = input.externalTaskId.trim();
+  if (!capabilitySlug || !externalTaskId) {
+    throw new Error('capabilitySlug and externalTaskId are required');
+  }
+  const idempotencyKey = input.idempotencyKey?.trim() || null;
+  const manifest = serializeExternalRunRecord(
+    input.inputManifest,
+    'inputManifest',
+  );
+  const callbackContext = input.callbackContext
+    ? serializeExternalRunRecord(input.callbackContext, 'callbackContext')
+    : null;
+  const tenantRef = input.tenantRef?.trim() || null;
+  const accountRef = input.accountRef?.trim() || null;
+  const now = new Date().toISOString();
+  const availableAt = input.availableAt ?? now;
+  const id = input.id ?? crypto.randomUUID();
+  if (!/^[0-9a-f-]{36}$/i.test(id)) {
+    throw new Error('External capability run ID must be server-generated');
+  }
+
+  return db.transaction(() => {
+    const existingByTask = db
+      .prepare(
+        `SELECT * FROM external_capability_runs
+         WHERE capability_slug = ? AND key_id IS ? AND external_task_id = ?`,
+      )
+      .get(capabilitySlug, keyId, externalTaskId) as
+      | ExternalCapabilityRunRow
+      | undefined;
+    if (existingByTask) {
+      return {
+        created: false,
+        reason: externalRunMatchesSubmission(existingByTask, {
+          keyId,
+          idempotencyKey,
+          externalTaskId,
+          tenantRef,
+          accountRef,
+          callbackContext,
+          manifest,
+        })
+          ? ('duplicate' as const)
+          : ('conflict' as const),
+        run: mapExternalCapabilityRunRow(existingByTask),
+      };
+    }
+    if (idempotencyKey) {
+      const existingByKey = db
+        .prepare(
+          `SELECT * FROM external_capability_runs
+           WHERE capability_slug = ? AND key_id IS ? AND idempotency_key = ?`,
+        )
+        .get(capabilitySlug, keyId, idempotencyKey) as
+        | ExternalCapabilityRunRow
+        | undefined;
+      if (existingByKey) {
+        return {
+          created: false,
+          reason: externalRunMatchesSubmission(existingByKey, {
+            keyId,
+            idempotencyKey,
+            externalTaskId,
+            tenantRef,
+            accountRef,
+            callbackContext,
+            manifest,
+          })
+            ? ('duplicate' as const)
+            : ('conflict' as const),
+          run: mapExternalCapabilityRunRow(existingByKey),
+        };
+      }
+    }
+    if (input.admissionLimits) {
+      const limits = input.admissionLimits;
+      const inputBytes = externalInputManifestBytes(input.inputManifest);
+      if (inputBytes > limits.maxInputBytesPerRun) {
+        throw new ExternalCapabilityQuotaError('input');
+      }
+      const queuedStatuses = "('queued', 'retry_wait')";
+      const globalQueued = (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM external_capability_runs
+             WHERE status IN ${queuedStatuses}`,
+          )
+          .get() as { count: number }
+      ).count;
+      if (globalQueued >= limits.globalQueueLimit) {
+        throw new ExternalCapabilityQuotaError('global');
+      }
+      const capabilityQueued = (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM external_capability_runs
+             WHERE capability_slug = ? AND status IN ${queuedStatuses}`,
+          )
+          .get(capabilitySlug) as { count: number }
+      ).count;
+      if (capabilityQueued >= limits.capabilityQueueLimit) {
+        throw new ExternalCapabilityQuotaError('capability');
+      }
+      if (keyId) {
+        const keyQueued = (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS count FROM external_capability_runs
+               WHERE capability_slug = ? AND key_id = ?
+                 AND status IN ${queuedStatuses}`,
+            )
+            .get(capabilitySlug, keyId) as { count: number }
+        ).count;
+        if (keyQueued >= limits.keyQueueLimit) {
+          throw new ExternalCapabilityQuotaError('key');
+        }
+        const minuteStart = new Date(Date.now() - 60_000).toISOString();
+        const dayStart = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+        const recentRuns = db
+          .prepare(
+            `SELECT
+                 SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS minute_count,
+                 COUNT(*) AS day_count
+               FROM external_capability_runs
+               WHERE capability_slug = ? AND key_id = ? AND created_at >= ?`,
+          )
+          .get(minuteStart, capabilitySlug, keyId, dayStart) as {
+          minute_count: number | null;
+          day_count: number;
+        };
+        if (
+          (recentRuns.minute_count ?? 0) >= limits.keyRunsPerMinute ||
+          recentRuns.day_count >= limits.keyRunsPerDay
+        ) {
+          throw new ExternalCapabilityQuotaError('rate');
+        }
+        const recentManifests = db
+          .prepare(
+            `SELECT input_manifest FROM external_capability_runs
+             WHERE capability_slug = ? AND key_id = ? AND created_at >= ?`,
+          )
+          .all(capabilitySlug, keyId, dayStart) as Array<{
+          input_manifest: string;
+        }>;
+        const usedInputBytes = recentManifests.reduce((total, run) => {
+          try {
+            const bytes = externalInputManifestBytes(
+              JSON.parse(run.input_manifest),
+            );
+            return total > Number.MAX_SAFE_INTEGER - bytes
+              ? Number.MAX_SAFE_INTEGER
+              : total + bytes;
+          } catch {
+            // A malformed historical manifest must consume the whole budget
+            // rather than becoming a quota bypass.
+            return Number.MAX_SAFE_INTEGER;
+          }
+        }, 0);
+        if (usedInputBytes > limits.keyInputBytesPerDay - inputBytes) {
+          throw new ExternalCapabilityQuotaError('volume');
+        }
+      }
+    }
+    db.prepare(
+      `INSERT INTO external_capability_runs (
+         id, capability_slug, key_id, idempotency_key, external_task_id, tenant_ref,
+         account_ref, callback_context, input_manifest, status, attempt,
+         available_at, lease_owner, lease_token, lease_expires_at, started_at,
+         completed_at, result, error_code, error_message, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, NULL, 0, NULL,
+                 NULL, NULL, NULL, NULL, NULL, ?, ?)`,
+    ).run(
+      id,
+      capabilitySlug,
+      keyId,
+      idempotencyKey,
+      externalTaskId,
+      tenantRef,
+      accountRef,
+      callbackContext,
+      manifest,
+      availableAt,
+      now,
+      now,
+    );
+    return {
+      created: true,
+      run: getExternalCapabilityRunById(id)!,
+    };
+  })();
+}
+
+export function getExternalCapabilityRunById(
+  id: string,
+): ExternalCapabilityRun | undefined {
+  const row = db
+    .prepare('SELECT * FROM external_capability_runs WHERE id = ?')
+    .get(id) as ExternalCapabilityRunRow | undefined;
+  return row ? mapExternalCapabilityRunRow(row) : undefined;
+}
+
+export interface CancelExternalCapabilityRunResult {
+  run: ExternalCapabilityRun;
+  /** False when the run was already in a terminal state. */
+  cancelled: boolean;
+}
+
+/**
+ * Cancel a run within the bearer key's namespace and fence its current worker.
+ * This is intentionally durable first; the local worker receives a best-effort
+ * in-process stop signal separately and cannot settle after this token bump.
+ */
+export function cancelExternalCapabilityRun(
+  capabilitySlug: string,
+  keyId: string,
+  id: string,
+): CancelExternalCapabilityRunResult | undefined {
+  return db.transaction(() => {
+    const existing = db
+      .prepare(
+        `SELECT * FROM external_capability_runs
+         WHERE id = ? AND capability_slug = ? AND key_id = ?`,
+      )
+      .get(id, capabilitySlug, keyId) as ExternalCapabilityRunRow | undefined;
+    if (!existing) return undefined;
+    if (
+      existing.status === 'succeeded' ||
+      existing.status === 'failed' ||
+      existing.status === 'cancelled'
+    ) {
+      return { run: mapExternalCapabilityRunRow(existing), cancelled: false };
+    }
+
+    const now = new Date().toISOString();
+    const changed = db
+      .prepare(
+        `UPDATE external_capability_runs
+         SET status = 'cancelled', completed_at = ?, updated_at = ?,
+             error_code = 'CANCELLED_BY_CALLER',
+             error_message = 'The caller cancelled this task.',
+             lease_owner = NULL, lease_expires_at = NULL,
+             lease_token = lease_token + 1
+         WHERE id = ? AND capability_slug = ? AND key_id = ?
+           AND status IN ('queued', 'running', 'retry_wait')`,
+      )
+      .run(now, now, id, capabilitySlug, keyId);
+    const run = getExternalCapabilityRunById(id)!;
+    return { run, cancelled: changed.changes === 1 };
+  })();
+}
+
+export function listExternalCapabilityRunsForRetention(
+  completedBefore: string,
+): ExternalCapabilityRun[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM external_capability_runs
+       WHERE status IN ('succeeded', 'failed', 'cancelled')
+         AND completed_at IS NOT NULL AND completed_at < ?
+         AND lease_owner IS NULL AND lease_expires_at IS NULL
+       ORDER BY completed_at, id`,
+    )
+    .all(completedBefore) as ExternalCapabilityRunRow[];
+  return rows.map(mapExternalCapabilityRunRow);
+}
+
+export function deleteExternalCapabilityRunForRetention(
+  id: string,
+  completedBefore: string,
+): boolean {
+  const changed = db
+    .prepare(
+      `DELETE FROM external_capability_runs
+       WHERE id = ?
+         AND status IN ('succeeded', 'failed', 'cancelled')
+         AND completed_at IS NOT NULL AND completed_at < ?
+         AND lease_owner IS NULL AND lease_expires_at IS NULL`,
+    )
+    .run(id, completedBefore);
+  return changed.changes === 1;
+}
+
+export function claimNextExternalCapabilityRun(
+  owner: string,
+  leaseMs: number,
+  limits: {
+    globalConcurrency?: number;
+    capabilityConcurrency?: number;
+    keyConcurrency?: number;
+  } = {},
+): ClaimedExternalCapabilityRun | undefined {
+  const globalConcurrency = limits.globalConcurrency ?? Number.MAX_SAFE_INTEGER;
+  const capabilityConcurrency =
+    limits.capabilityConcurrency ?? Number.MAX_SAFE_INTEGER;
+  const keyConcurrency = limits.keyConcurrency ?? Number.MAX_SAFE_INTEGER;
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
+  return db.transaction(() => {
+    const candidate = db
+      .prepare(
+        `SELECT candidate.* FROM external_capability_runs candidate
+         WHERE (
+           (candidate.status IN ('queued', 'retry_wait') AND candidate.available_at <= ?)
+           OR (candidate.status = 'running'
+               AND candidate.lease_expires_at IS NOT NULL
+               AND candidate.lease_expires_at <= ?
+               AND candidate.started_at IS NULL)
+         )
+         AND EXISTS (
+           SELECT 1 FROM external_capabilities capability
+           JOIN external_capability_keys key ON key.id = candidate.key_id
+           WHERE capability.slug = candidate.capability_slug
+             AND capability.status = 'active' AND key.status = 'active'
+         )
+         AND (
+           SELECT COUNT(*) FROM external_capability_runs active_run
+           WHERE active_run.status = 'running'
+             AND active_run.lease_expires_at > ?
+         ) < ?
+         AND (
+           SELECT COUNT(*) FROM external_capability_runs capability_run
+           WHERE capability_run.status = 'running'
+             AND capability_run.lease_expires_at > ?
+             AND capability_run.capability_slug = candidate.capability_slug
+         ) < ?
+         AND (
+           SELECT COUNT(*) FROM external_capability_runs key_run
+           WHERE key_run.status = 'running'
+             AND key_run.lease_expires_at > ?
+             AND key_run.key_id = candidate.key_id
+         ) < ?
+         ORDER BY candidate.available_at, candidate.created_at LIMIT 1`,
+      )
+      .get(
+        nowIso,
+        nowIso,
+        nowIso,
+        globalConcurrency,
+        nowIso,
+        capabilityConcurrency,
+        nowIso,
+        keyConcurrency,
+      ) as ExternalCapabilityRunRow | undefined;
+    if (!candidate) return undefined;
+    const nextToken = candidate.lease_token + 1;
+    const changed = db
+      .prepare(
+        `UPDATE external_capability_runs
+         SET status = 'running', lease_owner = ?, lease_token = ?,
+             lease_expires_at = ?, attempt = attempt + 1, updated_at = ?
+         WHERE id = ? AND (
+           (status IN ('queued', 'retry_wait') AND available_at <= ?)
+           OR (status = 'running' AND lease_expires_at IS NOT NULL
+               AND lease_expires_at <= ? AND started_at IS NULL)
+         ) AND EXISTS (
+           SELECT 1 FROM external_capabilities capability
+           JOIN external_capability_keys key ON key.id = external_capability_runs.key_id
+           WHERE capability.slug = external_capability_runs.capability_slug
+             AND capability.status = 'active' AND key.status = 'active'
+         )`,
+      )
+      .run(owner, nextToken, expiresAt, nowIso, candidate.id, nowIso, nowIso);
+    if (changed.changes !== 1) return undefined;
+    return getExternalCapabilityRunById(
+      candidate.id,
+    ) as ClaimedExternalCapabilityRun;
+  })();
+}
+
+/** Mark the at-most-once boundary immediately before invoking an Agent. */
+export function markExternalCapabilityRunExecutionStarted(
+  id: string,
+  owner: string,
+  token: number,
+): boolean {
+  const now = new Date().toISOString();
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_runs
+       SET started_at = COALESCE(started_at, ?), updated_at = ?
+       WHERE id = ? AND status = 'running' AND lease_owner = ?
+         AND lease_token = ? AND lease_expires_at > ?
+         AND EXISTS (
+           SELECT 1 FROM external_capabilities capability
+           JOIN external_capability_keys key ON key.id = external_capability_runs.key_id
+           WHERE capability.slug = external_capability_runs.capability_slug
+             AND capability.status = 'active' AND key.status = 'active'
+         )`,
+    )
+    .run(now, now, id, owner, token, now);
+  return changed.changes === 1;
+}
+
+/**
+ * Never replay a run that may already have caused model/tool side effects.
+ * Crashed workers after the execution boundary become a visible safe failure.
+ */
+export function failExpiredStartedExternalCapabilityRuns(): number {
+  const now = new Date().toISOString();
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_runs
+       SET status = 'failed', completed_at = ?, updated_at = ?,
+           error_code = COALESCE(error_code, 'PROCESSING_INTERRUPTED'),
+           error_message = COALESCE(error_message, '处理在执行中中断，未自动重试以避免重复处理。'),
+           lease_owner = NULL, lease_expires_at = NULL,
+           lease_token = lease_token + 1
+       WHERE status = 'running' AND started_at IS NOT NULL
+         AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
+    )
+    .run(now, now, now);
+  return changed.changes;
+}
+
+/** An unexpired owner/token lease is required for renewal or settlement. */
+export function renewExternalCapabilityRunLease(
+  id: string,
+  owner: string,
+  token: number,
+  leaseMs: number,
+): boolean {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_runs SET lease_expires_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'running' AND lease_owner = ?
+         AND lease_token = ? AND lease_expires_at > ?`,
+    )
+    .run(expiresAt, nowIso, id, owner, token, nowIso);
+  return changed.changes === 1;
+}
+
+export function releaseExternalCapabilityRunForRetry(
+  id: string,
+  owner: string,
+  token: number,
+  availableAt: string,
+  error: { code: string; message: string },
+  options: { countsAsAttempt?: boolean } = {},
+): boolean {
+  const now = new Date().toISOString();
+  const attemptExpr =
+    options.countsAsAttempt === false ? 'MAX(0, attempt - 1)' : 'attempt';
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_runs
+       SET status = 'retry_wait', available_at = ?, error_code = ?,
+           error_message = ?, attempt = ${attemptExpr}, lease_owner = NULL,
+           lease_expires_at = NULL, updated_at = ?
+       WHERE id = ? AND status = 'running' AND lease_owner = ?
+         AND lease_token = ? AND lease_expires_at > ?`,
+    )
+    .run(availableAt, error.code, error.message, now, id, owner, token, now);
+  return changed.changes === 1;
+}
+
+export interface CompleteExternalCapabilityRunInput {
+  status: 'succeeded' | 'failed' | 'cancelled';
+  result?: Record<string, unknown> | null;
+  error?: { code: string; message: string } | null;
+}
+
+export function completeExternalCapabilityRun(
+  id: string,
+  owner: string,
+  token: number,
+  input: CompleteExternalCapabilityRunInput,
+): boolean {
+  const isSuccess = input.status === 'succeeded';
+  if (isSuccess === !input.result) {
+    throw new Error(
+      isSuccess
+        ? 'A succeeded external capability run requires a result object'
+        : 'Only a succeeded external capability run may include a result',
+    );
+  }
+  if (isSuccess && input.error) {
+    throw new Error(
+      'A succeeded external capability run may not include an error',
+    );
+  }
+  if (!isSuccess && !input.error && input.status !== 'cancelled') {
+    throw new Error('A failed external capability run requires a safe error');
+  }
+  const result = input.result
+    ? serializeExternalRunRecord(input.result, 'result')
+    : null;
+  const now = new Date().toISOString();
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_runs
+       SET status = ?, result = ?, error_code = ?, error_message = ?,
+           completed_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+           updated_at = ?
+       WHERE id = ? AND status = 'running' AND lease_owner = ?
+         AND lease_token = ? AND lease_expires_at > ?`,
+    )
+    .run(
+      input.status,
+      result,
+      input.error?.code ?? null,
+      input.error?.message ?? null,
+      now,
+      now,
+      id,
+      owner,
+      token,
+      now,
+    );
+  return changed.changes === 1;
 }
 
 type CreateTaskInput = Omit<

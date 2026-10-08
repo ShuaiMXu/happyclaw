@@ -14,30 +14,32 @@
 
 ## 路由模块
 
-| 前缀                               | 实现                             | 用途                          |
-| ---------------------------------- | -------------------------------- | ----------------------------- |
-| `/api/auth`                        | `src/routes/auth.ts`             | 初始化、登录、账户、设备      |
-| `/api/groups`                      | `src/routes/groups.ts`           | 工作区兼容模型、消息和环境    |
-| `/api/groups`                      | `src/routes/files.ts`            | 工作区文件                    |
-| `/api/groups`                      | `src/routes/agents.ts`           | Runtime Session 与渠道绑定    |
-| `/api/groups`                      | `src/routes/workspace-config.ts` | 项目 Skills/MCP               |
-| `/api/workspaces`                  | `src/routes/workspaces.ts`       | Agent-first 工作区投影        |
-| `/api/agent-profiles`              | `src/routes/agent-profiles.ts`   | 产品级 Agent                  |
-| `/api/channel-accounts`            | `src/routes/channel-accounts.ts` | 多渠道账号                    |
-| `/api/config`                      | `src/routes/config.ts`           | Provider、系统与兼容渠道配置  |
-| `/api/config`                      | `src/routes/brand-assets.ts`     | 品牌资源上传、删除与公开读取  |
-| `/api/tasks`                       | `src/routes/tasks.ts`            | 定时任务和运行                |
-| `/api/memory`                      | `src/routes/memory.ts`           | Workspace Memory v2           |
-| `/api/skills`                      | `src/routes/skills.ts`           | 用户 Skills                   |
-| `/api/mcp-servers`                 | `src/routes/mcp-servers.ts`      | 用户/系统 MCP                 |
-| `/api/plugins`                     | `src/routes/plugins.ts`          | Plugin Catalog 与用户启用状态 |
-| `/api/usage`                       | `src/routes/usage.ts`            | Token 用量                    |
-| `/api/billing`                     | `src/routes/billing.ts`          | 订阅、余额和计费管理          |
-| `/api/admin`                       | `src/routes/admin.ts`            | 用户、邀请和审计              |
-| `/api/bug-report`                  | `src/routes/bug-report.ts`       | 脱敏问题报告                  |
-| `/api/browse`                      | `src/routes/browse.ts`           | Host 目录选择                 |
-| `/api`                             | `src/routes/monitor.ts`          | 健康、状态和 Docker 构建      |
-| `/api/messages`、`/api/follow-ups` | `src/web.ts`                     | 消息发送和 Follow-up          |
+| 前缀                               | 实现                                       | 用途                           |
+| ---------------------------------- | ------------------------------------------ | ------------------------------ |
+| `/api/auth`                        | `src/routes/auth.ts`                       | 初始化、登录、账户、设备       |
+| `/api/groups`                      | `src/routes/groups.ts`                     | 工作区兼容模型、消息和环境     |
+| `/api/groups`                      | `src/routes/files.ts`                      | 工作区文件                     |
+| `/api/groups`                      | `src/routes/agents.ts`                     | Runtime Session 与渠道绑定     |
+| `/api/groups`                      | `src/routes/workspace-config.ts`           | 项目 Skills/MCP                |
+| `/api/workspaces`                  | `src/routes/workspaces.ts`                 | Agent-first 工作区投影         |
+| `/api/agent-profiles`              | `src/routes/agent-profiles.ts`             | 产品级 Agent                   |
+| `/api/channel-accounts`            | `src/routes/channel-accounts.ts`           | 多渠道账号                     |
+| `/api/config`                      | `src/routes/config.ts`                     | Provider、系统与兼容渠道配置   |
+| `/api/config`                      | `src/routes/brand-assets.ts`               | 品牌资源上传、删除与公开读取   |
+| `/api/tasks`                       | `src/routes/tasks.ts`                      | 定时任务和运行                 |
+| `/api/external-capabilities`       | `src/routes/external-capabilities.ts`      | 对外能力控制面、密钥与生命周期 |
+| `/v1/external-capabilities`        | `src/routes/external-capability-invoke.ts` | 服务端数据规整调用面           |
+| `/api/memory`                      | `src/routes/memory.ts`                     | Workspace Memory v2            |
+| `/api/skills`                      | `src/routes/skills.ts`                     | 用户 Skills                    |
+| `/api/mcp-servers`                 | `src/routes/mcp-servers.ts`                | 用户/系统 MCP                  |
+| `/api/plugins`                     | `src/routes/plugins.ts`                    | Plugin Catalog 与用户启用状态  |
+| `/api/usage`                       | `src/routes/usage.ts`                      | Token 用量                     |
+| `/api/billing`                     | `src/routes/billing.ts`                    | 订阅、余额和计费管理           |
+| `/api/admin`                       | `src/routes/admin.ts`                      | 用户、邀请和审计               |
+| `/api/bug-report`                  | `src/routes/bug-report.ts`                 | 脱敏问题报告                   |
+| `/api/browse`                      | `src/routes/browse.ts`                     | Host 目录选择                  |
+| `/api`                             | `src/routes/monitor.ts`                    | 健康、状态和 Docker 构建       |
+| `/api/messages`、`/api/follow-ups` | `src/web.ts`                               | 消息发送和 Follow-up           |
 
 ## 认证
 
@@ -368,6 +370,26 @@ Legacy 渠道 facade 位于 `/api/config/user-im/*`，涵盖飞书、Telegram、
 
 PATCH 修改 `chat_jid` 时会同时更新任务的具体 `delivery_route_jid`。已经物化的 Run
 在 `definition_snapshot` 中冻结原投递路由，不会因后续任务编辑而切换目标。
+
+## 外调能力
+
+控制面要求浏览器 Cookie、`manage_external_capabilities` 权限，以及目标 Workspace 的
+修改权：
+
+- `GET|PATCH /api/external-capabilities/:slug`
+- `GET /api/external-capabilities/:slug/keys`
+- `POST /api/external-capabilities/:slug/keys`：创建响应仅返回一次明文 Key
+- `DELETE /api/external-capabilities/:slug/keys/:keyId`
+
+数据面只接受能力专属的 `Authorization: Bearer ec_...`，不接受 Cookie：
+
+- `POST /v1/external-capabilities/:slug/runs`：`multipart/form-data` 提交任务
+- `GET|DELETE /v1/external-capabilities/:slug/runs/:runId`：查询或取消同一 Key 的任务
+- `GET /v1/external-capabilities/:slug/runs/:runId/output`：下载同一 Key 的 XLSX 结果
+
+外部提交的文件和说明均是不可信数据；调用方不能指定 Workspace、模型、Prompt、工具、
+挂载或环境。能力默认不会接收流量，只有宿主发布闸门、专用 Docker 网络和生命周期状态
+都允许时才会受理。
 
 ## Skills、MCP 和 Plugins
 

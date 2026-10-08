@@ -37,6 +37,7 @@
     "cron-parser": "^5.5.0",
     "dingtalk-stream": "2.1.6-beta.1",
     "discord.js": "^14.26.2",
+    "exceljs": "4.4.0",
     "grammy": "^1.40.0",
     "hono": "^4.13.7",
     "music-metadata": "11.13.0",

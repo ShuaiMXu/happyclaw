@@ -151,7 +151,7 @@ describe('database upgrade safety gate', () => {
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = migrationBackups;
     const backupsBeforeCurrentOnlyRefusal = fs.readdirSync(migrationBackups);
     expect(() => db.initDatabase({ requireCurrentSchema: true })).toThrow(
-      'Database must already be schema v75',
+      'Database must already be schema v76',
     );
     expect(fs.readdirSync(migrationBackups)).toEqual(
       backupsBeforeCurrentOnlyRefusal,
@@ -193,6 +193,10 @@ describe('schema version head', () => {
     // v75: adds mount-specific interaction overrides and records the SDK
     // session's interaction contract without changing workspace defaults.
     // Migration and restart coverage: channel-mount-interaction-mode.test.ts.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(75);
+    // v76: adds external capability definitions, scoped API keys, runs, files,
+    // events, leases, quotas, retention metadata, and key-scoped idempotency.
+    // Migration coverage: schema-v75-external-capabilities.test.ts and
+    // schema-v76-external-capability-key-scope.test.ts.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(76);
   });
 });

@@ -113,6 +113,7 @@ import {
   resolveProviderReportedModelTier,
 } from './provider-runtime.js';
 import { resolveAgentSdkEffort } from './agent-effort.js';
+import { resolveExternalRestrictedSdkPolicy } from './external-restricted-execution.js';
 import {
   resolveAssistantErrorAttemptBoundary,
   decideProviderLimitAction,
@@ -1657,7 +1658,7 @@ function decorateChannelUserTurn(
 async function runQueryAttempt(
   prompt: string,
   sessionId: string | undefined,
-  mcpServerConfig: ReturnType<typeof createSdkMcpServer>,
+  mcpServerConfig: ReturnType<typeof createSdkMcpServer> | undefined,
   containerInput: ContainerInput,
   workspaceMemoryInstructions: string,
   resumeAt?: string,
@@ -1694,6 +1695,10 @@ async function runQueryAttempt(
   const queryModelRuntime = resolveClaudeQueryModelRuntime(
     CLAUDE_PROVIDER_RUNTIME,
     PROVIDER_FALLBACK_MODELS.activeModelOverride,
+  );
+  const externalSdkPolicy = resolveExternalRestrictedSdkPolicy(
+    containerInput,
+    DEFAULT_ALLOWED_TOOLS,
   );
   const stream = new MessageStream();
   // Track messages piped into this query.  When the query is interrupted,
@@ -2817,7 +2822,9 @@ async function runQueryAttempt(
       // New hosts pass the canonical manifest. Undefined preserves compatibility
       // with older hosts; an explicit [] intentionally enables no Skills.
       skills:
-        containerInput.skillManifest?.selectedSkillIds ?? ('all' as const),
+        externalSdkPolicy.skills ??
+        containerInput.skillManifest?.selectedSkillIds ??
+        ('all' as const),
       includePartialMessages: true,
       // Forward sub-agent (Task) text/thinking as stream events so the card's
       // sub-agent transcript lights up live instead of only filling in when the
@@ -2826,13 +2833,16 @@ async function runQueryAttempt(
       ...(Object.keys(flagSettings).length > 0
         ? { settings: flagSettings as any }
         : {}),
-      ...(userPlugins && { plugins: userPlugins }),
+      ...(externalSdkPolicy.allowPlugins &&
+        userPlugins && {
+          plugins: userPlugins,
+        }),
       ...(activeAgentMcpPolicy.strictMcpConfig
         ? { strictMcpConfig: true }
         : {}),
-      mcpServers: {
+      mcpServers: externalSdkPolicy.mcpServers ?? {
         ...userMcpServers,
-        happyclaw: mcpServerConfig,
+        ...(mcpServerConfig ? { happyclaw: mcpServerConfig } : {}),
       },
       hooks: {
         PreToolUse: [
@@ -4098,7 +4108,7 @@ type RunQueryResult = Awaited<ReturnType<typeof runQueryAttempt>>;
 async function runQuery(
   prompt: string,
   sessionId: string | undefined,
-  mcpServerConfig: ReturnType<typeof createSdkMcpServer>,
+  mcpServerConfig: ReturnType<typeof createSdkMcpServer> | undefined,
   containerInput: ContainerInput,
   workspaceMemoryInstructions: string,
   resumeAt?: string,
@@ -4250,6 +4260,15 @@ async function main(): Promise<void> {
     containerInput,
     isHome,
   );
+  // External capability work is a host-owned, no-tool data transformation.
+  // This marker carries no host paths or credentials, but must be enforced in
+  // the runner as a defense-in-depth boundary across every query continuation.
+  const externalSdkPolicy = resolveExternalRestrictedSdkPolicy(
+    containerInput,
+    DEFAULT_ALLOWED_TOOLS,
+  );
+  const externalRestrictedExecution = externalSdkPolicy.restricted;
+  const effectiveAllowedTools = externalSdkPolicy.allowedTools;
 
   // Create in-process SDK MCP server (replaces the stdio subprocess)
   // NOTE: chatJid and currentTaskId are mutated in-place by the main loop
@@ -4306,11 +4325,13 @@ async function main(): Promise<void> {
     parseAgentMcpPolicyMode(process.env.HAPPYCLAW_AGENT_MCP_POLICY),
   );
   const buildMcpServerConfig = () =>
-    createSdkMcpServer({
-      name: 'happyclaw',
-      version: '1.0.0',
-      tools: createMcpTools(mcpToolsConfig),
-    });
+    externalRestrictedExecution
+      ? undefined
+      : createSdkMcpServer({
+          name: 'happyclaw',
+          version: '1.0.0',
+          tools: createMcpTools(mcpToolsConfig),
+        });
   let mcpServerConfig = buildMcpServerConfig();
   const workspaceMemoryInstructions = MEMORY_SYSTEM_WORKSPACE;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
@@ -4463,7 +4484,7 @@ async function main(): Promise<void> {
         workspaceMemoryInstructions,
         resumeAt,
         true,
-        DEFAULT_ALLOWED_TOOLS,
+        effectiveAllowedTools,
         undefined,
         promptImages,
         undefined,
@@ -4744,7 +4765,7 @@ async function main(): Promise<void> {
             workspaceMemoryInstructions,
             resumeAt,
             true,
-            DEFAULT_ALLOWED_TOOLS,
+            effectiveAllowedTools,
             undefined,
             undefined,
             'auto_continue',
@@ -4917,7 +4938,7 @@ async function main(): Promise<void> {
           workspaceMemoryInstructions,
           resumeAt,
           true,
-          DEFAULT_ALLOWED_TOOLS,
+          effectiveAllowedTools,
           undefined,
           undefined,
           'truncation_continue',

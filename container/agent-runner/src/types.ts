@@ -316,6 +316,21 @@ export interface ContainerInput {
   contextAudit?: ClaudeContextAudit;
   /** Canonical effective Skill set resolved by the HappyClaw host. */
   skillManifest?: { hash: string; selectedSkillIds: string[] };
+  /** Host-only execution marker. Its path values are not used inside the runner. */
+  externalExecution?: {
+    inputDirectory: string;
+    outputDirectory: string;
+    runtimeDirectory: string;
+  };
+  /** Explicit SDK tool allow-list for a confined host-owned execution. */
+  allowedTools?: string[];
+  /** Non-secret marker that forces the runner's no-tool, no-MCP policy. */
+  externalRestrictedExecution?: boolean;
+  /** Host-bounded SDK limits used only by confined external executions. */
+  externalQueryLimits?: {
+    maxTurns: number;
+    maxBudgetUsd: number;
+  };
 }
 
 export interface ContainerOutput {

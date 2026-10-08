@@ -65,3 +65,43 @@ export function resolveMarkdownImageSrc(
     `/api/groups/${encodeURIComponent(baseJid)}/files/download/${encoded}`,
   );
 }
+
+/**
+ * Resolve a plain relative document link in a chat message through the
+ * authenticated workspace-file API. Without this, a Markdown link such as
+ * `output/report.pdf` is resolved by the browser below `/chat/` and becomes a
+ * non-existent public URL (`/chat/output/report.pdf`).
+ */
+export function resolveMarkdownWorkspaceFileHref(
+  href: string | undefined,
+  groupJid?: string,
+): string | undefined {
+  if (!href || !groupJid) return href;
+  const trimmed = href.trim();
+  if (
+    !trimmed ||
+    /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(trimmed) ||
+    trimmed.startsWith('/') ||
+    trimmed.includes('?') ||
+    trimmed.includes('#')
+  ) {
+    return href;
+  }
+
+  const decoded = decodeMarkdownImagePath(trimmed);
+  // Only rewrite a simple relative file path. The server revalidates this path
+  // against the workspace root before it ever reads a file.
+  if (
+    !/^(?!.*(?:^|\/)\.\.(?:\/|$))(?:[^/\s]+\/)*[^/\s]+\.[A-Za-z0-9]{1,16}$/.test(
+      decoded,
+    )
+  ) {
+    return href;
+  }
+
+  const baseJid = groupJid.replace(/#agent:.*$/, '');
+  const encoded = toBase64Url(decoded);
+  return withBasePath(
+    `/api/groups/${encodeURIComponent(baseJid)}/files/preview/${encoded}`,
+  );
+}

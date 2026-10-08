@@ -692,6 +692,81 @@ export interface TaskRunLog {
   error: string | null;
 }
 
+// --- External capability types ---
+
+/** A platform-owned server-to-server integration contract. */
+export interface ExternalCapability {
+  slug: string;
+  display_name: string;
+  description: string;
+  workspace_jid: string;
+  workspace_folder: string;
+  execution_mode: 'container';
+  status: 'draft' | 'active' | 'paused' | 'retired';
+  input_schema_version: number;
+  allowed_mime_types: string[];
+  max_file_bytes: number;
+  max_files_per_run: number;
+  max_total_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Safe operator view of a server-to-server capability credential. */
+export interface ExternalCapabilityKey {
+  id: string;
+  capability_slug: string;
+  label: string;
+  key_prefix: string;
+  status: 'active' | 'revoked';
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+/**
+ * Durable state for one external request. Fields that identify the caller are
+ * opaque references supplied by that caller's server, never personal data.
+ */
+export interface ExternalCapabilityRun {
+  id: string;
+  capability_slug: string;
+  /** The server-to-server key that owns this run. Never expose its hash. */
+  key_id: string | null;
+  idempotency_key: string | null;
+  external_task_id: string;
+  tenant_ref: string | null;
+  account_ref: string | null;
+  callback_context: Record<string, unknown> | null;
+  input_manifest: Record<string, unknown>;
+  status:
+    | 'queued'
+    | 'running'
+    | 'retry_wait'
+    | 'succeeded'
+    | 'failed'
+    | 'cancelled';
+  attempt: number;
+  available_at: string;
+  lease_owner: string | null;
+  lease_token: number;
+  lease_expires_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  result: Record<string, unknown> | null;
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A leased external run whose worker may dispatch the server-owned contract. */
+export interface ClaimedExternalCapabilityRun extends ExternalCapabilityRun {
+  status: 'running';
+  lease_owner: string;
+  lease_expires_at: string;
+}
+
 // --- Auth types ---
 
 export type UserRole = 'admin' | 'member';
@@ -709,6 +784,7 @@ export interface AuthUser {
 
 export type Permission =
   | 'manage_system_config'
+  | 'manage_external_capabilities'
   | 'manage_group_env'
   | 'manage_users'
   | 'manage_invites'
