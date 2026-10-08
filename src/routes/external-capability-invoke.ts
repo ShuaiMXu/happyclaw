@@ -9,6 +9,7 @@ import {
   authenticateExternalCapabilityKey,
   cancelExternalCapabilityRun,
   createExternalCapabilityRun,
+  ExternalCapabilityAdmissionError,
   ExternalCapabilityQuotaError,
   getExternalCapabilityRunById,
 } from '../db.js';
@@ -260,11 +261,14 @@ function detectMimeType(bytes: Buffer): string | null {
 
 async function hasSafeImageDimensions(bytes: Buffer): Promise<boolean> {
   try {
-    const metadata = await sharp(bytes, {
+    const options = {
       limitInputPixels: EXTERNAL_IMAGE_MAX_PIXELS,
       pages: 1,
-    }).metadata();
-    return (
+      failOn: 'error' as const,
+      sequentialRead: true,
+    };
+    const metadata = await sharp(bytes, options).metadata();
+    const dimensionsSafe =
       typeof metadata.width === 'number' &&
       typeof metadata.height === 'number' &&
       metadata.width > 0 &&
@@ -272,8 +276,13 @@ async function hasSafeImageDimensions(bytes: Buffer): Promise<boolean> {
       metadata.width <= EXTERNAL_IMAGE_MAX_DIMENSION &&
       metadata.height <= EXTERNAL_IMAGE_MAX_DIMENSION &&
       metadata.width * metadata.height <= EXTERNAL_IMAGE_MAX_PIXELS &&
-      (metadata.pages ?? 1) <= 1
-    );
+      (metadata.pages ?? 1) <= 1;
+    if (!dimensionsSafe) return false;
+
+    // metadata() can succeed on truncated PNG/JPEG/WebP inputs. Force libvips
+    // to decode every pixel before admitting the file to the private Vault.
+    await sharp(bytes, options).raw().toBuffer();
+    return true;
   } catch {
     return false;
   }
@@ -663,6 +672,12 @@ externalCapabilityInvokeRoutes.post('/:slug/runs', async (c) => {
       } catch {
         // Best-effort cleanup must not hide the intake failure.
       }
+    }
+    if (error instanceof ExternalCapabilityAdmissionError) {
+      return c.json(
+        { error: 'Capability is not available', code: error.code },
+        409,
+      );
     }
     if (error instanceof ExternalCapabilityQuotaError) {
       return c.json(

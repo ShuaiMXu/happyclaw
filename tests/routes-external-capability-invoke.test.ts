@@ -38,7 +38,11 @@ const { default: invokeRoutes } =
   await import('../src/routes/external-capability-invoke.js');
 
 const PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLZpQAAAABJRU5ErkJggg==',
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWP4////fwAJ+wP9CNHoHgAAAABJRU5ErkJggg==',
+  'base64',
+);
+const METADATA_READABLE_TRUNCATED_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLZpQAAAABJRU5ErkJg',
   'base64',
 );
 let bearer = '';
@@ -302,6 +306,26 @@ describe('external capability invoke API', () => {
       error: 'File type or content is not allowed',
       code: 'INVALID_FILE',
     });
+  });
+
+  test('rejects an image whose metadata parses but full decoding fails', async () => {
+    const body = requestBody('t2-task-truncated-image');
+    body.set(
+      'files',
+      new File([METADATA_READABLE_TRUNCATED_PNG], 'truncated.png', {
+        type: 'image/png',
+      }),
+    );
+    const response = await invokeRoutes.request(
+      '/quote-document-process/runs',
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${bearer}` },
+        body,
+      },
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'INVALID_FILE' });
   });
 
   test('accepts a bounded macro-free XLSX archive', async () => {

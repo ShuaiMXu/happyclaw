@@ -36,7 +36,10 @@ import {
   storeExternalCapabilityArtifact,
 } from './external-capability-storage.js';
 import { logger } from './logger.js';
-import { runContainerAgent } from './container-runner.js';
+import {
+  runContainerAgent,
+  type ContainerOutput,
+} from './container-runner.js';
 import type { ClaimedExternalCapabilityRun } from './types.js';
 
 const WORKER_ID = `external-capability-worker-${process.pid}`;
@@ -94,41 +97,99 @@ type ExternalContainerExecution = {
   timedOut: boolean;
   container: ChildProcess | null;
   containerName: string | null;
-  stopping: boolean;
+  terminationPromise: Promise<boolean> | null;
 };
 
-function stopContainerExecution(
-  execution: ExternalContainerExecution,
-  reason: 'cancelled' | 'lease_lost' | 'timeout',
-): void {
-  execution.cancelled = true;
-  if (reason === 'timeout') execution.timedOut = true;
-  if (execution.stopping || !execution.container || !execution.containerName) {
-    return;
+type ExternalContainerStopReason =
+  | 'cancelled'
+  | 'lease_lost'
+  | 'timeout'
+  | 'shutdown';
+
+const activeContainerExecutions = new Set<ExternalContainerExecution>();
+
+function runDockerCommand(args: string[], timeout: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile('docker', args, { timeout }, (error) => resolve(!error));
+  });
+}
+
+async function externalContainerExists(containerName: string): Promise<boolean> {
+  return runDockerCommand(['container', 'inspect', containerName], 5_000);
+}
+
+async function waitForExternalContainerRemoval(
+  containerName: string,
+  attempts = 10,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (!(await externalContainerExists(containerName))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  execution.stopping = true;
+  return false;
+}
+
+async function terminateExternalContainer(
+  execution: ExternalContainerExecution,
+  reason: ExternalContainerStopReason,
+): Promise<boolean> {
   const { container, containerName } = execution;
+  if (!container || !containerName) return true;
+
   logger.info(
     { containerName, reason },
     'Stopping external capability container',
   );
-  execFile(
-    'docker',
+  const stopped = await runDockerCommand(
     ['stop', '--time', '10', containerName],
-    { timeout: 15_000 },
-    (error) => {
-      if (!error) return;
-      logger.warn(
-        {
-          ...getExternalCapabilitySafeErrorMetadata(error),
-          containerName,
-          reason,
-        },
-        'Graceful external capability container stop failed',
-      );
-      container.kill('SIGTERM');
-    },
+    15_000,
   );
+  if (!stopped) {
+    logger.warn(
+      { containerName, reason },
+      'Graceful external capability container stop failed; escalating',
+    );
+  }
+  if (await waitForExternalContainerRemoval(containerName, stopped ? 5 : 1)) {
+    return true;
+  }
+
+  const killed = await runDockerCommand(['kill', containerName], 10_000);
+  if (!killed) {
+    logger.warn(
+      { containerName, reason },
+      'Forced external capability container kill failed',
+    );
+  }
+  container.kill('SIGKILL');
+  const removed = await waitForExternalContainerRemoval(containerName);
+  if (!removed) {
+    logger.error(
+      { containerName, reason },
+      'External capability container termination could not be verified',
+    );
+  }
+  return removed;
+}
+
+function stopContainerExecution(
+  execution: ExternalContainerExecution,
+  reason: ExternalContainerStopReason,
+): Promise<boolean> {
+  execution.cancelled = true;
+  if (reason === 'timeout') execution.timedOut = true;
+  if (!execution.container || !execution.containerName) {
+    return Promise.resolve(true);
+  }
+  if (execution.terminationPromise) return execution.terminationPromise;
+
+  const termination = terminateExternalContainer(execution, reason).finally(() => {
+    if (execution.terminationPromise === termination) {
+      execution.terminationPromise = null;
+    }
+  });
+  execution.terminationPromise = termination;
+  return termination;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -529,6 +590,7 @@ async function executeClaim(
     return;
   }
   let leaseOwned = true;
+  const quotaConfig = getExternalCapabilityQuotaConfig();
   const containerExecution: ExternalContainerExecution = {
     cancelled: false,
     timedOut: false,
@@ -580,7 +642,7 @@ async function executeClaim(
   };
   const executionTimeout = setTimeout(() => {
     stopContainerExecution(containerExecution, 'timeout');
-  }, getExternalCapabilityQuotaConfig().executionTimeoutMs);
+  }, quotaConfig.executionTimeoutMs);
   executionTimeout.unref?.();
   let executionDirectory: string | null = null;
   try {
@@ -652,7 +714,8 @@ async function executeClaim(
       return;
     }
     if (containerExecution.cancelled) return;
-    const output = await runContainerAgent(
+    let terminalOutput: ContainerOutput | null = null;
+    const runnerOutput = await runContainerAgent(
       latestGroup,
       {
         prompt: [
@@ -684,6 +747,10 @@ async function executeClaim(
           runtimeDirectory: externalExecution.runtimeDirectory,
         },
         allowedTools: [],
+        externalQueryLimits: {
+          maxTurns: quotaConfig.maxTurnsPerRun,
+          maxBudgetUsd: quotaConfig.maxBudgetUsdPerRun,
+        },
         agentProfile: {
           id: 'external-capability-worker',
           name: 'External capability worker',
@@ -716,7 +783,16 @@ async function executeClaim(
           stopContainerExecution(containerExecution, 'cancelled');
         }
       },
+      async (frame) => {
+        if (
+          frame.status === 'error' ||
+          (frame.status === 'success' && frame.result !== null)
+        ) {
+          terminalOutput = frame;
+        }
+      },
     );
+    const output = terminalOutput ?? runnerOutput;
     if (!leaseOwned) return;
     if (containerExecution.timedOut) {
       settleProcessingTimeout();
@@ -726,7 +802,7 @@ async function executeClaim(
     const normalized = parseAgentRows(
       output.result,
       schema.columns,
-      getExternalCapabilityQuotaConfig().maxOutputRows,
+      quotaConfig.maxOutputRows,
     );
     const spreadsheet = await createWorkbook(schema, normalized.rows);
     if (containerExecution.timedOut) {

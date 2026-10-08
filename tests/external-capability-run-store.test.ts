@@ -295,20 +295,51 @@ describe('external capability durable run persistence', () => {
     ).toBe(false);
   });
 
-  test('cancels queued runs when a capability is paused before dispatch', () => {
+  test('atomically rejects new runs after pause or key revocation', () => {
+    expect(
+      db.setExternalCapabilityStatus('quote-document-process', 'paused'),
+    ).toBe(true);
+    expect(() => createRun()).toThrow(db.ExternalCapabilityAdmissionError);
+    expect(
+      db.setExternalCapabilityStatus('quote-document-process', 'active'),
+    ).toBe(true);
+
+    const key = db.createExternalCapabilityKey({
+      capabilitySlug: 'quote-document-process',
+      label: 'admission fence test',
+    });
+    expect(
+      db.revokeExternalCapabilityKey('quote-document-process', key.key.id),
+    ).toBe(true);
+    expect(() => createRun(key.key.id)).toThrow(
+      db.ExternalCapabilityAdmissionError,
+    );
+  });
+
+  test('keeps queued runs recoverable while a capability is paused', () => {
     const created = createRun();
     expect(
       db.setExternalCapabilityStatus('quote-document-process', 'paused'),
     ).toBe(true);
     expect(db.getExternalCapabilityRunById(created.run.id)).toMatchObject({
-      status: 'cancelled',
-      error_code: 'CAPABILITY_UNAVAILABLE',
+      status: 'queued',
+      error_code: null,
     });
     expect(
       db.claimNextExternalCapabilityRun('worker-a', 60_000),
     ).toBeUndefined();
     expect(
       db.setExternalCapabilityStatus('quote-document-process', 'active'),
+    ).toBe(true);
+    const resumed = db.claimNextExternalCapabilityRun('worker-a', 60_000)!;
+    expect(resumed.id).toBe(created.run.id);
+    expect(
+      db.completeExternalCapabilityRun(
+        resumed.id,
+        resumed.lease_owner,
+        resumed.lease_token,
+        { status: 'cancelled' },
+      ),
     ).toBe(true);
   });
 
@@ -328,12 +359,25 @@ describe('external capability durable run persistence', () => {
       ),
     ).toBe(false);
     expect(db.getExternalCapabilityRunById(claim.id)).toMatchObject({
-      status: 'cancelled',
+      status: 'retry_wait',
+      attempt: 0,
       started_at: null,
       error_code: 'CAPABILITY_UNAVAILABLE',
+      lease_owner: null,
     });
     expect(
       db.setExternalCapabilityStatus('quote-document-process', 'active'),
+    ).toBe(true);
+    const resumed = db.claimNextExternalCapabilityRun('worker-b', 60_000)!;
+    expect(resumed.id).toBe(claim.id);
+    expect(resumed.lease_token).toBeGreaterThan(claim.lease_token);
+    expect(
+      db.completeExternalCapabilityRun(
+        resumed.id,
+        resumed.lease_owner,
+        resumed.lease_token,
+        { status: 'cancelled' },
+      ),
     ).toBe(true);
   });
 

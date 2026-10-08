@@ -2810,15 +2810,34 @@ async function runQueryAttempt(
       ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
       systemPrompt,
       allowedTools,
+      ...(externalSdkPolicy.tools !== undefined && {
+        tools: externalSdkPolicy.tools,
+      }),
       ...(effectiveDisallowedTools && {
         disallowedTools: effectiveDisallowedTools,
       }),
       thinking: { type: 'adaptive' as const, display: 'summarized' as const },
       ...(agentEffort ? { effort: agentEffort } : {}),
-      permissionMode: 'bypassPermissions' as const,
-      allowDangerouslySkipPermissions: true,
+      ...(externalSdkPolicy.restricted &&
+        containerInput.externalQueryLimits && {
+          maxTurns: containerInput.externalQueryLimits.maxTurns,
+          maxBudgetUsd: containerInput.externalQueryLimits.maxBudgetUsd,
+        }),
+      permissionMode: externalSdkPolicy.restricted
+        ? ('dontAsk' as const)
+        : ('bypassPermissions' as const),
+      ...(!externalSdkPolicy.restricted && {
+        allowDangerouslySkipPermissions: true,
+      }),
+      ...(externalSdkPolicy.restricted && {
+        canUseTool: async (toolName: string) => ({
+          behavior: 'deny' as const,
+          message: `Tool ${toolName} is disabled for external capability execution.`,
+        }),
+      }),
       agentProgressSummaries: true,
-      settingSources: activeAgentMcpPolicy.settingSources,
+      settingSources:
+        externalSdkPolicy.settingSources ?? activeAgentMcpPolicy.settingSources,
       // New hosts pass the canonical manifest. Undefined preserves compatibility
       // with older hosts; an explicit [] intentionally enables no Skills.
       skills:
@@ -4723,6 +4742,14 @@ async function main(): Promise<void> {
         // when the previous query was aborted mid-stream (#421).
         mcpServerConfig = buildMcpServerConfig();
         continue;
+      }
+
+      // External capability executions are one-shot transformations. Their
+      // terminal SDK frame has already been emitted by runQuery(), so exit now
+      // instead of keeping a credential-bearing container warm for IPC reuse.
+      if (externalRestrictedExecution) {
+        log('External restricted query completed; exiting one-shot runner');
+        break;
       }
 
       // Emit session update so host can track it

@@ -17,6 +17,8 @@ describe('external restricted SDK policy', () => {
     expect(policy).toEqual({
       restricted: true,
       allowedTools: [],
+      tools: [],
+      settingSources: [],
       skills: [],
       mcpServers: {},
       allowPlugins: false,
@@ -32,6 +34,8 @@ describe('external restricted SDK policy', () => {
     expect(policy).toEqual({
       restricted: false,
       allowedTools: ['Read'],
+      tools: undefined,
+      settingSources: undefined,
       skills: undefined,
       mcpServers: undefined,
       allowPlugins: true,

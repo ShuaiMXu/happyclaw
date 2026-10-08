@@ -4935,11 +4935,24 @@ export function setExternalCapabilityStatus(
         'UPDATE external_capabilities SET status = ?, updated_at = ? WHERE slug = ?',
       )
       .run(status, now, slug);
-    if (changed.changes === 1 && status !== 'active') {
-      // Pause and retirement are admission barriers: work not yet at the
-      // execution boundary must not start after an operator disables a
-      // capability. Already-running work remains observable and is handled by
-      // the explicit cancellation/incident policy.
+    if (changed.changes === 1 && status === 'paused') {
+      // A pause is reversible. Fence any claim that has not crossed the model
+      // execution boundary, but keep the work recoverable for a later resume.
+      db.prepare(
+        `UPDATE external_capability_runs
+         SET status = 'retry_wait', available_at = ?, updated_at = ?,
+             attempt = MAX(0, attempt - 1),
+             error_code = 'CAPABILITY_UNAVAILABLE',
+             error_message = 'The capability is temporarily paused.',
+             lease_owner = NULL, lease_expires_at = NULL,
+             lease_token = lease_token + 1
+         WHERE capability_slug = ?
+           AND status = 'running' AND started_at IS NULL`,
+      ).run(now, now, slug);
+    } else if (changed.changes === 1 && status !== 'active') {
+      // Retirement/draft are terminal admission barriers for work that has not
+      // crossed the execution boundary. Already-started work remains fenced by
+      // its lease and explicit cancellation policy.
       db.prepare(
         `UPDATE external_capability_runs
          SET status = 'cancelled', completed_at = ?, updated_at = ?,
@@ -5176,6 +5189,15 @@ export interface ExternalCapabilityAdmissionLimits {
   maxInputBytesPerRun: number;
 }
 
+export class ExternalCapabilityAdmissionError extends Error {
+  readonly code = 'CAPABILITY_UNAVAILABLE';
+
+  constructor() {
+    super('External capability is not accepting new runs');
+    this.name = 'ExternalCapabilityAdmissionError';
+  }
+}
+
 export class ExternalCapabilityQuotaError extends Error {
   readonly code = 'QUOTA_EXCEEDED';
 
@@ -5360,6 +5382,28 @@ export function createExternalCapabilityRun(
         };
       }
     }
+
+    // Authentication and multipart validation happen before this transaction.
+    // Revalidate the mutable lifecycle/key gates at the insertion boundary so
+    // a concurrent pause, retirement, or revocation cannot admit new work.
+    const activeCapability = db
+      .prepare(
+        `SELECT 1 FROM external_capabilities
+         WHERE slug = ? AND status = 'active'`,
+      )
+      .get(capabilitySlug);
+    const activeKey = keyId
+      ? db
+          .prepare(
+            `SELECT 1 FROM external_capability_keys
+             WHERE id = ? AND capability_slug = ? AND status = 'active'`,
+          )
+          .get(keyId, capabilitySlug)
+      : true;
+    if (!activeCapability || !activeKey) {
+      throw new ExternalCapabilityAdmissionError();
+    }
+
     if (input.admissionLimits) {
       const limits = input.admissionLimits;
       const inputBytes = externalInputManifestBytes(input.inputManifest);

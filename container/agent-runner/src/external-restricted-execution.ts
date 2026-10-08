@@ -1,6 +1,8 @@
 export interface ExternalRestrictedSdkPolicy {
   restricted: boolean;
   allowedTools: string[];
+  tools: string[] | undefined;
+  settingSources: [] | undefined;
   skills: string[] | undefined;
   mcpServers: Record<string, never> | undefined;
   allowPlugins: boolean;
@@ -22,6 +24,8 @@ export function resolveExternalRestrictedSdkPolicy(
     return {
       restricted: true,
       allowedTools: [],
+      tools: [],
+      settingSources: [],
       skills: [],
       mcpServers: {},
       allowPlugins: false,
@@ -31,6 +35,8 @@ export function resolveExternalRestrictedSdkPolicy(
   return {
     restricted: false,
     allowedTools: input.allowedTools ?? [...defaultAllowedTools],
+    tools: undefined,
+    settingSources: undefined,
     skills: undefined,
     mcpServers: undefined,
     allowPlugins: true,

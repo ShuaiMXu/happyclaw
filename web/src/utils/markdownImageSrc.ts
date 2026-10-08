@@ -89,12 +89,23 @@ export function resolveMarkdownWorkspaceFileHref(
   }
 
   const decoded = decodeMarkdownImagePath(trimmed);
-  // Only rewrite a simple relative file path. The server revalidates this path
-  // against the workspace root before it ever reads a file.
+  // Only rewrite a relative file path with a conventional extension. Spaces
+  // and Unicode are valid workspace filename characters, while empty,
+  // traversal, control-character, and Windows-style path segments are not.
+  // The server revalidates the decoded path against the workspace root before
+  // it ever reads a file.
+  const segments = decoded.split('/');
+  const fileName = segments.at(-1) ?? '';
   if (
-    !/^(?!.*(?:^|\/)\.\.(?:\/|$))(?:[^/\s]+\/)*[^/\s]+\.[A-Za-z0-9]{1,16}$/.test(
-      decoded,
-    )
+    /[\\\u0000-\u001f\u007f]/.test(decoded) ||
+    segments.some(
+      (segment) =>
+        !segment ||
+        !segment.trim() ||
+        segment === '.' ||
+        segment === '..',
+    ) ||
+    !/\.[A-Za-z0-9]{1,16}$/.test(fileName)
   ) {
     return href;
   }

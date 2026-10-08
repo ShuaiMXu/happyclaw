@@ -55,6 +55,7 @@ export function UnifiedSidebar({
 
   const user = useAuthStore((s) => s.user);
   const appearance = useAuthStore((s) => s.appearance);
+  const hasPermission = useAuthStore((s) => s.hasPermission);
   const billingEnabled = useBillingStore((s) => s.billingEnabled);
   const [showBugReport, setShowBugReport] = useState(false);
   const userInitial = (user?.display_name ||
@@ -62,8 +63,8 @@ export function UnifiedSidebar({
     '?')[0].toUpperCase();
 
   const navItems = useMemo(
-    () => filterNavItems(billingEnabled),
-    [billingEnabled],
+    () => filterNavItems(billingEnabled, hasPermission),
+    [billingEnabled, hasPermission, user],
   );
 
   const [createOpen, setCreateOpen] = useState(false);
