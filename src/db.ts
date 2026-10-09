@@ -6,8 +6,14 @@ import path from 'path';
 
 import { STORE_DIR, GROUPS_DIR } from './config.js';
 import { normalizeAgentEffort } from './agent-effort.js';
+import { EXTERNAL_CAPABILITY_DEFINITIONS } from './external-capability-definitions.js';
+import { getExternalCapabilityQuotaConfig } from './external-capability-quota-config.js';
+import { externalCapabilityStorageReservationKey } from './external-capability-storage-identity.js';
 import { logger } from './logger.js';
-import { isValidWorkspaceFolderName } from './workspace-folder.js';
+import {
+  assertValidWorkspaceFolderName,
+  isValidWorkspaceFolderName,
+} from './workspace-folder.js';
 import {
   AgentProfile,
   AgentBuilderDefinition,
@@ -116,6 +122,10 @@ export { CURRENT_SCHEMA_VERSION };
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
+}
+
+export function getDatabaseSynchronousModeForTest(): number {
+  return db.pragma('synchronous', { simple: true }) as number;
 }
 
 // Prepared statement cache — lazy-initialized on first use after initDatabase()
@@ -452,13 +462,18 @@ function createPreMigrationBackup(dbPath: string, schemaVersion: number): void {
     (process.env.HAPPYCLAW_SKIP_MIGRATION_BACKUP ?? '').trim().toLowerCase(),
   );
   if (skipBackup) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'HAPPYCLAW_SKIP_MIGRATION_BACKUP is forbidden in production',
+      );
+    }
     logger.warn(
       {
         fromVersion: schemaVersion,
         toVersion: CURRENT_SCHEMA_VERSION,
         environmentOverride: 'HAPPYCLAW_SKIP_MIGRATION_BACKUP',
       },
-      'Skipping pre-migration SQLite backup by explicit operator policy',
+      'Skipping pre-migration SQLite backup outside production',
     );
     return;
   }
@@ -519,12 +534,21 @@ function createPreMigrationBackup(dbPath: string, schemaVersion: number): void {
 function enforcePreMigrationBackup(dbPath: string): void {
   const rawVersion = getRouterStateInternal('schema_version');
   if (rawVersion === undefined) {
-    // Pre-versioned installations (and partially damaged router_state rows)
-    // can still carry the legacy memory chunk index. v67 drops those tables,
-    // so treat their presence as an upgrade even without a version marker.
-    // A genuinely fresh database has neither table and must not create an
-    // empty, misleading migration backup.
-    if (tableExists('memory_chunks') || tableExists('memory_chunks_fts')) {
+    // Any pre-versioned database with application tables is an upgrade source.
+    // Do not guess which historical tables are destructive: a partially
+    // damaged router_state row or an old installation may otherwise bypass the
+    // only restorable snapshot. A genuinely fresh database has no user tables.
+    const hasUserTables = Boolean(
+      db
+        .prepare(
+          `SELECT 1
+           FROM sqlite_master
+           WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+           LIMIT 1`,
+        )
+        .get(),
+    );
+    if (hasUserTables) {
       createPreMigrationBackup(dbPath, 0);
     }
     return;
@@ -539,7 +563,7 @@ function enforcePreMigrationBackup(dbPath: string): void {
       `Database schema v${schemaVersion} is newer than supported v${CURRENT_SCHEMA_VERSION}; refusing downgrade`,
     );
   }
-  if (schemaVersion >= 39 && schemaVersion < CURRENT_SCHEMA_VERSION) {
+  if (schemaVersion < CURRENT_SCHEMA_VERSION) {
     createPreMigrationBackup(dbPath, schemaVersion);
   }
 }
@@ -1108,6 +1132,20 @@ export function initDatabase(
     );
     CREATE INDEX IF NOT EXISTS idx_workspace_agent_profiles_profile
       ON workspace_agent_profiles(agent_profile_id);
+
+    -- Durable folder tombstones bridge logical workspace deletion and
+    -- irreversible filesystem cleanup. A folder cannot be published again until
+    -- the sweeper has strictly verified every owned artifact absent.
+    CREATE TABLE IF NOT EXISTS workspace_filesystem_cleanup_outbox (
+      folder TEXT PRIMARY KEY,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+      claim_owner TEXT,
+      claim_token INTEGER NOT NULL DEFAULT 0 CHECK (claim_token >= 0),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+      last_error TEXT
+    );
   `);
 
   // External capabilities are platform-owned, asynchronous server-to-server
@@ -1134,6 +1172,23 @@ export function initDatabase(
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS external_capability_workspace_deletion_fences (
+      capability_slug TEXT PRIMARY KEY,
+      operation_id TEXT NOT NULL,
+      previous_status TEXT NOT NULL
+        CHECK (previous_status IN ('draft', 'active', 'paused', 'retired')),
+      fenced_status TEXT NOT NULL
+        CHECK (fenced_status IN ('draft', 'active', 'paused', 'retired')),
+      quarantined INTEGER NOT NULL DEFAULT 0 CHECK (quarantined IN (0, 1)),
+      owner_id TEXT,
+      heartbeat_at TEXT,
+      expires_at TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (capability_slug) REFERENCES external_capabilities(slug)
+    );
+    CREATE INDEX IF NOT EXISTS idx_external_capability_deletion_operation
+      ON external_capability_workspace_deletion_fences(operation_id);
+
     CREATE TABLE IF NOT EXISTS external_capability_keys (
       id TEXT PRIMARY KEY,
       capability_slug TEXT NOT NULL,
@@ -1150,6 +1205,96 @@ export function initDatabase(
     CREATE INDEX IF NOT EXISTS idx_external_capability_keys_capability
       ON external_capability_keys(capability_slug, status);
 
+    CREATE TABLE IF NOT EXISTS external_capability_intake_reservations (
+      id TEXT PRIMARY KEY,
+      capability_slug TEXT NOT NULL,
+      key_id TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'active'
+        CHECK (state IN ('active', 'finished')),
+      outcome TEXT
+        CHECK (outcome IS NULL OR outcome IN (
+          'accepted', 'duplicate', 'conflict', 'invalid',
+          'payload_too_large', 'quota_rejected', 'unavailable',
+          'overloaded', 'aborted', 'failed', 'expired'
+        )),
+      quota_scope TEXT,
+      reserved_raw_bytes INTEGER NOT NULL CHECK (reserved_raw_bytes >= 0),
+      observed_raw_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK (observed_raw_bytes >= 0),
+      accepted_input_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK (accepted_input_bytes >= 0),
+      run_id TEXT,
+      lease_token INTEGER NOT NULL DEFAULT 1 CHECK (lease_token > 0),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      finished_at TEXT,
+      FOREIGN KEY (capability_slug) REFERENCES external_capabilities(slug),
+      FOREIGN KEY (key_id) REFERENCES external_capability_keys(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_external_capability_intake_active
+      ON external_capability_intake_reservations(state, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_external_capability_intake_capability_active
+      ON external_capability_intake_reservations(capability_slug, state, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_external_capability_intake_key_active
+      ON external_capability_intake_reservations(key_id, state, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_external_capability_intake_key_created
+      ON external_capability_intake_reservations(key_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_external_capability_intake_finished
+      ON external_capability_intake_reservations(state, finished_at);
+
+    CREATE TABLE IF NOT EXISTS external_capability_intake_rate_windows (
+      key_id TEXT PRIMARY KEY,
+      window_started_at TEXT NOT NULL,
+      request_count INTEGER NOT NULL CHECK (request_count > 0),
+      FOREIGN KEY (key_id) REFERENCES external_capability_keys(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS external_capability_intake_ingress_windows (
+      key_id TEXT NOT NULL,
+      window_started_at TEXT NOT NULL,
+      byte_count INTEGER NOT NULL CHECK (byte_count >= 0),
+      PRIMARY KEY (key_id, window_started_at),
+      FOREIGN KEY (key_id) REFERENCES external_capability_keys(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_external_capability_intake_ingress_window
+      ON external_capability_intake_ingress_windows(window_started_at);
+
+    CREATE TABLE IF NOT EXISTS external_capability_api_rate_windows (
+      key_id TEXT NOT NULL,
+      operation TEXT NOT NULL
+        CHECK (operation IN ('status', 'cancel', 'download')),
+      window_started_at TEXT NOT NULL,
+      request_count INTEGER NOT NULL CHECK (request_count > 0),
+      PRIMARY KEY (key_id, operation),
+      FOREIGN KEY (key_id) REFERENCES external_capability_keys(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS external_capability_storage_reservations (
+      reservation_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('input', 'runtime', 'output')),
+      object_key TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'reserved'
+        CHECK (state IN ('reserved', 'occupied', 'quarantined', 'released')),
+      reserved_bytes INTEGER NOT NULL
+        CHECK (reserved_bytes BETWEEN 0 AND 9007199254740991),
+      occupied_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK (occupied_bytes BETWEEN 0 AND 9007199254740991),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      released_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_external_capability_storage_object
+      ON external_capability_storage_reservations(run_id, kind, object_key);
+    CREATE INDEX IF NOT EXISTS idx_external_capability_storage_state
+      ON external_capability_storage_reservations(state, run_id);
+    CREATE INDEX IF NOT EXISTS idx_external_capability_storage_reconcile
+      ON external_capability_storage_reservations(created_at, reservation_key)
+      WHERE state != 'released';
+    CREATE INDEX IF NOT EXISTS idx_external_capability_storage_released_gc
+      ON external_capability_storage_reservations(released_at, reservation_key)
+      WHERE state = 'released' AND released_at IS NOT NULL;
+
     CREATE TABLE IF NOT EXISTS external_capability_runs (
       id TEXT PRIMARY KEY,
       capability_slug TEXT NOT NULL,
@@ -1160,6 +1305,7 @@ export function initDatabase(
       account_ref TEXT,
       callback_context TEXT,
       input_manifest TEXT NOT NULL,
+      input_bytes INTEGER NOT NULL DEFAULT 0 CHECK (input_bytes >= 0),
       status TEXT NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued', 'running', 'retry_wait', 'succeeded', 'failed', 'cancelled')),
       attempt INTEGER NOT NULL DEFAULT 0,
@@ -1169,6 +1315,10 @@ export function initDatabase(
       lease_expires_at TEXT,
       started_at TEXT,
       completed_at TEXT,
+      retention_cleaned_at TEXT,
+      container_cleanup_attempt INTEGER,
+      container_cleanup_lease_token INTEGER,
+      container_create_pending_until TEXT,
       result TEXT,
       error_code TEXT,
       error_message TEXT,
@@ -1178,37 +1328,311 @@ export function initDatabase(
     );
     CREATE INDEX IF NOT EXISTS idx_external_capability_runs_due
       ON external_capability_runs(status, available_at, lease_expires_at);
+
+    CREATE TABLE IF NOT EXISTS external_capability_cost_reservations (
+      run_id TEXT PRIMARY KEY,
+      capability_slug TEXT NOT NULL,
+      key_id TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'active'
+        CHECK (state IN ('active', 'settled', 'released', 'uncertain')),
+      reserved_microusd INTEGER NOT NULL CHECK (reserved_microusd >= 0),
+      actual_microusd INTEGER NOT NULL DEFAULT 0 CHECK (actual_microusd >= 0),
+      input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+      output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+      cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
+        CHECK (cache_read_input_tokens >= 0),
+      cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0
+        CHECK (cache_creation_input_tokens >= 0),
+      reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
+      lease_token INTEGER NOT NULL CHECK (lease_token > 0),
+      created_at TEXT NOT NULL,
+      settled_at TEXT,
+      FOREIGN KEY (run_id) REFERENCES external_capability_runs(id),
+      FOREIGN KEY (capability_slug) REFERENCES external_capabilities(slug),
+      FOREIGN KEY (key_id) REFERENCES external_capability_keys(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_created
+      ON external_capability_cost_reservations(
+        created_at, state, reserved_microusd, actual_microusd
+      )
+      WHERE state IN ('active', 'settled', 'uncertain');
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_capability_created
+      ON external_capability_cost_reservations(
+        capability_slug, created_at, state, reserved_microusd, actual_microusd
+      )
+      WHERE state IN ('active', 'settled', 'uncertain');
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_key_created
+      ON external_capability_cost_reservations(
+        key_id, created_at, state, reserved_microusd, actual_microusd
+      )
+      WHERE state IN ('active', 'settled', 'uncertain');
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_settled
+      ON external_capability_cost_reservations(settled_at, actual_microusd)
+      WHERE state = 'settled';
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_capability_settled
+      ON external_capability_cost_reservations(
+        capability_slug, settled_at, actual_microusd
+      )
+      WHERE state = 'settled';
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_key_settled
+      ON external_capability_cost_reservations(
+        key_id, settled_at, actual_microusd
+      )
+      WHERE state = 'settled';
+
+    CREATE TABLE IF NOT EXISTS external_capability_usage_events (
+      event_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      provider_cost_microusd INTEGER NOT NULL
+        CHECK (provider_cost_microusd >= 0),
+      input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+      output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+      cache_read_input_tokens INTEGER NOT NULL
+        CHECK (cache_read_input_tokens >= 0),
+      cache_creation_input_tokens INTEGER NOT NULL
+        CHECK (cache_creation_input_tokens >= 0),
+      reasoning_tokens INTEGER NOT NULL CHECK (reasoning_tokens >= 0),
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (run_id) REFERENCES external_capability_runs(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_external_capability_usage_run
+      ON external_capability_usage_events(run_id, created_at);
   `);
 
-  // The first contract is intentionally seeded as a draft. It cannot receive
-  // external traffic until the isolated runner, immutable input storage and
-  // callback delivery are complete. Keep its target server-owned.
-  const quoteCapabilityNow = new Date().toISOString();
-  db.prepare(
-    `INSERT OR IGNORE INTO external_capabilities (
-      slug, display_name, description, workspace_jid, workspace_folder,
-      execution_mode, status, input_schema_version, allowed_mime_types,
-      max_file_bytes, max_files_per_run, max_total_bytes, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'container', 'draft', ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    'quote-document-process',
-    '结构化数据规整',
-    '将图片或 Excel 中的业务数据按调用方提交的受限底表结构规整为标准结果。',
-    'web:6241df8f-b015-472e-9083-6c4ec31eedc1',
-    'flow-munrwfg2-u6u8',
-    1,
-    JSON.stringify([
-      'image/jpeg',
-      'image/png',
-      'image/webp',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    ]),
-    20 * 1024 * 1024,
-    10,
-    50 * 1024 * 1024,
-    quoteCapabilityNow,
-    quoteCapabilityNow,
+  // v83 -> v84: persist physical-container cleanup ownership and distinguish a
+  // crash-interrupted deletion from a deliberate fail-closed quarantine.
+  ensureColumn(
+    'external_capability_runs',
+    'container_cleanup_attempt',
+    'INTEGER',
   );
+  ensureColumn(
+    'external_capability_runs',
+    'container_cleanup_lease_token',
+    'INTEGER',
+  );
+  ensureColumn(
+    'external_capability_workspace_deletion_fences',
+    'quarantined',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (quarantined IN (0, 1))',
+  );
+  // v84 -> v85: lease deletion fences so one live process cannot restore or
+  // commit another process's in-flight workspace deletion.
+  ensureColumn(
+    'external_capability_workspace_deletion_fences',
+    'owner_id',
+    'TEXT',
+  );
+  ensureColumn(
+    'external_capability_workspace_deletion_fences',
+    'heartbeat_at',
+    'TEXT',
+  );
+  ensureColumn(
+    'external_capability_workspace_deletion_fences',
+    'expires_at',
+    'TEXT',
+  );
+  // v87 -> v88: fence the gap between durable Docker-create authorization and
+  // physical container creation without holding SQLite's writer lock.
+  ensureColumn(
+    'external_capability_runs',
+    'container_create_pending_until',
+    'TEXT',
+  );
+  // v88 -> v89: reserve Vault bytes durably before filesystem writes. The table
+  // is intentionally independent of external_capability_runs because intake
+  // must reserve and materialize private input before the run row can exist.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS external_capability_storage_reservations (
+      reservation_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('input', 'runtime', 'output')),
+      object_key TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'reserved'
+        CHECK (state IN ('reserved', 'occupied', 'quarantined', 'released')),
+      reserved_bytes INTEGER NOT NULL
+        CHECK (reserved_bytes BETWEEN 0 AND 9007199254740991),
+      occupied_bytes INTEGER NOT NULL DEFAULT 0
+        CHECK (occupied_bytes BETWEEN 0 AND 9007199254740991),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      released_at TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_external_capability_storage_object
+      ON external_capability_storage_reservations(run_id, kind, object_key);
+    CREATE INDEX IF NOT EXISTS idx_external_capability_storage_state
+      ON external_capability_storage_reservations(state, run_id);
+    CREATE INDEX IF NOT EXISTS idx_external_capability_storage_reconcile
+      ON external_capability_storage_reservations(created_at, reservation_key)
+      WHERE state != 'released';
+    CREATE INDEX IF NOT EXISTS idx_external_capability_storage_released_gc
+      ON external_capability_storage_reservations(released_at, reservation_key)
+      WHERE state = 'released' AND released_at IS NOT NULL;
+  `);
+  // v89 -> v90: bound reservation maintenance with age-ordered partial indexes.
+  // The CREATE INDEX statements above are idempotent for both fresh installs and
+  // upgrades from the v89 table.
+  // v90 -> v91: SQLite INTEGER accepts values above JavaScript's exact range.
+  // Rebuild the byte ledger with explicit safe-integer bounds so aggregate
+  // accounting can never observe a rounded reservation.
+  if (
+    Number(rawSchemaVersionBeforeInit ?? '0') < 91 &&
+    rawSchemaVersionBeforeInit !== null
+  ) {
+    db.transaction(() => {
+      db.exec(`
+        ALTER TABLE external_capability_storage_reservations
+          RENAME TO external_capability_storage_reservations_v90;
+        CREATE TABLE external_capability_storage_reservations (
+          reservation_key TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('input', 'runtime', 'output')),
+          object_key TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT 'reserved'
+            CHECK (state IN ('reserved', 'occupied', 'quarantined', 'released')),
+          reserved_bytes INTEGER NOT NULL
+            CHECK (reserved_bytes BETWEEN 0 AND 9007199254740991),
+          occupied_bytes INTEGER NOT NULL DEFAULT 0
+            CHECK (occupied_bytes BETWEEN 0 AND 9007199254740991),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          released_at TEXT
+        );
+        INSERT INTO external_capability_storage_reservations
+          SELECT * FROM external_capability_storage_reservations_v90;
+        DROP TABLE external_capability_storage_reservations_v90;
+        CREATE UNIQUE INDEX idx_external_capability_storage_object
+          ON external_capability_storage_reservations(run_id, kind, object_key);
+        CREATE INDEX idx_external_capability_storage_state
+          ON external_capability_storage_reservations(state, run_id);
+        CREATE INDEX idx_external_capability_storage_reconcile
+          ON external_capability_storage_reservations(created_at, reservation_key)
+          WHERE state != 'released';
+        CREATE INDEX idx_external_capability_storage_released_gc
+          ON external_capability_storage_reservations(released_at, reservation_key)
+          WHERE state = 'released' AND released_at IS NOT NULL;
+      `);
+    }).immediate();
+  }
+
+  // Only missing or expired non-quarantined leases are abandoned. A live
+  // foreign owner remains fenced, while quarantine is retained fail-closed
+  // until an explicit retry proves every container absent.
+  recoverExpiredExternalCapabilityWorkspaceDeletions();
+
+  // Synchronize every immutable server-owned contract field. If an active
+  // installation changes target or policy across an upgrade, pause it before
+  // exposing the new definition so ACL, admission, execution and billing never
+  // resolve different workspaces.
+  for (const definition of EXTERNAL_CAPABILITY_DEFINITIONS) {
+    db.transaction(() => {
+      const existing = db
+        .prepare('SELECT * FROM external_capabilities WHERE slug = ?')
+        .get(definition.slug) as
+        | (ExternalCapabilityRow & { allowed_mime_types: string })
+        | undefined;
+      const allowedMimeTypes = JSON.stringify(definition.allowed_mime_types);
+      const contractChanged =
+        existing !== undefined &&
+        (existing.display_name !== definition.display_name ||
+          existing.description !== definition.description ||
+          existing.workspace_jid !== definition.workspace_jid ||
+          existing.workspace_folder !== definition.workspace_folder ||
+          existing.execution_mode !== definition.execution_mode ||
+          existing.input_schema_version !== definition.input_schema_version ||
+          existing.allowed_mime_types !== allowedMimeTypes ||
+          existing.max_file_bytes !== definition.max_file_bytes ||
+          existing.max_files_per_run !== definition.max_files_per_run ||
+          existing.max_total_bytes !== definition.max_total_bytes);
+      const hasStartedExecution =
+        contractChanged &&
+        Boolean(
+          db
+            .prepare(
+              `SELECT 1 FROM external_capability_runs
+               WHERE capability_slug = ? AND status = 'running'
+                 AND started_at IS NOT NULL
+               LIMIT 1`,
+            )
+            .get(definition.slug),
+        );
+      const now = new Date().toISOString();
+      const status =
+        existing?.status === 'retired'
+          ? 'retired'
+          : contractChanged && existing?.status === 'active'
+            ? 'paused'
+            : (existing?.status ?? definition.status);
+      const updatedAt = contractChanged ? now : (existing?.updated_at ?? now);
+      if (existing && contractChanged && hasStartedExecution) {
+        // Keep the old target durable until every execution that may already be
+        // running there is terminal. Reconciliation must account that container
+        // to its execution-time workspace, never the newly compiled definition.
+        db.prepare(
+          `UPDATE external_capabilities
+           SET status = ?, updated_at = ?
+           WHERE slug = ?`,
+        ).run(status, updatedAt, definition.slug);
+      } else {
+        db.prepare(
+          `INSERT INTO external_capabilities (
+            slug, display_name, description, workspace_jid, workspace_folder,
+            execution_mode, status, input_schema_version, allowed_mime_types,
+            max_file_bytes, max_files_per_run, max_total_bytes, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(slug) DO UPDATE SET
+            display_name = excluded.display_name,
+            description = excluded.description,
+            workspace_jid = excluded.workspace_jid,
+            workspace_folder = excluded.workspace_folder,
+            execution_mode = excluded.execution_mode,
+            status = excluded.status,
+            input_schema_version = excluded.input_schema_version,
+            allowed_mime_types = excluded.allowed_mime_types,
+            max_file_bytes = excluded.max_file_bytes,
+            max_files_per_run = excluded.max_files_per_run,
+            max_total_bytes = excluded.max_total_bytes,
+            updated_at = excluded.updated_at`,
+        ).run(
+          definition.slug,
+          definition.display_name,
+          definition.description,
+          definition.workspace_jid,
+          definition.workspace_folder,
+          definition.execution_mode,
+          status,
+          definition.input_schema_version,
+          allowedMimeTypes,
+          definition.max_file_bytes,
+          definition.max_files_per_run,
+          definition.max_total_bytes,
+          existing?.created_at ?? now,
+          updatedAt,
+        );
+      }
+      if (contractChanged) {
+        db.prepare(
+          `UPDATE external_capability_runs
+           SET status = 'retry_wait', available_at = ?, updated_at = ?,
+               attempt = MAX(0, attempt - 1),
+               error_code = 'CAPABILITY_UNAVAILABLE',
+               error_message = 'The server-owned capability contract changed.',
+               lease_owner = NULL, lease_expires_at = NULL,
+               lease_token = lease_token + 1
+           WHERE capability_slug = ?
+             AND status = 'running' AND started_at IS NULL`,
+        ).run(now, now, definition.slug);
+        logger.warn(
+          {
+            capabilitySlug: definition.slug,
+            targetUpdateDeferred: hasStartedExecution,
+          },
+          'Paused external capability after its server-owned contract changed',
+        );
+      }
+    }).immediate();
+  }
 
   // Billing tables
   db.exec(`
@@ -1676,18 +2100,11 @@ export function initDatabase(
   ensureColumn('agents', 'title_source', 'TEXT');
   ensureColumn('agents', 'last_active_at', 'TEXT');
 
-  // Add index on target_agent_id for fast lookup of IM bindings
-  db.exec(
-    'CREATE INDEX IF NOT EXISTS idx_rg_target_agent ON registered_groups(target_agent_id)',
-  );
-  db.exec(
-    'CREATE INDEX IF NOT EXISTS idx_rg_target_main ON registered_groups(target_main_jid)',
-  );
-
-  // Migration: remove UNIQUE constraint from registered_groups.folder
+  // Migration: remove UNIQUE constraint from registered_groups.folder.
   // Multiple groups (web:main + feishu chats) share folder='main' by design.
-  // The old UNIQUE constraint caused INSERT OR REPLACE to silently delete
-  // the conflicting row, making web:main and feishu groups mutually exclusive.
+  // Rebuild from PRAGMA metadata instead of a hand-maintained column list: old
+  // databases may already contain newer columns, and omitting one would commit
+  // a destructive partial migration before a later schema assertion fails.
   const hasUniqueFolder =
     (
       db
@@ -1699,29 +2116,59 @@ export function initDatabase(
         .get() as { cnt: number }
     ).cnt > 0;
   if (hasUniqueFolder) {
+    const columns = db
+      .prepare('PRAGMA table_info(registered_groups)')
+      .all() as {
+      cid: number;
+      name: string;
+      type: string;
+      notnull: 0 | 1;
+      dflt_value: string | null;
+      pk: number;
+    }[];
+    const primaryKeyColumns = columns.filter((column) => column.pk > 0);
+    if (columns.length === 0 || primaryKeyColumns.length !== 1) {
+      throw new Error(
+        'Cannot safely rebuild registered_groups: unexpected primary-key schema',
+      );
+    }
+    const quoteIdentifier = (identifier: string): string =>
+      `"${identifier.replaceAll('"', '""')}"`;
+    const columnNames = columns
+      .sort((left, right) => left.cid - right.cid)
+      .map((column) => quoteIdentifier(column.name));
+    const columnDefinitions = columns.map((column) => {
+      const parts = [quoteIdentifier(column.name)];
+      if (column.type.trim()) parts.push(column.type);
+      if (column.pk > 0) parts.push('PRIMARY KEY');
+      if (column.notnull) parts.push('NOT NULL');
+      if (column.dflt_value !== null) {
+        parts.push(`DEFAULT ${column.dflt_value}`);
+      }
+      return parts.join(' ');
+    });
+
     db.transaction(() => {
       db.exec(`
         CREATE TABLE registered_groups_new (
-          jid TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          folder TEXT NOT NULL,
-          added_at TEXT NOT NULL,
-          avatar_url TEXT,
-          container_config TEXT,
-          execution_mode TEXT DEFAULT 'container',
-          custom_cwd TEXT,
-          init_source_path TEXT,
-          init_git_url TEXT,
-          created_by TEXT,
-          owner_claim_source TEXT,
-          is_home INTEGER DEFAULT 0
+          ${columnDefinitions.join(',\n          ')}
         );
-        INSERT INTO registered_groups_new SELECT jid, name, folder, added_at, avatar_url, container_config, execution_mode, custom_cwd, NULL, NULL, NULL, NULL, 0 FROM registered_groups;
+        INSERT INTO registered_groups_new (${columnNames.join(', ')})
+          SELECT ${columnNames.join(', ')} FROM registered_groups;
         DROP TABLE registered_groups;
         ALTER TABLE registered_groups_new RENAME TO registered_groups;
       `);
-    })();
+    }).immediate();
   }
+
+  // Recreate indexes after the possible table rebuild; DROP TABLE removes all
+  // indexes attached to the legacy table.
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_rg_target_agent ON registered_groups(target_agent_id)',
+  );
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_rg_target_main ON registered_groups(target_main_jid)',
+  );
 
   // v19→v20 migration: add token_usage column to messages
   ensureColumn('messages', 'token_usage', 'TEXT');
@@ -2798,6 +3245,315 @@ export function initDatabase(
       ON external_capability_runs(capability_slug, key_id, external_task_id)
       WHERE key_id IS NOT NULL;
   `);
+
+  // v82 -> v83: external workspace deletion now uses the operation-owned
+  // fence table created with the core external-capability schema above. The
+  // table is intentionally empty on upgrade; in-flight HTTP operations cannot
+  // survive a process restart and startup recovery handles later interruptions.
+
+  // v81 -> v82: make retention eligibility explicit and indexable. Historical
+  // tombstones are identified once in bounded batches instead of being selected
+  // and JSON-parsed again by every cleanup pass.
+  ensureColumn('external_capability_runs', 'retention_cleaned_at', 'TEXT');
+  const externalRunRetentionSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (externalRunRetentionSchemaVersion < 82) {
+    const selectLegacyRuns = db.prepare(
+      `SELECT id, input_manifest, updated_at FROM external_capability_runs
+       WHERE id > ? ORDER BY id LIMIT 500`,
+    );
+    const markRetentionCleaned = db.prepare(
+      `UPDATE external_capability_runs SET retention_cleaned_at = ?
+       WHERE id = ? AND retention_cleaned_at IS NULL`,
+    );
+    let lastId = '';
+    while (true) {
+      const legacyRuns = selectLegacyRuns.all(lastId) as Array<{
+        id: string;
+        input_manifest: string;
+        updated_at: string;
+      }>;
+      if (legacyRuns.length === 0) break;
+      db.transaction(() => {
+        for (const run of legacyRuns) {
+          const manifest = parseExternalRunRecord(run.input_manifest, null);
+          if (manifest?.retentionTombstone !== true) continue;
+          markRetentionCleaned.run(
+            typeof manifest.cleanedAt === 'string'
+              ? manifest.cleanedAt
+              : run.updated_at,
+            run.id,
+          );
+        }
+      })();
+      lastId = legacyRuns.at(-1)!.id;
+    }
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_external_capability_runs_retention_due
+      ON external_capability_runs(completed_at, id)
+      WHERE retention_cleaned_at IS NULL
+        AND status IN ('succeeded', 'failed', 'cancelled')
+        AND completed_at IS NOT NULL
+        AND lease_owner IS NULL
+        AND lease_expires_at IS NULL;
+  `);
+
+  // v80 -> v81: persist accepted bytes beside each run. Admission previously
+  // selected and JSON-parsed every same-key manifest from the last 24 hours
+  // while holding SQLite's writer lock. Backfill once, then use one covering
+  // range scan for both run-rate and input-volume accounting.
+  ensureColumn(
+    'external_capability_runs',
+    'input_bytes',
+    'INTEGER NOT NULL DEFAULT 0 CHECK (input_bytes >= 0)',
+  );
+  const externalRunInputBytesSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (externalRunInputBytesSchemaVersion < 81) {
+    const selectLegacyRuns = db.prepare(
+      `SELECT id, input_manifest FROM external_capability_runs
+       WHERE id > ? ORDER BY id LIMIT 500`,
+    );
+    const updateInputBytes = db.prepare(
+      'UPDATE external_capability_runs SET input_bytes = ? WHERE id = ?',
+    );
+    let lastId = '';
+    while (true) {
+      const legacyRuns = selectLegacyRuns.all(lastId) as Array<{
+        id: string;
+        input_manifest: string;
+      }>;
+      if (legacyRuns.length === 0) break;
+      db.transaction(() => {
+        for (const run of legacyRuns) {
+          let inputBytes = Number.MAX_SAFE_INTEGER;
+          try {
+            const measured = externalInputManifestBytes(
+              JSON.parse(run.input_manifest),
+            );
+            if (measured !== null) inputBytes = measured;
+          } catch {
+            // Malformed historical input fails closed against the rolling budget.
+          }
+          updateInputBytes.run(inputBytes, run.id);
+        }
+      })();
+      lastId = legacyRuns.at(-1)!.id;
+    }
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_external_capability_runs_key_created
+      ON external_capability_runs(
+        capability_slug, key_id, created_at, input_bytes
+      )
+      WHERE key_id IS NOT NULL;
+  `);
+
+  // v79 -> v80: every START authorization checks rolling Provider exposure at
+  // global, capability and credential scope. Put the time range after each
+  // optional equality prefix and exclude released rows from the index so these
+  // checks never require a full cost-ledger scan under SQLite's writer lock.
+  const externalCostIndexSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (externalCostIndexSchemaVersion < 80) {
+    db.exec('DROP INDEX IF EXISTS idx_external_capability_cost_scope');
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_created
+      ON external_capability_cost_reservations(
+        created_at, state, reserved_microusd, actual_microusd
+      )
+      WHERE state IN ('active', 'settled', 'uncertain');
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_capability_created
+      ON external_capability_cost_reservations(
+        capability_slug, created_at, state, reserved_microusd, actual_microusd
+      )
+      WHERE state IN ('active', 'settled', 'uncertain');
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_key_created
+      ON external_capability_cost_reservations(
+        key_id, created_at, state, reserved_microusd, actual_microusd
+      )
+      WHERE state IN ('active', 'settled', 'uncertain');
+  `);
+
+  // v91 -> v92: settled exposure is charged by settlement time. Give each
+  // rolling global/capability/key budget query a matching partial range index
+  // so START authorization never scans the entire historical settlement ledger
+  // while holding SQLite's writer lock.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_settled
+      ON external_capability_cost_reservations(settled_at, actual_microusd)
+      WHERE state = 'settled';
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_capability_settled
+      ON external_capability_cost_reservations(
+        capability_slug, settled_at, actual_microusd
+      )
+      WHERE state = 'settled';
+    CREATE INDEX IF NOT EXISTS idx_external_capability_cost_key_settled
+      ON external_capability_cost_reservations(
+        key_id, settled_at, actual_microusd
+      )
+      WHERE state = 'settled';
+  `);
+
+  // v78 -> v79: bound authenticated intake-abuse accounting. Quota-rejected
+  // requests no longer append permanent reservation rows; per-key rate and
+  // rolling-ingress buckets retain quota usage in bounded space. Backfill the
+  // current windows so an upgrade cannot reset already-consumed quota.
+  const externalIntakeWindowSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (externalIntakeWindowSchemaVersion < 79) {
+    const now = new Date();
+    const minuteWindowStart = new Date(
+      Math.floor(now.getTime() / 60_000) * 60_000,
+    ).toISOString();
+    const rollingIngressCutoff = new Date(
+      now.getTime() - 24 * 60 * 60_000,
+    ).toISOString();
+    db.prepare(
+      `INSERT OR REPLACE INTO external_capability_intake_rate_windows (
+         key_id, window_started_at, request_count
+       )
+       SELECT key_id, ?, COUNT(*)
+       FROM external_capability_intake_reservations
+       WHERE created_at >= ?
+       GROUP BY key_id`,
+    ).run(minuteWindowStart, minuteWindowStart);
+    db.prepare(
+      `INSERT OR REPLACE INTO external_capability_intake_ingress_windows (
+         key_id, window_started_at, byte_count
+       )
+       SELECT key_id,
+              substr(CASE WHEN state = 'active' THEN created_at
+                          ELSE COALESCE(finished_at, created_at) END, 1, 16)
+                || ':00.000Z',
+              COALESCE(SUM(
+                CASE WHEN state = 'active' THEN reserved_raw_bytes
+                     ELSE observed_raw_bytes END
+              ), 0)
+       FROM external_capability_intake_reservations
+       WHERE (CASE WHEN state = 'active' THEN created_at
+                   ELSE COALESCE(finished_at, created_at) END) >= ?
+       GROUP BY key_id,
+                substr(CASE WHEN state = 'active' THEN created_at
+                            ELSE COALESCE(finished_at, created_at) END, 1, 16)`,
+    ).run(rollingIngressCutoff);
+  }
+
+  // v85 -> v86: the Provider-cost ledger was added before every legacy STARTed
+  // run was guaranteed to have a reservation row. Preserve those unknown
+  // executions as fresh, uncertain maximum exposure so an upgrade cannot reset
+  // rolling Provider budgets. INSERT OR IGNORE keeps the repair idempotent.
+  const externalCostBackfillSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (externalCostBackfillSchemaVersion < 86) {
+    const nowDate = new Date();
+    const now = nowDate.toISOString();
+    const rollingCutoff = new Date(
+      nowDate.getTime() - 24 * 60 * 60 * 1_000,
+    ).toISOString();
+    const reservedMicrousd = externalUsdToMicrousd(
+      getExternalCapabilityQuotaConfig().maxBudgetUsdPerRun,
+    );
+    db.prepare(
+      `INSERT OR IGNORE INTO external_capability_cost_reservations (
+         run_id, capability_slug, key_id, state, reserved_microusd,
+         actual_microusd, input_tokens, output_tokens,
+         cache_read_input_tokens, cache_creation_input_tokens,
+         reasoning_tokens, lease_token, created_at, settled_at
+       )
+       SELECT run.id, run.capability_slug, run.key_id, 'uncertain', ?,
+              0, 0, 0, 0, 0, 0, MAX(run.lease_token, 1),
+              CASE
+                WHEN run.status IN ('succeeded', 'failed', 'cancelled')
+                  THEN COALESCE(run.completed_at, ?)
+                ELSE ?
+              END,
+              NULL
+       FROM external_capability_runs run
+       JOIN external_capability_keys key
+         ON key.id = run.key_id
+        AND key.capability_slug = run.capability_slug
+       WHERE run.started_at IS NOT NULL
+         AND (
+           run.status NOT IN ('succeeded', 'failed', 'cancelled')
+           OR run.completed_at IS NULL
+           OR run.completed_at >= ?
+         )`,
+    ).run(reservedMicrousd, now, now, rollingCutoff);
+  }
+
+  // v86 -> v87: finished ingress belongs to its completion minute, not the
+  // request-start minute. Rebuild the bounded rolling windows accordingly and
+  // repair historical zero-byte rows whose JSON parsed but whose structure was
+  // invalid under strict artifact accounting.
+  const externalAccountingRepairSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (externalAccountingRepairSchemaVersion < 87) {
+    const ingressRetentionCutoff = new Date(
+      Date.now() - 25 * 60 * 60 * 1_000,
+    ).toISOString();
+    db.transaction(() => {
+      db.prepare(
+        'DELETE FROM external_capability_intake_ingress_windows',
+      ).run();
+      db.prepare(
+        `INSERT INTO external_capability_intake_ingress_windows (
+           key_id, window_started_at, byte_count
+         )
+         SELECT key_id,
+                substr(CASE WHEN state = 'active' THEN created_at
+                            ELSE COALESCE(finished_at, created_at) END, 1, 16)
+                  || ':00.000Z',
+                SUM(CASE WHEN state = 'active' THEN reserved_raw_bytes
+                         ELSE observed_raw_bytes END)
+         FROM external_capability_intake_reservations
+         WHERE (CASE WHEN state = 'active' THEN created_at
+                     ELSE COALESCE(finished_at, created_at) END) >= ?
+         GROUP BY key_id,
+                  substr(CASE WHEN state = 'active' THEN created_at
+                              ELSE COALESCE(finished_at, created_at) END, 1, 16)`,
+      ).run(ingressRetentionCutoff);
+
+      const selectZeroByteRuns = db.prepare(
+        `SELECT id, input_manifest FROM external_capability_runs
+         WHERE input_bytes = 0 AND id > ? ORDER BY id LIMIT 500`,
+      );
+      const markInvalidInputBytes = db.prepare(
+        `UPDATE external_capability_runs SET input_bytes = ?
+         WHERE id = ? AND input_bytes = 0`,
+      );
+      let lastId = '';
+      while (true) {
+        const rows = selectZeroByteRuns.all(lastId) as Array<{
+          id: string;
+          input_manifest: string;
+        }>;
+        if (rows.length === 0) break;
+        for (const row of rows) {
+          let valid = false;
+          try {
+            valid =
+              externalInputManifestBytes(JSON.parse(row.input_manifest)) !==
+              null;
+          } catch {
+            // Invalid historical input remains fail closed below.
+          }
+          if (!valid) {
+            markInvalidInputBytes.run(Number.MAX_SAFE_INTEGER, row.id);
+          }
+        }
+        lastId = rows.at(-1)!.id;
+      }
+    }).immediate();
+  }
 
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
@@ -4921,25 +5677,224 @@ export function getExternalCapabilityBySlug(
   return row ? parseExternalCapabilityRow(row) : undefined;
 }
 
+function externalCapabilityContractMatchesDefinition(
+  capability: ExternalCapability,
+  definition: ExternalCapability,
+): boolean {
+  return (
+    capability.display_name === definition.display_name &&
+    capability.description === definition.description &&
+    capability.workspace_jid === definition.workspace_jid &&
+    capability.workspace_folder === definition.workspace_folder &&
+    capability.execution_mode === definition.execution_mode &&
+    capability.input_schema_version === definition.input_schema_version &&
+    JSON.stringify(capability.allowed_mime_types) ===
+      JSON.stringify(definition.allowed_mime_types) &&
+    capability.max_file_bytes === definition.max_file_bytes &&
+    capability.max_files_per_run === definition.max_files_per_run &&
+    capability.max_total_bytes === definition.max_total_bytes
+  );
+}
+
+function reconcileDeferredExternalCapabilityDefinitionsInTransaction(): string[] {
+  const reconciled: string[] = [];
+  const now = new Date().toISOString();
+  for (const definition of EXTERNAL_CAPABILITY_DEFINITIONS) {
+    const current = getExternalCapabilityBySlug(definition.slug);
+    if (
+      !current ||
+      externalCapabilityContractMatchesDefinition(current, definition)
+    ) {
+      continue;
+    }
+    const hasStartedExecution = Boolean(
+      db
+        .prepare(
+          `SELECT 1 FROM external_capability_runs
+           WHERE capability_slug = ? AND status = 'running'
+             AND started_at IS NOT NULL
+           LIMIT 1`,
+        )
+        .get(definition.slug),
+    );
+    if (hasStartedExecution) continue;
+
+    const status =
+      current.status === 'retired'
+        ? 'retired'
+        : current.status === 'active'
+          ? 'paused'
+          : current.status;
+    db.prepare(
+      `UPDATE external_capabilities
+       SET display_name = ?, description = ?, workspace_jid = ?,
+           workspace_folder = ?, execution_mode = ?, status = ?,
+           input_schema_version = ?, allowed_mime_types = ?,
+           max_file_bytes = ?, max_files_per_run = ?, max_total_bytes = ?,
+           updated_at = ?
+       WHERE slug = ?`,
+    ).run(
+      definition.display_name,
+      definition.description,
+      definition.workspace_jid,
+      definition.workspace_folder,
+      definition.execution_mode,
+      status,
+      definition.input_schema_version,
+      JSON.stringify(definition.allowed_mime_types),
+      definition.max_file_bytes,
+      definition.max_files_per_run,
+      definition.max_total_bytes,
+      now,
+      definition.slug,
+    );
+    db.prepare(
+      `UPDATE external_capability_runs
+       SET status = 'retry_wait', available_at = ?, updated_at = ?,
+           attempt = MAX(0, attempt - 1),
+           error_code = 'CAPABILITY_UNAVAILABLE',
+           error_message = 'The server-owned capability contract changed.',
+           lease_owner = NULL, lease_expires_at = NULL,
+           lease_token = lease_token + 1
+       WHERE capability_slug = ?
+         AND status = 'running' AND started_at IS NULL`,
+    ).run(now, now, definition.slug);
+    reconciled.push(definition.slug);
+  }
+  return reconciled;
+}
+
+export function reconcileDeferredExternalCapabilityDefinitions(): string[] {
+  if (!isDatabaseInitialized()) return [];
+  return db
+    .transaction(() =>
+      reconcileDeferredExternalCapabilityDefinitionsInTransaction(),
+    )
+    .immediate();
+}
+
+function pauseExternalCapabilitiesForWorkspaceJids(
+  workspaceJids: readonly string[],
+  now = new Date().toISOString(),
+): string[] {
+  const uniqueJids = Array.from(new Set(workspaceJids.filter(Boolean)));
+  if (uniqueJids.length === 0) return [];
+  const placeholders = uniqueJids.map(() => '?').join(', ');
+  const rows = db
+    .prepare(
+      `SELECT slug FROM external_capabilities
+       WHERE workspace_jid IN (${placeholders}) AND status = 'active'
+       ORDER BY slug`,
+    )
+    .all(...uniqueJids) as Array<{ slug: string }>;
+  const slugs = rows.map((row) => row.slug);
+  if (slugs.length === 0) return [];
+  const slugPlaceholders = slugs.map(() => '?').join(', ');
+  db.prepare(
+    `UPDATE external_capabilities
+     SET status = 'paused', updated_at = ?
+     WHERE slug IN (${slugPlaceholders}) AND status = 'active'`,
+  ).run(now, ...slugs);
+  db.prepare(
+    `UPDATE external_capability_runs
+     SET status = 'retry_wait', available_at = ?, updated_at = ?,
+         attempt = MAX(0, attempt - 1),
+         error_code = 'CAPABILITY_UNAVAILABLE',
+         error_message = 'The capability target workspace is temporarily unavailable.',
+         lease_owner = NULL, lease_expires_at = NULL,
+         lease_token = lease_token + 1
+     WHERE capability_slug IN (${slugPlaceholders})
+       AND status = 'running' AND started_at IS NULL`,
+  ).run(now, now, ...slugs);
+  return slugs;
+}
+
+export function pauseActiveExternalCapabilitiesForClosedReleaseGate(): string[] {
+  return db
+    .transaction(() => {
+      const slugs = (
+        db
+          .prepare(
+            `SELECT slug FROM external_capabilities
+             WHERE status = 'active'
+             ORDER BY slug`,
+          )
+          .all() as Array<{ slug: string }>
+      ).map((row) => row.slug);
+      if (slugs.length === 0) return [];
+
+      const now = new Date().toISOString();
+      const placeholders = slugs.map(() => '?').join(', ');
+      db.prepare(
+        `UPDATE external_capabilities
+         SET status = 'paused', updated_at = ?
+         WHERE slug IN (${placeholders}) AND status = 'active'`,
+      ).run(now, ...slugs);
+      db.prepare(
+        `UPDATE external_capability_runs
+         SET status = 'retry_wait', available_at = ?, updated_at = ?,
+             attempt = MAX(0, attempt - 1),
+             error_code = 'CAPABILITY_UNAVAILABLE',
+             error_message = 'The external capability release gate is closed.',
+             lease_owner = NULL, lease_expires_at = NULL,
+             lease_token = lease_token + 1
+         WHERE capability_slug IN (${placeholders})
+           AND status = 'running' AND started_at IS NULL`,
+      ).run(now, now, ...slugs);
+      return slugs;
+    })
+    .immediate();
+}
+
 export function setExternalCapabilityStatus(
   slug: string,
   status: ExternalCapability['status'],
 ): boolean {
-  return db.transaction(() => {
-    const current = getExternalCapabilityBySlug(slug);
-    if (!current) return false;
-    if (current.status === 'retired' && status !== 'retired') return false;
-    const now = new Date().toISOString();
-    const changed = db
-      .prepare(
-        'UPDATE external_capabilities SET status = ?, updated_at = ? WHERE slug = ?',
-      )
-      .run(status, now, slug);
-    if (changed.changes === 1 && status === 'paused') {
-      // A pause is reversible. Fence any claim that has not crossed the model
-      // execution boundary, but keep the work recoverable for a later resume.
-      db.prepare(
-        `UPDATE external_capability_runs
+  return db
+    .transaction(() => {
+      if (status === 'active') {
+        reconcileDeferredExternalCapabilityDefinitionsInTransaction();
+      }
+      const current = getExternalCapabilityBySlug(slug);
+      if (!current) return false;
+      const deletionFence = db
+        .prepare(
+          `SELECT 1 FROM external_capability_workspace_deletion_fences
+         WHERE capability_slug = ?`,
+        )
+        .get(slug);
+      if (deletionFence) return false;
+      if (current.status === 'retired' && status !== 'retired') return false;
+      if (status === 'active') {
+        const definition = EXTERNAL_CAPABILITY_DEFINITIONS.find(
+          (candidate) => candidate.slug === slug,
+        );
+        if (
+          !definition ||
+          !externalCapabilityContractMatchesDefinition(current, definition)
+        ) {
+          return false;
+        }
+        const target = getRegisteredGroup(current.workspace_jid);
+        if (
+          !target ||
+          target.folder !== current.workspace_folder ||
+          target.executionMode !== 'container'
+        ) {
+          return false;
+        }
+      }
+      const now = new Date().toISOString();
+      const changed = db
+        .prepare(
+          'UPDATE external_capabilities SET status = ?, updated_at = ? WHERE slug = ?',
+        )
+        .run(status, now, slug);
+      if (changed.changes === 1 && status === 'paused') {
+        // A pause is reversible. Fence any claim that has not crossed the model
+        // execution boundary, but keep the work recoverable for a later resume.
+        db.prepare(
+          `UPDATE external_capability_runs
          SET status = 'retry_wait', available_at = ?, updated_at = ?,
              attempt = MAX(0, attempt - 1),
              error_code = 'CAPABILITY_UNAVAILABLE',
@@ -4948,13 +5903,13 @@ export function setExternalCapabilityStatus(
              lease_token = lease_token + 1
          WHERE capability_slug = ?
            AND status = 'running' AND started_at IS NULL`,
-      ).run(now, now, slug);
-    } else if (changed.changes === 1 && status !== 'active') {
-      // Retirement/draft are terminal admission barriers for work that has not
-      // crossed the execution boundary. Already-started work remains fenced by
-      // its lease and explicit cancellation policy.
-      db.prepare(
-        `UPDATE external_capability_runs
+        ).run(now, now, slug);
+      } else if (changed.changes === 1 && status !== 'active') {
+        // Retirement/draft are terminal admission barriers for work that has not
+        // crossed the execution boundary. Already-started work remains fenced by
+        // its lease and explicit cancellation policy.
+        db.prepare(
+          `UPDATE external_capability_runs
          SET status = 'cancelled', completed_at = ?, updated_at = ?,
              error_code = 'CAPABILITY_UNAVAILABLE',
              error_message = 'The capability is no longer accepting queued tasks.',
@@ -4963,10 +5918,11 @@ export function setExternalCapabilityStatus(
          WHERE capability_slug = ?
            AND (status IN ('queued', 'retry_wait')
                 OR (status = 'running' AND started_at IS NULL))`,
-      ).run(now, now, slug);
-    }
-    return changed.changes === 1;
-  })();
+        ).run(now, now, slug);
+      }
+      return changed.changes === 1;
+    })
+    .immediate();
 }
 
 type ExternalCapabilityKeyRow = ExternalCapabilityKey & { secret_hash: string };
@@ -4999,43 +5955,47 @@ export function createExternalCapabilityKey(input: {
   if (!capabilitySlug || !label || label.length > 120) {
     throw new Error('A capability key requires a label up to 120 characters');
   }
-  const capability = getExternalCapabilityBySlug(capabilitySlug);
-  if (!capability) {
-    throw new Error('External capability not found');
-  }
-  if (capability.status === 'paused' || capability.status === 'retired') {
-    throw new Error('External capability is not accepting new keys');
-  }
   const id = crypto.randomUUID();
   const keyPrefix = crypto.randomBytes(6).toString('hex');
   const secret = `ec_${keyPrefix}_${crypto.randomBytes(32).toString('base64url')}`;
   const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO external_capability_keys (
-      id, capability_slug, label, key_prefix, secret_hash, status, created_at,
-      last_used_at, revoked_at
-    ) VALUES (?, ?, ?, ?, ?, 'active', ?, NULL, NULL)`,
-  ).run(
-    id,
-    capabilitySlug,
-    label,
-    keyPrefix,
-    hashExternalCapabilitySecret(secret),
-    now,
-  );
-  return {
-    key: {
-      id,
-      capability_slug: capabilitySlug,
-      label,
-      key_prefix: keyPrefix,
-      status: 'active',
-      created_at: now,
-      last_used_at: null,
-      revoked_at: null,
-    },
-    secret,
-  };
+  return db
+    .transaction(() => {
+      const capability = getExternalCapabilityBySlug(capabilitySlug);
+      if (!capability) {
+        throw new Error('External capability not found');
+      }
+      if (capability.status !== 'active') {
+        throw new Error('External capability is not accepting new keys');
+      }
+      db.prepare(
+        `INSERT INTO external_capability_keys (
+        id, capability_slug, label, key_prefix, secret_hash, status, created_at,
+        last_used_at, revoked_at
+      ) VALUES (?, ?, ?, ?, ?, 'active', ?, NULL, NULL)`,
+      ).run(
+        id,
+        capabilitySlug,
+        label,
+        keyPrefix,
+        hashExternalCapabilitySecret(secret),
+        now,
+      );
+      return {
+        key: {
+          id,
+          capability_slug: capabilitySlug,
+          label,
+          key_prefix: keyPrefix,
+          status: 'active' as const,
+          created_at: now,
+          last_used_at: null,
+          revoked_at: null,
+        },
+        secret,
+      };
+    })
+    .immediate();
 }
 
 export function getExternalCapabilityKeys(
@@ -5081,7 +6041,9 @@ export function revokeExternalCapabilityKey(
   })();
 }
 
-/** Verify one bearer secret and record its use without ever returning its hash. */
+const EXTERNAL_CAPABILITY_KEY_USAGE_WRITE_INTERVAL_MS = 60_000;
+
+/** Verify one bearer secret and coalesce its usage timestamp writes. */
 export function authenticateExternalCapabilityKey(
   secret: string,
 ): ExternalCapabilityKey | undefined {
@@ -5093,11 +6055,1786 @@ export function authenticateExternalCapabilityKey(
     )
     .get(hash) as ExternalCapabilityKeyRow | undefined;
   if (!row) return undefined;
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
+  const cutoff = new Date(
+    nowDate.getTime() - EXTERNAL_CAPABILITY_KEY_USAGE_WRITE_INTERVAL_MS,
+  ).toISOString();
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_keys SET last_used_at = ?
+       WHERE id = ? AND status = 'active'
+         AND (last_used_at IS NULL OR last_used_at < ?)`,
+    )
+    .run(now, row.id, cutoff);
+  if (changed.changes === 1) {
+    return { ...mapExternalCapabilityKeyRow(row), last_used_at: now };
+  }
+  const current = db
+    .prepare(
+      `SELECT * FROM external_capability_keys
+       WHERE id = ? AND status = 'active'`,
+    )
+    .get(row.id) as ExternalCapabilityKeyRow | undefined;
+  return current ? mapExternalCapabilityKeyRow(current) : undefined;
+}
+
+export type ExternalCapabilityApiOperation = 'status' | 'cancel' | 'download';
+
+/** Durable, credential-scoped fixed-window limit for non-submit API lanes. */
+export function consumeExternalCapabilityApiRateLimit(input: {
+  keyId: string;
+  operation: ExternalCapabilityApiOperation;
+  limit: number;
+  windowMs?: number;
+  now?: string;
+}): boolean {
+  const keyId = input.keyId.trim();
+  const windowMs = input.windowMs ?? 60_000;
+  if (
+    !keyId ||
+    !Number.isSafeInteger(input.limit) ||
+    input.limit < 1 ||
+    !Number.isSafeInteger(windowMs) ||
+    windowMs < 1
+  ) {
+    throw new Error('Invalid external capability API rate limit');
+  }
+  const nowDate = input.now ? new Date(input.now) : new Date();
+  if (!Number.isFinite(nowDate.getTime())) throw new Error('Invalid rate time');
+  const now = nowDate.toISOString();
+
+  return db
+    .transaction(() => {
+      const row = db
+        .prepare(
+          `SELECT window_started_at, request_count
+         FROM external_capability_api_rate_windows
+         WHERE key_id = ? AND operation = ?`,
+        )
+        .get(keyId, input.operation) as
+        | { window_started_at: string; request_count: number }
+        | undefined;
+      if (!row) {
+        db.prepare(
+          `INSERT INTO external_capability_api_rate_windows (
+           key_id, operation, window_started_at, request_count
+         ) VALUES (?, ?, ?, 1)`,
+        ).run(keyId, input.operation, now);
+        return true;
+      }
+
+      const windowStartMs = Date.parse(row.window_started_at);
+      if (
+        !Number.isFinite(windowStartMs) ||
+        nowDate.getTime() - windowStartMs >= windowMs
+      ) {
+        db.prepare(
+          `UPDATE external_capability_api_rate_windows
+         SET window_started_at = ?, request_count = 1
+         WHERE key_id = ? AND operation = ?`,
+        ).run(now, keyId, input.operation);
+        return true;
+      }
+      if (row.request_count >= input.limit) return false;
+      db.prepare(
+        `UPDATE external_capability_api_rate_windows
+       SET request_count = request_count + 1
+       WHERE key_id = ? AND operation = ?`,
+      ).run(keyId, input.operation);
+      return true;
+    })
+    .immediate();
+}
+
+export type ExternalCapabilityStorageKind = 'input' | 'runtime' | 'output';
+export type ExternalCapabilityStorageState =
+  | 'reserved'
+  | 'occupied'
+  | 'quarantined'
+  | 'released';
+
+export interface ExternalCapabilityStorageReservation {
+  reservation_key: string;
+  run_id: string;
+  kind: ExternalCapabilityStorageKind;
+  object_key: string;
+  state: ExternalCapabilityStorageState;
+  reserved_bytes: number;
+  occupied_bytes: number;
+  created_at: string;
+  updated_at: string;
+  released_at: string | null;
+}
+
+export interface ReserveExternalCapabilityStorageInput {
+  reservationKey: string;
+  runId: string;
+  kind: ExternalCapabilityStorageKind;
+  objectKey: string;
+  reservedBytes: number;
+  filesystemAvailableBytes: number | (() => number);
+  filesystemSafetyReserveBytes: number;
+  logicalLimitBytes: number;
+  now?: string;
+}
+
+export type ReserveExternalCapabilityStorageResult =
+  | {
+      admitted: true;
+      reservation: ExternalCapabilityStorageReservation;
+      existing: boolean;
+    }
+  | {
+      admitted: false;
+      reason: 'filesystem_capacity' | 'logical_capacity' | 'conflict';
+    };
+
+function assertExternalCapabilityStorageByteCount(
+  value: number,
+  field: string,
+): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative safe integer`);
+  }
+}
+
+function assertExternalCapabilityStorageIdentity(
+  value: string,
+  field: string,
+): string {
+  const normalized = value.trim();
+  if (!normalized || normalized.length > 512) {
+    throw new Error(`${field} must be a non-empty bounded identifier`);
+  }
+  return normalized;
+}
+
+function getExternalCapabilityStorageUsageBigInt(): {
+  logicalBytes: bigint;
+  pendingBytes: bigint;
+} {
+  const rows = db
+    .prepare(
+      `SELECT state, reserved_bytes, occupied_bytes
+       FROM external_capability_storage_reservations
+       WHERE state != 'released'`,
+    )
+    .all() as Array<{
+    state: ExternalCapabilityStorageState;
+    reserved_bytes: number;
+    occupied_bytes: number;
+  }>;
+  let logicalBytes = 0n;
+  let pendingBytes = 0n;
+  for (const row of rows) {
+    assertExternalCapabilityStorageByteCount(
+      row.reserved_bytes,
+      'stored reservedBytes',
+    );
+    assertExternalCapabilityStorageByteCount(
+      row.occupied_bytes,
+      'stored occupiedBytes',
+    );
+    const reserved = BigInt(row.reserved_bytes);
+    const occupied = BigInt(row.occupied_bytes);
+    if (row.state === 'reserved') {
+      logicalBytes += reserved;
+      pendingBytes += reserved > occupied ? reserved - occupied : 0n;
+    } else if (row.state === 'occupied') {
+      logicalBytes += occupied;
+    } else if (row.state === 'quarantined') {
+      logicalBytes += reserved > occupied ? reserved : occupied;
+      pendingBytes += reserved > occupied ? reserved - occupied : 0n;
+    } else {
+      throw new Error('External capability storage has an invalid live state');
+    }
+    if (
+      logicalBytes > BigInt(Number.MAX_SAFE_INTEGER) ||
+      pendingBytes > BigInt(Number.MAX_SAFE_INTEGER)
+    ) {
+      throw new Error('External capability storage usage overflowed');
+    }
+  }
+  return { logicalBytes, pendingBytes };
+}
+
+/**
+ * Atomically reserve logical and physical Vault capacity across service
+ * processes. Filesystem availability is sampled while holding SQLite's writer
+ * lock, and outstanding unmaterialized reservations are subtracted under that
+ * same fence so neither stale samplers nor concurrent reservations can over-admit.
+ */
+export function reserveExternalCapabilityStorage(
+  input: ReserveExternalCapabilityStorageInput,
+): ReserveExternalCapabilityStorageResult {
+  const reservationKey = assertExternalCapabilityStorageIdentity(
+    input.reservationKey,
+    'reservationKey',
+  );
+  const runId = assertExternalCapabilityStorageIdentity(input.runId, 'runId');
+  const objectKey = assertExternalCapabilityStorageIdentity(
+    input.objectKey,
+    'objectKey',
+  );
+  if (!['input', 'runtime', 'output'].includes(input.kind)) {
+    throw new Error('Invalid external capability storage kind');
+  }
+  for (const [field, value] of [
+    ['reservedBytes', input.reservedBytes],
+    ['filesystemSafetyReserveBytes', input.filesystemSafetyReserveBytes],
+    ['logicalLimitBytes', input.logicalLimitBytes],
+  ] as const) {
+    assertExternalCapabilityStorageByteCount(value, field);
+  }
+  if (typeof input.filesystemAvailableBytes !== 'function') {
+    assertExternalCapabilityStorageByteCount(
+      input.filesystemAvailableBytes,
+      'filesystemAvailableBytes',
+    );
+  }
+  const nowDate = input.now ? new Date(input.now) : new Date();
+  if (!Number.isFinite(nowDate.getTime())) {
+    throw new Error('Invalid external capability storage reservation time');
+  }
+  const now = nowDate.toISOString();
+
+  return withFullSynchronousExternalBoundary(() =>
+    db
+      .transaction(() => {
+        const existing = db
+          .prepare(
+            `SELECT * FROM external_capability_storage_reservations
+           WHERE reservation_key = ?`,
+          )
+          .get(reservationKey) as
+          | ExternalCapabilityStorageReservation
+          | undefined;
+        if (existing) {
+          if (
+            existing.run_id === runId &&
+            existing.kind === input.kind &&
+            existing.object_key === objectKey &&
+            existing.reserved_bytes === input.reservedBytes &&
+            existing.state !== 'released'
+          ) {
+            return {
+              admitted: true as const,
+              reservation: existing,
+              existing: true,
+            };
+          }
+          return { admitted: false as const, reason: 'conflict' as const };
+        }
+        const objectReservation = db
+          .prepare(
+            `SELECT reservation_key
+           FROM external_capability_storage_reservations
+           WHERE run_id = ? AND kind = ? AND object_key = ?`,
+          )
+          .get(runId, input.kind, objectKey) as
+          | { reservation_key: string }
+          | undefined;
+        if (objectReservation) {
+          return { admitted: false as const, reason: 'conflict' as const };
+        }
+        const retainedRun = db
+          .prepare(
+            `SELECT 1 FROM external_capability_runs
+           WHERE id = ? AND retention_cleaned_at IS NOT NULL`,
+          )
+          .get(runId);
+        if (retainedRun) {
+          return { admitted: false as const, reason: 'conflict' as const };
+        }
+
+        const usage = getExternalCapabilityStorageUsageBigInt();
+        const requestedBytes = BigInt(input.reservedBytes);
+        if (
+          usage.logicalBytes + requestedBytes >
+          BigInt(input.logicalLimitBytes)
+        ) {
+          return {
+            admitted: false as const,
+            reason: 'logical_capacity' as const,
+          };
+        }
+        const filesystemAvailableBytes =
+          typeof input.filesystemAvailableBytes === 'function'
+            ? input.filesystemAvailableBytes()
+            : input.filesystemAvailableBytes;
+        assertExternalCapabilityStorageByteCount(
+          filesystemAvailableBytes,
+          'filesystemAvailableBytes',
+        );
+        if (
+          usage.pendingBytes +
+            requestedBytes +
+            BigInt(input.filesystemSafetyReserveBytes) >
+          BigInt(filesystemAvailableBytes)
+        ) {
+          return {
+            admitted: false as const,
+            reason: 'filesystem_capacity' as const,
+          };
+        }
+
+        db.prepare(
+          `INSERT INTO external_capability_storage_reservations (
+           reservation_key, run_id, kind, object_key, state, reserved_bytes,
+           occupied_bytes, created_at, updated_at, released_at
+         ) VALUES (?, ?, ?, ?, 'reserved', ?, 0, ?, ?, NULL)`,
+        ).run(
+          reservationKey,
+          runId,
+          input.kind,
+          objectKey,
+          input.reservedBytes,
+          now,
+          now,
+        );
+        return {
+          admitted: true as const,
+          reservation: db
+            .prepare(
+              `SELECT * FROM external_capability_storage_reservations
+             WHERE reservation_key = ?`,
+            )
+            .get(reservationKey) as ExternalCapabilityStorageReservation,
+          existing: false,
+        };
+      })
+      .immediate(),
+  );
+}
+
+/**
+ * Monotonically checkpoint bytes that are already durable on the Vault
+ * filesystem. The reservation remains live, but only its unmaterialized
+ * remainder consumes future filesystem headroom.
+ */
+export function recordExternalCapabilityStorageMaterializedBytes(
+  reservationKey: string,
+  materializedBytes: number,
+): boolean {
+  const key = assertExternalCapabilityStorageIdentity(
+    reservationKey,
+    'reservationKey',
+  );
+  assertExternalCapabilityStorageByteCount(
+    materializedBytes,
+    'materializedBytes',
+  );
   const now = new Date().toISOString();
+  return db
+    .transaction(() => {
+      const row = db
+        .prepare(
+          `SELECT state, reserved_bytes, occupied_bytes
+           FROM external_capability_storage_reservations
+           WHERE reservation_key = ?`,
+        )
+        .get(key) as
+        | {
+            state: ExternalCapabilityStorageState;
+            reserved_bytes: number;
+            occupied_bytes: number;
+          }
+        | undefined;
+      if (
+        !row ||
+        row.state === 'released' ||
+        row.state === 'occupied' ||
+        materializedBytes > row.reserved_bytes
+      ) {
+        return (
+          row?.state === 'occupied' && row.occupied_bytes === materializedBytes
+        );
+      }
+      if (materializedBytes <= row.occupied_bytes) return true;
+      return (
+        db
+          .prepare(
+            `UPDATE external_capability_storage_reservations
+             SET occupied_bytes = ?, updated_at = ?
+             WHERE reservation_key = ?
+               AND state IN ('reserved', 'quarantined')
+               AND occupied_bytes < ? AND reserved_bytes >= ?`,
+          )
+          .run(
+            materializedBytes,
+            now,
+            key,
+            materializedBytes,
+            materializedBytes,
+          ).changes === 1
+      );
+    })
+    .immediate();
+}
+
+/** Settle a reservation to exact materialized bytes without expanding it. */
+export function settleExternalCapabilityStorage(
+  reservationKey: string,
+  occupiedBytes: number,
+): boolean {
+  const key = assertExternalCapabilityStorageIdentity(
+    reservationKey,
+    'reservationKey',
+  );
+  assertExternalCapabilityStorageByteCount(occupiedBytes, 'occupiedBytes');
+  const now = new Date().toISOString();
+  return db
+    .transaction(() => {
+      const row = db
+        .prepare(
+          `SELECT state, reserved_bytes, occupied_bytes
+           FROM external_capability_storage_reservations
+           WHERE reservation_key = ?`,
+        )
+        .get(key) as
+        | {
+            state: ExternalCapabilityStorageState;
+            reserved_bytes: number;
+            occupied_bytes: number;
+          }
+        | undefined;
+      if (
+        !row ||
+        row.state === 'released' ||
+        occupiedBytes > row.reserved_bytes ||
+        row.occupied_bytes > occupiedBytes
+      ) {
+        return false;
+      }
+      if (row.state === 'occupied') return row.occupied_bytes === occupiedBytes;
+      if (row.state === 'quarantined') return false;
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_storage_reservations
+           SET state = 'occupied', occupied_bytes = ?, updated_at = ?
+           WHERE reservation_key = ? AND state = 'reserved'
+             AND reserved_bytes >= ?`,
+        )
+        .run(occupiedBytes, now, key, occupiedBytes);
+      return changed.changes === 1;
+    })
+    .immediate();
+}
+
+/** Keep uncertain physical bytes charged until explicit deletion succeeds. */
+export function quarantineExternalCapabilityStorage(
+  reservationKey: string,
+): boolean {
+  const key = assertExternalCapabilityStorageIdentity(
+    reservationKey,
+    'reservationKey',
+  );
+  const now = new Date().toISOString();
+  const row = db
+    .prepare(
+      `SELECT state FROM external_capability_storage_reservations
+       WHERE reservation_key = ?`,
+    )
+    .get(key) as { state: ExternalCapabilityStorageState } | undefined;
+  if (!row) return false;
+  if (row.state === 'released') return false;
+  if (row.state === 'quarantined') return true;
+  return (
+    db
+      .prepare(
+        `UPDATE external_capability_storage_reservations
+         SET state = 'quarantined', updated_at = ?
+         WHERE reservation_key = ? AND state IN ('reserved', 'occupied')`,
+      )
+      .run(now, key).changes === 1
+  );
+}
+
+/** Release one charge only after its physical object is known absent. */
+export function releaseExternalCapabilityStorage(
+  reservationKey: string,
+): boolean {
+  const key = assertExternalCapabilityStorageIdentity(
+    reservationKey,
+    'reservationKey',
+  );
+  const now = new Date().toISOString();
+  return db
+    .transaction(() => {
+      const row = db
+        .prepare(
+          `SELECT state FROM external_capability_storage_reservations
+           WHERE reservation_key = ?`,
+        )
+        .get(key) as { state: ExternalCapabilityStorageState } | undefined;
+      if (!row) return true;
+      if (row.state === 'released') return true;
+      return (
+        db
+          .prepare(
+            `UPDATE external_capability_storage_reservations
+             SET state = 'released', updated_at = ?, released_at = ?
+             WHERE reservation_key = ? AND state != 'released'`,
+          )
+          .run(now, now, key).changes === 1
+      );
+    })
+    .immediate();
+}
+
+/**
+ * Release a pre-publication intake charge after the caller proved its physical
+ * object absent. The writer transaction rechecks that no run can still be
+ * published: the bound intake must be finished or irreversibly expired.
+ */
+export function releaseOrphanedExternalCapabilityIntakeStorage(
+  reservationKey: string,
+  runId: string,
+  nowIso: string,
+): boolean {
+  const key = assertExternalCapabilityStorageIdentity(
+    reservationKey,
+    'reservationKey',
+  );
+  const normalizedRunId = assertExternalCapabilityStorageIdentity(
+    runId,
+    'runId',
+  );
+  if (!Number.isFinite(Date.parse(nowIso))) {
+    throw new Error('Invalid external capability intake reconciliation time');
+  }
+  return db
+    .transaction(() => {
+      const eligible = db
+        .prepare(
+          `SELECT 1
+           FROM external_capability_storage_reservations AS storage
+           WHERE storage.reservation_key = ?
+             AND storage.run_id = ?
+             AND storage.kind = 'input'
+             AND storage.state != 'released'
+             AND NOT EXISTS (
+               SELECT 1 FROM external_capability_runs AS run
+               WHERE run.id = storage.run_id
+             )
+             AND EXISTS (
+               SELECT 1 FROM external_capability_intake_reservations AS intake
+               WHERE intake.run_id = storage.run_id
+                 AND (intake.state = 'finished' OR intake.expires_at <= ?)
+             )`,
+        )
+        .get(key, normalizedRunId, nowIso);
+      if (!eligible) return false;
+      return (
+        db
+          .prepare(
+            `UPDATE external_capability_storage_reservations
+             SET state = 'released', updated_at = ?, released_at = ?
+             WHERE reservation_key = ? AND run_id = ? AND kind = 'input'
+               AND state != 'released'`,
+          )
+          .run(nowIso, nowIso, key, normalizedRunId).changes === 1
+      );
+    })
+    .immediate();
+}
+
+/** Release run-artifact charges after the whole durable run tree is absent. */
+export function releaseExternalCapabilityStorageForRunArtifacts(
+  runId: string,
+): number {
+  const normalizedRunId = assertExternalCapabilityStorageIdentity(
+    runId,
+    'runId',
+  );
+  const now = new Date().toISOString();
+  return db
+    .prepare(
+      `UPDATE external_capability_storage_reservations
+       SET state = 'released', updated_at = ?, released_at = ?
+       WHERE run_id = ? AND kind IN ('input', 'output')
+         AND state != 'released'`,
+    )
+    .run(now, now, normalizedRunId).changes;
+}
+
+/** Release every remaining charge only after every physical object is absent. */
+export function releaseExternalCapabilityStorageForRun(runId: string): number {
+  const normalizedRunId = assertExternalCapabilityStorageIdentity(
+    runId,
+    'runId',
+  );
+  const now = new Date().toISOString();
+  return db
+    .prepare(
+      `UPDATE external_capability_storage_reservations
+       SET state = 'released', updated_at = ?, released_at = ?
+       WHERE run_id = ? AND state != 'released'`,
+    )
+    .run(now, now, normalizedRunId).changes;
+}
+
+export function listExternalCapabilityStorageReservationsForReconciliation(
+  createdBefore: string,
+  limit = 100,
+  after?: { createdAt: string; reservationKey: string },
+): ExternalCapabilityStorageReservation[] {
+  if (!Number.isFinite(Date.parse(createdBefore))) {
+    throw new Error('Invalid external capability storage reconciliation time');
+  }
+  if (after && !Number.isFinite(Date.parse(after.createdAt))) {
+    throw new Error(
+      'Invalid external capability storage reconciliation cursor',
+    );
+  }
+  const boundedLimit = Number.isSafeInteger(limit)
+    ? Math.max(1, Math.min(1_000, limit))
+    : 100;
+  return db
+    .prepare(
+      `SELECT * FROM external_capability_storage_reservations
+       WHERE state != 'released' AND created_at <= ?
+         AND (
+           ? IS NULL OR created_at > ?
+           OR (created_at = ? AND reservation_key > ?)
+         )
+       ORDER BY created_at ASC, reservation_key ASC
+       LIMIT ?`,
+    )
+    .all(
+      createdBefore,
+      after?.createdAt ?? null,
+      after?.createdAt ?? null,
+      after?.createdAt ?? null,
+      after?.reservationKey ?? null,
+      boundedLimit,
+    ) as ExternalCapabilityStorageReservation[];
+}
+
+export function purgeReleasedExternalCapabilityStorageReservations(
+  releasedBefore: string,
+  limit = 1_000,
+): number {
+  if (!Number.isFinite(Date.parse(releasedBefore))) {
+    throw new Error('Invalid external capability storage purge time');
+  }
+  const boundedLimit = Number.isSafeInteger(limit)
+    ? Math.max(1, Math.min(1_000, limit))
+    : 1_000;
+  return db
+    .transaction(
+      () =>
+        db
+          .prepare(
+            `DELETE FROM external_capability_storage_reservations
+           WHERE reservation_key IN (
+             SELECT reservation.reservation_key
+             FROM external_capability_storage_reservations AS reservation
+             WHERE reservation.state = 'released'
+               AND reservation.released_at IS NOT NULL
+               AND reservation.released_at <= ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM external_capability_runs AS run
+                 WHERE run.id = reservation.run_id
+                   AND run.retention_cleaned_at IS NULL
+               )
+             ORDER BY reservation.released_at ASC,
+                      reservation.reservation_key ASC
+             LIMIT ?
+           )
+             AND state = 'released'
+             AND released_at IS NOT NULL
+             AND released_at <= ?`,
+          )
+          .run(releasedBefore, boundedLimit, releasedBefore).changes,
+    )
+    .immediate();
+}
+
+export function getExternalCapabilityStorageReservationForTest(
+  reservationKey: string,
+): ExternalCapabilityStorageReservation | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM external_capability_storage_reservations
+       WHERE reservation_key = ?`,
+    )
+    .get(reservationKey) as ExternalCapabilityStorageReservation | undefined;
+}
+
+export function getExternalCapabilityDatabaseSynchronousModeForTest(): number {
+  return db.pragma('synchronous', { simple: true }) as number;
+}
+
+export function getExternalCapabilityStorageUsageForTest(): {
+  logicalBytes: number;
+  pendingBytes: number;
+} {
+  const usage = getExternalCapabilityStorageUsageBigInt();
+  return {
+    logicalBytes: Number(usage.logicalBytes),
+    pendingBytes: Number(usage.pendingBytes),
+  };
+}
+
+export const EXTERNAL_CAPABILITY_VAULT_CENSUS_STATE_KEY =
+  'external_capability_storage_inventory_v2';
+export const EXTERNAL_CAPABILITY_VAULT_PHYSICAL_IDENTITY_KEY =
+  'external_capability_vault_physical_identity_v2';
+
+export function beginExternalCapabilityVaultCensus(
+  blockedValue: string,
+  currentPhysicalIdentity: string,
+): void {
+  const value = assertExternalCapabilityStorageIdentity(
+    blockedValue,
+    'blockedValue',
+  );
+  const physicalIdentity = assertExternalCapabilityStorageIdentity(
+    currentPhysicalIdentity,
+    'currentPhysicalIdentity',
+  );
+  if (!physicalIdentity.startsWith('v2:')) {
+    throw new Error('External capability Vault physical identity is invalid');
+  }
+  if (!value.startsWith('blocked:')) {
+    throw new Error('External capability Vault census fence is invalid');
+  }
+  withFullSynchronousExternalBoundary(() =>
+    db
+      .transaction(() => {
+        const publishedPhysicalIdentity = getRouterStateInternal(
+          EXTERNAL_CAPABILITY_VAULT_PHYSICAL_IDENTITY_KEY,
+        );
+        if (
+          publishedPhysicalIdentity !== undefined &&
+          publishedPhysicalIdentity !== physicalIdentity
+        ) {
+          throw new Error(
+            'External capability Vault physical identity changed; explicit Vault migration is required',
+          );
+        }
+        db.prepare(
+          `INSERT INTO router_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        ).run(EXTERNAL_CAPABILITY_VAULT_CENSUS_STATE_KEY, value);
+
+        // The caller holds the physical Vault's exclusive process lock. No
+        // current-version producer can still own these durable leases, even if
+        // its wall-clock expiry lies in the future after a host crash/restart.
+        const now = new Date().toISOString();
+        db.prepare(
+          `UPDATE external_capability_intake_reservations
+           SET expires_at = ?
+           WHERE state = 'active' AND expires_at > ?`,
+        ).run(now, now);
+        expireStaleExternalCapabilityIntakes(now);
+        db.prepare(
+          `UPDATE external_capability_runs
+           SET status = CASE
+                 WHEN started_at IS NULL THEN 'retry_wait'
+                 ELSE 'running'
+               END,
+               available_at = CASE
+                 WHEN started_at IS NULL THEN ?
+                 ELSE available_at
+               END,
+               lease_owner = NULL,
+               lease_expires_at = NULL,
+               lease_token = lease_token + 1,
+               container_create_pending_until = NULL,
+               error_code = CASE
+                 WHEN started_at IS NULL THEN 'CAPABILITY_UNAVAILABLE'
+                 ELSE 'START_RECOVERY_PENDING'
+               END,
+               error_message = CASE
+                 WHEN started_at IS NULL
+                   THEN 'The previous worker stopped before processing began.'
+                 ELSE 'Start publication recovery is pending.'
+               END,
+               updated_at = ?
+           WHERE status = 'running'
+             AND (lease_owner IS NOT NULL
+               OR lease_expires_at IS NOT NULL
+               OR container_create_pending_until IS NOT NULL)`,
+        ).run(now, now);
+      })
+      .immediate(),
+  );
+}
+
+export function abortExternalCapabilityVaultCensus(
+  publishedValue: string | null,
+  blockedValue: string,
+): void {
+  const blocked = assertExternalCapabilityStorageIdentity(
+    blockedValue,
+    'blockedValue',
+  );
+  if (!blocked.startsWith('blocked:')) {
+    throw new Error('External capability Vault census fence is invalid');
+  }
+  withFullSynchronousExternalBoundary(() =>
+    db
+      .transaction(() => {
+        const current = getRouterStateInternal(
+          EXTERNAL_CAPABILITY_VAULT_CENSUS_STATE_KEY,
+        );
+        if (
+          current !== blocked &&
+          (publishedValue === null || current !== publishedValue)
+        ) {
+          throw new Error(
+            'External capability Vault census ownership was lost',
+          );
+        }
+        db.prepare(
+          `INSERT INTO router_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        ).run(EXTERNAL_CAPABILITY_VAULT_CENSUS_STATE_KEY, blocked);
+      })
+      .immediate(),
+  );
+}
+
+export interface ExternalCapabilityStorageBackfillOccupancy {
+  runId: string;
+  kind: 'artifact' | 'input' | 'runtime' | 'output';
+  objectKey: string;
+  occupiedBytes: number;
+}
+
+export interface ExternalCapabilityStorageBackfillResult {
+  alreadyComplete: boolean;
+  insertedRows: number;
+  expandedRows: number;
+  importedBytes: number;
+}
+
+function externalCapabilityStorageChargedBytes(
+  row: ExternalCapabilityStorageReservation,
+): number {
+  if (row.state === 'reserved') return row.reserved_bytes;
+  if (row.state === 'occupied') return row.occupied_bytes;
+  if (row.state === 'quarantined') {
+    return Math.max(row.reserved_bytes, row.occupied_bytes);
+  }
+  return 0;
+}
+
+/**
+ * Import a strict pre-ledger Vault census and publish its completion marker in
+ * one FULL-synchronous writer transaction. Existing charges are never reduced.
+ */
+export function backfillExternalCapabilityStorageOccupancy(input: {
+  markerKey: string;
+  markerValue: string;
+  occupancies: readonly ExternalCapabilityStorageBackfillOccupancy[];
+  blockedValue?: string;
+}): ExternalCapabilityStorageBackfillResult {
+  const markerKey = assertExternalCapabilityStorageIdentity(
+    input.markerKey,
+    'markerKey',
+  );
+  const markerValue = assertExternalCapabilityStorageIdentity(
+    input.markerValue,
+    'markerValue',
+  );
+  const seenObjects = new Set<string>();
+  const occupancies = input.occupancies.map((occupancy) => {
+    const runId = assertExternalCapabilityStorageIdentity(
+      occupancy.runId,
+      'runId',
+    );
+    const objectKey = assertExternalCapabilityStorageIdentity(
+      occupancy.objectKey,
+      'objectKey',
+    );
+    if (
+      occupancy.kind !== 'artifact' &&
+      occupancy.kind !== 'input' &&
+      occupancy.kind !== 'runtime' &&
+      occupancy.kind !== 'output'
+    ) {
+      throw new Error('Invalid external capability storage backfill kind');
+    }
+    assertExternalCapabilityStorageByteCount(
+      occupancy.occupiedBytes,
+      'occupiedBytes',
+    );
+    const identity = `${runId}\0${occupancy.kind}\0${objectKey}`;
+    if (seenObjects.has(identity)) {
+      throw new Error('Duplicate external capability storage backfill object');
+    }
+    seenObjects.add(identity);
+    return { ...occupancy, runId, objectKey };
+  });
+
+  return withFullSynchronousExternalBoundary(() =>
+    db
+      .transaction(() => {
+        if (input.blockedValue) {
+          const blockedValue = assertExternalCapabilityStorageIdentity(
+            input.blockedValue,
+            'blockedValue',
+          );
+          if (getRouterStateInternal(markerKey) !== blockedValue) {
+            throw new Error(
+              'External capability Vault census ownership was lost',
+            );
+          }
+          const now = new Date().toISOString();
+          const activeIntakes = db
+            .prepare(
+              `SELECT COUNT(*) AS count
+               FROM external_capability_intake_reservations
+               WHERE state = 'active' AND expires_at > ?`,
+            )
+            .get(now) as { count: number };
+          const activeRuns = db
+            .prepare(
+              `SELECT COUNT(*) AS count
+               FROM external_capability_runs
+               WHERE (status = 'running' AND lease_expires_at > ?)
+                  OR container_create_pending_until > ?`,
+            )
+            .get(now, now) as { count: number };
+          if (activeIntakes.count > 0 || activeRuns.count > 0) {
+            throw new Error(
+              `External capability Vault census is blocked by active producers (${activeIntakes.count} intakes, ${activeRuns.count} runs)`,
+            );
+          }
+        }
+        if (getRouterStateInternal(markerKey) === markerValue) {
+          return {
+            alreadyComplete: true,
+            insertedRows: 0,
+            expandedRows: 0,
+            importedBytes: 0,
+          };
+        }
+
+        const attributedOccupancies: Array<{
+          runId: string;
+          kind: ExternalCapabilityStorageKind;
+          objectKey: string;
+          occupiedBytes: number;
+        }> = occupancies
+          .filter((occupancy) => occupancy.kind !== 'artifact')
+          .map((occupancy) => ({
+            ...occupancy,
+            kind: occupancy.kind as ExternalCapabilityStorageKind,
+          }));
+        const artifactsByRun = new Map<
+          string,
+          Array<(typeof occupancies)[number]>
+        >();
+        for (const occupancy of occupancies) {
+          if (occupancy.kind !== 'artifact') continue;
+          const artifacts = artifactsByRun.get(occupancy.runId) ?? [];
+          artifacts.push(occupancy);
+          artifactsByRun.set(occupancy.runId, artifacts);
+        }
+        const selectRunManifest = db.prepare(
+          'SELECT input_manifest FROM external_capability_runs WHERE id = ?',
+        );
+        const selectRunArtifactRowsForAttribution = db.prepare(
+          `SELECT * FROM external_capability_storage_reservations
+           WHERE run_id = ? AND kind IN ('input', 'output')`,
+        );
+        for (const [runId, artifacts] of artifactsByRun) {
+          const manifestRow = selectRunManifest.get(runId) as
+            | { input_manifest: string }
+            | undefined;
+          const inputArtifactIds = new Set<string>();
+          if (manifestRow) {
+            let manifest: unknown;
+            try {
+              manifest = JSON.parse(manifestRow.input_manifest) as unknown;
+            } catch {
+              throw new Error(
+                'External capability storage backfill found an invalid input manifest',
+              );
+            }
+            if (
+              typeof manifest !== 'object' ||
+              manifest === null ||
+              !Array.isArray((manifest as { artifacts?: unknown }).artifacts)
+            ) {
+              throw new Error(
+                'External capability storage backfill found an invalid input manifest',
+              );
+            }
+            for (const artifact of (manifest as { artifacts: unknown[] })
+              .artifacts) {
+              if (
+                typeof artifact !== 'object' ||
+                artifact === null ||
+                typeof (artifact as { id?: unknown }).id !== 'string'
+              ) {
+                throw new Error(
+                  'External capability storage backfill found an invalid input artifact',
+                );
+              }
+              const artifactId = (artifact as { id: string }).id;
+              if (inputArtifactIds.has(artifactId)) {
+                throw new Error(
+                  'External capability storage backfill found duplicate input artifacts',
+                );
+              }
+              inputArtifactIds.add(artifactId);
+            }
+          }
+          const liveRows = selectRunArtifactRowsForAttribution.all(
+            runId,
+          ) as ExternalCapabilityStorageReservation[];
+          const aggregateInputReservation = liveRows.find(
+            (row) =>
+              row.kind === 'input' &&
+              row.object_key === 'run-artifacts' &&
+              row.state !== 'released',
+          );
+          let inputBytes = 0;
+          let legacyBytes = 0;
+          for (const artifact of artifacts) {
+            const exactRows = liveRows.filter(
+              (row) => row.object_key === artifact.objectKey,
+            );
+            if (exactRows.length > 1) {
+              throw new Error(
+                'External capability storage backfill artifact attribution is ambiguous',
+              );
+            }
+            const exact = exactRows[0];
+            if (exact) {
+              attributedOccupancies.push({
+                runId,
+                kind: exact.kind,
+                objectKey: exact.object_key,
+                occupiedBytes: artifact.occupiedBytes,
+              });
+            } else if (
+              inputArtifactIds.has(artifact.objectKey) ||
+              (!manifestRow && aggregateInputReservation)
+            ) {
+              // Intake reserves aggregate run-artifacts capacity before the run
+              // row is published. If startup finds those files after a crash,
+              // charge the existing aggregate reservation instead of creating a
+              // second legacy reservation for the same physical bytes.
+              inputBytes = addSafeExternalCapabilityStorageBytes(
+                inputBytes,
+                artifact.occupiedBytes,
+              );
+            } else {
+              legacyBytes = addSafeExternalCapabilityStorageBytes(
+                legacyBytes,
+                artifact.occupiedBytes,
+              );
+            }
+          }
+          if (inputBytes > 0) {
+            attributedOccupancies.push({
+              runId,
+              kind: 'input',
+              objectKey: 'run-artifacts',
+              occupiedBytes: inputBytes,
+            });
+          }
+          if (legacyBytes > 0) {
+            attributedOccupancies.push({
+              runId,
+              kind: 'input',
+              objectKey: 'legacy-run-artifacts',
+              occupiedBytes: legacyBytes,
+            });
+          }
+        }
+
+        const now = new Date().toISOString();
+        let insertedRows = 0;
+        let expandedRows = 0;
+        let importedBytes = 0n;
+        const selectByObject = db.prepare(
+          `SELECT * FROM external_capability_storage_reservations
+           WHERE run_id = ? AND kind = ? AND object_key = ?`,
+        );
+        const selectByKey = db.prepare(
+          `SELECT * FROM external_capability_storage_reservations
+           WHERE reservation_key = ?`,
+        );
+        const insertOccupied = db.prepare(
+          `INSERT INTO external_capability_storage_reservations (
+             reservation_key, run_id, kind, object_key, state,
+             reserved_bytes, occupied_bytes, created_at, updated_at, released_at
+           ) VALUES (?, ?, ?, ?, 'occupied', ?, ?, ?, ?, NULL)`,
+        );
+        const expandExisting = db.prepare(
+          `UPDATE external_capability_storage_reservations
+           SET reserved_bytes = MAX(reserved_bytes, ?),
+               occupied_bytes = MAX(occupied_bytes, ?),
+               updated_at = ?
+           WHERE reservation_key = ? AND state != 'released'`,
+        );
+        for (const occupancy of attributedOccupancies) {
+          const reservationKey = externalCapabilityStorageReservationKey({
+            runId: occupancy.runId,
+            kind: occupancy.kind,
+            objectKey: occupancy.objectKey,
+          });
+          const existingObject = selectByObject.get(
+            occupancy.runId,
+            occupancy.kind,
+            occupancy.objectKey,
+          ) as ExternalCapabilityStorageReservation | undefined;
+          const existingKey = selectByKey.get(reservationKey) as
+            | ExternalCapabilityStorageReservation
+            | undefined;
+          if (
+            existingKey &&
+            (existingKey.run_id !== occupancy.runId ||
+              existingKey.kind !== occupancy.kind ||
+              existingKey.object_key !== occupancy.objectKey)
+          ) {
+            throw new Error(
+              'External capability storage backfill key conflict',
+            );
+          }
+          if (
+            existingObject &&
+            existingObject.reservation_key !== reservationKey
+          ) {
+            throw new Error(
+              'External capability storage backfill object conflict',
+            );
+          }
+          if (existingObject?.state === 'released') {
+            throw new Error(
+              'External capability storage backfill found released materialized storage',
+            );
+          }
+
+          if (!existingObject) {
+            insertOccupied.run(
+              reservationKey,
+              occupancy.runId,
+              occupancy.kind,
+              occupancy.objectKey,
+              occupancy.occupiedBytes,
+              occupancy.occupiedBytes,
+              now,
+              now,
+            );
+            insertedRows += 1;
+            importedBytes += BigInt(occupancy.occupiedBytes);
+            if (importedBytes > BigInt(Number.MAX_SAFE_INTEGER)) {
+              throw new Error(
+                'External capability storage backfill size overflowed',
+              );
+            }
+            continue;
+          }
+
+          const chargedBefore =
+            externalCapabilityStorageChargedBytes(existingObject);
+          const targetReservedBytes = Math.max(
+            existingObject.reserved_bytes,
+            occupancy.occupiedBytes,
+          );
+          const targetOccupiedBytes = Math.max(
+            existingObject.occupied_bytes,
+            occupancy.occupiedBytes,
+          );
+          if (
+            targetReservedBytes === existingObject.reserved_bytes &&
+            targetOccupiedBytes === existingObject.occupied_bytes
+          ) {
+            continue;
+          }
+          expandExisting.run(
+            targetReservedBytes,
+            targetOccupiedBytes,
+            now,
+            reservationKey,
+          );
+          expandedRows += 1;
+          const chargedAfter =
+            existingObject.state === 'occupied'
+              ? targetOccupiedBytes
+              : Math.max(targetReservedBytes, targetOccupiedBytes);
+          importedBytes += BigInt(chargedAfter - chargedBefore);
+          if (importedBytes > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw new Error(
+              'External capability storage backfill size overflowed',
+            );
+          }
+        }
+
+        const publishRouterState = db.prepare(
+          `INSERT INTO router_state (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        );
+        publishRouterState.run(markerKey, markerValue);
+        if (markerKey === EXTERNAL_CAPABILITY_VAULT_CENSUS_STATE_KEY) {
+          publishRouterState.run(
+            EXTERNAL_CAPABILITY_VAULT_PHYSICAL_IDENTITY_KEY,
+            markerValue,
+          );
+        }
+        return {
+          alreadyComplete: false,
+          insertedRows,
+          expandedRows,
+          importedBytes: Number(importedBytes),
+        };
+      })
+      .immediate(),
+  );
+}
+
+function addSafeExternalCapabilityStorageBytes(
+  total: number,
+  bytes: number,
+): number {
+  if (
+    !Number.isSafeInteger(bytes) ||
+    bytes < 0 ||
+    total > Number.MAX_SAFE_INTEGER - bytes
+  ) {
+    throw new Error('External capability storage backfill size overflowed');
+  }
+  return total + bytes;
+}
+
+export type ExternalCapabilityIntakeOutcome =
+  | 'accepted'
+  | 'duplicate'
+  | 'conflict'
+  | 'invalid'
+  | 'payload_too_large'
+  | 'quota_rejected'
+  | 'unavailable'
+  | 'overloaded'
+  | 'aborted'
+  | 'failed'
+  | 'expired';
+
+export type ExternalCapabilityIntakeQuotaScope =
+  | 'global_requests'
+  | 'capability_requests'
+  | 'key_requests'
+  | 'global_bytes'
+  | 'capability_bytes'
+  | 'key_bytes'
+  | 'attempt_rate'
+  | 'ingress_volume';
+
+export interface ExternalCapabilityIntakeReservation {
+  id: string;
+  capability_slug: string;
+  key_id: string;
+  state: 'active' | 'finished';
+  outcome: ExternalCapabilityIntakeOutcome | null;
+  quota_scope: ExternalCapabilityIntakeQuotaScope | null;
+  reserved_raw_bytes: number;
+  observed_raw_bytes: number;
+  accepted_input_bytes: number;
+  run_id: string | null;
+  lease_token: number;
+  created_at: string;
+  expires_at: string;
+  finished_at: string | null;
+}
+
+export interface ExternalCapabilityIntakeLimits {
+  globalIntakeLimit: number;
+  capabilityIntakeLimit: number;
+  keyIntakeLimit: number;
+  globalIntakeBytes: number;
+  capabilityIntakeBytes: number;
+  keyIntakeBytes: number;
+  keyIntakeAttemptsPerMinute: number;
+  keyIngressBytesPerDay: number;
+  intakeReservationTtlMs: number;
+}
+
+export interface ExternalCapabilityWorkspaceFence {
+  jid: string;
+  folder: string;
+  executionMode: 'container';
+}
+
+export interface ReserveExternalCapabilityIntakeInput {
+  capabilitySlug: string;
+  keyId: string;
+  reservedRawBytes: number;
+  limits: ExternalCapabilityIntakeLimits;
+  expectedWorkspace?: ExternalCapabilityWorkspaceFence;
+  now?: string;
+}
+
+export type ReserveExternalCapabilityIntakeResult =
+  | {
+      admitted: true;
+      reservation: ExternalCapabilityIntakeReservation;
+    }
+  | {
+      admitted: false;
+      reason: 'quota' | 'unavailable';
+      quotaScope?: ExternalCapabilityIntakeQuotaScope;
+    };
+
+type ExternalCapabilityIntakeReservationRow =
+  ExternalCapabilityIntakeReservation;
+
+function mapExternalCapabilityIntakeReservationRow(
+  row: ExternalCapabilityIntakeReservationRow,
+): ExternalCapabilityIntakeReservation {
+  return { ...row };
+}
+
+function assertExternalCapabilityIntakeByteCount(
+  value: number,
+  field: string,
+): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative safe integer`);
+  }
+}
+
+function expireStaleExternalCapabilityIntakes(now: string): void {
+  const stale = db
+    .prepare(
+      `SELECT key_id, reserved_raw_bytes, observed_raw_bytes, created_at
+       FROM external_capability_intake_reservations
+       WHERE state = 'active' AND expires_at <= ?`,
+    )
+    .all(now) as Array<{
+    key_id: string;
+    reserved_raw_bytes: number;
+    observed_raw_bytes: number;
+    created_at: string;
+  }>;
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_intake_reservations
+       SET state = 'finished', outcome = 'expired', quota_scope = NULL,
+           observed_raw_bytes = MAX(observed_raw_bytes, reserved_raw_bytes),
+           finished_at = ?
+       WHERE state = 'active' AND expires_at <= ?`,
+    )
+    .run(now, now);
+  if (changed.changes !== stale.length) {
+    throw new Error('External capability intake expiry lost its durable fence');
+  }
+  for (const reservation of stale) {
+    rebucketExternalIntakeIngress({
+      keyId: reservation.key_id,
+      reservedRawBytes: reservation.reserved_raw_bytes,
+      observedRawBytes: Math.max(
+        reservation.observed_raw_bytes,
+        reservation.reserved_raw_bytes,
+      ),
+      createdAt: reservation.created_at,
+      finishedAt: now,
+    });
+  }
+}
+
+function fixedExternalIntakeMinuteStart(now: Date): string {
+  return new Date(Math.floor(now.getTime() / 60_000) * 60_000).toISOString();
+}
+
+function rebucketExternalIntakeIngress(input: {
+  keyId: string;
+  reservedRawBytes: number;
+  observedRawBytes: number;
+  createdAt: string;
+  finishedAt: string;
+}): void {
+  const createdAt = new Date(input.createdAt);
+  const finishedAt = new Date(input.finishedAt);
+  if (
+    !Number.isFinite(createdAt.getTime()) ||
+    !Number.isFinite(finishedAt.getTime())
+  ) {
+    throw new Error('External capability intake has invalid accounting time');
+  }
+  const startWindow = fixedExternalIntakeMinuteStart(createdAt);
+  const finishWindow = fixedExternalIntakeMinuteStart(finishedAt);
+  if (startWindow === finishWindow) {
+    const adjustment = input.observedRawBytes - input.reservedRawBytes;
+    if (adjustment !== 0) {
+      db.prepare(
+        `UPDATE external_capability_intake_ingress_windows
+         SET byte_count = MAX(0, byte_count + ?)
+         WHERE key_id = ? AND window_started_at = ?`,
+      ).run(adjustment, input.keyId, startWindow);
+    }
+    return;
+  }
+
   db.prepare(
-    'UPDATE external_capability_keys SET last_used_at = ? WHERE id = ?',
-  ).run(now, row.id);
-  return { ...mapExternalCapabilityKeyRow(row), last_used_at: now };
+    `UPDATE external_capability_intake_ingress_windows
+     SET byte_count = MAX(0, byte_count - ?)
+     WHERE key_id = ? AND window_started_at = ?`,
+  ).run(input.reservedRawBytes, input.keyId, startWindow);
+  if (input.observedRawBytes > 0) {
+    db.prepare(
+      `INSERT INTO external_capability_intake_ingress_windows (
+         key_id, window_started_at, byte_count
+       ) VALUES (?, ?, ?)
+       ON CONFLICT(key_id, window_started_at) DO UPDATE SET
+         byte_count = external_capability_intake_ingress_windows.byte_count + excluded.byte_count`,
+    ).run(input.keyId, finishWindow, input.observedRawBytes);
+  }
+}
+
+/**
+ * Reserve cross-process intake capacity before the request body is consumed.
+ * Rejected authenticated attempts increment a fixed per-key rate window rather
+ * than appending permanent rows, which bounds write amplification under abuse.
+ */
+export function reserveExternalCapabilityIntake(
+  input: ReserveExternalCapabilityIntakeInput,
+): ReserveExternalCapabilityIntakeResult {
+  const capabilitySlug = input.capabilitySlug.trim();
+  const keyId = input.keyId.trim();
+  if (!capabilitySlug || !keyId) {
+    throw new Error('capabilitySlug and keyId are required');
+  }
+  assertExternalCapabilityIntakeByteCount(
+    input.reservedRawBytes,
+    'reservedRawBytes',
+  );
+  const nowDate = input.now ? new Date(input.now) : new Date();
+  if (!Number.isFinite(nowDate.getTime()))
+    throw new Error('Invalid intake time');
+  const now = nowDate.toISOString();
+  const expiresAt = new Date(
+    nowDate.getTime() + input.limits.intakeReservationTtlMs,
+  ).toISOString();
+  const minuteWindowStart = fixedExternalIntakeMinuteStart(nowDate);
+  const rollingIngressCutoff = fixedExternalIntakeMinuteStart(
+    new Date(nowDate.getTime() - 24 * 60 * 60_000),
+  );
+  const reservationRetentionCutoff = new Date(
+    nowDate.getTime() - 48 * 60 * 60_000,
+  ).toISOString();
+  const ingressWindowRetentionCutoff = new Date(
+    nowDate.getTime() - 25 * 60 * 60_000,
+  ).toISOString();
+  const id = crypto.randomUUID();
+
+  return db
+    .transaction(() => {
+      expireStaleExternalCapabilityIntakes(now);
+      db.prepare(
+        `DELETE FROM external_capability_intake_reservations
+         WHERE id IN (
+           SELECT id FROM external_capability_intake_reservations
+           WHERE state = 'finished' AND finished_at < ?
+           ORDER BY finished_at ASC
+           LIMIT 100
+         )`,
+      ).run(reservationRetentionCutoff);
+      db.prepare(
+        `DELETE FROM external_capability_intake_ingress_windows
+         WHERE window_started_at < ?`,
+      ).run(ingressWindowRetentionCutoff);
+
+      const currentRateWindow = db
+        .prepare(
+          `SELECT window_started_at, request_count
+           FROM external_capability_intake_rate_windows
+           WHERE key_id = ?`,
+        )
+        .get(keyId) as
+        | { window_started_at: string; request_count: number }
+        | undefined;
+      const priorMinuteAttempts =
+        currentRateWindow?.window_started_at === minuteWindowStart
+          ? currentRateWindow.request_count
+          : 0;
+      db.prepare(
+        `INSERT INTO external_capability_intake_rate_windows (
+           key_id, window_started_at, request_count
+         ) VALUES (?, ?, 1)
+         ON CONFLICT(key_id) DO UPDATE SET
+           window_started_at = excluded.window_started_at,
+           request_count = CASE
+             WHEN external_capability_intake_rate_windows.window_started_at = excluded.window_started_at
+               THEN external_capability_intake_rate_windows.request_count + 1
+             ELSE 1
+           END`,
+      ).run(keyId, minuteWindowStart);
+
+      const available = db
+        .prepare(
+          `SELECT 1
+         FROM external_capability_keys AS key_record
+         JOIN external_capabilities capability
+           ON capability.slug = key_record.capability_slug
+         JOIN registered_groups workspace ON workspace.jid = capability.workspace_jid
+         JOIN users owner ON owner.id = workspace.created_by
+         WHERE key_record.id = ? AND key_record.status = 'active'
+           AND capability.slug = ? AND capability.status = 'active'
+           AND owner.status = 'active'
+           AND (? IS NULL OR capability.workspace_jid = ?)
+           AND (? IS NULL OR capability.workspace_folder = ?)
+           AND (? IS NULL OR workspace.jid = ?)
+           AND (? IS NULL OR workspace.folder = ?)
+           AND (? IS NULL OR COALESCE(workspace.execution_mode, 'container') = ?)`,
+        )
+        .get(
+          keyId,
+          capabilitySlug,
+          input.expectedWorkspace?.jid ?? null,
+          input.expectedWorkspace?.jid ?? null,
+          input.expectedWorkspace?.folder ?? null,
+          input.expectedWorkspace?.folder ?? null,
+          input.expectedWorkspace?.jid ?? null,
+          input.expectedWorkspace?.jid ?? null,
+          input.expectedWorkspace?.folder ?? null,
+          input.expectedWorkspace?.folder ?? null,
+          input.expectedWorkspace?.executionMode ?? null,
+          input.expectedWorkspace?.executionMode ?? null,
+        );
+      if (!available) {
+        return {
+          admitted: false as const,
+          reason: 'unavailable' as const,
+        };
+      }
+
+      const active = db
+        .prepare(
+          `SELECT
+           COUNT(*) AS global_count,
+           COALESCE(SUM(reserved_raw_bytes), 0) AS global_bytes,
+           SUM(CASE WHEN capability_slug = ? THEN 1 ELSE 0 END) AS capability_count,
+           COALESCE(SUM(CASE WHEN capability_slug = ? THEN reserved_raw_bytes ELSE 0 END), 0) AS capability_bytes,
+           SUM(CASE WHEN key_id = ? THEN 1 ELSE 0 END) AS key_count,
+           COALESCE(SUM(CASE WHEN key_id = ? THEN reserved_raw_bytes ELSE 0 END), 0) AS key_bytes
+         FROM external_capability_intake_reservations
+         WHERE state = 'active' AND expires_at > ?`,
+        )
+        .get(capabilitySlug, capabilitySlug, keyId, keyId, now) as {
+        global_count: number;
+        global_bytes: number;
+        capability_count: number | null;
+        capability_bytes: number;
+        key_count: number | null;
+        key_bytes: number;
+      };
+      const rollingIngress = db
+        .prepare(
+          `SELECT COALESCE(SUM(byte_count), 0) AS byte_count
+           FROM external_capability_intake_ingress_windows
+           WHERE key_id = ? AND window_started_at >= ?`,
+        )
+        .get(keyId, rollingIngressCutoff) as { byte_count: number };
+      const dayIngressBytes = rollingIngress.byte_count;
+
+      let quotaScope: ExternalCapabilityIntakeQuotaScope | null = null;
+      if (active.global_count >= input.limits.globalIntakeLimit) {
+        quotaScope = 'global_requests';
+      } else if (
+        (active.capability_count ?? 0) >= input.limits.capabilityIntakeLimit
+      ) {
+        quotaScope = 'capability_requests';
+      } else if ((active.key_count ?? 0) >= input.limits.keyIntakeLimit) {
+        quotaScope = 'key_requests';
+      } else if (
+        active.global_bytes >
+        input.limits.globalIntakeBytes - input.reservedRawBytes
+      ) {
+        quotaScope = 'global_bytes';
+      } else if (
+        active.capability_bytes >
+        input.limits.capabilityIntakeBytes - input.reservedRawBytes
+      ) {
+        quotaScope = 'capability_bytes';
+      } else if (
+        active.key_bytes >
+        input.limits.keyIntakeBytes - input.reservedRawBytes
+      ) {
+        quotaScope = 'key_bytes';
+      } else if (
+        priorMinuteAttempts >= input.limits.keyIntakeAttemptsPerMinute
+      ) {
+        quotaScope = 'attempt_rate';
+      } else if (
+        dayIngressBytes >
+        input.limits.keyIngressBytesPerDay - input.reservedRawBytes
+      ) {
+        quotaScope = 'ingress_volume';
+      }
+
+      if (quotaScope) {
+        return {
+          admitted: false as const,
+          reason: 'quota' as const,
+          quotaScope,
+        };
+      }
+
+      db.prepare(
+        `INSERT INTO external_capability_intake_ingress_windows (
+           key_id, window_started_at, byte_count
+         ) VALUES (?, ?, ?)
+         ON CONFLICT(key_id, window_started_at) DO UPDATE SET
+           byte_count = external_capability_intake_ingress_windows.byte_count + excluded.byte_count`,
+      ).run(keyId, minuteWindowStart, input.reservedRawBytes);
+
+      db.prepare(
+        `INSERT INTO external_capability_intake_reservations (
+         id, capability_slug, key_id, state, outcome, quota_scope,
+         reserved_raw_bytes, observed_raw_bytes, accepted_input_bytes, run_id,
+         lease_token, created_at, expires_at, finished_at
+       ) VALUES (?, ?, ?, 'active', NULL, NULL, ?, 0, 0, NULL, 1, ?, ?, NULL)`,
+      ).run(id, capabilitySlug, keyId, input.reservedRawBytes, now, expiresAt);
+      return {
+        admitted: true as const,
+        reservation: mapExternalCapabilityIntakeReservationRow(
+          db
+            .prepare(
+              'SELECT * FROM external_capability_intake_reservations WHERE id = ?',
+            )
+            .get(id) as ExternalCapabilityIntakeReservationRow,
+        ),
+      };
+    })
+    .immediate();
+}
+
+export function renewExternalCapabilityIntake(
+  id: string,
+  leaseToken: number,
+  ttlMs: number,
+): boolean {
+  if (!id || !Number.isSafeInteger(leaseToken) || leaseToken <= 0) {
+    throw new Error('Invalid external capability intake lease');
+  }
+  if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+    throw new Error('Invalid external capability intake TTL');
+  }
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + ttlMs).toISOString();
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_intake_reservations
+       SET expires_at = ?
+       WHERE id = ? AND lease_token = ? AND state = 'active'
+         AND expires_at > ?`,
+    )
+    .run(expiresAt, id, leaseToken, now.toISOString());
+  return changed.changes === 1;
+}
+
+export interface FinishExternalCapabilityIntakeInput {
+  id: string;
+  leaseToken: number;
+  outcome: ExternalCapabilityIntakeOutcome;
+  observedRawBytes: number;
+  acceptedInputBytes?: number;
+  runId?: string | null;
+  quotaScope?: ExternalCapabilityIntakeQuotaScope | null;
+}
+
+function finishExternalCapabilityIntakeInternal(
+  input: FinishExternalCapabilityIntakeInput,
+  finishedAt: string,
+): boolean {
+  assertExternalCapabilityIntakeByteCount(
+    input.observedRawBytes,
+    'observedRawBytes',
+  );
+  assertExternalCapabilityIntakeByteCount(
+    input.acceptedInputBytes ?? 0,
+    'acceptedInputBytes',
+  );
+  const reservation = db
+    .prepare(
+      `SELECT key_id, state, reserved_raw_bytes, created_at
+       FROM external_capability_intake_reservations
+       WHERE id = ? AND lease_token = ?`,
+    )
+    .get(input.id, input.leaseToken) as
+    | {
+        key_id: string;
+        state: 'active' | 'finished';
+        reserved_raw_bytes: number;
+        created_at: string;
+      }
+    | undefined;
+  if (!reservation) return false;
+  if (reservation.state === 'finished') return true;
+
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_intake_reservations
+       SET state = 'finished', outcome = ?, quota_scope = ?,
+           observed_raw_bytes = ?, accepted_input_bytes = ?,
+           run_id = COALESCE(?, run_id), finished_at = ?
+       WHERE id = ? AND lease_token = ? AND state = 'active'`,
+    )
+    .run(
+      input.outcome,
+      input.quotaScope ?? null,
+      input.observedRawBytes,
+      input.acceptedInputBytes ?? 0,
+      input.runId ?? null,
+      finishedAt,
+      input.id,
+      input.leaseToken,
+    );
+  if (changed.changes !== 1) return false;
+
+  rebucketExternalIntakeIngress({
+    keyId: reservation.key_id,
+    reservedRawBytes: reservation.reserved_raw_bytes,
+    observedRawBytes: input.observedRawBytes,
+    createdAt: reservation.created_at,
+    finishedAt,
+  });
+  return true;
+}
+
+/** Finish an intake attempt exactly once; repeated cleanup calls are harmless. */
+export function finishExternalCapabilityIntake(
+  input: FinishExternalCapabilityIntakeInput,
+): boolean {
+  const finishedAt = new Date().toISOString();
+  return db
+    .transaction(() =>
+      finishExternalCapabilityIntakeInternal(input, finishedAt),
+    )
+    .immediate();
+}
+
+export function getExternalCapabilityIntakeReservationForTest(
+  id: string,
+): ExternalCapabilityIntakeReservation | undefined {
+  const row = db
+    .prepare(
+      'SELECT * FROM external_capability_intake_reservations WHERE id = ?',
+    )
+    .get(id) as ExternalCapabilityIntakeReservationRow | undefined;
+  return row ? mapExternalCapabilityIntakeReservationRow(row) : undefined;
+}
+
+export function getExternalCapabilityIntakeReservationsForTest(
+  keyId: string,
+): ExternalCapabilityIntakeReservation[] {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM external_capability_intake_reservations
+         WHERE key_id = ? ORDER BY created_at ASC, id ASC`,
+      )
+      .all(keyId) as ExternalCapabilityIntakeReservationRow[]
+  ).map(mapExternalCapabilityIntakeReservationRow);
 }
 
 type ExternalCapabilityRunRow = Omit<
@@ -5163,6 +7900,7 @@ function mapExternalCapabilityRunRow(
     // A corrupted manifest must become inert. Future dispatch code must require
     // the expected file entries rather than treating an empty object as input.
     input_manifest: parseExternalRunRecord(row.input_manifest, {}) ?? {},
+    input_bytes: row.input_bytes,
     status: validStatus.includes(row.status) ? row.status : 'failed',
     attempt: row.attempt,
     available_at: row.available_at,
@@ -5171,6 +7909,10 @@ function mapExternalCapabilityRunRow(
     lease_expires_at: row.lease_expires_at,
     started_at: row.started_at,
     completed_at: row.completed_at,
+    retention_cleaned_at: row.retention_cleaned_at,
+    container_cleanup_attempt: row.container_cleanup_attempt,
+    container_cleanup_lease_token: row.container_cleanup_lease_token,
+    container_create_pending_until: row.container_create_pending_until,
     result: parseExternalRunRecord(row.result, null),
     error_code: row.error_code,
     error_message: row.error_message,
@@ -5198,6 +7940,15 @@ export class ExternalCapabilityAdmissionError extends Error {
   }
 }
 
+export class ExternalCapabilityIntakeReservationError extends Error {
+  readonly code = 'INTAKE_RESERVATION_INVALID';
+
+  constructor() {
+    super('External capability intake reservation is no longer valid');
+    this.name = 'ExternalCapabilityIntakeReservationError';
+  }
+}
+
 export class ExternalCapabilityQuotaError extends Error {
   readonly code = 'QUOTA_EXCEEDED';
 
@@ -5219,7 +7970,7 @@ export interface CreateExternalCapabilityRunInput {
   /** Optional server-generated ID, used to allocate a private artifact vault first. */
   id?: string;
   capabilitySlug: string;
-  keyId?: string | null;
+  keyId: string;
   externalTaskId: string;
   idempotencyKey?: string | null;
   tenantRef?: string | null;
@@ -5228,6 +7979,12 @@ export interface CreateExternalCapabilityRunInput {
   inputManifest: Record<string, unknown>;
   availableAt?: string;
   admissionLimits?: ExternalCapabilityAdmissionLimits;
+  expectedWorkspace?: ExternalCapabilityWorkspaceFence;
+  intakeReservation?: {
+    id: string;
+    leaseToken: number;
+    observedRawBytes: number;
+  };
 }
 
 export interface CreateExternalCapabilityRunResult {
@@ -5249,37 +8006,81 @@ function externalRequestFingerprint(manifest: string): string | null {
   }
 }
 
-function externalInputManifestBytes(manifest: unknown): number {
-  if (!isJsonRecord(manifest) || !Array.isArray(manifest.artifacts)) return 0;
+function externalRequestContextFingerprint(input: {
+  tenantRef: string | null;
+  accountRef: string | null;
+  callbackContext: string | null;
+}): string {
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify([
+        input.tenantRef,
+        input.accountRef,
+        input.callbackContext,
+      ]),
+    )
+    .digest('hex');
+}
+
+function externalInputManifestBytes(manifest: unknown): number | null {
+  if (!isJsonRecord(manifest)) return null;
+  if (manifest.retentionTombstone === true) {
+    return Number.isSafeInteger(manifest.retainedInputBytes) &&
+      (manifest.retainedInputBytes as number) >= 0
+      ? (manifest.retainedInputBytes as number)
+      : null;
+  }
+  if (manifest.artifacts === undefined) return 0;
+  if (!Array.isArray(manifest.artifacts)) return null;
   let total = 0;
   for (const artifact of manifest.artifacts) {
     if (!isJsonRecord(artifact) || !Number.isSafeInteger(artifact.byteLength)) {
-      return 0;
+      return null;
     }
     const byteLength = artifact.byteLength as number;
-    if (byteLength < 0 || total > Number.MAX_SAFE_INTEGER - byteLength)
-      return 0;
+    if (byteLength < 0 || total > Number.MAX_SAFE_INTEGER - byteLength) {
+      return null;
+    }
     total += byteLength;
   }
   return total;
 }
 
+interface ExternalCapabilityRunSubmissionIdentity {
+  capabilitySlug: string;
+  keyId: string | null;
+  idempotencyKey: string | null;
+  externalTaskId: string;
+  tenantRef: string | null;
+  accountRef: string | null;
+  callbackContext: string | null;
+  manifest: string;
+}
+
 function externalRunMatchesSubmission(
   row: ExternalCapabilityRunRow,
-  input: {
-    keyId: string | null;
-    idempotencyKey: string | null;
-    externalTaskId: string;
-    tenantRef: string | null;
-    accountRef: string | null;
-    callbackContext: string | null;
-    manifest: string;
-  },
+  input: ExternalCapabilityRunSubmissionIdentity,
 ): boolean {
   if (
     row.key_id !== input.keyId ||
     row.idempotency_key !== input.idempotencyKey ||
-    row.external_task_id !== input.externalTaskId ||
+    row.external_task_id !== input.externalTaskId
+  ) {
+    return false;
+  }
+  const retainedManifest = parseExternalRunRecord(row.input_manifest, null);
+  const isRetentionTombstone = retainedManifest?.retentionTombstone === true;
+  if (isRetentionTombstone) {
+    const retainedContextFingerprint = retainedManifest?.requestContextSha256;
+    if (
+      typeof retainedContextFingerprint !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(retainedContextFingerprint) ||
+      retainedContextFingerprint !== externalRequestContextFingerprint(input)
+    ) {
+      return false;
+    }
+  } else if (
     row.tenant_ref !== input.tenantRef ||
     row.account_ref !== input.accountRef ||
     row.callback_context !== input.callbackContext
@@ -5288,15 +8089,195 @@ function externalRunMatchesSubmission(
   }
   const existingFingerprint = externalRequestFingerprint(row.input_manifest);
   const submittedFingerprint = externalRequestFingerprint(input.manifest);
-  // Runs created before request fingerprints existed remain comparable only when
-  // their exact immutable manifests match. New HTTP submissions always include
-  // a fingerprint that intentionally excludes random artifact storage IDs.
+  // Runs created before request fingerprints existed remain comparable by a
+  // retained manifest digest after private fields are scrubbed. New HTTP
+  // submissions always include a stable fingerprint that excludes random
+  // artifact storage IDs.
   if (!existingFingerprint && !submittedFingerprint) {
+    if (
+      isRetentionTombstone &&
+      typeof retainedManifest?.manifestSha256 === 'string'
+    ) {
+      return (
+        retainedManifest.manifestSha256 ===
+        crypto.createHash('sha256').update(input.manifest).digest('hex')
+      );
+    }
     return row.input_manifest === input.manifest;
   }
   return (
     existingFingerprint !== null && existingFingerprint === submittedFingerprint
   );
+}
+
+function findExternalCapabilityRunSubmission(
+  input: ExternalCapabilityRunSubmissionIdentity,
+):
+  | {
+      row: ExternalCapabilityRunRow;
+      reason: 'duplicate' | 'conflict';
+    }
+  | undefined {
+  const existingByTask = db
+    .prepare(
+      `SELECT * FROM external_capability_runs
+       WHERE capability_slug = ? AND key_id IS ? AND external_task_id = ?`,
+    )
+    .get(input.capabilitySlug, input.keyId, input.externalTaskId) as
+    | ExternalCapabilityRunRow
+    | undefined;
+  const row =
+    existingByTask ??
+    (input.idempotencyKey
+      ? (db
+          .prepare(
+            `SELECT * FROM external_capability_runs
+             WHERE capability_slug = ? AND key_id IS ? AND idempotency_key = ?`,
+          )
+          .get(input.capabilitySlug, input.keyId, input.idempotencyKey) as
+          | ExternalCapabilityRunRow
+          | undefined)
+      : undefined);
+  if (!row) return undefined;
+  return {
+    row,
+    reason: externalRunMatchesSubmission(row, input) ? 'duplicate' : 'conflict',
+  };
+}
+
+export interface PreflightExternalCapabilityRunSubmissionInput {
+  capabilitySlug: string;
+  keyId: string;
+  externalTaskId: string;
+  idempotencyKey?: string | null;
+  tenantRef?: string | null;
+  accountRef?: string | null;
+  callbackContext?: Record<string, unknown> | null;
+  requestFingerprint: string;
+  plannedRunId: string;
+  intakeReservation: {
+    id: string;
+    leaseToken: number;
+    observedRawBytes: number;
+  };
+}
+
+export type PreflightExternalCapabilityRunSubmissionResult =
+  | { existing: false }
+  | {
+      existing: true;
+      reason: 'duplicate' | 'conflict';
+      run: ExternalCapabilityRun;
+    };
+
+/**
+ * Resolve known duplicates and conflicts before allocating private Vault
+ * storage. A no-match result is advisory; createExternalCapabilityRun remains
+ * the final uniqueness fence for concurrent first submissions.
+ */
+export function preflightExternalCapabilityRunSubmission(
+  input: PreflightExternalCapabilityRunSubmissionInput,
+): PreflightExternalCapabilityRunSubmissionResult {
+  const capabilitySlug = input.capabilitySlug.trim();
+  const keyId = input.keyId.trim();
+  const externalTaskId = input.externalTaskId.trim();
+  if (!capabilitySlug || !keyId || !externalTaskId) {
+    throw new Error('capabilitySlug, keyId, and externalTaskId are required');
+  }
+  const idempotencyKey = input.idempotencyKey?.trim() || null;
+  const tenantRef = input.tenantRef?.trim() || null;
+  const accountRef = input.accountRef?.trim() || null;
+  const callbackContext = input.callbackContext
+    ? serializeExternalRunRecord(input.callbackContext, 'callbackContext')
+    : null;
+  if (!/^[a-f0-9]{64}$/.test(input.requestFingerprint)) {
+    throw new Error('requestFingerprint must be a lowercase SHA-256 digest');
+  }
+  if (!/^[0-9a-f-]{36}$/i.test(input.plannedRunId)) {
+    throw new Error('plannedRunId must be server-generated');
+  }
+  assertExternalCapabilityIntakeByteCount(
+    input.intakeReservation.observedRawBytes,
+    'intakeReservation.observedRawBytes',
+  );
+  const manifest = serializeExternalRunRecord(
+    { requestFingerprint: input.requestFingerprint },
+    'inputManifest',
+  );
+  const now = new Date().toISOString();
+
+  return db
+    .transaction(() => {
+      const activeReservation = db
+        .prepare(
+          `SELECT 1 FROM external_capability_intake_reservations
+           WHERE id = ? AND lease_token = ? AND state = 'active'
+             AND capability_slug = ? AND key_id = ? AND expires_at > ?`,
+        )
+        .get(
+          input.intakeReservation.id,
+          input.intakeReservation.leaseToken,
+          capabilitySlug,
+          keyId,
+          now,
+        );
+      if (!activeReservation) {
+        throw new ExternalCapabilityIntakeReservationError();
+      }
+
+      const existing = findExternalCapabilityRunSubmission({
+        capabilitySlug,
+        keyId,
+        idempotencyKey,
+        externalTaskId,
+        tenantRef,
+        accountRef,
+        callbackContext,
+        manifest,
+      });
+      if (!existing) {
+        const bound = db
+          .prepare(
+            `UPDATE external_capability_intake_reservations
+             SET run_id = ?
+             WHERE id = ? AND lease_token = ? AND state = 'active'
+               AND capability_slug = ? AND key_id = ? AND expires_at > ?
+               AND (run_id IS NULL OR run_id = ?)`,
+          )
+          .run(
+            input.plannedRunId,
+            input.intakeReservation.id,
+            input.intakeReservation.leaseToken,
+            capabilitySlug,
+            keyId,
+            now,
+            input.plannedRunId,
+          );
+        if (bound.changes !== 1) {
+          throw new ExternalCapabilityIntakeReservationError();
+        }
+        return { existing: false as const };
+      }
+
+      const finished = finishExternalCapabilityIntakeInternal(
+        {
+          id: input.intakeReservation.id,
+          leaseToken: input.intakeReservation.leaseToken,
+          outcome: existing.reason,
+          observedRawBytes: input.intakeReservation.observedRawBytes,
+          acceptedInputBytes: 0,
+          runId: existing.row.id,
+        },
+        now,
+      );
+      if (!finished) throw new ExternalCapabilityIntakeReservationError();
+      return {
+        existing: true as const,
+        reason: existing.reason,
+        run: mapExternalCapabilityRunRow(existing.row),
+      };
+    })
+    .immediate();
 }
 
 /**
@@ -5307,10 +8288,10 @@ export function createExternalCapabilityRun(
   input: CreateExternalCapabilityRunInput,
 ): CreateExternalCapabilityRunResult {
   const capabilitySlug = input.capabilitySlug.trim();
-  const keyId = input.keyId?.trim() || null;
+  const keyId = input.keyId.trim();
   const externalTaskId = input.externalTaskId.trim();
-  if (!capabilitySlug || !externalTaskId) {
-    throw new Error('capabilitySlug and externalTaskId are required');
+  if (!capabilitySlug || !keyId || !externalTaskId) {
+    throw new Error('capabilitySlug, keyId, and externalTaskId are required');
   }
   const idempotencyKey = input.idempotencyKey?.trim() || null;
   const manifest = serializeExternalRunRecord(
@@ -5328,198 +8309,221 @@ export function createExternalCapabilityRun(
   if (!/^[0-9a-f-]{36}$/i.test(id)) {
     throw new Error('External capability run ID must be server-generated');
   }
+  const inputBytes = externalInputManifestBytes(input.inputManifest);
+  if (inputBytes === null) {
+    throw new Error('inputManifest has invalid artifact byte lengths');
+  }
+  if (input.intakeReservation) {
+    assertExternalCapabilityIntakeByteCount(
+      input.intakeReservation.observedRawBytes,
+      'intakeReservation.observedRawBytes',
+    );
+  }
 
-  return db.transaction(() => {
-    const existingByTask = db
-      .prepare(
-        `SELECT * FROM external_capability_runs
-         WHERE capability_slug = ? AND key_id IS ? AND external_task_id = ?`,
-      )
-      .get(capabilitySlug, keyId, externalTaskId) as
-      | ExternalCapabilityRunRow
-      | undefined;
-    if (existingByTask) {
-      return {
-        created: false,
-        reason: externalRunMatchesSubmission(existingByTask, {
-          keyId,
-          idempotencyKey,
-          externalTaskId,
-          tenantRef,
-          accountRef,
-          callbackContext,
-          manifest,
-        })
-          ? ('duplicate' as const)
-          : ('conflict' as const),
-        run: mapExternalCapabilityRunRow(existingByTask),
+  return db
+    .transaction(() => {
+      if (input.intakeReservation) {
+        const activeReservation = db
+          .prepare(
+            `SELECT 1 FROM external_capability_intake_reservations
+           WHERE id = ? AND lease_token = ? AND state = 'active'
+             AND capability_slug = ? AND key_id = ? AND expires_at > ?`,
+          )
+          .get(
+            input.intakeReservation.id,
+            input.intakeReservation.leaseToken,
+            capabilitySlug,
+            keyId,
+            now,
+          );
+        if (!keyId || !activeReservation) {
+          throw new ExternalCapabilityIntakeReservationError();
+        }
+      }
+
+      const finishIntake = (
+        outcome: 'accepted' | 'duplicate' | 'conflict',
+        runId: string,
+      ): void => {
+        if (!input.intakeReservation) return;
+        const finished = finishExternalCapabilityIntakeInternal(
+          {
+            id: input.intakeReservation.id,
+            leaseToken: input.intakeReservation.leaseToken,
+            outcome,
+            observedRawBytes: input.intakeReservation.observedRawBytes,
+            acceptedInputBytes: outcome === 'accepted' ? inputBytes : 0,
+            runId,
+          },
+          now,
+        );
+        if (!finished) throw new ExternalCapabilityIntakeReservationError();
       };
-    }
-    if (idempotencyKey) {
-      const existingByKey = db
-        .prepare(
-          `SELECT * FROM external_capability_runs
-           WHERE capability_slug = ? AND key_id IS ? AND idempotency_key = ?`,
-        )
-        .get(capabilitySlug, keyId, idempotencyKey) as
-        | ExternalCapabilityRunRow
-        | undefined;
-      if (existingByKey) {
+
+      const existing = findExternalCapabilityRunSubmission({
+        capabilitySlug,
+        keyId,
+        idempotencyKey,
+        externalTaskId,
+        tenantRef,
+        accountRef,
+        callbackContext,
+        manifest,
+      });
+      if (existing) {
+        finishIntake(existing.reason, existing.row.id);
         return {
           created: false,
-          reason: externalRunMatchesSubmission(existingByKey, {
-            keyId,
-            idempotencyKey,
-            externalTaskId,
-            tenantRef,
-            accountRef,
-            callbackContext,
-            manifest,
-          })
-            ? ('duplicate' as const)
-            : ('conflict' as const),
-          run: mapExternalCapabilityRunRow(existingByKey),
+          reason: existing.reason,
+          run: mapExternalCapabilityRunRow(existing.row),
         };
       }
-    }
 
-    // Authentication and multipart validation happen before this transaction.
-    // Revalidate the mutable lifecycle/key gates at the insertion boundary so
-    // a concurrent pause, retirement, or revocation cannot admit new work.
-    const activeCapability = db
-      .prepare(
-        `SELECT 1 FROM external_capabilities
-         WHERE slug = ? AND status = 'active'`,
-      )
-      .get(capabilitySlug);
-    const activeKey = keyId
-      ? db
-          .prepare(
-            `SELECT 1 FROM external_capability_keys
+      // Authentication and multipart validation happen before this transaction.
+      // Revalidate the mutable lifecycle/key gates at the insertion boundary so
+      // a concurrent pause, retirement, or revocation cannot admit new work.
+      const activeCapability = db
+        .prepare(
+          `SELECT 1 FROM external_capabilities capability
+         JOIN registered_groups workspace ON workspace.jid = capability.workspace_jid
+         JOIN users owner ON owner.id = workspace.created_by
+         WHERE capability.slug = ? AND capability.status = 'active'
+           AND owner.status = 'active'
+           AND (? IS NULL OR capability.workspace_jid = ?)
+           AND (? IS NULL OR capability.workspace_folder = ?)
+           AND (? IS NULL OR workspace.jid = ?)
+           AND (? IS NULL OR workspace.folder = ?)
+           AND (? IS NULL OR COALESCE(workspace.execution_mode, 'container') = ?)`,
+        )
+        .get(
+          capabilitySlug,
+          input.expectedWorkspace?.jid ?? null,
+          input.expectedWorkspace?.jid ?? null,
+          input.expectedWorkspace?.folder ?? null,
+          input.expectedWorkspace?.folder ?? null,
+          input.expectedWorkspace?.jid ?? null,
+          input.expectedWorkspace?.jid ?? null,
+          input.expectedWorkspace?.folder ?? null,
+          input.expectedWorkspace?.folder ?? null,
+          input.expectedWorkspace?.executionMode ?? null,
+          input.expectedWorkspace?.executionMode ?? null,
+        );
+      const activeKey = keyId
+        ? db
+            .prepare(
+              `SELECT 1 FROM external_capability_keys
              WHERE id = ? AND capability_slug = ? AND status = 'active'`,
-          )
-          .get(keyId, capabilitySlug)
-      : true;
-    if (!activeCapability || !activeKey) {
-      throw new ExternalCapabilityAdmissionError();
-    }
+            )
+            .get(keyId, capabilitySlug)
+        : true;
+      if (!activeCapability || !activeKey) {
+        throw new ExternalCapabilityAdmissionError();
+      }
 
-    if (input.admissionLimits) {
-      const limits = input.admissionLimits;
-      const inputBytes = externalInputManifestBytes(input.inputManifest);
-      if (inputBytes > limits.maxInputBytesPerRun) {
-        throw new ExternalCapabilityQuotaError('input');
-      }
-      const queuedStatuses = "('queued', 'retry_wait')";
-      const globalQueued = (
-        db
-          .prepare(
-            `SELECT COUNT(*) AS count FROM external_capability_runs
-             WHERE status IN ${queuedStatuses}`,
-          )
-          .get() as { count: number }
-      ).count;
-      if (globalQueued >= limits.globalQueueLimit) {
-        throw new ExternalCapabilityQuotaError('global');
-      }
-      const capabilityQueued = (
-        db
-          .prepare(
-            `SELECT COUNT(*) AS count FROM external_capability_runs
-             WHERE capability_slug = ? AND status IN ${queuedStatuses}`,
-          )
-          .get(capabilitySlug) as { count: number }
-      ).count;
-      if (capabilityQueued >= limits.capabilityQueueLimit) {
-        throw new ExternalCapabilityQuotaError('capability');
-      }
-      if (keyId) {
-        const keyQueued = (
+      if (input.admissionLimits) {
+        const limits = input.admissionLimits;
+        if (inputBytes > limits.maxInputBytesPerRun) {
+          throw new ExternalCapabilityQuotaError('input');
+        }
+        const queuedStatuses = "('queued', 'retry_wait')";
+        const globalQueued = (
           db
             .prepare(
               `SELECT COUNT(*) AS count FROM external_capability_runs
+             WHERE status IN ${queuedStatuses}`,
+            )
+            .get() as { count: number }
+        ).count;
+        if (globalQueued >= limits.globalQueueLimit) {
+          throw new ExternalCapabilityQuotaError('global');
+        }
+        const capabilityQueued = (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS count FROM external_capability_runs
+             WHERE capability_slug = ? AND status IN ${queuedStatuses}`,
+            )
+            .get(capabilitySlug) as { count: number }
+        ).count;
+        if (capabilityQueued >= limits.capabilityQueueLimit) {
+          throw new ExternalCapabilityQuotaError('capability');
+        }
+        if (keyId) {
+          const keyQueued = (
+            db
+              .prepare(
+                `SELECT COUNT(*) AS count FROM external_capability_runs
                WHERE capability_slug = ? AND key_id = ?
                  AND status IN ${queuedStatuses}`,
-            )
-            .get(capabilitySlug, keyId) as { count: number }
-        ).count;
-        if (keyQueued >= limits.keyQueueLimit) {
-          throw new ExternalCapabilityQuotaError('key');
-        }
-        const minuteStart = new Date(Date.now() - 60_000).toISOString();
-        const dayStart = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
-        const recentRuns = db
-          .prepare(
-            `SELECT
+              )
+              .get(capabilitySlug, keyId) as { count: number }
+          ).count;
+          if (keyQueued >= limits.keyQueueLimit) {
+            throw new ExternalCapabilityQuotaError('key');
+          }
+          const minuteStart = new Date(Date.now() - 60_000).toISOString();
+          const dayStart = new Date(
+            Date.now() - 24 * 60 * 60_000,
+          ).toISOString();
+          const recentRuns = db
+            .prepare(
+              `SELECT
                  SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS minute_count,
-                 COUNT(*) AS day_count
+                 COUNT(*) AS day_count,
+                 TOTAL(input_bytes) AS input_bytes
                FROM external_capability_runs
                WHERE capability_slug = ? AND key_id = ? AND created_at >= ?`,
-          )
-          .get(minuteStart, capabilitySlug, keyId, dayStart) as {
-          minute_count: number | null;
-          day_count: number;
-        };
-        if (
-          (recentRuns.minute_count ?? 0) >= limits.keyRunsPerMinute ||
-          recentRuns.day_count >= limits.keyRunsPerDay
-        ) {
-          throw new ExternalCapabilityQuotaError('rate');
-        }
-        const recentManifests = db
-          .prepare(
-            `SELECT input_manifest FROM external_capability_runs
-             WHERE capability_slug = ? AND key_id = ? AND created_at >= ?`,
-          )
-          .all(capabilitySlug, keyId, dayStart) as Array<{
-          input_manifest: string;
-        }>;
-        const usedInputBytes = recentManifests.reduce((total, run) => {
-          try {
-            const bytes = externalInputManifestBytes(
-              JSON.parse(run.input_manifest),
-            );
-            return total > Number.MAX_SAFE_INTEGER - bytes
-              ? Number.MAX_SAFE_INTEGER
-              : total + bytes;
-          } catch {
-            // A malformed historical manifest must consume the whole budget
-            // rather than becoming a quota bypass.
-            return Number.MAX_SAFE_INTEGER;
+            )
+            .get(minuteStart, capabilitySlug, keyId, dayStart) as {
+            minute_count: number | null;
+            day_count: number;
+            input_bytes: number;
+          };
+          if (
+            (recentRuns.minute_count ?? 0) >= limits.keyRunsPerMinute ||
+            recentRuns.day_count >= limits.keyRunsPerDay
+          ) {
+            throw new ExternalCapabilityQuotaError('rate');
           }
-        }, 0);
-        if (usedInputBytes > limits.keyInputBytesPerDay - inputBytes) {
-          throw new ExternalCapabilityQuotaError('volume');
+          const usedInputBytes = Math.min(
+            Number.MAX_SAFE_INTEGER,
+            recentRuns.input_bytes,
+          );
+          if (usedInputBytes > limits.keyInputBytesPerDay - inputBytes) {
+            throw new ExternalCapabilityQuotaError('volume');
+          }
         }
       }
-    }
-    db.prepare(
-      `INSERT INTO external_capability_runs (
+      db.prepare(
+        `INSERT INTO external_capability_runs (
          id, capability_slug, key_id, idempotency_key, external_task_id, tenant_ref,
-         account_ref, callback_context, input_manifest, status, attempt,
+         account_ref, callback_context, input_manifest, input_bytes, status, attempt,
          available_at, lease_owner, lease_token, lease_expires_at, started_at,
          completed_at, result, error_code, error_message, created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, NULL, 0, NULL,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, NULL, 0, NULL,
                  NULL, NULL, NULL, NULL, NULL, ?, ?)`,
-    ).run(
-      id,
-      capabilitySlug,
-      keyId,
-      idempotencyKey,
-      externalTaskId,
-      tenantRef,
-      accountRef,
-      callbackContext,
-      manifest,
-      availableAt,
-      now,
-      now,
-    );
-    return {
-      created: true,
-      run: getExternalCapabilityRunById(id)!,
-    };
-  })();
+      ).run(
+        id,
+        capabilitySlug,
+        keyId,
+        idempotencyKey,
+        externalTaskId,
+        tenantRef,
+        accountRef,
+        callbackContext,
+        manifest,
+        inputBytes,
+        availableAt,
+        now,
+        now,
+      );
+      finishIntake('accepted', id);
+      return {
+        created: true,
+        run: getExternalCapabilityRunById(id)!,
+      };
+    })
+    .immediate();
 }
 
 export function getExternalCapabilityRunById(
@@ -5529,6 +8533,329 @@ export function getExternalCapabilityRunById(
     .prepare('SELECT * FROM external_capability_runs WHERE id = ?')
     .get(id) as ExternalCapabilityRunRow | undefined;
   return row ? mapExternalCapabilityRunRow(row) : undefined;
+}
+
+export function hasExternalCapabilityContainerLifecycleDebt(): boolean {
+  return Boolean(
+    db
+      .prepare(
+        `SELECT 1
+         FROM external_capability_runs
+         WHERE status = 'running'
+            OR container_cleanup_attempt IS NOT NULL
+            OR container_cleanup_lease_token IS NOT NULL
+            OR container_create_pending_until IS NOT NULL
+         LIMIT 1`,
+      )
+      .get(),
+  );
+}
+
+export function listExternalCapabilityContainerCleanupDebts(): Array<{
+  runId: string;
+  attempt: number;
+  leaseToken: number;
+}> {
+  return (
+    db
+      .prepare(
+        `SELECT id, container_cleanup_attempt, container_cleanup_lease_token
+         FROM external_capability_runs
+         WHERE container_cleanup_attempt IS NOT NULL
+           AND container_cleanup_lease_token IS NOT NULL
+         ORDER BY created_at, id`,
+      )
+      .all() as Array<{
+      id: string;
+      container_cleanup_attempt: number;
+      container_cleanup_lease_token: number;
+    }>
+  ).map((row) => ({
+    runId: row.id,
+    attempt: row.container_cleanup_attempt,
+    leaseToken: row.container_cleanup_lease_token,
+  }));
+}
+
+export function markExternalCapabilityRunContainerCleanupRequired(
+  id: string,
+  owner: string,
+  token: number,
+  attempt: number,
+): boolean {
+  const now = new Date().toISOString();
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_runs
+       SET container_cleanup_attempt = ?, container_cleanup_lease_token = ?,
+           updated_at = ?
+       WHERE id = ? AND status = 'running' AND lease_owner = ?
+         AND lease_token = ? AND attempt = ? AND lease_expires_at > ?
+         AND container_cleanup_attempt IS NULL
+         AND container_cleanup_lease_token IS NULL
+         AND container_create_pending_until IS NULL`,
+    )
+    .run(attempt, token, now, id, owner, token, attempt, now);
+  return changed.changes === 1;
+}
+
+export function clearExternalCapabilityRunContainerCleanupRequired(
+  id: string,
+  attempt: number,
+  token: number,
+): boolean {
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_runs
+       SET container_cleanup_attempt = NULL,
+           container_cleanup_lease_token = NULL,
+           updated_at = ?
+       WHERE id = ? AND container_cleanup_attempt = ?
+         AND container_cleanup_lease_token = ?
+         AND container_create_pending_until IS NULL`,
+    )
+    .run(new Date().toISOString(), id, attempt, token);
+  return changed.changes === 1;
+}
+
+/**
+ * An external observer may clear a cleanup marker only after proving Docker
+ * absence and proving that the exact marked attempt no longer owns a live lease.
+ * The worker-owned clear above is used after that worker has itself stopped the
+ * physical container.
+ */
+export function clearExternalCapabilityRunContainerCleanupAfterVerifiedAbsence(
+  id: string,
+  attempt: number,
+  token: number,
+): boolean {
+  const now = new Date().toISOString();
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_runs
+       SET container_cleanup_attempt = NULL,
+           container_cleanup_lease_token = NULL,
+           container_create_pending_until = NULL,
+           updated_at = ?
+       WHERE id = ? AND container_cleanup_attempt = ?
+         AND container_cleanup_lease_token = ?
+         AND (
+           container_create_pending_until IS NULL
+           OR container_create_pending_until <= ?
+         )
+         AND NOT (
+           status = 'running' AND attempt = ? AND lease_token = ?
+           AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+         )`,
+    )
+    .run(now, id, attempt, token, now, attempt, token, now);
+  return changed.changes === 1;
+}
+
+export const EXTERNAL_CAPABILITY_MAX_CONTAINER_CREATE_PENDING_MS = 5 * 60_000;
+
+function isValidExternalCapabilityContainerCreateDuration(
+  value: number,
+): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+/**
+ * Reserve the short gap in which Docker may create a physical object. The
+ * transaction commits before the Docker CLI runs, so cancellation and other
+ * writers remain responsive while absence checks fail closed on the deadline.
+ */
+export function reserveExternalCapabilityRunContainerCreation(
+  id: string,
+  owner: string,
+  token: number,
+  attempt: number,
+  leaseMs: number,
+  createPendingMs: number,
+): string | null {
+  if (
+    !isValidExternalCapabilityContainerCreateDuration(leaseMs) ||
+    !isValidExternalCapabilityContainerCreateDuration(createPendingMs) ||
+    createPendingMs > EXTERNAL_CAPABILITY_MAX_CONTAINER_CREATE_PENDING_MS ||
+    createPendingMs > leaseMs
+  ) {
+    return null;
+  }
+  return db
+    .transaction(() => {
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
+      const pendingUntil = new Date(
+        now.getTime() + createPendingMs,
+      ).toISOString();
+      const authorized = db
+        .prepare(
+          `SELECT 1
+           FROM external_capability_runs run
+           JOIN external_capabilities capability
+             ON capability.slug = run.capability_slug
+           JOIN external_capability_keys key
+             ON key.id = run.key_id
+            AND key.capability_slug = run.capability_slug
+           JOIN registered_groups workspace
+             ON workspace.jid = capability.workspace_jid
+           JOIN users workspace_owner
+             ON workspace_owner.id = workspace.created_by
+           WHERE run.id = ? AND run.status = 'running'
+             AND run.lease_owner = ? AND run.lease_token = ?
+             AND run.attempt = ? AND run.lease_expires_at > ?
+             AND run.started_at IS NULL
+             AND run.container_cleanup_attempt = ?
+             AND run.container_cleanup_lease_token = ?
+             AND run.container_create_pending_until IS NULL
+             AND capability.status = 'active' AND key.status = 'active'
+             AND workspace_owner.status = 'active'
+             AND workspace.folder = capability.workspace_folder
+             AND COALESCE(workspace.execution_mode, 'container') = 'container'`,
+        )
+        .get(id, owner, token, attempt, nowIso, attempt, token);
+      if (!authorized) return null;
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_runs
+           SET lease_expires_at = ?, container_create_pending_until = ?,
+               updated_at = ?
+           WHERE id = ? AND status = 'running' AND lease_owner = ?
+             AND lease_token = ? AND attempt = ? AND lease_expires_at > ?
+             AND started_at IS NULL
+             AND container_cleanup_attempt = ?
+             AND container_cleanup_lease_token = ?
+             AND container_create_pending_until IS NULL`,
+        )
+        .run(
+          expiresAt,
+          pendingUntil,
+          nowIso,
+          id,
+          owner,
+          token,
+          attempt,
+          nowIso,
+          attempt,
+          token,
+        );
+      return changed.changes === 1 ? pendingUntil : null;
+    })
+    .immediate();
+}
+
+/**
+ * Settle a successfully completed Docker create. The pending deadline is
+ * cleared even when a concurrent cancellation or lifecycle fence now denies
+ * startup; the durable cleanup identity remains until Docker absence is proved.
+ */
+export function finishExternalCapabilityRunContainerCreation(
+  id: string,
+  owner: string,
+  token: number,
+  attempt: number,
+  pendingUntil: string,
+  leaseMs: number,
+): boolean {
+  if (
+    !isValidExternalCapabilityContainerCreateDuration(leaseMs) ||
+    Number.isNaN(Date.parse(pendingUntil))
+  ) {
+    return false;
+  }
+  return db
+    .transaction(() => {
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
+      const authorized = db
+        .prepare(
+          `SELECT 1
+           FROM external_capability_runs run
+           JOIN external_capabilities capability
+             ON capability.slug = run.capability_slug
+           JOIN external_capability_keys key
+             ON key.id = run.key_id
+            AND key.capability_slug = run.capability_slug
+           JOIN registered_groups workspace
+             ON workspace.jid = capability.workspace_jid
+           JOIN users workspace_owner
+             ON workspace_owner.id = workspace.created_by
+           WHERE run.id = ? AND run.status = 'running'
+             AND run.lease_owner = ? AND run.lease_token = ?
+             AND run.attempt = ? AND run.lease_expires_at > ?
+             AND run.started_at IS NULL
+             AND run.container_cleanup_attempt = ?
+             AND run.container_cleanup_lease_token = ?
+             AND run.container_create_pending_until = ?
+             AND run.container_create_pending_until > ?
+             AND capability.status = 'active' AND key.status = 'active'
+             AND workspace_owner.status = 'active'
+             AND workspace.folder = capability.workspace_folder
+             AND COALESCE(workspace.execution_mode, 'container') = 'container'`,
+        )
+        .get(
+          id,
+          owner,
+          token,
+          attempt,
+          nowIso,
+          attempt,
+          token,
+          pendingUntil,
+          nowIso,
+        );
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_runs
+           SET container_create_pending_until = NULL,
+               lease_expires_at = CASE WHEN ? THEN ? ELSE lease_expires_at END,
+               updated_at = ?
+           WHERE id = ? AND container_cleanup_attempt = ?
+             AND container_cleanup_lease_token = ?
+             AND container_create_pending_until = ?`,
+        )
+        .run(
+          authorized ? 1 : 0,
+          expiresAt,
+          nowIso,
+          id,
+          attempt,
+          token,
+          pendingUntil,
+        );
+      return changed.changes === 1 && Boolean(authorized);
+    })
+    .immediate();
+}
+
+function wakeExternalCapabilityCostQuotaRetries(now: string): void {
+  db.prepare(
+    `UPDATE external_capability_runs
+     SET available_at = ?, updated_at = ?
+     WHERE status = 'retry_wait'
+       AND error_code = 'PROVIDER_COST_QUOTA_EXCEEDED'
+       AND available_at > ?`,
+  ).run(now, now, now);
+}
+
+function fenceExternalCostReservationForCancellation(
+  runId: string,
+  startedAt: string | null,
+  now: string,
+): void {
+  const state = startedAt ? 'uncertain' : 'released';
+  const changed = db
+    .prepare(
+      `UPDATE external_capability_cost_reservations
+       SET state = ?, settled_at = ?
+       WHERE run_id = ? AND state = 'active'`,
+    )
+    .run(state, now, runId);
+  if (state === 'released' && changed.changes > 0) {
+    wakeExternalCapabilityCostQuotaRetries(now);
+  }
 }
 
 export interface CancelExternalCapabilityRunResult {
@@ -5547,26 +8874,27 @@ export function cancelExternalCapabilityRun(
   keyId: string,
   id: string,
 ): CancelExternalCapabilityRunResult | undefined {
-  return db.transaction(() => {
-    const existing = db
-      .prepare(
-        `SELECT * FROM external_capability_runs
+  return db
+    .transaction(() => {
+      const existing = db
+        .prepare(
+          `SELECT * FROM external_capability_runs
          WHERE id = ? AND capability_slug = ? AND key_id = ?`,
-      )
-      .get(id, capabilitySlug, keyId) as ExternalCapabilityRunRow | undefined;
-    if (!existing) return undefined;
-    if (
-      existing.status === 'succeeded' ||
-      existing.status === 'failed' ||
-      existing.status === 'cancelled'
-    ) {
-      return { run: mapExternalCapabilityRunRow(existing), cancelled: false };
-    }
+        )
+        .get(id, capabilitySlug, keyId) as ExternalCapabilityRunRow | undefined;
+      if (!existing) return undefined;
+      if (
+        existing.status === 'succeeded' ||
+        existing.status === 'failed' ||
+        existing.status === 'cancelled'
+      ) {
+        return { run: mapExternalCapabilityRunRow(existing), cancelled: false };
+      }
 
-    const now = new Date().toISOString();
-    const changed = db
-      .prepare(
-        `UPDATE external_capability_runs
+      const now = new Date().toISOString();
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_runs
          SET status = 'cancelled', completed_at = ?, updated_at = ?,
              error_code = 'CANCELLED_BY_CALLER',
              error_message = 'The caller cancelled this task.',
@@ -5574,42 +8902,191 @@ export function cancelExternalCapabilityRun(
              lease_token = lease_token + 1
          WHERE id = ? AND capability_slug = ? AND key_id = ?
            AND status IN ('queued', 'running', 'retry_wait')`,
-      )
-      .run(now, now, id, capabilitySlug, keyId);
-    const run = getExternalCapabilityRunById(id)!;
-    return { run, cancelled: changed.changes === 1 };
-  })();
+        )
+        .run(now, now, id, capabilitySlug, keyId);
+      if (changed.changes === 1) {
+        fenceExternalCostReservationForCancellation(
+          id,
+          existing.started_at,
+          now,
+        );
+      }
+      const run = getExternalCapabilityRunById(id)!;
+      return { run, cancelled: changed.changes === 1 };
+    })
+    .immediate();
+}
+
+/**
+ * Operator incident stop scoped by capability rather than bearer credential.
+ * The durable token bump is authoritative even when the executing worker is in
+ * another process; the control-plane route separately requests a local stop.
+ */
+export function cancelExternalCapabilityRunByOperator(
+  capabilitySlug: string,
+  id: string,
+): CancelExternalCapabilityRunResult | undefined {
+  return db
+    .transaction(() => {
+      const existing = db
+        .prepare(
+          `SELECT * FROM external_capability_runs
+         WHERE id = ? AND capability_slug = ?`,
+        )
+        .get(id, capabilitySlug) as ExternalCapabilityRunRow | undefined;
+      if (!existing) return undefined;
+      if (
+        existing.status === 'succeeded' ||
+        existing.status === 'failed' ||
+        existing.status === 'cancelled'
+      ) {
+        return { run: mapExternalCapabilityRunRow(existing), cancelled: false };
+      }
+
+      const now = new Date().toISOString();
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_runs
+         SET status = 'cancelled', completed_at = ?, updated_at = ?,
+             error_code = 'CANCELLED_BY_OPERATOR',
+             error_message = 'An operator stopped this task.',
+             lease_owner = NULL, lease_expires_at = NULL,
+             lease_token = lease_token + 1
+         WHERE id = ? AND capability_slug = ?
+           AND status IN ('queued', 'running', 'retry_wait')`,
+        )
+        .run(now, now, id, capabilitySlug);
+      if (changed.changes === 1) {
+        fenceExternalCostReservationForCancellation(
+          id,
+          existing.started_at,
+          now,
+        );
+      }
+      const run = getExternalCapabilityRunById(id)!;
+      return { run, cancelled: changed.changes === 1 };
+    })
+    .immediate();
 }
 
 export function listExternalCapabilityRunsForRetention(
   completedBefore: string,
+  limit = 50,
+  after?: { completedAt: string; id: string },
+  createPendingBefore = new Date().toISOString(),
 ): ExternalCapabilityRun[] {
-  const rows = db
-    .prepare(
-      `SELECT * FROM external_capability_runs
-       WHERE status IN ('succeeded', 'failed', 'cancelled')
-         AND completed_at IS NOT NULL AND completed_at < ?
-         AND lease_owner IS NULL AND lease_expires_at IS NULL
-       ORDER BY completed_at, id`,
-    )
-    .all(completedBefore) as ExternalCapabilityRunRow[];
+  const boundedLimit = Number.isSafeInteger(limit)
+    ? Math.max(1, Math.min(500, limit))
+    : 50;
+  const baseSql = `SELECT * FROM external_capability_runs
+    INDEXED BY idx_external_capability_runs_retention_due
+    WHERE retention_cleaned_at IS NULL
+      AND status IN ('succeeded', 'failed', 'cancelled')
+      AND completed_at IS NOT NULL AND completed_at <= ?
+      AND lease_owner IS NULL AND lease_expires_at IS NULL
+      AND (
+        container_create_pending_until IS NULL
+        OR container_create_pending_until <= ?
+      )`;
+  const rows = after
+    ? (db
+        .prepare(
+          `${baseSql}
+           AND (completed_at > ? OR (completed_at = ? AND id > ?))
+           ORDER BY completed_at, id
+           LIMIT ?`,
+        )
+        .all(
+          completedBefore,
+          createPendingBefore,
+          after.completedAt,
+          after.completedAt,
+          after.id,
+          boundedLimit,
+        ) as ExternalCapabilityRunRow[])
+    : (db
+        .prepare(
+          `${baseSql}
+           ORDER BY completed_at, id
+           LIMIT ?`,
+        )
+        .all(
+          completedBefore,
+          createPendingBefore,
+          boundedLimit,
+        ) as ExternalCapabilityRunRow[]);
   return rows.map(mapExternalCapabilityRunRow);
 }
 
-export function deleteExternalCapabilityRunForRetention(
+export function sanitizeExternalCapabilityRunForRetention(
   id: string,
   completedBefore: string,
 ): boolean {
-  const changed = db
-    .prepare(
-      `DELETE FROM external_capability_runs
-       WHERE id = ?
-         AND status IN ('succeeded', 'failed', 'cancelled')
-         AND completed_at IS NOT NULL AND completed_at < ?
-         AND lease_owner IS NULL AND lease_expires_at IS NULL`,
-    )
-    .run(id, completedBefore);
-  return changed.changes === 1;
+  return db.transaction(() => {
+    const row = db
+      .prepare(
+        `SELECT * FROM external_capability_runs
+         WHERE id = ?
+           AND retention_cleaned_at IS NULL
+           AND status IN ('succeeded', 'failed', 'cancelled')
+           AND completed_at IS NOT NULL AND completed_at <= ?
+           AND lease_owner IS NULL AND lease_expires_at IS NULL
+           AND container_cleanup_attempt IS NULL
+           AND container_cleanup_lease_token IS NULL
+           AND container_create_pending_until IS NULL`,
+      )
+      .get(id, completedBefore) as ExternalCapabilityRunRow | undefined;
+    if (!row) return false;
+
+    const manifest = parseExternalRunRecord(row.input_manifest, {}) ?? {};
+    if (manifest.retentionTombstone === true) return false;
+    const result = parseExternalRunRecord(row.result, null);
+    const output = result && isJsonRecord(result.output) ? result.output : null;
+    const cleanedAt = new Date().toISOString();
+    const retainedManifest = JSON.stringify({
+      version: 1,
+      retentionTombstone: true,
+      requestFingerprint: externalRequestFingerprint(row.input_manifest),
+      requestContextSha256: externalRequestContextFingerprint({
+        tenantRef: row.tenant_ref,
+        accountRef: row.account_ref,
+        callbackContext: row.callback_context,
+      }),
+      manifestSha256: crypto
+        .createHash('sha256')
+        .update(row.input_manifest)
+        .digest('hex'),
+      retainedInputBytes: row.input_bytes,
+      resultSha256:
+        output && typeof output.sha256 === 'string' ? output.sha256 : null,
+      cleanedAt,
+    });
+    const changed = db
+      .prepare(
+        `UPDATE external_capability_runs
+         SET tenant_ref = NULL, account_ref = NULL, callback_context = NULL,
+             input_manifest = ?, result = NULL, error_message = NULL,
+             retention_cleaned_at = ?, updated_at = ?
+         WHERE id = ?
+           AND retention_cleaned_at IS NULL
+           AND status IN ('succeeded', 'failed', 'cancelled')
+           AND completed_at IS NOT NULL AND completed_at <= ?
+           AND lease_owner IS NULL AND lease_expires_at IS NULL
+           AND container_cleanup_attempt IS NULL
+           AND container_cleanup_lease_token IS NULL
+           AND container_create_pending_until IS NULL
+           AND input_manifest = ?`,
+      )
+      .run(
+        retainedManifest,
+        cleanedAt,
+        cleanedAt,
+        id,
+        completedBefore,
+        row.input_manifest,
+      );
+    return changed.changes === 1;
+  })();
 }
 
 export function claimNextExternalCapabilityRun(
@@ -5628,10 +9105,11 @@ export function claimNextExternalCapabilityRun(
   const now = new Date();
   const nowIso = now.toISOString();
   const expiresAt = new Date(now.getTime() + leaseMs).toISOString();
-  return db.transaction(() => {
-    const candidate = db
-      .prepare(
-        `SELECT candidate.* FROM external_capability_runs candidate
+  return db
+    .transaction(() => {
+      const candidate = db
+        .prepare(
+          `SELECT candidate.* FROM external_capability_runs candidate
          WHERE (
            (candidate.status IN ('queued', 'retry_wait') AND candidate.available_at <= ?)
            OR (candidate.status = 'running'
@@ -5639,113 +9117,999 @@ export function claimNextExternalCapabilityRun(
                AND candidate.lease_expires_at <= ?
                AND candidate.started_at IS NULL)
          )
+         AND (
+           candidate.container_create_pending_until IS NULL
+           OR candidate.container_create_pending_until <= ?
+         )
          AND EXISTS (
            SELECT 1 FROM external_capabilities capability
            JOIN external_capability_keys key ON key.id = candidate.key_id
+           JOIN registered_groups workspace ON workspace.jid = capability.workspace_jid
+           JOIN users owner ON owner.id = workspace.created_by
            WHERE capability.slug = candidate.capability_slug
              AND capability.status = 'active' AND key.status = 'active'
+             AND owner.status = 'active'
          )
          AND (
            SELECT COUNT(*) FROM external_capability_runs active_run
-           WHERE active_run.status = 'running'
-             AND active_run.lease_expires_at > ?
+           WHERE active_run.id <> candidate.id AND (
+             (active_run.status = 'running' AND (
+               active_run.lease_expires_at > ?
+               OR active_run.started_at IS NOT NULL
+             ))
+             OR active_run.container_create_pending_until > ?
+             OR active_run.container_cleanup_attempt IS NOT NULL
+             OR active_run.container_cleanup_lease_token IS NOT NULL
+           )
          ) < ?
          AND (
            SELECT COUNT(*) FROM external_capability_runs capability_run
-           WHERE capability_run.status = 'running'
-             AND capability_run.lease_expires_at > ?
+           WHERE capability_run.id <> candidate.id AND (
+             (capability_run.status = 'running' AND (
+               capability_run.lease_expires_at > ?
+               OR capability_run.started_at IS NOT NULL
+             ))
+             OR capability_run.container_create_pending_until > ?
+             OR capability_run.container_cleanup_attempt IS NOT NULL
+             OR capability_run.container_cleanup_lease_token IS NOT NULL
+           )
              AND capability_run.capability_slug = candidate.capability_slug
          ) < ?
          AND (
            SELECT COUNT(*) FROM external_capability_runs key_run
-           WHERE key_run.status = 'running'
-             AND key_run.lease_expires_at > ?
+           WHERE key_run.id <> candidate.id AND (
+             (key_run.status = 'running' AND (
+               key_run.lease_expires_at > ?
+               OR key_run.started_at IS NOT NULL
+             ))
+             OR key_run.container_create_pending_until > ?
+             OR key_run.container_cleanup_attempt IS NOT NULL
+             OR key_run.container_cleanup_lease_token IS NOT NULL
+           )
              AND key_run.key_id = candidate.key_id
          ) < ?
          ORDER BY candidate.available_at, candidate.created_at LIMIT 1`,
-      )
-      .get(
-        nowIso,
-        nowIso,
-        nowIso,
-        globalConcurrency,
-        nowIso,
-        capabilityConcurrency,
-        nowIso,
-        keyConcurrency,
-      ) as ExternalCapabilityRunRow | undefined;
-    if (!candidate) return undefined;
-    const nextToken = candidate.lease_token + 1;
-    const changed = db
-      .prepare(
-        `UPDATE external_capability_runs
+        )
+        .get(
+          nowIso,
+          nowIso,
+          nowIso,
+          nowIso,
+          nowIso,
+          globalConcurrency,
+          nowIso,
+          nowIso,
+          capabilityConcurrency,
+          nowIso,
+          nowIso,
+          keyConcurrency,
+        ) as ExternalCapabilityRunRow | undefined;
+      if (!candidate) return undefined;
+      const nextToken = candidate.lease_token + 1;
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_runs
          SET status = 'running', lease_owner = ?, lease_token = ?,
-             lease_expires_at = ?, attempt = attempt + 1, updated_at = ?
+             lease_expires_at = ?,
+             attempt = attempt + CASE WHEN status = 'running' THEN 0 ELSE 1 END,
+             updated_at = ?
          WHERE id = ? AND (
            (status IN ('queued', 'retry_wait') AND available_at <= ?)
            OR (status = 'running' AND lease_expires_at IS NOT NULL
                AND lease_expires_at <= ? AND started_at IS NULL)
+         )
+         AND (
+           container_create_pending_until IS NULL
+           OR container_create_pending_until <= ?
          ) AND EXISTS (
            SELECT 1 FROM external_capabilities capability
            JOIN external_capability_keys key ON key.id = external_capability_runs.key_id
            WHERE capability.slug = external_capability_runs.capability_slug
              AND capability.status = 'active' AND key.status = 'active'
          )`,
-      )
-      .run(owner, nextToken, expiresAt, nowIso, candidate.id, nowIso, nowIso);
-    if (changed.changes !== 1) return undefined;
-    return getExternalCapabilityRunById(
-      candidate.id,
-    ) as ClaimedExternalCapabilityRun;
-  })();
+        )
+        .run(
+          owner,
+          nextToken,
+          expiresAt,
+          nowIso,
+          candidate.id,
+          nowIso,
+          nowIso,
+          nowIso,
+        );
+      if (changed.changes !== 1) return undefined;
+      return getExternalCapabilityRunById(
+        candidate.id,
+      ) as ClaimedExternalCapabilityRun;
+    })
+    .immediate();
 }
 
-/** Mark the at-most-once boundary immediately before invoking an Agent. */
+function withFullSynchronousExternalBoundary<T>(operation: () => T): T {
+  const previousSynchronous = db.pragma('synchronous', {
+    simple: true,
+  }) as number;
+  db.pragma('synchronous = FULL');
+  try {
+    return operation();
+  } finally {
+    db.pragma(`synchronous = ${previousSynchronous}`);
+  }
+}
+
+export interface ExternalCapabilityProviderCostLimits {
+  reserveUsd: number;
+  globalUsdPerDay: number;
+  capabilityUsdPerDay: number;
+  keyUsdPerDay: number;
+}
+
+const MAX_EXTERNAL_COST_MICROUSD = Number.MAX_SAFE_INTEGER;
+
+function externalUsdToMicrousd(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(MAX_EXTERNAL_COST_MICROUSD, Math.ceil(value * 1_000_000));
+}
+
+interface ExternalProviderCostExposure {
+  exposureMicrousd: number;
+  eligibleAfter: string | null;
+}
+
+function getExternalProviderCostExposure(
+  since: string,
+  permittedExistingExposure: number,
+  scopeSql = '',
+  scopeValue?: string,
+): ExternalProviderCostExposure {
+  const row = db
+    .prepare(
+      `WITH exposure_events AS (
+         SELECT created_at AS exposure_at,
+                MAX(reserved_microusd, actual_microusd) AS exposure
+         FROM external_capability_cost_reservations
+         WHERE state IN ('active', 'uncertain')
+           AND created_at >= ? ${scopeSql}
+         UNION ALL
+         SELECT settled_at AS exposure_at, actual_microusd AS exposure
+         FROM external_capability_cost_reservations
+         WHERE state = 'settled' AND settled_at >= ? ${scopeSql}
+       ), exposure_by_time AS (
+         SELECT exposure_at, SUM(exposure) AS exposure
+         FROM exposure_events
+         GROUP BY exposure_at
+         HAVING exposure > 0
+       ), chronological AS (
+         SELECT exposure_at,
+                SUM(exposure) OVER () AS total_exposure,
+                SUM(exposure) OVER (
+                  ORDER BY exposure_at
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS expired_exposure
+         FROM exposure_by_time
+       )
+       SELECT COALESCE(MAX(total_exposure), 0) AS exposure,
+              MIN(CASE
+                WHEN total_exposure - expired_exposure <= ? THEN exposure_at
+                ELSE NULL
+              END) AS eligible_after
+       FROM chronological`,
+    )
+    .get(
+      ...(scopeValue === undefined
+        ? [since, since, permittedExistingExposure]
+        : [since, scopeValue, since, scopeValue, permittedExistingExposure]),
+    ) as { exposure: number; eligible_after: string | null };
+  return {
+    exposureMicrousd: Number(row.exposure) || 0,
+    eligibleAfter: row.eligible_after,
+  };
+}
+
+function getExternalProviderCostRetryAt(
+  nowDate: Date,
+  exposure: ExternalProviderCostExposure,
+  limitMicrousd: number,
+  reserveMicrousd: number,
+): number {
+  const minimumRetryAt = nowDate.getTime() + 60_000;
+  if (
+    limitMicrousd <= 0 ||
+    limitMicrousd < reserveMicrousd ||
+    !exposure.eligibleAfter
+  ) {
+    return minimumRetryAt;
+  }
+  return Math.max(
+    minimumRetryAt,
+    new Date(exposure.eligibleAfter).getTime() + 24 * 60 * 60 * 1_000 + 1_000,
+  );
+}
+
+export type ExternalCapabilityExecutionStartResult =
+  | { outcome: 'started' }
+  | { outcome: 'quota_exceeded'; retryAt: string }
+  | { outcome: 'denied' };
+
+/**
+ * Mark the at-most-once boundary immediately before invoking an Agent and hold
+ * the maximum Provider exposure in the same FULL-synchronous transaction.
+ */
+export function authorizeExternalCapabilityRunExecutionStart(
+  id: string,
+  owner: string,
+  token: number,
+  costLimits?: ExternalCapabilityProviderCostLimits,
+): ExternalCapabilityExecutionStartResult {
+  return withFullSynchronousExternalBoundary(() =>
+    db
+      .transaction(() => {
+        const nowDate = new Date();
+        const now = nowDate.toISOString();
+        const candidate = db
+          .prepare(
+            `SELECT run.capability_slug, run.key_id
+           FROM external_capability_runs run
+           JOIN external_capabilities capability
+             ON capability.slug = run.capability_slug
+           JOIN external_capability_keys key
+             ON key.id = run.key_id
+            AND key.capability_slug = run.capability_slug
+           JOIN registered_groups workspace
+             ON workspace.jid = capability.workspace_jid
+           JOIN users workspace_owner
+             ON workspace_owner.id = workspace.created_by
+           WHERE run.id = ? AND run.status = 'running'
+             AND run.lease_owner = ? AND run.lease_token = ?
+             AND run.lease_expires_at > ? AND run.started_at IS NULL
+             AND run.container_create_pending_until IS NULL
+             AND capability.status = 'active' AND key.status = 'active'
+             AND workspace_owner.status = 'active'
+             AND workspace.folder = capability.workspace_folder
+             AND COALESCE(workspace.execution_mode, 'container') = 'container'`,
+          )
+          .get(id, owner, token, now) as
+          | { capability_slug: string; key_id: string }
+          | undefined;
+        if (!candidate) return { outcome: 'denied' };
+
+        const reserveMicrousd = externalUsdToMicrousd(
+          costLimits?.reserveUsd ?? 0,
+        );
+        if (costLimits && reserveMicrousd > 0) {
+          const since = new Date(
+            nowDate.getTime() - 24 * 60 * 60 * 1_000,
+          ).toISOString();
+          const globalLimit = externalUsdToMicrousd(costLimits.globalUsdPerDay);
+          const capabilityLimit = externalUsdToMicrousd(
+            costLimits.capabilityUsdPerDay,
+          );
+          const keyLimit = externalUsdToMicrousd(costLimits.keyUsdPerDay);
+          const limits = [
+            {
+              ...getExternalProviderCostExposure(
+                since,
+                globalLimit - reserveMicrousd,
+              ),
+              limit: globalLimit,
+            },
+            {
+              ...getExternalProviderCostExposure(
+                since,
+                capabilityLimit - reserveMicrousd,
+                'AND capability_slug = ?',
+                candidate.capability_slug,
+              ),
+              limit: capabilityLimit,
+            },
+            {
+              ...getExternalProviderCostExposure(
+                since,
+                keyLimit - reserveMicrousd,
+                'AND key_id = ?',
+                candidate.key_id,
+              ),
+              limit: keyLimit,
+            },
+          ];
+          const exceeded = limits.filter(
+            ({ exposureMicrousd, limit }) =>
+              limit <= 0 || exposureMicrousd > limit - reserveMicrousd,
+          );
+          if (exceeded.length > 0) {
+            const retryAtMs = Math.max(
+              ...exceeded.map((exposure) =>
+                getExternalProviderCostRetryAt(
+                  nowDate,
+                  exposure,
+                  exposure.limit,
+                  reserveMicrousd,
+                ),
+              ),
+            );
+            return {
+              outcome: 'quota_exceeded',
+              retryAt: new Date(retryAtMs).toISOString(),
+            };
+          }
+        }
+
+        const changed = db
+          .prepare(
+            `UPDATE external_capability_runs
+           SET started_at = ?, updated_at = ?
+           WHERE id = ? AND status = 'running' AND lease_owner = ?
+             AND lease_token = ? AND lease_expires_at > ?
+             AND started_at IS NULL
+             AND container_create_pending_until IS NULL`,
+          )
+          .run(now, now, id, owner, token, now);
+        if (changed.changes !== 1) return { outcome: 'denied' };
+
+        db.prepare(
+          `INSERT INTO external_capability_cost_reservations (
+           run_id, capability_slug, key_id, state, reserved_microusd,
+           actual_microusd, input_tokens, output_tokens,
+           cache_read_input_tokens, cache_creation_input_tokens,
+           reasoning_tokens, lease_token, created_at, settled_at
+         ) VALUES (?, ?, ?, 'active', ?, 0, 0, 0, 0, 0, 0, ?, ?, NULL)
+         ON CONFLICT(run_id) DO UPDATE SET
+           capability_slug = excluded.capability_slug,
+           key_id = excluded.key_id,
+           state = 'active',
+           reserved_microusd = excluded.reserved_microusd,
+           actual_microusd = 0,
+           input_tokens = 0,
+           output_tokens = 0,
+           cache_read_input_tokens = 0,
+           cache_creation_input_tokens = 0,
+           reasoning_tokens = 0,
+           lease_token = excluded.lease_token,
+           created_at = excluded.created_at,
+           settled_at = NULL
+         WHERE external_capability_cost_reservations.state = 'released'
+           AND external_capability_cost_reservations.actual_microusd = 0`,
+        ).run(
+          id,
+          candidate.capability_slug,
+          candidate.key_id,
+          reserveMicrousd,
+          token,
+          now,
+        );
+        const reservation = db
+          .prepare(
+            `SELECT state, lease_token FROM external_capability_cost_reservations
+           WHERE run_id = ?`,
+          )
+          .get(id) as { state: string; lease_token: number } | undefined;
+        if (
+          reservation?.state !== 'active' ||
+          reservation.lease_token !== token
+        ) {
+          throw new Error(
+            'External Provider cost reservation was not acquired',
+          );
+        }
+        return { outcome: 'started' };
+      })
+      .immediate(),
+  );
+}
+
+/** Backward-compatible boolean wrapper for store callers and migrations. */
 export function markExternalCapabilityRunExecutionStarted(
   id: string,
   owner: string,
   token: number,
+  costLimits?: ExternalCapabilityProviderCostLimits,
 ): boolean {
-  const now = new Date().toISOString();
-  const changed = db
-    .prepare(
-      `UPDATE external_capability_runs
-       SET started_at = COALESCE(started_at, ?), updated_at = ?
-       WHERE id = ? AND status = 'running' AND lease_owner = ?
-         AND lease_token = ? AND lease_expires_at > ?
-         AND EXISTS (
-           SELECT 1 FROM external_capabilities capability
-           JOIN external_capability_keys key ON key.id = external_capability_runs.key_id
-           WHERE capability.slug = external_capability_runs.capability_slug
+  return (
+    authorizeExternalCapabilityRunExecutionStart(id, owner, token, costLimits)
+      .outcome === 'started'
+  );
+}
+
+/**
+ * Revalidate and publish START while holding SQLite's cross-process write lock.
+ * The durable START transaction has already committed. This second serialized
+ * boundary prevents cancellation or lifecycle fencing from committing between
+ * the final lease check and atomic decision-file publication.
+ */
+export function publishExternalCapabilityRunExecutionStart(
+  id: string,
+  owner: string,
+  token: number,
+  publishStart: () => void,
+): boolean {
+  return db
+    .transaction(() => {
+      const now = new Date().toISOString();
+      const authorized = db
+        .prepare(
+          `SELECT 1
+           FROM external_capability_runs run
+           JOIN external_capabilities capability
+             ON capability.slug = run.capability_slug
+           JOIN external_capability_keys key
+             ON key.id = run.key_id
+            AND key.capability_slug = run.capability_slug
+           JOIN registered_groups workspace
+             ON workspace.jid = capability.workspace_jid
+           JOIN users workspace_owner
+             ON workspace_owner.id = workspace.created_by
+           JOIN external_capability_cost_reservations reservation
+             ON reservation.run_id = run.id
+            AND reservation.state = 'active'
+            AND reservation.lease_token = run.lease_token
+           WHERE run.id = ? AND run.status = 'running'
+             AND run.lease_owner = ? AND run.lease_token = ?
+             AND run.lease_expires_at > ? AND run.started_at IS NOT NULL
+             AND run.container_create_pending_until IS NULL
              AND capability.status = 'active' AND key.status = 'active'
-         )`,
-    )
-    .run(now, now, id, owner, token, now);
-  return changed.changes === 1;
+             AND workspace_owner.status = 'active'
+             AND workspace.folder = capability.workspace_folder
+             AND COALESCE(workspace.execution_mode, 'container') = 'container'`,
+        )
+        .get(id, owner, token, now);
+      if (!authorized) return false;
+      publishStart();
+      return true;
+    })
+    .immediate();
+}
+
+/**
+ * Revalidate the final Provider boundary while holding SQLite's cross-process
+ * write lock. Cancellation either commits before this check and denies the
+ * confirmation, or waits until the complete acknowledgement is durable.
+ */
+export function publishExternalCapabilityRunExecutionAcknowledgement(
+  id: string,
+  owner: string,
+  token: number,
+  publishAcknowledgement: () => void,
+): boolean {
+  return db
+    .transaction(() => {
+      const now = new Date().toISOString();
+      const authorized = db
+        .prepare(
+          `SELECT 1
+           FROM external_capability_runs run
+           JOIN external_capabilities capability
+             ON capability.slug = run.capability_slug
+           JOIN external_capability_keys key
+             ON key.id = run.key_id
+            AND key.capability_slug = run.capability_slug
+           JOIN registered_groups workspace
+             ON workspace.jid = capability.workspace_jid
+           JOIN users workspace_owner
+             ON workspace_owner.id = workspace.created_by
+           JOIN external_capability_cost_reservations reservation
+             ON reservation.run_id = run.id
+            AND reservation.state = 'active'
+            AND reservation.lease_token = run.lease_token
+           WHERE run.id = ? AND run.status = 'running'
+             AND run.lease_owner = ? AND run.lease_token = ?
+             AND run.lease_expires_at > ? AND run.started_at IS NOT NULL
+             AND run.container_create_pending_until IS NULL
+             AND capability.status = 'active' AND key.status = 'active'
+             AND workspace_owner.status = 'active'
+             AND workspace.folder = capability.workspace_folder
+             AND COALESCE(workspace.execution_mode, 'container') = 'container'`,
+        )
+        .get(id, owner, token, now);
+      if (!authorized) return false;
+      publishAcknowledgement();
+      return true;
+    })
+    .immediate();
+}
+
+/**
+ * Roll back START only when its decision was never made visible to the runner.
+ * Reapply every durable lifecycle fence in the same FULL-synchronous
+ * transaction: a one-shot pause/revocation sweep may have skipped this row
+ * while started_at was set, and must not leave it stranded after rollback.
+ */
+export function rollbackExternalCapabilityRunExecutionStartBeforePublication(
+  id: string,
+  owner: string,
+  token: number,
+): boolean {
+  return withFullSynchronousExternalBoundary(() =>
+    db
+      .transaction(() => {
+        const now = new Date().toISOString();
+        const cancelledBeforePublication = db
+          .prepare(
+            `SELECT 1
+             FROM external_capability_runs run
+             JOIN external_capability_cost_reservations reservation
+               ON reservation.run_id = run.id
+             WHERE run.id = ? AND run.status = 'cancelled'
+               AND run.started_at IS NOT NULL
+               AND run.lease_owner IS NULL AND run.lease_token = ?
+               AND reservation.state = 'uncertain'
+               AND reservation.actual_microusd = 0
+               AND reservation.lease_token = ?`,
+          )
+          .get(id, token + 1, token);
+        if (cancelledBeforePublication) {
+          const released = db
+            .prepare(
+              `UPDATE external_capability_cost_reservations
+               SET state = 'released', settled_at = ?
+               WHERE run_id = ? AND state = 'uncertain'
+                 AND actual_microusd = 0 AND lease_token = ?`,
+            )
+            .run(now, id, token);
+          if (released.changes === 1) {
+            wakeExternalCapabilityCostQuotaRetries(now);
+            return true;
+          }
+          return false;
+        }
+
+        const fence = db
+          .prepare(
+            `SELECT capability.status AS capability_status,
+                  capability.workspace_folder AS capability_workspace_folder,
+                  key.status AS key_status,
+                  workspace.jid AS workspace_jid,
+                  workspace.folder AS workspace_folder,
+                  workspace.execution_mode AS workspace_execution_mode,
+                  workspace_owner.status AS owner_status
+           FROM external_capability_runs run
+           JOIN external_capabilities capability
+             ON capability.slug = run.capability_slug
+           LEFT JOIN external_capability_keys key
+             ON key.id = run.key_id
+            AND key.capability_slug = run.capability_slug
+           LEFT JOIN registered_groups workspace
+             ON workspace.jid = capability.workspace_jid
+           LEFT JOIN users workspace_owner
+             ON workspace_owner.id = workspace.created_by
+           WHERE run.id = ? AND run.status = 'running'
+             AND run.lease_owner = ? AND run.lease_token = ?
+             AND run.started_at IS NOT NULL`,
+          )
+          .get(id, owner, token) as
+          | {
+              capability_status: ExternalCapability['status'];
+              capability_workspace_folder: string;
+              key_status: ExternalCapabilityKey['status'] | null;
+              workspace_jid: string | null;
+              workspace_folder: string | null;
+              workspace_execution_mode: string | null;
+              owner_status: User['status'] | null;
+            }
+          | undefined;
+        if (!fence) return false;
+
+        let changed: { changes: number };
+        if (fence.owner_status !== 'active') {
+          changed = db
+            .prepare(
+              `UPDATE external_capability_runs
+             SET status = 'cancelled', started_at = NULL,
+                 completed_at = ?, updated_at = ?,
+                 error_code = 'OWNER_INACTIVE',
+                 error_message = 'The capability owner is no longer active.',
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 lease_token = lease_token + 1
+             WHERE id = ? AND status = 'running' AND lease_owner = ?
+               AND lease_token = ? AND started_at IS NOT NULL`,
+            )
+            .run(now, now, id, owner, token);
+        } else if (
+          !fence.workspace_jid ||
+          fence.workspace_folder !== fence.capability_workspace_folder ||
+          (fence.workspace_execution_mode ?? 'container') !== 'container'
+        ) {
+          changed = db
+            .prepare(
+              `UPDATE external_capability_runs
+             SET status = 'failed', started_at = NULL,
+                 completed_at = ?, updated_at = ?,
+                 error_code = 'CAPABILITY_CONFIGURATION_INVALID',
+                 error_message = 'The processing capability is not ready.',
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 lease_token = lease_token + 1
+             WHERE id = ? AND status = 'running' AND lease_owner = ?
+               AND lease_token = ? AND started_at IS NOT NULL`,
+            )
+            .run(now, now, id, owner, token);
+        } else if (fence.key_status !== 'active') {
+          changed = db
+            .prepare(
+              `UPDATE external_capability_runs
+             SET status = 'cancelled', started_at = NULL,
+                 completed_at = ?, updated_at = ?,
+                 error_code = 'KEY_REVOKED',
+                 error_message = 'The capability key was revoked before processing began.',
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 lease_token = lease_token + 1
+             WHERE id = ? AND status = 'running' AND lease_owner = ?
+               AND lease_token = ? AND started_at IS NOT NULL`,
+            )
+            .run(now, now, id, owner, token);
+        } else if (fence.capability_status === 'paused') {
+          changed = db
+            .prepare(
+              `UPDATE external_capability_runs
+             SET status = 'retry_wait', started_at = NULL,
+                 available_at = ?, updated_at = ?,
+                 attempt = MAX(0, attempt - 1),
+                 error_code = 'CAPABILITY_UNAVAILABLE',
+                 error_message = 'The capability is temporarily paused.',
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 lease_token = lease_token + 1
+             WHERE id = ? AND status = 'running' AND lease_owner = ?
+               AND lease_token = ? AND started_at IS NOT NULL`,
+            )
+            .run(now, now, id, owner, token);
+        } else if (fence.capability_status !== 'active') {
+          changed = db
+            .prepare(
+              `UPDATE external_capability_runs
+             SET status = 'cancelled', started_at = NULL,
+                 completed_at = ?, updated_at = ?,
+                 error_code = 'CAPABILITY_UNAVAILABLE',
+                 error_message = 'The capability is no longer accepting queued tasks.',
+                 lease_owner = NULL, lease_expires_at = NULL,
+                 lease_token = lease_token + 1
+             WHERE id = ? AND status = 'running' AND lease_owner = ?
+               AND lease_token = ? AND started_at IS NOT NULL`,
+            )
+            .run(now, now, id, owner, token);
+        } else {
+          changed = db
+            .prepare(
+              `UPDATE external_capability_runs
+             SET started_at = NULL, updated_at = ?
+             WHERE id = ? AND status = 'running' AND lease_owner = ?
+               AND lease_token = ? AND started_at IS NOT NULL`,
+            )
+            .run(now, id, owner, token);
+        }
+        if (changed.changes !== 1) return false;
+
+        const reservation = db
+          .prepare(
+            `SELECT state, actual_microusd, lease_token
+           FROM external_capability_cost_reservations WHERE run_id = ?`,
+          )
+          .get(id) as
+          | { state: string; actual_microusd: number; lease_token: number }
+          | undefined;
+        if (reservation) {
+          if (
+            reservation.state !== 'active' ||
+            reservation.actual_microusd !== 0 ||
+            reservation.lease_token !== token
+          ) {
+            throw new Error(
+              'External START rollback found non-replayable Provider usage',
+            );
+          }
+          const released = db
+            .prepare(
+              `UPDATE external_capability_cost_reservations
+             SET state = 'released', settled_at = ?
+             WHERE run_id = ? AND state = 'active'
+               AND actual_microusd = 0 AND lease_token = ?`,
+            )
+            .run(now, id, token);
+          if (released.changes !== 1) {
+            throw new Error(
+              'External Provider cost reservation release failed',
+            );
+          }
+          wakeExternalCapabilityCostQuotaRetries(now);
+        }
+        return true;
+      })
+      .immediate(),
+  );
 }
 
 /**
  * Never replay a run that may already have caused model/tool side effects.
  * Crashed workers after the execution boundary become a visible safe failure.
  */
-export function failExpiredStartedExternalCapabilityRuns(): number {
-  const now = new Date().toISOString();
-  const changed = db
-    .prepare(
-      `UPDATE external_capability_runs
-       SET status = 'failed', completed_at = ?, updated_at = ?,
-           error_code = COALESCE(error_code, 'PROCESSING_INTERRUPTED'),
-           error_message = COALESCE(error_message, '处理在执行中中断，未自动重试以避免重复处理。'),
-           lease_owner = NULL, lease_expires_at = NULL,
-           lease_token = lease_token + 1
-       WHERE status = 'running' AND started_at IS NOT NULL
-         AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
-    )
-    .run(now, now, now);
-  return changed.changes;
+export function failExpiredStartedExternalCapabilityRuns(
+  excludeRunIds: readonly string[] = [],
+): number {
+  const excluded = [...new Set(excludeRunIds.filter(Boolean))];
+  const exclusionSql = excluded.length
+    ? ` AND id NOT IN (${excluded.map(() => '?').join(', ')})`
+    : '';
+  return db.transaction(() => {
+    const now = new Date().toISOString();
+    db.prepare(
+      `UPDATE external_capability_cost_reservations
+       SET state = 'uncertain', settled_at = ?
+       WHERE state = 'active' AND run_id IN (
+         SELECT id FROM external_capability_runs
+         WHERE status = 'running' AND started_at IS NOT NULL
+           AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+           ${exclusionSql}
+       )`,
+    ).run(now, now, ...excluded);
+    const changed = db
+      .prepare(
+        `UPDATE external_capability_runs
+         SET status = 'failed', completed_at = ?, updated_at = ?,
+             error_code = COALESCE(error_code, 'PROCESSING_INTERRUPTED'),
+             error_message = COALESCE(error_message, '处理在执行中中断，未自动重试以避免重复处理。'),
+             lease_owner = NULL, lease_expires_at = NULL,
+             lease_token = lease_token + 1
+         WHERE status = 'running' AND started_at IS NOT NULL
+           AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+           ${exclusionSql}`,
+      )
+      .run(now, now, now, ...excluded);
+    return changed.changes;
+  })();
 }
 
-/** An unexpired owner/token lease is required for renewal or settlement. */
+export type ExternalCapabilityContainerLeaseFenceResult =
+  | 'active'
+  | 'fenced'
+  | 'stale';
+
+/**
+ * Atomically decide whether a discovered container still owns a live lease. An
+ * expired matching identity is fenced before Docker termination, so a foreign
+ * worker cannot renew the same token between the decision and the stop.
+ */
+export function fenceExternalCapabilityContainerLease(input: {
+  runId: string;
+  attempt: number;
+  leaseToken: number;
+  now?: Date;
+}): ExternalCapabilityContainerLeaseFenceResult {
+  return db
+    .transaction(() => {
+      const row = db
+        .prepare(
+          `SELECT status, attempt, lease_token, lease_expires_at, started_at
+         FROM external_capability_runs WHERE id = ?`,
+        )
+        .get(input.runId) as
+        | {
+            status: ExternalCapabilityRun['status'];
+            attempt: number;
+            lease_token: number;
+            lease_expires_at: string | null;
+            started_at: string | null;
+          }
+        | undefined;
+      if (
+        !row ||
+        row.status !== 'running' ||
+        row.attempt !== input.attempt ||
+        row.lease_token !== input.leaseToken ||
+        !row.lease_expires_at
+      ) {
+        return 'stale';
+      }
+      const now = input.now ?? new Date();
+      const nowIso = now.toISOString();
+      if (row.lease_expires_at > nowIso) return 'active';
+
+      if (row.started_at !== null) {
+        const changed = db
+          .prepare(
+            `UPDATE external_capability_runs
+             SET updated_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+                 lease_token = lease_token + 1,
+                 container_create_pending_until = NULL,
+                 error_code = 'START_RECOVERY_PENDING',
+                 error_message = 'Start publication recovery is pending.'
+             WHERE id = ? AND status = 'running' AND attempt = ?
+               AND lease_token = ? AND lease_expires_at <= ?`,
+          )
+          .run(nowIso, input.runId, input.attempt, input.leaseToken, nowIso);
+        if (changed.changes !== 1) return 'stale';
+      } else {
+        const changed = db
+          .prepare(
+            `UPDATE external_capability_runs
+           SET status = 'retry_wait', available_at = ?, updated_at = ?,
+               attempt = MAX(0, attempt - 1),
+               error_code = 'CAPABILITY_UNAVAILABLE',
+               error_message = 'The previous worker lease expired before processing began.',
+               lease_owner = NULL, lease_expires_at = NULL,
+               lease_token = lease_token + 1,
+               container_create_pending_until = NULL
+           WHERE id = ? AND status = 'running' AND attempt = ?
+             AND lease_token = ? AND lease_expires_at <= ?`,
+          )
+          .run(
+            nowIso,
+            nowIso,
+            input.runId,
+            input.attempt,
+            input.leaseToken,
+            nowIso,
+          );
+        if (changed.changes !== 1) return 'stale';
+      }
+      return 'fenced';
+    })
+    .immediate();
+}
+
+export function fenceExpiredStartedExternalCapabilityRunsForRecovery(
+  excludeRunIds: readonly string[] = [],
+): string[] {
+  const excluded = [...new Set(excludeRunIds.filter(Boolean))];
+  const exclusionSql = excluded.length
+    ? ` AND id NOT IN (${excluded.map(() => '?').join(', ')})`
+    : '';
+  return db
+    .transaction(() => {
+      const now = new Date().toISOString();
+      const rows = db
+        .prepare(
+          `SELECT id
+           FROM external_capability_runs
+           WHERE status = 'running' AND started_at IS NOT NULL
+             AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+             AND container_create_pending_until IS NULL
+             ${exclusionSql}
+           ORDER BY id`,
+        )
+        .all(now, ...excluded) as Array<{ id: string }>;
+      if (rows.length === 0) return [];
+      const ids = rows.map((row) => row.id);
+      const placeholders = ids.map(() => '?').join(', ');
+      db.prepare(
+        `UPDATE external_capability_runs
+         SET updated_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+             lease_token = lease_token + 1,
+             error_code = 'START_RECOVERY_PENDING',
+             error_message = 'Start publication recovery is pending.'
+         WHERE id IN (${placeholders}) AND status = 'running'
+           AND started_at IS NOT NULL AND lease_expires_at IS NOT NULL
+           AND lease_expires_at <= ?
+           AND container_create_pending_until IS NULL`,
+      ).run(now, ...ids, now);
+      return ids;
+    })
+    .immediate();
+}
+
+export function listExternalCapabilityRunsAwaitingStartRecovery(): Array<{
+  id: string;
+  attempt: number;
+  leaseToken: number;
+}> {
+  return (
+    db
+      .prepare(
+        `SELECT id, attempt, lease_token
+         FROM external_capability_runs
+         WHERE status = 'running' AND started_at IS NOT NULL
+           AND lease_owner IS NULL AND lease_expires_at IS NULL
+           AND lease_token > 0
+           AND container_create_pending_until IS NULL
+           AND error_code = 'START_RECOVERY_PENDING'
+         ORDER BY id`,
+      )
+      .all() as Array<{ id: string; attempt: number; lease_token: number }>
+  ).map((row) => ({
+    id: row.id,
+    attempt: row.attempt,
+    // Fencing invalidates the expired owner by incrementing its lease token.
+    // Filesystem evidence belongs to that immediately preceding lease only.
+    leaseToken: row.lease_token - 1,
+  }));
+}
+
+export function resolveExternalCapabilityRunStartRecovery(
+  id: string,
+  startDefinitelyUnpublished: boolean,
+  maxPrestartAttempts = 3,
+): boolean {
+  if (!Number.isSafeInteger(maxPrestartAttempts) || maxPrestartAttempts < 1) {
+    throw new Error('External pre-START attempt limit is invalid');
+  }
+  return db
+    .transaction(() => {
+      const reservation = db
+        .prepare(
+          `SELECT reservation.state, reservation.actual_microusd, run.attempt
+           FROM external_capability_cost_reservations reservation
+           JOIN external_capability_runs run ON run.id = reservation.run_id
+           WHERE reservation.run_id = ?`,
+        )
+        .get(id) as
+        | { state: string; actual_microusd: number; attempt: number }
+        | undefined;
+      const now = new Date().toISOString();
+      if (
+        startDefinitelyUnpublished &&
+        reservation?.state === 'active' &&
+        reservation.actual_microusd === 0
+      ) {
+        const retryAllowed = reservation.attempt < maxPrestartAttempts;
+        const changed = retryAllowed
+          ? db
+              .prepare(
+                `UPDATE external_capability_runs
+                 SET status = 'retry_wait', available_at = ?, started_at = NULL,
+                     completed_at = NULL, updated_at = ?,
+                     error_code = 'CAPABILITY_UNAVAILABLE',
+                     error_message = 'The previous worker stopped before START was published.'
+                 WHERE id = ? AND status = 'running' AND started_at IS NOT NULL
+                   AND lease_owner IS NULL AND lease_expires_at IS NULL
+                   AND container_cleanup_attempt IS NULL
+                   AND container_cleanup_lease_token IS NULL
+                   AND container_create_pending_until IS NULL
+                   AND error_code = 'START_RECOVERY_PENDING'`,
+              )
+              .run(now, now, id)
+          : db
+              .prepare(
+                `UPDATE external_capability_runs
+                 SET status = 'failed', started_at = NULL,
+                     completed_at = ?, updated_at = ?,
+                     error_code = 'PRESTART_RETRY_EXHAUSTED',
+                     error_message = 'The run exhausted its retry limit before START publication.'
+                 WHERE id = ? AND status = 'running' AND started_at IS NOT NULL
+                   AND lease_owner IS NULL AND lease_expires_at IS NULL
+                   AND container_cleanup_attempt IS NULL
+                   AND container_cleanup_lease_token IS NULL
+                   AND container_create_pending_until IS NULL
+                   AND error_code = 'START_RECOVERY_PENDING'`,
+              )
+              .run(now, now, id);
+        if (changed.changes !== 1) return false;
+        const released = db
+          .prepare(
+            `UPDATE external_capability_cost_reservations
+             SET state = 'released', settled_at = ?
+             WHERE run_id = ? AND state = 'active' AND actual_microusd = 0`,
+          )
+          .run(now, id);
+        if (released.changes !== 1) {
+          throw new Error('External Provider cost reservation release failed');
+        }
+        wakeExternalCapabilityCostQuotaRetries(now);
+        return true;
+      }
+
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_runs
+           SET status = 'failed', completed_at = ?, updated_at = ?,
+               error_code = 'PROCESSING_INTERRUPTED',
+               error_message = '处理在执行中中断，未自动重试以避免重复处理。'
+           WHERE id = ? AND status = 'running' AND started_at IS NOT NULL
+             AND lease_owner IS NULL AND lease_expires_at IS NULL
+             AND container_cleanup_attempt IS NULL
+             AND container_cleanup_lease_token IS NULL
+             AND container_create_pending_until IS NULL
+             AND error_code = 'START_RECOVERY_PENDING'`,
+        )
+        .run(now, now, id);
+      if (changed.changes !== 1) return false;
+      db.prepare(
+        `UPDATE external_capability_cost_reservations
+         SET state = 'uncertain', settled_at = ?
+         WHERE run_id = ? AND state = 'active'`,
+      ).run(now, id);
+      return true;
+    })
+    .immediate();
+}
+
+/** Lease expiry permits takeover; owner plus token remains the commit fence. */
 export function renewExternalCapabilityRunLease(
   id: string,
   owner: string,
@@ -5783,16 +10147,204 @@ export function releaseExternalCapabilityRunForRetry(
            error_message = ?, attempt = ${attemptExpr}, lease_owner = NULL,
            lease_expires_at = NULL, updated_at = ?
        WHERE id = ? AND status = 'running' AND lease_owner = ?
-         AND lease_token = ? AND lease_expires_at > ?`,
+         AND lease_token = ? AND lease_expires_at > ?
+         AND started_at IS NULL
+         AND container_create_pending_until IS NULL`,
     )
     .run(availableAt, error.code, error.message, now, id, owner, token, now);
   return changed.changes === 1;
+}
+
+export interface ExternalCapabilityUsageEventInput {
+  eventId: string;
+  providerCostUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningTokens: number;
+}
+
+function requireExternalUsageCount(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Invalid external usage ${field}`);
+  }
+  return value;
+}
+
+export type ExternalCapabilityUsageWriteResult =
+  | 'inserted'
+  | 'duplicate'
+  | 'fenced'
+  | 'conflict';
+
+/** Persist one trusted runner usage delta exactly once under the active lease. */
+export function writeExternalCapabilityRunUsage(
+  id: string,
+  owner: string,
+  token: number,
+  input: ExternalCapabilityUsageEventInput,
+): ExternalCapabilityUsageWriteResult {
+  const eventId = input.eventId.trim();
+  if (!eventId || eventId.length > 500) {
+    throw new Error('Invalid external usage event ID');
+  }
+  if (!Number.isFinite(input.providerCostUsd) || input.providerCostUsd < 0) {
+    throw new Error('Invalid external usage providerCostUsd');
+  }
+  const providerCostMicrousd = externalUsdToMicrousd(input.providerCostUsd);
+  const inputTokens = requireExternalUsageCount(
+    input.inputTokens,
+    'inputTokens',
+  );
+  const outputTokens = requireExternalUsageCount(
+    input.outputTokens,
+    'outputTokens',
+  );
+  const cacheReadInputTokens = requireExternalUsageCount(
+    input.cacheReadInputTokens,
+    'cacheReadInputTokens',
+  );
+  const cacheCreationInputTokens = requireExternalUsageCount(
+    input.cacheCreationInputTokens,
+    'cacheCreationInputTokens',
+  );
+  const reasoningTokens = requireExternalUsageCount(
+    input.reasoningTokens,
+    'reasoningTokens',
+  );
+
+  return db
+    .transaction(() => {
+      const now = new Date().toISOString();
+      const authorized = db
+        .prepare(
+          `SELECT 1 FROM external_capability_runs run
+         JOIN external_capability_cost_reservations reservation
+           ON reservation.run_id = run.id
+         WHERE run.id = ? AND run.status = 'running'
+           AND run.started_at IS NOT NULL
+           AND run.lease_owner = ? AND run.lease_token = ?
+           AND run.lease_expires_at > ?
+           AND reservation.state = 'active'
+           AND reservation.lease_token = ?`,
+        )
+        .get(id, owner, token, now, token);
+      if (!authorized) return 'fenced';
+
+      const existing = db
+        .prepare(
+          `SELECT run_id, provider_cost_microusd, input_tokens, output_tokens,
+                  cache_read_input_tokens, cache_creation_input_tokens,
+                  reasoning_tokens
+           FROM external_capability_usage_events WHERE event_id = ?`,
+        )
+        .get(eventId) as
+        | {
+            run_id: string;
+            provider_cost_microusd: number;
+            input_tokens: number;
+            output_tokens: number;
+            cache_read_input_tokens: number;
+            cache_creation_input_tokens: number;
+            reasoning_tokens: number;
+          }
+        | undefined;
+      if (existing) {
+        return existing.run_id === id &&
+          existing.provider_cost_microusd === providerCostMicrousd &&
+          existing.input_tokens === inputTokens &&
+          existing.output_tokens === outputTokens &&
+          existing.cache_read_input_tokens === cacheReadInputTokens &&
+          existing.cache_creation_input_tokens === cacheCreationInputTokens &&
+          existing.reasoning_tokens === reasoningTokens
+          ? 'duplicate'
+          : 'conflict';
+      }
+
+      const inserted = db
+        .prepare(
+          `INSERT INTO external_capability_usage_events (
+           event_id, run_id, provider_cost_microusd, input_tokens,
+           output_tokens, cache_read_input_tokens,
+           cache_creation_input_tokens, reasoning_tokens, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          eventId,
+          id,
+          providerCostMicrousd,
+          inputTokens,
+          outputTokens,
+          cacheReadInputTokens,
+          cacheCreationInputTokens,
+          reasoningTokens,
+          now,
+        );
+      if (inserted.changes !== 1) {
+        throw new Error('External usage event insertion failed');
+      }
+
+      const accumulated = db
+        .prepare(
+          `UPDATE external_capability_cost_reservations
+         SET actual_microusd = actual_microusd + ?,
+             input_tokens = input_tokens + ?,
+             output_tokens = output_tokens + ?,
+             cache_read_input_tokens = cache_read_input_tokens + ?,
+             cache_creation_input_tokens = cache_creation_input_tokens + ?,
+             reasoning_tokens = reasoning_tokens + ?
+         WHERE run_id = ? AND state = 'active' AND lease_token = ?`,
+        )
+        .run(
+          providerCostMicrousd,
+          inputTokens,
+          outputTokens,
+          cacheReadInputTokens,
+          cacheCreationInputTokens,
+          reasoningTokens,
+          id,
+          token,
+        );
+      if (accumulated.changes !== 1) {
+        throw new Error('External usage reservation settlement was fenced');
+      }
+      return 'inserted';
+    })
+    .immediate();
+}
+
+/** Backward-compatible boolean wrapper for callers that only need insertion. */
+export function recordExternalCapabilityRunUsage(
+  id: string,
+  owner: string,
+  token: number,
+  input: ExternalCapabilityUsageEventInput,
+): boolean {
+  return (
+    writeExternalCapabilityRunUsage(id, owner, token, input) === 'inserted'
+  );
+}
+
+export function getExternalCapabilityCostReservationForTest(
+  runId: string,
+): Record<string, unknown> | undefined {
+  return db
+    .prepare(
+      'SELECT * FROM external_capability_cost_reservations WHERE run_id = ?',
+    )
+    .get(runId) as Record<string, unknown> | undefined;
 }
 
 export interface CompleteExternalCapabilityRunInput {
   status: 'succeeded' | 'failed' | 'cancelled';
   result?: Record<string, unknown> | null;
   error?: { code: string; message: string } | null;
+  /**
+   * Set only after the final trusted usage batch was persisted. Omitting this
+   * keeps any active Provider-cost reservation conservatively uncertain.
+   */
+  providerCostDisposition?: 'settled' | 'uncertain';
 }
 
 export function completeExternalCapabilityRun(
@@ -5820,29 +10372,45 @@ export function completeExternalCapabilityRun(
   const result = input.result
     ? serializeExternalRunRecord(input.result, 'result')
     : null;
-  const now = new Date().toISOString();
-  const changed = db
-    .prepare(
-      `UPDATE external_capability_runs
-       SET status = ?, result = ?, error_code = ?, error_message = ?,
-           completed_at = ?, lease_owner = NULL, lease_expires_at = NULL,
-           updated_at = ?
-       WHERE id = ? AND status = 'running' AND lease_owner = ?
-         AND lease_token = ? AND lease_expires_at > ?`,
-    )
-    .run(
-      input.status,
-      result,
-      input.error?.code ?? null,
-      input.error?.message ?? null,
-      now,
-      now,
-      id,
-      owner,
-      token,
-      now,
-    );
-  return changed.changes === 1;
+  return db.transaction(() => {
+    const now = new Date().toISOString();
+    const changed = db
+      .prepare(
+        `UPDATE external_capability_runs
+         SET status = ?, result = ?, error_code = ?, error_message = ?,
+             completed_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+             updated_at = ?
+         WHERE id = ? AND status = 'running' AND lease_owner = ?
+           AND lease_token = ? AND lease_expires_at > ?
+           AND container_create_pending_until IS NULL`,
+      )
+      .run(
+        input.status,
+        result,
+        input.error?.code ?? null,
+        input.error?.message ?? null,
+        now,
+        now,
+        id,
+        owner,
+        token,
+        now,
+      );
+    if (changed.changes !== 1) return false;
+    const providerCostDisposition =
+      input.providerCostDisposition ?? 'uncertain';
+    const settled = db
+      .prepare(
+        `UPDATE external_capability_cost_reservations
+         SET state = ?, settled_at = ?
+         WHERE run_id = ? AND state = 'active' AND lease_token = ?`,
+      )
+      .run(providerCostDisposition, now, id, token);
+    if (providerCostDisposition === 'settled' && settled.changes > 0) {
+      wakeExternalCapabilityCostQuotaRetries(now);
+    }
+    return true;
+  })();
 }
 
 type CreateTaskInput = Omit<
@@ -12416,34 +16984,140 @@ export function countChannelAccountBindings(id: string): number {
   return row.count;
 }
 
-export function deleteChannelAccount(id: string, ownerUserId: string): boolean {
-  return db.transaction(() => {
-    const current = getChannelAccountForUser(id, ownerUserId);
-    if (!current) return false;
-    // Keep cleanup correct even on legacy databases where foreign-key
-    // enforcement had to be disabled because of unrelated historical orphans.
-    db.prepare(
-      'DELETE FROM wechat_context_tokens WHERE channel_account_id = ?',
-    ).run(id);
-    const result = db
-      .prepare(
-        'DELETE FROM channel_accounts WHERE id = ? AND owner_user_id = ?',
-      )
-      .run(id, ownerUserId);
-    if (result.changes > 0 && current.is_default) {
-      const replacement = db
-        .prepare(
-          'SELECT id FROM channel_accounts WHERE owner_user_id = ? AND provider = ? ORDER BY created_at ASC LIMIT 1',
-        )
-        .get(ownerUserId, current.provider) as { id: string } | undefined;
-      if (replacement) {
-        db.prepare(
-          'UPDATE channel_accounts SET is_default = 1, updated_at = ? WHERE id = ?',
-        ).run(new Date().toISOString(), replacement.id);
+export type DeleteChannelAccountResult =
+  | { status: 'deleted' }
+  | { status: 'bound'; bindingCount: number }
+  | { status: 'not_found' };
+
+export function deleteChannelAccountIfUnbound(
+  id: string,
+  ownerUserId: string,
+): DeleteChannelAccountResult {
+  return db
+    .transaction(() => {
+      const current = getChannelAccountForUser(id, ownerUserId);
+      if (!current) return { status: 'not_found' } as const;
+      const bindingCount = countChannelAccountBindings(id);
+      if (bindingCount > 0) {
+        return { status: 'bound', bindingCount } as const;
       }
-    }
-    return result.changes > 0;
-  })();
+      // Keep cleanup correct even on legacy databases where foreign-key
+      // enforcement had to be disabled because of unrelated historical orphans.
+      db.prepare(
+        'DELETE FROM wechat_context_tokens WHERE channel_account_id = ?',
+      ).run(id);
+      const result = db
+        .prepare(
+          'DELETE FROM channel_accounts WHERE id = ? AND owner_user_id = ?',
+        )
+        .run(id, ownerUserId);
+      if (result.changes !== 1) return { status: 'not_found' } as const;
+      if (current.is_default) {
+        const replacement = db
+          .prepare(
+            'SELECT id FROM channel_accounts WHERE owner_user_id = ? AND provider = ? ORDER BY created_at ASC LIMIT 1',
+          )
+          .get(ownerUserId, current.provider) as { id: string } | undefined;
+        if (replacement) {
+          db.prepare(
+            'UPDATE channel_accounts SET is_default = 1, updated_at = ? WHERE id = ?',
+          ).run(new Date().toISOString(), replacement.id);
+        }
+      }
+      return { status: 'deleted' } as const;
+    })
+    .immediate();
+}
+
+export function deleteChannelAccount(id: string, ownerUserId: string): boolean {
+  return deleteChannelAccountIfUnbound(id, ownerUserId).status === 'deleted';
+}
+
+function assertChannelAccountExists(channelAccountId?: string | null): void {
+  if (!channelAccountId) return;
+  const exists = db
+    .prepare('SELECT 1 FROM channel_accounts WHERE id = ?')
+    .get(channelAccountId);
+  if (!exists) {
+    throw new Error('Channel account does not exist; binding rejected');
+  }
+}
+
+function assertChannelMountTargetIsNotBeingDeleted(
+  existing: RegisteredGroup | undefined,
+  group: RegisteredGroup,
+): void {
+  const targetMainChanged =
+    group.target_main_jid !== undefined &&
+    group.target_main_jid !== existing?.target_main_jid;
+  const targetAgentChanged =
+    group.target_agent_id !== undefined &&
+    group.target_agent_id !== existing?.target_agent_id;
+  if (!targetMainChanged && !targetAgentChanged) return;
+
+  const blocked = db
+    .prepare(
+      `SELECT 1
+       FROM external_capability_workspace_deletion_fences AS fence
+       JOIN external_capabilities AS capability
+         ON capability.slug = fence.capability_slug
+       WHERE (
+         ? IS NOT NULL
+         AND (
+           capability.workspace_jid = ?
+           OR ? = 'web:' || capability.workspace_folder
+         )
+       ) OR (
+         ? IS NOT NULL
+         AND EXISTS (
+           SELECT 1
+           FROM agents AS target_agent
+           WHERE target_agent.id = ?
+             AND (
+               target_agent.chat_jid = capability.workspace_jid
+               OR target_agent.group_folder = capability.workspace_folder
+             )
+         )
+       )
+       LIMIT 1`,
+    )
+    .get(
+      targetMainChanged ? group.target_main_jid : null,
+      targetMainChanged ? group.target_main_jid : null,
+      targetMainChanged ? group.target_main_jid : null,
+      targetAgentChanged ? group.target_agent_id : null,
+      targetAgentChanged ? group.target_agent_id : null,
+    );
+  if (blocked) {
+    throw new Error(
+      'External capability workspace deletion is in progress; channel mount rejected',
+    );
+  }
+}
+
+export class WorkspaceFolderCleanupPendingError extends Error {
+  constructor(readonly folder: string) {
+    super(`Workspace folder cleanup is still pending for ${folder}`);
+    this.name = 'WorkspaceFolderCleanupPendingError';
+  }
+}
+
+export function hasWorkspaceFilesystemCleanupTombstone(
+  folder: string,
+): boolean {
+  return Boolean(
+    db
+      .prepare(
+        'SELECT 1 FROM workspace_filesystem_cleanup_outbox WHERE folder = ?',
+      )
+      .get(folder),
+  );
+}
+
+export function assertWorkspaceFolderReusable(folder: string): void {
+  if (hasWorkspaceFilesystemCleanupTombstone(folder)) {
+    throw new WorkspaceFolderCleanupPendingError(folder);
+  }
 }
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
@@ -12461,6 +17135,19 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
 
   db.transaction(() => {
     const existing = getRegisteredGroup(jid);
+    if (!existing || existing.folder !== group.folder) {
+      assertValidWorkspaceFolderName(group.folder);
+      assertWorkspaceFolderReusable(group.folder);
+    }
+    assertChannelAccountExists(group.channel_account_id);
+    assertChannelMountTargetIsNotBeingDeleted(existing, group);
+    if (
+      existing &&
+      (existing.executionMode ?? 'container') === 'container' &&
+      (group.executionMode ?? 'container') === 'host'
+    ) {
+      pauseExternalCapabilitiesForWorkspaceJids([jid]);
+    }
     db.prepare(
       `INSERT INTO registered_groups (jid, name, folder, added_at, avatar_url, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, channel_account_id, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, audience_mode, owner_im_id, owner_claim_source, mcp_mode, selected_mcps, conversation_source, conversation_nav_mode, binding_mode, native_context_type, feishu_chat_mode, feishu_group_message_type, sender_allowlist)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -12541,7 +17228,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
       syncWorkspaceRuntimeSessionsForFolder(group.folder);
       syncAgentChannelMountsForWorkspaceJid(jid);
     }
-  })();
+  }).immediate();
 }
 
 /**
@@ -12587,9 +17274,653 @@ export function updateRegisteredGroupAvatar(
   return result.changes > 0;
 }
 
-export function deleteRegisteredGroup(jid: string): void {
-  db.transaction(() => {
+export function getSurvivingExternalCapabilityCanonicalWorkspace(
+  jid: string,
+  folder?: string,
+): string | null {
+  if (!folder) return null;
+  const row = db
+    .prepare(
+      `SELECT capability.workspace_jid
+       FROM external_capabilities AS capability
+       JOIN registered_groups AS canonical_workspace
+         ON canonical_workspace.jid = capability.workspace_jid
+       WHERE capability.workspace_folder = ?
+         AND capability.workspace_jid <> ?
+       ORDER BY capability.workspace_jid
+       LIMIT 1`,
+    )
+    .get(folder, jid) as { workspace_jid: string } | undefined;
+  return row?.workspace_jid ?? null;
+}
+
+function getExternalCapabilitySlugsForWorkspaceDeletion(
+  jid: string,
+  folder?: string,
+): string[] {
+  return (
+    db
+      .prepare(
+        `SELECT capability.slug
+         FROM external_capabilities AS capability
+         WHERE capability.workspace_jid = ?
+            OR (
+              capability.workspace_folder = ?
+              AND NOT EXISTS (
+                SELECT 1
+                FROM registered_groups AS canonical_workspace
+                WHERE canonical_workspace.jid = capability.workspace_jid
+                  AND canonical_workspace.jid <> ?
+              )
+            )`,
+      )
+      .all(jid, folder ?? '', jid) as Array<{ slug: string }>
+  ).map((row) => row.slug);
+}
+
+export function getRunningExternalCapabilityRunIdsForWorkspaceDeletion(
+  jid: string,
+  folder?: string,
+): string[] {
+  const capabilitySlugs = getExternalCapabilitySlugsForWorkspaceDeletion(
+    jid,
+    folder,
+  );
+  if (capabilitySlugs.length === 0) return [];
+  const placeholders = capabilitySlugs.map(() => '?').join(', ');
+  return (
+    db
+      .prepare(
+        `SELECT id
+         FROM external_capability_runs
+         WHERE (
+           status = 'running'
+           OR container_cleanup_attempt IS NOT NULL
+           OR container_cleanup_lease_token IS NOT NULL
+           OR container_create_pending_until IS NOT NULL
+         )
+           AND capability_slug IN (${placeholders})
+         ORDER BY id`,
+      )
+      .all(...capabilitySlugs) as Array<{ id: string }>
+  ).map((row) => row.id);
+}
+
+export const EXTERNAL_CAPABILITY_WORKSPACE_DELETION_LEASE_MS = 60_000;
+
+const EXTERNAL_CAPABILITY_WORKSPACE_DELETION_FENCE_COLUMNS =
+  'capability_slug, operation_id, previous_status, fenced_status, quarantined, owner_id, heartbeat_at, expires_at';
+
+type ExternalCapabilityWorkspaceDeletionFenceRow = {
+  capability_slug: string;
+  operation_id: string;
+  previous_status: ExternalCapability['status'];
+  fenced_status: ExternalCapability['status'];
+  quarantined: number;
+  owner_id: string | null;
+  heartbeat_at: string | null;
+  expires_at: string | null;
+};
+
+function externalCapabilityWorkspaceDeletionLeaseTimes(now = new Date()): {
+  heartbeatAt: string;
+  expiresAt: string;
+} {
+  return {
+    heartbeatAt: now.toISOString(),
+    expiresAt: new Date(
+      now.getTime() + EXTERNAL_CAPABILITY_WORKSPACE_DELETION_LEASE_MS,
+    ).toISOString(),
+  };
+}
+
+function restoreExternalCapabilityWorkspaceDeletionOperation(
+  operationId: string,
+  ownerId: string | null,
+  options: { allowExpired?: boolean } = {},
+): boolean {
+  const now = new Date().toISOString();
+  const rows = db
+    .prepare(
+      `SELECT ${EXTERNAL_CAPABILITY_WORKSPACE_DELETION_FENCE_COLUMNS}
+       FROM external_capability_workspace_deletion_fences
+       WHERE operation_id = ?
+         AND owner_id IS ?
+         ${options.allowExpired ? '' : 'AND expires_at > ?'}
+       ORDER BY capability_slug`,
+    )
+    .all(
+      operationId,
+      ownerId,
+      ...(options.allowExpired ? [] : [now]),
+    ) as ExternalCapabilityWorkspaceDeletionFenceRow[];
+  if (rows.length === 0) return false;
+  const restoreStatus = db.prepare(
+    `UPDATE external_capabilities SET status = ?, updated_at = ?
+     WHERE slug = ? AND status = ?`,
+  );
+  for (const row of rows) {
+    const changed = restoreStatus.run(
+      row.previous_status,
+      now,
+      row.capability_slug,
+      row.fenced_status,
+    );
+    if (changed.changes !== 1) {
+      throw new Error(
+        'External capability deletion fence no longer owns lifecycle state',
+      );
+    }
+  }
+  const deleted = db
+    .prepare(
+      `DELETE FROM external_capability_workspace_deletion_fences
+       WHERE operation_id = ? AND owner_id IS ?`,
+    )
+    .run(operationId, ownerId);
+  if (deleted.changes !== rows.length) {
+    throw new Error(
+      'External capability deletion fence ownership changed during restore',
+    );
+  }
+  return true;
+}
+
+export function recoverExpiredExternalCapabilityWorkspaceDeletions(
+  now = new Date(),
+): number {
+  if (!isDatabaseInitialized()) return 0;
+  const nowIso = now.toISOString();
+  const operations = db
+    .prepare(
+      `SELECT operation_id, owner_id
+       FROM external_capability_workspace_deletion_fences
+       GROUP BY operation_id
+       HAVING MAX(quarantined) = 0
+          AND (
+            SUM(CASE
+              WHEN owner_id IS NULL OR heartbeat_at IS NULL OR expires_at IS NULL
+              THEN 1 ELSE 0
+            END) = COUNT(*)
+            OR (
+              COUNT(DISTINCT owner_id) = 1
+              AND COUNT(DISTINCT heartbeat_at) = 1
+              AND COUNT(DISTINCT expires_at) = 1
+              AND MAX(expires_at) <= ?
+            )
+          )
+       ORDER BY operation_id`,
+    )
+    .all(nowIso) as Array<{ operation_id: string; owner_id: string | null }>;
+  let recovered = 0;
+  for (const operation of operations) {
+    const restored = db
+      .transaction(() =>
+        restoreExternalCapabilityWorkspaceDeletionOperation(
+          operation.operation_id,
+          operation.owner_id,
+          { allowExpired: true },
+        ),
+      )
+      .immediate();
+    if (!restored) continue;
+    recovered += 1;
+    logger.warn(
+      { operationId: operation.operation_id },
+      'Recovered expired external capability workspace deletion fence',
+    );
+  }
+  return recovered;
+}
+
+export interface ExternalCapabilityWorkspaceDeletionFence {
+  operationId: string;
+  ownerId: string;
+  jid: string;
+  folder?: string;
+  capabilitySlugs: string[];
+  activeCapabilitySlugs: string[];
+  runningRunIds: string[];
+  initiallyQuarantined: boolean;
+}
+
+export function beginExternalCapabilityWorkspaceDeletion(
+  jid: string,
+  folder?: string,
+): ExternalCapabilityWorkspaceDeletionFence {
+  const ownerId = crypto.randomUUID();
+  const lease = externalCapabilityWorkspaceDeletionLeaseTimes();
+  return db
+    .transaction(() => {
+      const capabilitySlugs = getExternalCapabilitySlugsForWorkspaceDeletion(
+        jid,
+        folder,
+      );
+      if (capabilitySlugs.length > 0) {
+        const placeholders = capabilitySlugs.map(() => '?').join(', ');
+        const existingRows = db
+          .prepare(
+            `SELECT ${EXTERNAL_CAPABILITY_WORKSPACE_DELETION_FENCE_COLUMNS}
+             FROM external_capability_workspace_deletion_fences
+             WHERE capability_slug IN (${placeholders})
+             ORDER BY capability_slug`,
+          )
+          .all(
+            ...capabilitySlugs,
+          ) as ExternalCapabilityWorkspaceDeletionFenceRow[];
+        if (existingRows.length > 0) {
+          const operationId = existingRows[0].operation_id;
+          const operationRows = db
+            .prepare(
+              `SELECT ${EXTERNAL_CAPABILITY_WORKSPACE_DELETION_FENCE_COLUMNS}
+               FROM external_capability_workspace_deletion_fences
+               WHERE operation_id = ? ORDER BY capability_slug`,
+            )
+            .all(operationId) as ExternalCapabilityWorkspaceDeletionFenceRow[];
+          const expectedSlugs = [...capabilitySlugs].sort();
+          if (
+            existingRows.length !== expectedSlugs.length ||
+            operationRows.length !== expectedSlugs.length ||
+            operationRows.some(
+              (row, index) =>
+                row.operation_id !== operationId ||
+                row.capability_slug !== expectedSlugs[index] ||
+                getExternalCapabilityBySlug(row.capability_slug)?.status !==
+                  row.fenced_status,
+            )
+          ) {
+            throw new Error(
+              'External capability workspace deletion fence is owned by another operation',
+            );
+          }
+          const allQuarantined = operationRows.every(
+            (row) => row.quarantined === 1,
+          );
+          const noneQuarantined = operationRows.every(
+            (row) => row.quarantined === 0,
+          );
+          if (!allQuarantined && !noneQuarantined) {
+            throw new Error(
+              'External capability workspace deletion quarantine state is inconsistent',
+            );
+          }
+          const staleLease = operationRows.every(
+            (row) =>
+              row.owner_id === null ||
+              row.heartbeat_at === null ||
+              row.expires_at === null ||
+              row.expires_at <= lease.heartbeatAt,
+          );
+          if (noneQuarantined) {
+            if (!staleLease) {
+              throw new Error(
+                'External capability workspace deletion fence is owned by another live process',
+              );
+            }
+            if (
+              !restoreExternalCapabilityWorkspaceDeletionOperation(
+                operationId,
+                operationRows[0].owner_id,
+                { allowExpired: true },
+              )
+            ) {
+              throw new Error(
+                'External capability workspace deletion fence could not be recovered',
+              );
+            }
+          } else {
+            const adopted = db
+              .prepare(
+                `UPDATE external_capability_workspace_deletion_fences
+                 SET quarantined = 0, owner_id = ?, heartbeat_at = ?, expires_at = ?
+                 WHERE operation_id = ? AND quarantined = 1`,
+              )
+              .run(ownerId, lease.heartbeatAt, lease.expiresAt, operationId);
+            if (adopted.changes !== operationRows.length) {
+              throw new Error(
+                'External capability workspace deletion quarantine ownership changed',
+              );
+            }
+            return {
+              operationId,
+              ownerId,
+              jid,
+              folder,
+              capabilitySlugs: expectedSlugs,
+              activeCapabilitySlugs: operationRows
+                .filter((row) => row.previous_status === 'active')
+                .map((row) => row.capability_slug),
+              runningRunIds:
+                getRunningExternalCapabilityRunIdsForWorkspaceDeletion(
+                  jid,
+                  folder,
+                ),
+              initiallyQuarantined: true,
+            };
+          }
+        }
+      }
+      const operationId = crypto.randomUUID();
+      const now = lease.heartbeatAt;
+      const activeCapabilitySlugs: string[] = [];
+      const insertFence = db.prepare(
+        `INSERT INTO external_capability_workspace_deletion_fences (
+           capability_slug, operation_id, previous_status, fenced_status,
+           quarantined, owner_id, heartbeat_at, expires_at, created_at
+         ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+      );
+      for (const slug of capabilitySlugs) {
+        const capability = getExternalCapabilityBySlug(slug);
+        if (!capability) {
+          throw new Error('External capability disappeared during deletion');
+        }
+        const fencedStatus =
+          capability.status === 'active' ? 'paused' : capability.status;
+        insertFence.run(
+          slug,
+          operationId,
+          capability.status,
+          fencedStatus,
+          ownerId,
+          lease.heartbeatAt,
+          lease.expiresAt,
+          now,
+        );
+        if (capability.status === 'active') activeCapabilitySlugs.push(slug);
+      }
+      if (activeCapabilitySlugs.length > 0) {
+        const placeholders = activeCapabilitySlugs.map(() => '?').join(', ');
+        const changed = db
+          .prepare(
+            `UPDATE external_capabilities
+             SET status = 'paused', updated_at = ?
+             WHERE status = 'active' AND slug IN (${placeholders})`,
+          )
+          .run(now, ...activeCapabilitySlugs);
+        if (changed.changes !== activeCapabilitySlugs.length) {
+          throw new Error(
+            'External capability lifecycle changed during workspace deletion',
+          );
+        }
+      }
+      return {
+        operationId,
+        ownerId,
+        jid,
+        folder,
+        capabilitySlugs,
+        activeCapabilitySlugs,
+        runningRunIds: getRunningExternalCapabilityRunIdsForWorkspaceDeletion(
+          jid,
+          folder,
+        ),
+        initiallyQuarantined: false,
+      };
+    })
+    .immediate();
+}
+
+export function renewExternalCapabilityWorkspaceDeletion(
+  fence: ExternalCapabilityWorkspaceDeletionFence,
+  now = new Date(),
+): boolean {
+  if (fence.capabilitySlugs.length === 0) return true;
+  const lease = externalCapabilityWorkspaceDeletionLeaseTimes(now);
+  return db
+    .transaction(() => {
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_workspace_deletion_fences
+           SET heartbeat_at = ?, expires_at = ?
+           WHERE operation_id = ? AND owner_id = ?
+             AND quarantined = 0 AND expires_at > ?`,
+        )
+        .run(
+          lease.heartbeatAt,
+          lease.expiresAt,
+          fence.operationId,
+          fence.ownerId,
+          lease.heartbeatAt,
+        );
+      return changed.changes === fence.capabilitySlugs.length;
+    })
+    .immediate();
+}
+
+export function restoreExternalCapabilityWorkspaceDeletion(
+  fence: ExternalCapabilityWorkspaceDeletionFence,
+): boolean {
+  if (fence.capabilitySlugs.length === 0) return true;
+  return db
+    .transaction(() =>
+      restoreExternalCapabilityWorkspaceDeletionOperation(
+        fence.operationId,
+        fence.ownerId,
+      ),
+    )
+    .immediate();
+}
+
+export function quarantineExternalCapabilityWorkspaceDeletion(
+  fence: ExternalCapabilityWorkspaceDeletionFence,
+): boolean {
+  if (fence.capabilitySlugs.length === 0) return true;
+  const now = new Date().toISOString();
+  return db
+    .transaction(() => {
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_workspace_deletion_fences
+           SET quarantined = 1, heartbeat_at = ?, expires_at = ?
+           WHERE operation_id = ? AND owner_id = ? AND expires_at > ?`,
+        )
+        .run(now, now, fence.operationId, fence.ownerId, now);
+      return changed.changes === fence.capabilitySlugs.length;
+    })
+    .immediate();
+}
+
+export function terminalizeExternalCapabilityRunForWorkspaceDeletion(
+  runId: string,
+  operationId: string,
+  ownerId: string,
+): boolean {
+  return db
+    .transaction(() => {
+      const run = db
+        .prepare(
+          `SELECT run.status, run.started_at, run.container_cleanup_attempt,
+                  run.container_cleanup_lease_token,
+                  run.container_create_pending_until
+           FROM external_capability_runs AS run
+           JOIN external_capability_workspace_deletion_fences AS fence
+             ON fence.capability_slug = run.capability_slug
+           WHERE run.id = ? AND fence.operation_id = ?
+             AND fence.owner_id = ? AND fence.expires_at > ?`,
+        )
+        .get(runId, operationId, ownerId, new Date().toISOString()) as
+        | {
+            status: ExternalCapabilityRun['status'];
+            started_at: string | null;
+            container_cleanup_attempt: number | null;
+            container_cleanup_lease_token: number | null;
+            container_create_pending_until: string | null;
+          }
+        | undefined;
+      if (
+        !run ||
+        run.container_cleanup_attempt !== null ||
+        run.container_cleanup_lease_token !== null ||
+        run.container_create_pending_until !== null
+      ) {
+        return false;
+      }
+      if (
+        run.status === 'succeeded' ||
+        run.status === 'failed' ||
+        run.status === 'cancelled'
+      ) {
+        return true;
+      }
+      const now = new Date().toISOString();
+      db.prepare(
+        `UPDATE external_capability_cost_reservations
+         SET state = ?, settled_at = ?
+         WHERE run_id = ? AND state = 'active'`,
+      ).run(run.started_at ? 'uncertain' : 'released', now, runId);
+      const changed = db
+        .prepare(
+          `UPDATE external_capability_runs
+           SET status = 'cancelled', completed_at = ?, updated_at = ?,
+               error_code = 'WORKSPACE_DELETION_FENCED',
+               error_message = 'Processing stopped for workspace deletion.',
+               lease_owner = NULL, lease_expires_at = NULL,
+               lease_token = lease_token + 1
+           WHERE id = ? AND status IN ('queued', 'running', 'retry_wait')
+             AND container_cleanup_attempt IS NULL
+             AND container_cleanup_lease_token IS NULL
+             AND container_create_pending_until IS NULL`,
+        )
+        .run(now, now, runId);
+      return changed.changes === 1;
+    })
+    .immediate();
+}
+
+function terminalizeExternalCapabilitiesForWorkspace(
+  jid: string,
+  folder?: string,
+  deletionOperationId?: string,
+  deletionOwnerId?: string,
+): string[] {
+  const capabilitySlugs = getExternalCapabilitySlugsForWorkspaceDeletion(
+    jid,
+    folder,
+  );
+  if (capabilitySlugs.length === 0) return [];
+  const placeholders = capabilitySlugs.map(() => '?').join(', ');
+  const deletionFences = db
+    .prepare(
+      `SELECT capability_slug, operation_id, owner_id, expires_at
+       FROM external_capability_workspace_deletion_fences
+       WHERE capability_slug IN (${placeholders})`,
+    )
+    .all(...capabilitySlugs) as Array<{
+    capability_slug: string;
+    operation_id: string;
+    owner_id: string | null;
+    expires_at: string | null;
+  }>;
+  const now = new Date().toISOString();
+  if (
+    deletionFences.length > 0 &&
+    (!deletionOperationId ||
+      !deletionOwnerId ||
+      deletionFences.length !== capabilitySlugs.length ||
+      deletionFences.some(
+        (fence) =>
+          fence.operation_id !== deletionOperationId ||
+          fence.owner_id !== deletionOwnerId ||
+          fence.expires_at === null ||
+          fence.expires_at <= now,
+      ))
+  ) {
+    throw new Error(
+      'External capability workspace deletion fence is owned by another operation',
+    );
+  }
+  if (deletionOperationId && deletionFences.length !== capabilitySlugs.length) {
+    throw new Error('External capability workspace deletion fence was lost');
+  }
+  const running = getRunningExternalCapabilityRunIdsForWorkspaceDeletion(
+    jid,
+    folder,
+  );
+  db.prepare(
+    `UPDATE external_capabilities
+     SET status = 'retired', updated_at = ?
+     WHERE slug IN (${placeholders})`,
+  ).run(now, ...capabilitySlugs);
+  db.prepare(
+    `UPDATE external_capability_keys
+     SET status = 'revoked', revoked_at = ?
+     WHERE status = 'active'
+       AND capability_slug IN (${placeholders})`,
+  ).run(now, ...capabilitySlugs);
+  db.prepare(
+    `UPDATE external_capability_intake_reservations
+     SET state = 'finished', outcome = 'unavailable', quota_scope = NULL,
+         observed_raw_bytes = MAX(observed_raw_bytes, reserved_raw_bytes),
+         finished_at = ?
+     WHERE state = 'active'
+       AND capability_slug IN (${placeholders})`,
+  ).run(now, ...capabilitySlugs);
+  db.prepare(
+    `UPDATE external_capability_cost_reservations
+     SET state = 'uncertain', settled_at = ?
+     WHERE state = 'active' AND run_id IN (
+       SELECT id
+       FROM external_capability_runs
+       WHERE capability_slug IN (${placeholders})
+         AND status = 'running' AND started_at IS NOT NULL
+     )`,
+  ).run(now, ...capabilitySlugs);
+  const cleanupDebt = db
+    .prepare(
+      `SELECT id
+       FROM external_capability_runs
+       WHERE capability_slug IN (${placeholders})
+         AND (
+           container_cleanup_attempt IS NOT NULL
+           OR container_cleanup_lease_token IS NOT NULL
+           OR container_create_pending_until IS NOT NULL
+         )
+       LIMIT 1`,
+    )
+    .get(...capabilitySlugs) as { id: string } | undefined;
+  if (cleanupDebt) {
+    throw new Error(
+      'External capability container cleanup is still active during workspace deletion',
+    );
+  }
+  db.prepare(
+    `UPDATE external_capability_runs
+     SET status = 'cancelled', completed_at = ?, updated_at = ?,
+         error_code = 'WORKSPACE_DELETED',
+         error_message = 'The processing workspace was deleted.',
+         lease_owner = NULL, lease_expires_at = NULL,
+         lease_token = lease_token + 1
+     WHERE (
+         status IN ('queued', 'running', 'retry_wait')
+         OR (status = 'cancelled' AND error_code = 'WORKSPACE_DELETION_FENCED')
+       )
+       AND capability_slug IN (${placeholders})
+       AND container_cleanup_attempt IS NULL
+       AND container_cleanup_lease_token IS NULL
+       AND container_create_pending_until IS NULL`,
+  ).run(now, now, ...capabilitySlugs);
+  if (deletionOperationId) {
+    const deleted = db
+      .prepare(
+        `DELETE FROM external_capability_workspace_deletion_fences
+         WHERE operation_id = ? AND owner_id = ?`,
+      )
+      .run(deletionOperationId, deletionOwnerId);
+    if (deleted.changes !== capabilitySlugs.length) {
+      throw new Error('External capability workspace deletion fence was lost');
+    }
+  }
+  return running;
+}
+
+export function deleteRegisteredGroup(jid: string): string[] {
+  return db.transaction(() => {
     const existing = getRegisteredGroup(jid);
+    // IM chat rows may share their workspace's folder. Removing an IM binding
+    // must not retire the workspace-owned capability or cancel its runs.
+    const stoppedExternalRunIds = jid.startsWith('web:')
+      ? terminalizeExternalCapabilitiesForWorkspace(jid, existing?.folder)
+      : [];
     deleteChannelMount(jid);
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
     if (jid.startsWith('web:')) {
@@ -12605,6 +17936,7 @@ export function deleteRegisteredGroup(jid: string): void {
         ).run(existing.folder);
       }
     }
+    return stoppedExternalRunIds;
   })();
 }
 
@@ -12758,6 +18090,10 @@ function forceRuntimesToHostForFolderQuery(
       ...affectedTasks.map((task) => task.group_folder),
     ]),
   ).sort();
+
+  pauseExternalCapabilitiesForWorkspaceJids(
+    affectedGroups.map((group) => group.jid),
+  );
 
   db.prepare(
     `UPDATE registered_groups
@@ -12945,6 +18281,7 @@ export function upsertChannelMount(
 ): ChannelMount {
   return db.transaction(() => {
     const now = new Date().toISOString();
+    assertChannelAccountExists(mount.channel_account_id);
     const existing = getChannelMount(mount.channel_jid);
     // Legacy group projections do not own this setting. Preserve it across
     // renames/activation changes; a new binding starts by inheriting its target.
@@ -13174,31 +18511,50 @@ export function getImContextBindingByRootMessageId(
 }
 
 export function upsertImContextBinding(binding: ImContextBinding): void {
-  db.prepare(
-    `INSERT INTO im_context_bindings (
-      source_jid, context_type, context_id, workspace_jid, agent_id,
-      root_message_id, title, last_active_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(source_jid, context_type, context_id) DO UPDATE SET
-      workspace_jid = excluded.workspace_jid,
-      agent_id = excluded.agent_id,
-      -- COALESCE: 首条消息设定 root_message_id/title 后，后续消息传 null 不会覆盖
-      root_message_id = COALESCE(excluded.root_message_id, im_context_bindings.root_message_id),
-      title = COALESCE(excluded.title, im_context_bindings.title),
-      last_active_at = excluded.last_active_at,
-      updated_at = excluded.updated_at`,
-  ).run(
-    binding.source_jid,
-    binding.context_type,
-    binding.context_id,
-    binding.workspace_jid,
-    binding.agent_id,
-    binding.root_message_id,
-    binding.title,
-    binding.last_active_at,
-    binding.created_at,
-    binding.updated_at,
-  );
+  db.transaction(() => {
+    const blocked = db
+      .prepare(
+        `SELECT 1
+         FROM external_capability_workspace_deletion_fences AS fence
+         JOIN external_capabilities AS capability
+           ON capability.slug = fence.capability_slug
+         WHERE capability.workspace_jid = ?
+            OR ? = 'web:' || capability.workspace_folder
+         LIMIT 1`,
+      )
+      .get(binding.workspace_jid, binding.workspace_jid);
+    if (blocked) {
+      throw new Error(
+        'External capability workspace deletion is in progress; native context mount rejected',
+      );
+    }
+
+    db.prepare(
+      `INSERT INTO im_context_bindings (
+        source_jid, context_type, context_id, workspace_jid, agent_id,
+        root_message_id, title, last_active_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(source_jid, context_type, context_id) DO UPDATE SET
+        workspace_jid = excluded.workspace_jid,
+        agent_id = excluded.agent_id,
+        -- COALESCE: 首条消息设定 root_message_id/title 后，后续消息传 null 不会覆盖
+        root_message_id = COALESCE(excluded.root_message_id, im_context_bindings.root_message_id),
+        title = COALESCE(excluded.title, im_context_bindings.title),
+        last_active_at = excluded.last_active_at,
+        updated_at = excluded.updated_at`,
+    ).run(
+      binding.source_jid,
+      binding.context_type,
+      binding.context_id,
+      binding.workspace_jid,
+      binding.agent_id,
+      binding.root_message_id,
+      binding.title,
+      binding.last_active_at,
+      binding.created_at,
+      binding.updated_at,
+    );
+  }).immediate();
 }
 
 export function listImContextBindingsByWorkspace(
@@ -13601,6 +18957,259 @@ export function deleteImGroupRecord(jid: string): void {
   tx();
 }
 
+export interface WorkspaceFilesystemCleanupOutboxEntry {
+  folder: string;
+  revision: number;
+  claim_owner: string | null;
+  claim_token: number;
+  created_at: string;
+  updated_at: string;
+  attempts: number;
+  last_error: string | null;
+}
+
+export type WorkspaceFilesystemCleanupAttempt =
+  | { status: 'cleaned'; folder: string }
+  | { status: 'blocked'; folder: string; survivingJids: string[] }
+  | { status: 'pending'; folder: string; error: string };
+
+export interface WorkspaceFilesystemCleanupClaim {
+  folder: string;
+  revision: number;
+  owner: string;
+  token: number;
+}
+
+export type WorkspaceFilesystemCleanupClaimResult =
+  | { status: 'cleaned'; folder: string }
+  | { status: 'blocked'; folder: string; survivingJids: string[] }
+  | { status: 'pending'; folder: string; error: string }
+  | { status: 'claimed'; claim: WorkspaceFilesystemCleanupClaim };
+
+export function listWorkspaceFilesystemCleanupOutbox(): WorkspaceFilesystemCleanupOutboxEntry[] {
+  return db
+    .prepare(
+      `SELECT folder, revision, claim_owner, claim_token,
+              created_at, updated_at, attempts, last_error
+       FROM workspace_filesystem_cleanup_outbox
+       ORDER BY created_at, folder`,
+    )
+    .all() as WorkspaceFilesystemCleanupOutboxEntry[];
+}
+
+/**
+ * Recover claims left by the previous service process. This runs once during
+ * startup before Web intake can issue a cleanup claim. In-process callers may
+ * never supersede a non-null owner while its physical deletion is in flight.
+ */
+export function recoverWorkspaceFilesystemCleanupClaimsOnStartup(): number {
+  return db
+    .prepare(
+      `UPDATE workspace_filesystem_cleanup_outbox
+       SET claim_owner = NULL, updated_at = ?,
+           last_error = CASE
+             WHEN claim_owner IS NULL THEN last_error
+             ELSE 'Recovered cleanup claim after service restart'
+           END
+       WHERE claim_owner IS NOT NULL`,
+    )
+    .run(new Date().toISOString()).changes;
+}
+
+function cleanupErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, 4000);
+}
+
+function getSurvivingWorkspaceFolderJids(folder: string): string[] {
+  return (
+    db
+      .prepare(
+        'SELECT jid FROM registered_groups WHERE folder = ? ORDER BY jid',
+      )
+      .all(folder) as Array<{ jid: string }>
+  ).map((row) => row.jid);
+}
+
+/**
+ * Claim one cleanup generation after rechecking the folder under SQLite's
+ * writer lock. The physical recursive deletion intentionally happens after
+ * this short transaction commits; the tombstone remains visible to every
+ * publisher throughout that window.
+ */
+export function claimWorkspaceFilesystemCleanup(
+  folder: string,
+): WorkspaceFilesystemCleanupClaimResult {
+  assertValidWorkspaceFolderName(folder);
+  return db
+    .transaction((): WorkspaceFilesystemCleanupClaimResult => {
+      const row = db
+        .prepare(
+          `SELECT revision, claim_owner, claim_token
+           FROM workspace_filesystem_cleanup_outbox WHERE folder = ?`,
+        )
+        .get(folder) as
+        | { revision: number; claim_owner: string | null; claim_token: number }
+        | undefined;
+      if (!row) return { status: 'cleaned', folder };
+      if (row.claim_owner) {
+        return {
+          status: 'pending',
+          folder,
+          error: 'Workspace cleanup is already claimed',
+        };
+      }
+
+      const survivingJids = getSurvivingWorkspaceFolderJids(folder);
+      if (survivingJids.length > 0) {
+        db.prepare(
+          `UPDATE workspace_filesystem_cleanup_outbox
+           SET updated_at = ?, last_error = ?
+           WHERE folder = ? AND revision = ?`,
+        ).run(
+          new Date().toISOString(),
+          `Cleanup blocked by surviving registered_groups rows: ${survivingJids.join(', ')}`,
+          folder,
+          row.revision,
+        );
+        return { status: 'blocked', folder, survivingJids };
+      }
+
+      const owner = crypto.randomUUID();
+      const token = row.claim_token + 1;
+      const claimed = db
+        .prepare(
+          `UPDATE workspace_filesystem_cleanup_outbox
+           SET claim_owner = ?, claim_token = ?, updated_at = ?, last_error = NULL
+           WHERE folder = ? AND revision = ? AND claim_token = ?
+             AND claim_owner IS NULL`,
+        )
+        .run(
+          owner,
+          token,
+          new Date().toISOString(),
+          folder,
+          row.revision,
+          row.claim_token,
+        );
+      return claimed.changes === 1
+        ? {
+            status: 'claimed',
+            claim: { folder, revision: row.revision, owner, token },
+          }
+        : {
+            status: 'pending',
+            folder,
+            error: 'Workspace cleanup claim changed before publication',
+          };
+    })
+    .immediate();
+}
+
+/** Acknowledge only the exact claimed generation after a second locked recheck. */
+export function completeWorkspaceFilesystemCleanup(
+  claim: WorkspaceFilesystemCleanupClaim,
+): WorkspaceFilesystemCleanupAttempt {
+  return db
+    .transaction((): WorkspaceFilesystemCleanupAttempt => {
+      const row = db
+        .prepare(
+          `SELECT 1 FROM workspace_filesystem_cleanup_outbox
+           WHERE folder = ? AND revision = ?
+             AND claim_owner = ? AND claim_token = ?`,
+        )
+        .get(claim.folder, claim.revision, claim.owner, claim.token);
+      if (!row) {
+        return hasWorkspaceFilesystemCleanupTombstone(claim.folder)
+          ? {
+              status: 'pending',
+              folder: claim.folder,
+              error: 'Workspace cleanup claim was superseded',
+            }
+          : { status: 'cleaned', folder: claim.folder };
+      }
+
+      const survivingJids = getSurvivingWorkspaceFolderJids(claim.folder);
+      if (survivingJids.length > 0) {
+        db.prepare(
+          `UPDATE workspace_filesystem_cleanup_outbox
+           SET claim_owner = NULL, updated_at = ?, last_error = ?
+           WHERE folder = ? AND revision = ?
+             AND claim_owner = ? AND claim_token = ?`,
+        ).run(
+          new Date().toISOString(),
+          `Cleanup blocked by surviving registered_groups rows: ${survivingJids.join(', ')}`,
+          claim.folder,
+          claim.revision,
+          claim.owner,
+          claim.token,
+        );
+        return { status: 'blocked', folder: claim.folder, survivingJids };
+      }
+
+      const deleted = db
+        .prepare(
+          `DELETE FROM workspace_filesystem_cleanup_outbox
+           WHERE folder = ? AND revision = ?
+             AND claim_owner = ? AND claim_token = ?`,
+        )
+        .run(claim.folder, claim.revision, claim.owner, claim.token);
+      return deleted.changes === 1
+        ? { status: 'cleaned', folder: claim.folder }
+        : {
+            status: 'pending',
+            folder: claim.folder,
+            error: 'Workspace cleanup claim was superseded',
+          };
+    })
+    .immediate();
+}
+
+export function failWorkspaceFilesystemCleanup(
+  claim: WorkspaceFilesystemCleanupClaim,
+  error: unknown,
+): WorkspaceFilesystemCleanupAttempt {
+  const message = cleanupErrorMessage(error);
+  return db
+    .transaction((): WorkspaceFilesystemCleanupAttempt => {
+      const updated = db
+        .prepare(
+          `UPDATE workspace_filesystem_cleanup_outbox
+           SET claim_owner = NULL, attempts = attempts + 1,
+               updated_at = ?, last_error = ?
+           WHERE folder = ? AND revision = ?
+             AND claim_owner = ? AND claim_token = ?`,
+        )
+        .run(
+          new Date().toISOString(),
+          message,
+          claim.folder,
+          claim.revision,
+          claim.owner,
+          claim.token,
+        );
+      return updated.changes === 1
+        ? { status: 'pending', folder: claim.folder, error: message }
+        : hasWorkspaceFilesystemCleanupTombstone(claim.folder)
+          ? {
+              status: 'pending',
+              folder: claim.folder,
+              error: 'Workspace cleanup failure belonged to a superseded claim',
+            }
+          : { status: 'cleaned', folder: claim.folder };
+    })
+    .immediate();
+}
+
+export class SharedWorkspaceFolderDeletionError extends Error {
+  constructor(readonly survivingWorkspaceJids: string[]) {
+    super(
+      'Workspace storage folder is still referenced by another registration',
+    );
+    this.name = 'SharedWorkspaceFolderDeletionError';
+  }
+}
+
 export function deleteGroupData(
   jid: string,
   folder: string,
@@ -13613,14 +19222,46 @@ export function deleteGroupData(
     channelUpdates?:
       | Array<{ jid: string; group: RegisteredGroup }>
       | (() => Array<{ jid: string; group: RegisteredGroup }>);
+    externalDeletionOperationId?: string;
+    externalDeletionOwnerId?: string;
   } = {},
-): void {
+): string[] {
+  assertValidWorkspaceFolderName(folder);
   const tx = db.transaction(() => {
     const legacyMainJid = `web:${folder}`;
+    // Resolve and validate bindings only after BEGIN IMMEDIATE owns the writer
+    // lock. A concurrent mount must either commit before this snapshot and be
+    // included, or wait until the workspace deletion commits.
     const channelUpdates =
       typeof options.channelUpdates === 'function'
         ? options.channelUpdates()
         : (options.channelUpdates ?? []);
+    const reroutedJids = new Set(
+      channelUpdates
+        .filter((update) => update.group.folder !== folder)
+        .map((update) => update.jid),
+    );
+    const survivingWorkspaceJids = (
+      db
+        .prepare(
+          `SELECT jid
+           FROM registered_groups
+           WHERE folder = ? AND jid != ?
+           ORDER BY jid`,
+        )
+        .all(folder, jid) as Array<{ jid: string }>
+    )
+      .map((row) => row.jid)
+      .filter((survivingJid) => !reroutedJids.has(survivingJid));
+    if (survivingWorkspaceJids.length > 0) {
+      throw new SharedWorkspaceFolderDeletionError(survivingWorkspaceJids);
+    }
+    const stoppedExternalRunIds = terminalizeExternalCapabilitiesForWorkspace(
+      jid,
+      folder,
+      options.externalDeletionOperationId,
+      options.externalDeletionOwnerId,
+    );
     for (const update of channelUpdates) {
       setRegisteredGroup(update.jid, update.group);
     }
@@ -13698,8 +19339,40 @@ export function deleteGroupData(
     db.prepare(
       'UPDATE scheduled_tasks SET workspace_jid = NULL, workspace_folder = NULL WHERE workspace_jid = ?',
     ).run(jid);
+
+    const cleanupQueuedAt = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO workspace_filesystem_cleanup_outbox (
+         folder, revision, claim_owner, claim_token,
+         created_at, updated_at, attempts, last_error
+       ) VALUES (?, 1, NULL, 0, ?, ?, 0, NULL)
+       ON CONFLICT(folder) DO UPDATE SET
+         revision = workspace_filesystem_cleanup_outbox.revision + 1,
+         claim_owner = NULL,
+         updated_at = excluded.updated_at,
+         last_error = NULL`,
+    ).run(folder, cleanupQueuedAt, cleanupQueuedAt);
+    return stoppedExternalRunIds;
   });
-  tx();
+
+  // Workspace files must not be removed on the weaker WAL+NORMAL boundary used
+  // by ordinary runtime writes. Temporarily make this deletion commit FULL, then
+  // restore the connection's normal mode before the caller starts filesystem
+  // cleanup. The finally path also restores it after a failed transaction.
+  if (db.inTransaction) {
+    throw new Error(
+      'deleteGroupData must run as a top-level transaction for durable filesystem cleanup',
+    );
+  }
+  const previousSynchronous = db.pragma('synchronous', {
+    simple: true,
+  }) as number;
+  db.pragma('synchronous = FULL');
+  try {
+    return tx.immediate();
+  } finally {
+    db.pragma(`synchronous = ${previousSynchronous}`);
+  }
 }
 
 // --- User pinned groups ---
@@ -14472,6 +20145,38 @@ export type UserFieldUpdates = Partial<
   >
 >;
 
+function fenceExternalCapabilitiesForInactiveOwner(
+  userId: string,
+  now: string,
+): void {
+  const ownedCapabilities = `SELECT capability.slug
+    FROM external_capabilities capability
+    JOIN registered_groups workspace ON workspace.jid = capability.workspace_jid
+    WHERE workspace.created_by = ?`;
+
+  db.prepare(
+    `UPDATE external_capabilities
+     SET status = 'paused', updated_at = ?
+     WHERE status = 'active' AND slug IN (${ownedCapabilities})`,
+  ).run(now, userId);
+  db.prepare(
+    `UPDATE external_capability_keys
+     SET status = 'revoked', revoked_at = ?
+     WHERE status = 'active' AND capability_slug IN (${ownedCapabilities})`,
+  ).run(now, userId);
+  db.prepare(
+    `UPDATE external_capability_runs
+     SET status = 'cancelled', completed_at = ?, updated_at = ?,
+         error_code = 'OWNER_INACTIVE',
+         error_message = 'The capability owner is no longer active.',
+         lease_owner = NULL, lease_expires_at = NULL,
+         lease_token = lease_token + 1
+     WHERE capability_slug IN (${ownedCapabilities})
+       AND (status IN ('queued', 'retry_wait')
+            OR (status = 'running' AND started_at IS NULL))`,
+  ).run(now, now, userId);
+}
+
 export function updateUserFields(id: string, updates: UserFieldUpdates): void {
   const fields: string[] = [];
   const values: unknown[] = [];
@@ -14555,13 +20260,24 @@ export function updateUserFields(id: string, updates: UserFieldUpdates): void {
 
   if (fields.length === 0) return;
 
+  const now = new Date().toISOString();
   fields.push('updated_at = ?');
-  values.push(new Date().toISOString());
+  values.push(now);
   values.push(id);
 
-  db.prepare(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`).run(
-    ...values,
-  );
+  const apply = () => {
+    const changed = db
+      .prepare(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`)
+      .run(...values);
+    if (
+      changed.changes === 1 &&
+      (updates.status === 'disabled' || updates.status === 'deleted')
+    ) {
+      fenceExternalCapabilitiesForInactiveOwner(id, now);
+    }
+  };
+  if (db.inTransaction) apply();
+  else db.transaction(apply).immediate();
 }
 
 /**
@@ -14595,11 +20311,16 @@ export function deleteUser(id: string): void {
   const now = new Date().toISOString();
   const tx = db.transaction((userId: string) => {
     db.prepare('DELETE FROM user_sessions WHERE user_id = ?').run(userId);
-    db.prepare(
-      `UPDATE users
-       SET status = 'deleted', deleted_at = ?, disable_reason = COALESCE(disable_reason, 'deleted_by_admin'), updated_at = ?
-       WHERE id = ?`,
-    ).run(now, now, userId);
+    const changed = db
+      .prepare(
+        `UPDATE users
+         SET status = 'deleted', deleted_at = ?, disable_reason = COALESCE(disable_reason, 'deleted_by_admin'), updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(now, now, userId);
+    if (changed.changes === 1) {
+      fenceExternalCapabilitiesForInactiveOwner(userId, now);
+    }
   });
   tx(id);
 }
@@ -15048,6 +20769,47 @@ export function createAgent(agent: SubAgent): void {
   );
 }
 
+export type CreateWorkspaceConversationResult =
+  | { status: 'created'; agent: SubAgent }
+  | { status: 'workspace_not_found' }
+  | { status: 'forbidden' };
+
+/**
+ * Publish a manually-created conversation only while its authoritative Web
+ * workspace still exists and is owned by the caller. Storage provisioning runs
+ * under the same writer lock so workspace deletion cannot commit between the
+ * database insert and creation of the conversation directories.
+ */
+export function createWorkspaceConversation(
+  workspaceJid: string,
+  ownerUserId: string,
+  agent: Omit<SubAgent, 'group_folder' | 'chat_jid' | 'created_by'>,
+  provisionStorage: (groupFolder: string, agentId: string) => void,
+): CreateWorkspaceConversationResult {
+  return db
+    .transaction(() => {
+      const workspace = getRegisteredGroup(workspaceJid);
+      if (!workspace || !workspaceJid.startsWith('web:')) {
+        return { status: 'workspace_not_found' } as const;
+      }
+      if (workspace.created_by !== ownerUserId) {
+        return { status: 'forbidden' } as const;
+      }
+
+      const created: SubAgent = {
+        ...agent,
+        group_folder: workspace.folder,
+        chat_jid: workspaceJid,
+        created_by: ownerUserId,
+      };
+      createAgent(created);
+      ensureChatExists(`${workspaceJid}#agent:${created.id}`);
+      provisionStorage(workspace.folder, created.id);
+      return { status: 'created', agent: created } as const;
+    })
+    .immediate();
+}
+
 export function getAgent(id: string): SubAgent | undefined {
   const row = db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as
     | Record<string, unknown>
@@ -15251,6 +21013,93 @@ export function deleteAgent(id: string): void {
     deleteImContextBindingsByAgent(id);
     db.prepare('DELETE FROM agents WHERE id = ?').run(id);
   })();
+}
+
+export type DeleteWorkspaceAgentResult =
+  | { status: 'deleted'; agent: SubAgent; groupFolder: string }
+  | { status: 'workspace_not_found' }
+  | { status: 'forbidden' }
+  | { status: 'agent_not_found' }
+  | { status: 'not_conversation' }
+  | { status: 'native_managed' }
+  | { status: 'bound' };
+
+/**
+ * Authoritative deletion fence for a workspace Agent/Session. The route stops
+ * and mutation-pauses the runtime first; this immediate transaction then
+ * revalidates every independently-written binding projection before removing
+ * all database state together.
+ */
+export function deleteWorkspaceAgentIfUnbound(
+  workspaceJid: string,
+  agentId: string,
+  ownerUserId: string,
+  options: { requireConversation?: boolean } = {},
+): DeleteWorkspaceAgentResult {
+  return db
+    .transaction(() => {
+      const workspace = getRegisteredGroup(workspaceJid);
+      if (!workspace || !workspaceJid.startsWith('web:')) {
+        return { status: 'workspace_not_found' } as const;
+      }
+      if (workspace.created_by !== ownerUserId) {
+        return { status: 'forbidden' } as const;
+      }
+
+      const agent = getAgent(agentId);
+      if (!agent || agent.chat_jid !== workspaceJid) {
+        return { status: 'agent_not_found' } as const;
+      }
+      if (options.requireConversation && agent.kind !== 'conversation') {
+        return { status: 'not_conversation' } as const;
+      }
+      if (
+        agent.kind === 'conversation' &&
+        (agent.source_kind === 'native_thread' ||
+          agent.source_kind === 'feishu_thread' ||
+          agent.title_source === 'native_root' ||
+          agent.title_source === 'feishu_root')
+      ) {
+        return { status: 'native_managed' } as const;
+      }
+
+      if (agent.kind === 'conversation') {
+        const bindingCount = (
+          db
+            .prepare(
+              `SELECT
+                 (SELECT COUNT(*) FROM registered_groups WHERE target_agent_id = ?) +
+                 (SELECT COUNT(*) FROM channel_mounts WHERE session_id = ?) +
+                 (SELECT COUNT(*) FROM agent_channel_mounts WHERE session_id = ?) +
+                 (SELECT COUNT(*) FROM im_context_bindings WHERE agent_id = ?)
+                 AS count`,
+            )
+            .get(agentId, agentId, agentId, agentId) as { count: number }
+        ).count;
+        if (bindingCount > 0) return { status: 'bound' } as const;
+      }
+
+      const virtualChatJid = `${workspaceJid}#agent:${agentId}`;
+      db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(virtualChatJid);
+      db.prepare('DELETE FROM chats WHERE jid = ?').run(virtualChatJid);
+      db.prepare(
+        'DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?',
+      ).run(workspace.folder, agentId);
+      db.prepare(
+        'DELETE FROM workspace_runtime_sessions WHERE group_folder = ? AND runtime_agent_id = ?',
+      ).run(workspace.folder, agentId);
+      db.prepare('DELETE FROM router_state WHERE key = ?').run(
+        sessionChannelOwnerKey(workspace.folder, agentId),
+      );
+      db.prepare('DELETE FROM agents WHERE id = ?').run(agentId);
+
+      return {
+        status: 'deleted',
+        agent,
+        groupFolder: workspace.folder,
+      } as const;
+    })
+    .immediate();
 }
 
 function mapAgentRow(row: Record<string, unknown>): SubAgent {

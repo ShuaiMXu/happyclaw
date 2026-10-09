@@ -13,6 +13,10 @@ function inspect(overrides: Record<string, unknown> = {}): string {
       Internal: true,
       Ingress: false,
       ConfigOnly: false,
+      EnableIPv6: false,
+      Options: {
+        'com.docker.network.bridge.gateway_mode_ipv4': 'isolated',
+      },
       Labels: {
         'com.happyclaw.external-capability-egress': 'true',
         'com.happyclaw.egress-policy': 'provider-only',
@@ -36,6 +40,16 @@ describe('external capability Docker network readiness', () => {
     ['direct Internet egress', { Internal: false }],
     ['ingress network', { Ingress: true }],
     ['config-only network', { ConfigOnly: true }],
+    ['host-addressable IPv4 gateway', { Options: {} }],
+    [
+      'host-addressable IPv6 gateway',
+      {
+        EnableIPv6: true,
+        Options: {
+          'com.docker.network.bridge.gateway_mode_ipv4': 'isolated',
+        },
+      },
+    ],
     ['missing labels', { Labels: {} }],
     [
       'unapproved policy',

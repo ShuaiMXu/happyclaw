@@ -22,6 +22,10 @@ import {
   Music,
   AlertCircle,
   Copy,
+  ListChecks,
+  Square,
+  CheckSquare,
+  FolderInput,
 } from 'lucide-react';
 import { useFileStore, FileEntry, toBase64Url } from '../../stores/files';
 import { useChatStore } from '../../stores/chat';
@@ -29,9 +33,19 @@ import { useAuthStore } from '../../stores/auth';
 import { useScrollIsolation } from '../../hooks/useScrollIsolation';
 import { api } from '../../api/client';
 import { withBasePath } from '../../utils/url';
-import { downloadFromUrl } from '../../utils/download';
+import { downloadFromUrlWithProgress } from '../../utils/download';
 import { showToast } from '../../utils/toast';
 import { copyToClipboard } from '../../utils/clipboard';
+import {
+  IMAGE_EXTENSIONS,
+  TEXT_EXTENSIONS,
+  CODE_EXTENSIONS,
+  ARCHIVE_EXTENSIONS,
+  VIDEO_EXTENSIONS,
+  AUDIO_EXTENSIONS,
+  getFileExt,
+  classifyFileKind,
+} from '../../utils/fileKind';
 import {
   Dialog,
   DialogContent,
@@ -46,92 +60,15 @@ import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
 import { FileUploadZone } from './FileUploadZone';
 import { MarkdownRenderer } from './MarkdownRenderer';
+import { MoveFilesDialog } from './MoveFilesDialog';
 import { PreviewDialog } from './PreviewDialog';
 import { ScrollEdgeAffordance } from '../common/ScrollEdgeAffordance';
+import { naturalCompare } from '../../utils/naturalSort';
 
 interface FilePanelProps {
   groupJid: string;
   onClose?: () => void;
 }
-
-// ─── File type constants ─────────────────────────────────────────
-
-const IMAGE_EXTENSIONS = new Set([
-  'png',
-  'jpg',
-  'jpeg',
-  'gif',
-  'svg',
-  'webp',
-  'bmp',
-  'ico',
-]);
-
-const TEXT_EXTENSIONS = new Set([
-  'txt',
-  'md',
-  'json',
-  'js',
-  'ts',
-  'jsx',
-  'tsx',
-  'css',
-  'html',
-  'xml',
-  'py',
-  'go',
-  'rs',
-  'java',
-  'c',
-  'cpp',
-  'h',
-  'sh',
-  'yaml',
-  'yml',
-  'toml',
-  'ini',
-  'conf',
-  'log',
-  'csv',
-  'svg',
-]);
-
-const CODE_EXTENSIONS = new Set([
-  'js',
-  'ts',
-  'jsx',
-  'tsx',
-  'py',
-  'go',
-  'rs',
-  'java',
-  'c',
-  'cpp',
-  'h',
-  'sh',
-  'css',
-  'html',
-  'xml',
-  'yaml',
-  'yml',
-  'toml',
-]);
-
-const ARCHIVE_EXTENSIONS = new Set([
-  'zip',
-  'tar',
-  'gz',
-  '7z',
-  'rar',
-  'bz2',
-  'xz',
-]);
-
-const PDF_EXTENSIONS = new Set(['pdf']);
-
-const VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'avi', 'mkv']);
-
-const AUDIO_EXTENSIONS = new Set(['mp3', 'wav', 'ogg', 'aac', 'm4a', 'flac']);
 
 // ─── File icon component ────────────────────────────────────────
 
@@ -154,10 +91,6 @@ function FileIcon({ name }: { name: string }) {
   if (TEXT_EXTENSIONS.has(ext))
     return <FileText className="w-4 h-4 text-muted-foreground" />;
   return <File className="w-4 h-4 text-muted-foreground" />;
-}
-
-function getFileExt(name: string): string {
-  return name.split('.').pop()?.toLowerCase() || '';
 }
 
 /** 黑名单扩展名/文件名模式：不显示预览/编辑按钮 */
@@ -738,6 +671,7 @@ function GenericTextPreview({
   const [loadError, setLoadError] = useState(false);
   const overlayRef = useRef<HTMLDivElement>(null);
   const contentScrollRef = useRef<HTMLDivElement>(null);
+  const preRef = useRef<HTMLPreElement>(null);
 
   useScrollIsolation(overlayRef);
   useEffect(() => {
@@ -760,6 +694,39 @@ function GenericTextPreview({
     };
   }, [groupJid, file.path, getFileContent]);
 
+  // 弹窗默认没有可聚焦元素时，Radix 会把焦点落在整个 Dialog 容器上——这时按
+  // Ctrl/Cmd+A 走浏览器默认行为会全选整个页面（弹窗前后的内容都会被框进去），
+  // 而不是只选中预览的正文。这里在弹窗挂载期间监听 keydown，把全选范围收窄到
+  // <pre> 正文节点；弹窗关闭（组件卸载）时监听器自动移除，不影响其他地方。
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const isSelectAll =
+        (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a';
+      if (!isSelectAll || !preRef.current) return;
+      e.preventDefault();
+      const selection = window.getSelection();
+      if (!selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(preRef.current);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  const handleCopyContent = () => {
+    copyToClipboard(content)
+      .then(() => showToast('已复制', '文件内容已复制到剪贴板'))
+      .catch((err) => {
+        console.error('Copy failed:', err);
+        showToast(
+          '复制失败',
+          err instanceof Error ? err.message : '无法写入剪贴板',
+        );
+      });
+  };
+
   return (
     <PreviewDialog
       ref={overlayRef}
@@ -777,13 +744,24 @@ function GenericTextPreview({
               {file.name}
             </span>
           </div>
-          <button
-            onClick={onClose}
-            className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
-            aria-label="关闭预览"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-1 flex-shrink-0">
+            <button
+              onClick={handleCopyContent}
+              disabled={loading || loadError || !content}
+              className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              aria-label="复制文件内容"
+              title="复制全部内容"
+            >
+              <Copy className="w-4 h-4" />
+            </button>
+            <button
+              onClick={onClose}
+              className="text-muted-foreground hover:text-foreground transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
+              aria-label="关闭预览"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Content */}
@@ -804,6 +782,7 @@ function GenericTextPreview({
               </div>
             ) : (
               <pre
+                ref={preRef}
                 data-preview-select-root
                 className="text-sm text-foreground whitespace-pre-wrap break-all font-mono"
               >
@@ -816,7 +795,7 @@ function GenericTextPreview({
 
         {/* Footer hint */}
         <div className="px-4 py-2 border-t border-border text-xs text-muted-foreground flex-shrink-0">
-          Esc 关闭
+          Ctrl/Cmd+A 只选中正文 · Esc 关闭
         </div>
       </div>
     </PreviewDialog>
@@ -832,9 +811,13 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     loading,
     loadFiles,
     deleteFile,
+    batchDeleteFiles,
+    moveFiles,
     createDirectory,
     navigateTo,
+    clearPendingFileOpen,
   } = useFileStore();
+  const pendingFileOpen = useFileStore((s) => s.pendingFileOpen[groupJid]);
 
   const [createDirModal, setCreateDirModal] = useState(false);
   const [newDirName, setNewDirName] = useState('');
@@ -850,8 +833,23 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
   }>({ open: false, path: '', name: '', isDir: false });
   const [deleteLoading, setDeleteLoading] = useState(false);
 
+  // 下载进度：key 是文件相对路径，值为 0-100 的百分比；后端没有返回
+  // Content-Length（罕见）时为 null，此时只显示旋转图标，不显示具体数字。
+  // key 存在即代表"正在下载中"。
+  const [downloadingPaths, setDownloadingPaths] = useState<
+    Record<string, number | null>
+  >({});
+
   // Preview / Editor state — only one overlay can be open at a time
   const [preview, setPreview] = useState<PreviewState>(null);
+
+  // 多选：选择范围限定在"当前目录这一屏"，切换目录时清空——避免选中项跑到
+  // 看不见的地方，用户也搞不清批量操作到底会作用在哪些文件上。
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const [batchDeleteModal, setBatchDeleteModal] = useState(false);
+  const [batchDeleteLoading, setBatchDeleteLoading] = useState(false);
+  const [moveDialogOpen, setMoveDialogOpen] = useState(false);
 
   const isStreaming = useChatStore((s) => !!s.streaming[groupJid]);
   const canOpenLocalFolder = useAuthStore((s) => s.user?.role === 'admin');
@@ -884,12 +882,77 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     }
   }, [isStreaming, groupJid, currentDir, loadFiles]);
 
+  // 响应"点击聊天消息里的文件路径"发来的打开请求（见
+  // useFileStore.openWorkspaceFileByAgentPath）：切到文件所在目录并直接用
+  // 已经拿到的 FileEntry 打开对应预览，不需要等目录列表加载完再去里面找。
+  useEffect(() => {
+    if (!pendingFileOpen) return;
+    const { file } = pendingFileOpen;
+    if (file.type === 'directory') {
+      navigateTo(groupJid, file.path);
+    } else {
+      const lastSlash = file.path.lastIndexOf('/');
+      navigateTo(
+        groupJid,
+        lastSlash === -1 ? '' : file.path.slice(0, lastSlash),
+      );
+      const kind = classifyFileKind(file.name);
+      if (kind === 'image') {
+        setPreview({ kind: 'image', file });
+      } else if (kind === 'pdf') {
+        setPreview({ kind: 'pdf', file });
+      } else if (kind === 'video') {
+        setPreview({ kind: 'video', file });
+      } else if (kind === 'audio') {
+        setPreview({ kind: 'audio', file });
+      } else if (getFileExt(file.name) === 'md' && isEntryEditable(file)) {
+        setPreview({ kind: 'markdown', file });
+      } else {
+        setPreview({ kind: 'text', file });
+      }
+    }
+    clearPendingFileOpen(groupJid);
+  }, [pendingFileOpen, groupJid, navigateTo, clearPendingFileOpen]);
+
   const sortedFiles = useMemo(() => {
     return [...fileList].sort((a, b) => {
       if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
-      return a.name.localeCompare(b.name);
+      return naturalCompare(a.name, b.name);
     });
   }, [fileList]);
+
+  // 系统文件本来就不给删/不给移，多选里也不提供，省得批量操作报一堆
+  // "系统路径不可删除" 的部分失败。
+  const selectableFiles = useMemo(
+    () => sortedFiles.filter((f) => !f.isSystem),
+    [sortedFiles],
+  );
+  const allSelected =
+    selectableFiles.length > 0 && selectedPaths.size === selectableFiles.length;
+
+  useEffect(() => {
+    setSelectedPaths(new Set());
+  }, [currentDir]);
+
+  const toggleSelectionMode = () => {
+    setSelectionMode((prev) => !prev);
+    setSelectedPaths(new Set());
+  };
+
+  const toggleItemSelected = (path: string) => {
+    setSelectedPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    setSelectedPaths(
+      allSelected ? new Set() : new Set(selectableFiles.map((f) => f.path)),
+    );
+  };
 
   const breadcrumbs = useMemo(() => {
     if (!currentDir) return [];
@@ -904,43 +967,75 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     }
   };
 
+  const handleDownload = useCallback(
+    (item: FileEntry) => {
+      setDownloadingPaths((prev) => {
+        if (prev[item.path] !== undefined) return prev; // 正在下载，忽略重复点击
+        return { ...prev, [item.path]: null };
+      });
+
+      const encoded = toBase64Url(item.path);
+      const url = `/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`;
+
+      downloadFromUrlWithProgress(url, item.name, (loaded, total) => {
+        setDownloadingPaths((prev) => ({
+          ...prev,
+          [item.path]: total ? Math.round((loaded / total) * 100) : null,
+        }));
+      })
+        .catch((err) => {
+          console.error('Download failed:', err);
+          showToast(
+            '下载失败',
+            err instanceof Error ? err.message : '文件下载出错，请重试',
+          );
+        })
+        .finally(() => {
+          setDownloadingPaths((prev) => {
+            if (!(item.path in prev)) return prev;
+            const next = { ...prev };
+            delete next[item.path];
+            return next;
+          });
+        });
+    },
+    [groupJid],
+  );
+
+  // 与 classifyFileKind 对应：能预览的类型进对应的 overlay，压缩包和其他
+  // 无法预览的类型直接下载——此前压缩包会掉进最后的 text 分支，打开一个只会
+  // 显示"此文件类型不支持预览"的空预览，体验上跟没反应差不多。
   const handleItemClick = useCallback(
     (item: FileEntry) => {
+      if (selectionMode) {
+        toggleItemSelected(item.path);
+        return;
+      }
       if (item.type === 'directory') {
         navigateTo(groupJid, item.path);
         return;
       }
 
-      const ext = getFileExt(item.name);
+      const kind = classifyFileKind(item.name);
 
-      if (IMAGE_EXTENSIONS.has(ext)) {
+      if (kind === 'download') {
+        handleDownload(item);
+      } else if (kind === 'image') {
         setPreview({ kind: 'image', file: item });
-      } else if (PDF_EXTENSIONS.has(ext)) {
+      } else if (kind === 'pdf') {
         setPreview({ kind: 'pdf', file: item });
-      } else if (VIDEO_EXTENSIONS.has(ext)) {
+      } else if (kind === 'video') {
         setPreview({ kind: 'video', file: item });
-      } else if (AUDIO_EXTENSIONS.has(ext)) {
+      } else if (kind === 'audio') {
         setPreview({ kind: 'audio', file: item });
-      } else if (ext === 'md' && isEntryEditable(item)) {
+      } else if (getFileExt(item.name) === 'md' && isEntryEditable(item)) {
         setPreview({ kind: 'markdown', file: item });
       } else {
         setPreview({ kind: 'text', file: item });
       }
     },
-    [groupJid, navigateTo],
+    [groupJid, navigateTo, selectionMode, handleDownload],
   );
-
-  const handleDownload = (item: FileEntry) => {
-    const encoded = toBase64Url(item.path);
-    const url = `/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`;
-    downloadFromUrl(url, item.name).catch((err) => {
-      console.error('Download failed:', err);
-      showToast(
-        '下载失败',
-        err instanceof Error ? err.message : '文件下载出错，请重试',
-      );
-    });
-  };
 
   const handleCopyPath = (item: FileEntry) => {
     const target = item.absolutePath || item.path;
@@ -974,6 +1069,54 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     } finally {
       setDeleteLoading(false);
     }
+  };
+
+  const handleBatchDeleteConfirm = async () => {
+    setBatchDeleteLoading(true);
+    try {
+      const result = await batchDeleteFiles(groupJid, [...selectedPaths]);
+      if (result.failed.length === 0) {
+        showToast('已删除', `成功删除 ${result.succeeded.length} 项`);
+        setSelectionMode(false);
+      } else if (result.succeeded.length === 0) {
+        showToast(
+          '删除失败',
+          result.failed[0]?.error || '所选项均删除失败，请重试',
+        );
+      } else {
+        showToast(
+          '部分删除失败',
+          `成功 ${result.succeeded.length} 项，失败 ${result.failed.length} 项：${result.failed[0].error}`,
+        );
+      }
+      setSelectedPaths(new Set());
+      setBatchDeleteModal(false);
+    } finally {
+      setBatchDeleteLoading(false);
+    }
+  };
+
+  const handleMoveConfirm = async (destination: string) => {
+    const result = await moveFiles(groupJid, [...selectedPaths], destination);
+    if (result.failed.length === 0) {
+      showToast('已移动', `成功移动 ${result.succeeded.length} 项`);
+      setSelectedPaths(new Set());
+      setMoveDialogOpen(false);
+      setSelectionMode(false);
+      return;
+    }
+    if (result.succeeded.length === 0) {
+      showToast('移动失败', result.failed[0]?.error || '所选项均移动失败');
+      return;
+    }
+    showToast(
+      '部分移动失败',
+      `成功 ${result.succeeded.length} 项，失败 ${result.failed.length} 项：${result.failed[0].error}`,
+    );
+    setSelectedPaths(
+      (prev) => new Set([...prev].filter((p) => !result.succeeded.includes(p))),
+    );
+    setMoveDialogOpen(false);
   };
 
   const handleRefresh = () => {
@@ -1051,6 +1194,18 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
+          <button
+            onClick={toggleSelectionMode}
+            className={`p-2 rounded-md transition-colors cursor-pointer ${
+              selectionMode
+                ? 'bg-brand-50 text-primary'
+                : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+            }`}
+            title={selectionMode ? '退出多选' : '多选'}
+            aria-label={selectionMode ? '退出多选' : '多选'}
+          >
+            <ListChecks className="w-4 h-4" />
+          </button>
           {onClose && (
             <button
               onClick={onClose}
@@ -1063,27 +1218,67 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
         </div>
       </div>
 
-      {/* Breadcrumb */}
+      {/* Breadcrumb（多选时替换成批量操作工具栏） */}
       <div className="px-4 py-2 border-b border-border bg-muted">
-        <div className="flex items-center gap-1 text-sm overflow-x-auto">
-          <button
-            onClick={() => handleNavigate(-1)}
-            className="text-primary hover:underline whitespace-nowrap cursor-pointer"
-          >
-            根目录
-          </button>
-          {breadcrumbs.map((crumb, index) => (
-            <div key={index} className="flex items-center gap-1">
-              <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+        {selectionMode ? (
+          <div className="flex items-center justify-between gap-2">
+            <button
+              onClick={toggleSelectAll}
+              disabled={selectableFiles.length === 0}
+              className="flex flex-shrink-0 items-center gap-1.5 text-sm text-primary hover:underline cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:no-underline"
+            >
+              {allSelected ? (
+                <CheckSquare className="w-4 h-4" />
+              ) : (
+                <Square className="w-4 h-4" />
+              )}
+              {allSelected ? '取消全选' : '全选'}
+            </button>
+            <span className="flex-1 truncate text-center text-xs text-muted-foreground">
+              已选择 {selectedPaths.size} 项
+            </span>
+            <div className="flex flex-shrink-0 items-center gap-1">
               <button
-                onClick={() => handleNavigate(index)}
-                className="text-primary hover:underline whitespace-nowrap cursor-pointer"
+                onClick={() => setMoveDialogOpen(true)}
+                disabled={selectedPaths.size === 0}
+                className="p-1.5 rounded hover:bg-background text-muted-foreground hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                title="移动到…"
+                aria-label="移动所选项"
               >
-                {crumb}
+                <FolderInput className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setBatchDeleteModal(true)}
+                disabled={selectedPaths.size === 0}
+                className="p-1.5 rounded hover:bg-red-100 dark:hover:bg-red-950/40 text-muted-foreground hover:text-red-600 dark:hover:text-red-400 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                title="删除所选项"
+                aria-label="删除所选项"
+              >
+                <Trash2 className="w-4 h-4" />
               </button>
             </div>
-          ))}
-        </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-1 text-sm overflow-x-auto">
+            <button
+              onClick={() => handleNavigate(-1)}
+              className="text-primary hover:underline whitespace-nowrap cursor-pointer"
+            >
+              根目录
+            </button>
+            {breadcrumbs.map((crumb, index) => (
+              <div key={index} className="flex items-center gap-1">
+                <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                <button
+                  onClick={() => handleNavigate(index)}
+                  className="text-primary hover:underline whitespace-nowrap cursor-pointer"
+                >
+                  {crumb}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {openDirError && (
@@ -1110,8 +1305,13 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           ) : (
             <div className="space-y-0.5">
               {sortedFiles.map((item) => {
-                const clickable =
-                  item.type === 'directory' || isPreviewableFile(item);
+                const isSelected = selectedPaths.has(item.path);
+                // 多选模式下，非系统项整行都用来切换选中（跟入口的"多选"按钮
+                // 一起构成"先进多选模式、再点条目挑选"的两步交互）；系统项没有
+                // 复选框，保持不可点。多选模式外沿用原来的预览/进入文件夹逻辑。
+                const clickable = selectionMode
+                  ? !item.isSystem
+                  : item.type === 'directory' || isPreviewableFile(item);
                 const summary = (
                   <>
                     <div className="flex-shrink-0 w-5 flex items-center justify-center">
@@ -1146,13 +1346,32 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                   <div
                     key={item.path}
                     className={`flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors ${
-                      clickable
-                        ? 'hover:bg-muted'
-                        : item.isSystem
-                          ? 'bg-muted/60'
-                          : 'hover:bg-muted/50'
+                      isSelected
+                        ? 'bg-brand-50'
+                        : clickable
+                          ? 'hover:bg-muted'
+                          : item.isSystem
+                            ? 'bg-muted/60'
+                            : 'hover:bg-muted/50'
                     }`}
                   >
+                    {selectionMode && !item.isSystem && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleItemSelected(item.path);
+                        }}
+                        className="-ml-1 flex-shrink-0 cursor-pointer p-1"
+                        aria-label={isSelected ? '取消选择' : '选择'}
+                      >
+                        {isSelected ? (
+                          <CheckSquare className="w-4.5 h-4.5 text-primary" />
+                        ) : (
+                          <Square className="w-4.5 h-4.5 text-muted-foreground" />
+                        )}
+                      </button>
+                    )}
                     {clickable ? (
                       <button
                         type="button"
@@ -1167,67 +1386,83 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                       </div>
                     )}
 
-                    {/* Actions */}
-                    <div className="flex-shrink-0 flex items-center gap-0.5">
-                      {/* Copy absolute path (always available) */}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleCopyPath(item);
-                        }}
-                        className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                        title={
-                          item.absolutePath
-                            ? `复制路径：${item.absolutePath}`
-                            : '复制路径'
-                        }
-                        aria-label="复制绝对路径"
-                      >
-                        <Copy className="w-3.5 h-3.5" />
-                      </button>
-                      {/* Edit button for editable text files (系统文件里的
+                    {/* Actions（多选模式下隐藏，靠顶部工具栏的批量操作） */}
+                    {!selectionMode && (
+                      <div className="flex-shrink-0 flex items-center gap-0.5">
+                        {/* Copy absolute path (always available) */}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleCopyPath(item);
+                          }}
+                          className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                          title={
+                            item.absolutePath
+                              ? `复制路径：${item.absolutePath}`
+                              : '复制路径'
+                          }
+                          aria-label="复制绝对路径"
+                        >
+                          <Copy className="w-3.5 h-3.5" />
+                        </button>
+                        {/* Edit button for editable text files (系统文件里的
                           CLAUDE.md 例外也可编辑，但仍然没有删除按钮) */}
-                      {isEntryEditable(item) &&
-                        TEXT_EXTENSIONS.has(getFileExt(item.name)) && (
+                        {isEntryEditable(item) &&
+                          TEXT_EXTENSIONS.has(getFileExt(item.name)) && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setPreview({ kind: 'edit', file: item });
+                              }}
+                              className="p-2.5 rounded hover:bg-brand-100 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
+                              title="编辑"
+                              aria-label="编辑文件"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        {item.type === 'file' &&
+                          (() => {
+                            const progress = downloadingPaths[item.path];
+                            const isDownloading = progress !== undefined;
+                            return (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDownload(item);
+                                }}
+                                disabled={isDownloading}
+                                className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer disabled:cursor-wait disabled:hover:bg-transparent"
+                                title={isDownloading ? '下载中…' : '下载'}
+                                aria-label="下载文件"
+                              >
+                                {!isDownloading ? (
+                                  <Download className="w-3.5 h-3.5" />
+                                ) : progress === null ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <span className="block w-7 text-center text-[10px] font-medium tabular-nums">
+                                    {progress}%
+                                  </span>
+                                )}
+                              </button>
+                            );
+                          })()}
+                        {!item.isSystem && (
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              setPreview({ kind: 'edit', file: item });
+                              handleDeleteClick(item);
                             }}
-                            className="p-2.5 rounded hover:bg-brand-100 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
-                            title="编辑"
-                            aria-label="编辑文件"
+                            className="p-2.5 rounded hover:bg-red-100 dark:hover:bg-red-950/40 text-muted-foreground hover:text-red-600 dark:hover:text-red-400 transition-colors cursor-pointer"
+                            title="删除"
+                            aria-label="删除文件"
                           >
-                            <Pencil className="w-3.5 h-3.5" />
+                            <Trash2 className="w-3.5 h-3.5" />
                           </button>
                         )}
-                      {item.type === 'file' && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDownload(item);
-                          }}
-                          className="p-2.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                          title="下载"
-                          aria-label="下载文件"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                      {!item.isSystem && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteClick(item);
-                          }}
-                          className="p-2.5 rounded hover:bg-red-100 dark:hover:bg-red-950/40 text-muted-foreground hover:text-red-600 dark:hover:text-red-400 transition-colors cursor-pointer"
-                          title="删除"
-                          aria-label="删除文件"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                    </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -1313,6 +1548,29 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
         cancelText="取消"
         confirmVariant="danger"
         loading={deleteLoading}
+      />
+
+      {/* Batch Delete Confirm */}
+      <ConfirmDialog
+        open={batchDeleteModal}
+        onClose={() => setBatchDeleteModal(false)}
+        onConfirm={handleBatchDeleteConfirm}
+        title="批量删除"
+        message={`确认删除选中的 ${selectedPaths.size} 项吗？如果包含文件夹，其中所有内容也会被删除。此操作不可恢复。`}
+        confirmText="删除"
+        cancelText="取消"
+        confirmVariant="danger"
+        loading={batchDeleteLoading}
+      />
+
+      {/* Move To Dialog */}
+      <MoveFilesDialog
+        open={moveDialogOpen}
+        groupJid={groupJid}
+        itemCount={selectedPaths.size}
+        excludePaths={[...selectedPaths]}
+        onClose={() => setMoveDialogOpen(false)}
+        onConfirm={handleMoveConfirm}
       />
 
       {/* Preview / Editor Overlays */}

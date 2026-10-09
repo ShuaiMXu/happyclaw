@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useMediaQuery } from '../../hooks/useMediaQuery';
 import {
   ChevronDown,
   ChevronRight,
@@ -121,6 +122,11 @@ export function CreateContainerDialog({
   const [hostMounts, setHostMounts] = useState<HostDirectoryMountDraft[]>([]);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  // Auto-focusing the name field pops the on-screen keyboard the instant
+  // this dialog opens on mobile, pushing the profile picker and other
+  // fields above it off-screen before the user has seen them. Desktop has
+  // no on-screen keyboard to worry about, so keep the convenience there.
+  const isDesktop = useMediaQuery('(min-width: 1024px)');
 
   const createFlow = useChatStore((s) => s.createFlow);
   const adminHostOnlyMode = useChatStore((s) => s.adminHostOnlyMode);
@@ -362,6 +368,12 @@ export function CreateContainerDialog({
             >
               工作区名称
             </label>
+            {/* No onKeyDown-Enter-submits here on purpose — same reason as
+                RenameDialog.tsx: an IME's Enter-to-confirm-a-character was
+                also submitting this dialog, so composing e.g. Chinese text
+                would land a single letter and trigger "创建" at once.
+                Submitting the new workspace always requires an explicit
+                click on the create button now. */}
             <Input
               id="workspace-name"
               value={name}
@@ -369,11 +381,8 @@ export function CreateContainerDialog({
                 setName(e.target.value);
                 clearSubmissionErrors();
               }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') handleConfirm();
-              }}
               placeholder="输入这个智能体工作区的名称"
-              autoFocus
+              autoFocus={isDesktop}
             />
           </div>
 

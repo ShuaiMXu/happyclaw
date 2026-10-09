@@ -8,7 +8,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'task-scheduler-shutdown-'));
 const store = path.join(root, 'db');
 const groups = path.join(root, 'groups');
 fs.mkdirSync(store, { recursive: true });
-fs.mkdirSync(groups, { recursive: true });
+fs.mkdirSync(path.join(groups, 'workspace'), { recursive: true });
 
 vi.mock(import('../src/config.js'), async (importOriginal) => ({
   ...(await importOriginal()),
@@ -21,8 +21,10 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 const db = await import('../src/db.js');
-const { startSchedulerLoop, notifyTaskSchedulerChanged } =
+const { startSchedulerLoop, notifyTaskSchedulerChanged, stopSchedulerLoop } =
   await import('../src/task-scheduler.js');
+const { getActiveScriptCount, runScript } =
+  await import('../src/script-runner.js');
 
 beforeAll(() => {
   vi.useFakeTimers();
@@ -37,7 +39,7 @@ afterAll(() => {
 });
 
 describe('task scheduler shutdown boundary', () => {
-  test('does not materialize or re-arm a past-due task during shutdown', () => {
+  test('does not materialize or re-arm a past-due task during shutdown', async () => {
     const createdAt = new Date().toISOString();
     db.createTask({
       id: 'past-due-at-shutdown',
@@ -56,7 +58,7 @@ describe('task scheduler shutdown boundary', () => {
       notify_channels: null,
     });
 
-    startSchedulerLoop({
+    await startSchedulerLoop({
       registeredGroups: () => ({}),
       getSessions: () => ({}),
       queue: { isShuttingDown: () => true },
@@ -72,5 +74,20 @@ describe('task scheduler shutdown boundary', () => {
     expect(vi.getTimerCount()).toBe(0);
     vi.runOnlyPendingTimers();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test('actively terminates detached scripts instead of only timing out the drain', async () => {
+    const pending = runScript('sleep 10', 'workspace');
+    expect(getActiveScriptCount()).toBe(1);
+
+    await stopSchedulerLoop({ drainMs: 1_000 });
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      aborted: true,
+      timedOut: false,
+      exitCode: null,
+    });
+    expect(getActiveScriptCount()).toBe(0);
   });
 });

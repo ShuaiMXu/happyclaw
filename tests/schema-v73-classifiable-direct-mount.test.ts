@@ -60,6 +60,13 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
       added_at: now,
       created_by: 'owner-a',
     });
+    db.createChannelAccount({
+      id: 'bot-a',
+      owner_user_id: 'owner-a',
+      provider: 'whatsapp',
+      name: 'Legacy shared test bot',
+      secret_ref: 'channel-account:bot-a',
+    });
     db.createAgent({
       id: 'manual-session',
       group_folder: 'legacy-shared-ws',
@@ -358,6 +365,13 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
       added_at: now,
       created_by: 'owner-wa',
     });
+    db.createChannelAccount({
+      id: 'bot-b',
+      owner_user_id: 'owner-wa',
+      provider: 'whatsapp',
+      name: 'Secondary WhatsApp test bot',
+      secret_ref: 'channel-account:bot-b',
+    });
     db.setRegisteredGroup(waGroupJid, {
       name: 'WhatsApp group',
       folder: 'wa-group',
@@ -420,6 +434,13 @@ describe('schema v73 classifiable direct workspace-mount migration', () => {
     const cleanWorkspaceJid = 'web:v72-wecom-no-evidence';
     const cleanFolder = 'v72-wecom-no-evidence';
     const cleanDirectJid = 'wecom:c2c:v72-bob#account:wecom-a';
+    db.createChannelAccount({
+      id: 'wecom-a',
+      owner_user_id: 'owner-wecom',
+      provider: 'wecom',
+      name: 'v72 WeCom test bot',
+      secret_ref: 'channel-account:wecom-a',
+    });
     for (const [workspace, folder] of [
       [repairedWorkspaceJid, repairedFolder],
       [cleanWorkspaceJid, cleanFolder],

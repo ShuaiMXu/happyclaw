@@ -48,6 +48,13 @@ describe('schema v72 WeCom direct workspace-mount migration', () => {
       added_at: now,
       created_by: 'owner-a',
     });
+    db.createChannelAccount({
+      id: 'bot-a',
+      owner_user_id: 'owner-a',
+      provider: 'wecom',
+      name: 'Legacy WeCom bot',
+      secret_ref: 'channel-account:bot-a',
+    });
     db.createAgent({
       id: 'manual-session',
       group_folder: 'wecom-legacy-ws',

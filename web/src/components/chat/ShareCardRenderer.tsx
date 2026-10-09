@@ -37,16 +37,16 @@ const LIGHT_BASE_VARS: Record<string, string> = {
   '--ring': '#a3a3a3',
 };
 
-/** Default brand fallbacks (classic orange) in case CSS vars are unavailable. */
+/** Default brand fallbacks (#FF6600 scale) in case CSS vars are unavailable. */
 const BRAND_DEFAULTS: Record<string, string> = {
-  '--brand-50': '#fff7ed',
-  '--brand-100': '#ffedd5',
-  '--brand-200': '#fed7aa',
-  '--brand-300': '#fdba74',
-  '--brand-400': '#fb923c',
-  '--brand-500': '#f97316',
-  '--brand-600': '#ea580c',
-  '--brand-700': '#c2410c',
+  '--brand-50': '#fff4eb',
+  '--brand-100': '#ffe6d1',
+  '--brand-200': '#ffc9a3',
+  '--brand-300': '#ffac73',
+  '--brand-400': '#ff8e42',
+  '--brand-500': '#ff6600',
+  '--brand-600': '#e55a00',
+  '--brand-700': '#b34700',
 };
 
 /**
@@ -97,107 +97,123 @@ const CONTENT_OVERRIDE_STYLE = `
   }
 `;
 
-export const ShareCardRenderer = forwardRef<HTMLDivElement, ShareCardRendererProps>(
-  function ShareCardRenderer(
-    { content, senderName, timestamp, groupJid, aiEmoji, aiColor, aiImageUrl },
-    ref,
-  ) {
-    // Merge fixed light-mode base vars with dynamic brand colors from current theme
-    const themeVars = useMemo<React.CSSProperties>(() => {
-      const brandVars = getCurrentBrandVars();
-      return { ...LIGHT_BASE_VARS, ...brandVars } as React.CSSProperties;
-    }, []);
+export const ShareCardRenderer = forwardRef<
+  HTMLDivElement,
+  ShareCardRendererProps
+>(function ShareCardRenderer(
+  { content, senderName, timestamp, groupJid, aiEmoji, aiColor, aiImageUrl },
+  ref,
+) {
+  // Merge fixed light-mode base vars with dynamic brand colors from current theme
+  const themeVars = useMemo<React.CSSProperties>(() => {
+    const brandVars = getCurrentBrandVars();
+    return { ...LIGHT_BASE_VARS, ...brandVars } as React.CSSProperties;
+  }, []);
 
-    return (
+  return (
+    <div
+      ref={ref}
+      style={{
+        ...themeVars,
+        minWidth: SHARE_CARD_DEFAULT_WIDTH,
+        fontFamily:
+          "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+        background: '#ffffff',
+        color: '#0f172a',
+        borderRadius: 16,
+        WebkitFontSmoothing: 'antialiased',
+      }}
+    >
+      <style>{CONTENT_OVERRIDE_STYLE}</style>
+
+      {/* Header */}
       <div
-        ref={ref}
         style={{
-          ...themeVars,
-          minWidth: SHARE_CARD_DEFAULT_WIDTH,
-          fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-          background: '#ffffff',
-          color: '#0f172a',
-          borderRadius: 16,
-          WebkitFontSmoothing: 'antialiased',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          padding: '16px 24px',
+          borderBottom: '1px solid #e2e8f0',
+          background: '#f8fafc',
+          borderRadius: '16px 16px 0 0',
         }}
       >
-        <style>{CONTENT_OVERRIDE_STYLE}</style>
-
-        {/* Header */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '16px 24px',
-            borderBottom: '1px solid #e2e8f0',
-            background: '#f8fafc',
-            borderRadius: '16px 16px 0 0',
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <EmojiAvatar
-              imageUrl={aiImageUrl}
-              emoji={aiEmoji}
-              color={aiColor}
-              fallbackChar={senderName[0]}
-              size="md"
-            />
-            <span style={{ fontSize: 15, fontWeight: 600, color: '#0f172a' }}>{senderName}</span>
-          </div>
-          <span style={{ fontSize: 13, color: '#64748b', whiteSpace: 'nowrap', marginLeft: 16 }}>{timestamp}</span>
-        </div>
-
-        {/* Content */}
-        <div
-          style={{
-            padding: '20px 24px',
-            maxHeight: MAX_HEIGHT,
-            position: 'relative',
-          }}
-        >
-          <div className="share-card-content max-w-none">
-            <MarkdownRenderer content={content} groupJid={groupJid} variant="chat" eagerImages />
-          </div>
-          {/* Gradient fade for extremely long content */}
-          {content.length > 30000 && (
-            <div
-              style={{
-                position: 'absolute',
-                bottom: 0,
-                left: 0,
-                right: 0,
-                height: 80,
-                background: 'linear-gradient(transparent, #ffffff)',
-                pointerEvents: 'none',
-              }}
-            />
-          )}
-        </div>
-
-        {/* Footer */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '12px 24px',
-            gap: '6px',
-            borderTop: '1px solid #e2e8f0',
-            background: '#f8fafc',
-            borderRadius: '0 0 16px 16px',
-          }}
-        >
-          <img
-            src="/icons/icon-192.png"
-            alt="HappyClaw"
-            style={{ width: 16, height: 16, borderRadius: 3 }}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <EmojiAvatar
+            imageUrl={aiImageUrl}
+            emoji={aiEmoji}
+            color={aiColor}
+            fallbackChar={senderName[0]}
+            size="md"
           />
-          <span style={{ fontSize: 12, color: '#94a3b8' }}>
-            HappyClaw · github.com/riba2534/happyclaw
+          <span style={{ fontSize: 15, fontWeight: 600, color: '#0f172a' }}>
+            {senderName}
           </span>
         </div>
+        <span
+          style={{
+            fontSize: 13,
+            color: '#64748b',
+            whiteSpace: 'nowrap',
+            marginLeft: 16,
+          }}
+        >
+          {timestamp}
+        </span>
       </div>
-    );
-  },
-);
+
+      {/* Content */}
+      <div
+        style={{
+          padding: '20px 24px',
+          maxHeight: MAX_HEIGHT,
+          position: 'relative',
+        }}
+      >
+        <div className="share-card-content max-w-none">
+          <MarkdownRenderer
+            content={content}
+            groupJid={groupJid}
+            variant="chat"
+            eagerImages
+          />
+        </div>
+        {/* Gradient fade for extremely long content */}
+        {content.length > 30000 && (
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 0,
+              left: 0,
+              right: 0,
+              height: 80,
+              background: 'linear-gradient(transparent, #ffffff)',
+              pointerEvents: 'none',
+            }}
+          />
+        )}
+      </div>
+
+      {/* Footer */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '12px 24px',
+          gap: '6px',
+          borderTop: '1px solid #e2e8f0',
+          background: '#f8fafc',
+          borderRadius: '0 0 16px 16px',
+        }}
+      >
+        <img
+          src="/icons/icon-192.png"
+          alt="SoftopiaAI"
+          style={{ width: 16, height: 16, borderRadius: 3 }}
+        />
+        <span style={{ fontSize: 12, color: '#94a3b8' }}>SoftopiaAI</span>
+      </div>
+    </div>
+  );
+});

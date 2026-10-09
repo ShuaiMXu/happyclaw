@@ -4,6 +4,7 @@
  */
 import {
   ChildProcess,
+  type ChildProcessWithoutNullStreams,
   exec,
   execFile,
   execFileSync,
@@ -26,7 +27,16 @@ import {
   type ContainerProxyConfig,
 } from './config.js';
 import { logger } from './logger.js';
-import { getExternalCapabilityDockerNetwork } from './external-capability-release-config.js';
+import {
+  EXTERNAL_RUNNER_PROTOCOL_VERSION,
+  getExternalCapabilityDockerNetwork,
+  isExternalCapabilityContainerImagePinned,
+} from './external-capability-release-config.js';
+import { assertExternalCapabilityProviderRoute } from './external-capability-provider-route.js';
+import {
+  ExternalStartAuthorizationController,
+  ExternalStartAuthorizationExpiredError,
+} from './external-start-authorization.js';
 import {
   resolveCodexGatewayBaseUrl,
   isCodexGatewayBaseUrl,
@@ -76,6 +86,18 @@ import {
 } from './workspace-memory-capability.js';
 import { releaseHappyClawOwnerIntroductionLease } from './owner-profile-store.js';
 import { applyProviderSwitchToInput } from './provider-switch-context.js';
+import { ensureDirectoryTreeNoSymlinks } from './utils.js';
+import {
+  clearOrdinaryContainerCreateFence,
+  createOrdinaryContainerCreateFence,
+  type OrdinaryContainerCreateFence,
+} from './ordinary-container-create-fence.js';
+import {
+  getInstallationId,
+  getInstallationNamespace,
+  hostRunnerOwnershipArgument,
+  ownedDockerLabelArgs,
+} from './instance-ownership.js';
 import {
   getUserById,
   getTaskRunById,
@@ -345,6 +367,7 @@ export function workspaceRuntimeCredentialOwnerId(folder: string): string {
 }
 
 /** Required env flags for settings.json — 每次启动时强制写入，不可被宿主机配置覆盖。 */
+
 const REQUIRED_SETTINGS_ENV: Record<string, string> = {
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
   // Workspace Memory is the sole managed long-term store. Additional
@@ -409,16 +432,46 @@ function writeAtomicFile(
   mode: number,
 ): void {
   const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let descriptor: number | undefined;
+  let parentDescriptor: number | undefined;
   try {
-    fs.writeFileSync(tmpPath, contents, { flag: 'wx', mode });
+    descriptor = fs.openSync(
+      tmpPath,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
+      mode,
+    );
+    fs.writeFileSync(descriptor, contents, 'utf8');
+    // Creation modes are reduced by the host umask. Reapply the exact reviewed
+    // mode before the durability fence so cross-UID read-only mounts remain
+    // readable after rename.
+    fs.fchmodSync(descriptor, mode);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
     fs.renameSync(tmpPath, filePath);
+    parentDescriptor = fs.openSync(
+      path.dirname(filePath),
+      fs.constants.O_RDONLY | fs.constants.O_DIRECTORY,
+    );
+    fs.fsyncSync(parentDescriptor);
   } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    if (parentDescriptor !== undefined) fs.closeSync(parentDescriptor);
     try {
       fs.unlinkSync(tmpPath);
     } catch {
       /* ignore */
     }
   }
+}
+
+/** Dependency-free seam for exact-mode atomic publication regressions. */
+export function writeAtomicFileForTest(
+  filePath: string,
+  contents: string,
+  mode: number,
+): void {
+  writeAtomicFile(filePath, contents, mode);
 }
 
 function readSettingsRecord(
@@ -616,11 +669,47 @@ export interface ContainerInput {
     inputDirectory: string;
     outputDirectory: string;
     runtimeDirectory: string;
+    runId: string;
+    attempt: number;
+    leaseToken: number;
+    executionDeadline: number;
+    /**
+     * Create the physical Docker object while the exact durable lease and
+     * cleanup marker remain protected by a cross-process write fence.
+     */
+    authorizeContainerCreation: (
+      createContainer: () => Promise<void>,
+    ) => Promise<boolean>;
+    /** Expose the cancellable Docker create client before the object exists. */
+    onContainerCreationProcess?: (process: ChildProcess) => void;
+    /**
+     * Persist and revalidate the durable boundary, publishing START only while
+     * the final cross-process lifecycle fence remains serialized.
+     */
+    authorizeStart: (publishStart: () => void) => boolean;
+    /**
+     * Revalidate the durable lifecycle boundary after the runner consumes START,
+     * publishing its acknowledgement and confirmation under the same fence.
+     */
+    acknowledgeStart: (publishAcknowledgement: () => void) => boolean;
+    /**
+     * Verify that every host-created runtime byte plus the bounded remaining
+     * control/log allowance fits the durable Vault reservation.
+     */
+    assertRuntimeStorageBound: (additionalBytes: number) => void;
+    /** Latch a runner-control failure and terminate via the worker. */
+    onProtocolFailure: (error: unknown, retryableBeforeStart: boolean) => void;
   };
   /** Explicit SDK tool allow-list for a confined host-owned execution. */
   allowedTools?: string[];
   /** Non-secret marker forwarded to agent-runner after host paths are removed. */
   externalRestrictedExecution?: boolean;
+  /** Attempt-scoped nonce used by the runner's fail-closed start handshake. */
+  externalStartAuthorization?: {
+    protocol: 1;
+    authorizationId: string;
+    expiresAt: number;
+  };
   /** Host-bounded SDK limits used only by confined external executions. */
   externalQueryLimits?: {
     maxTurns: number;
@@ -1295,13 +1384,15 @@ export function willClearSessionOnProviderSwitch(
  * block" 400 errors when a conversation that produced thinking blocks under
  * provider A gets resumed in a fresh container that the pool routes to provider B
  * (different OAuth account / API key). Each successful selection updates the
- * binding via setSessionProviderId().
+ * binding unless the caller explicitly requests nonpersistent selection for an
+ * isolated execution that cannot be resumed.
  */
 export function trySelectPoolProvider(
   groupFolder: string,
   agentId?: string | null,
   modelConfigId?: string | null,
   transientRetryProfileId?: string | null,
+  options?: { persistSessionBinding?: boolean },
 ): {
   profileId: string;
   resolved: ResolvedProvider;
@@ -1313,8 +1404,16 @@ export function trySelectPoolProvider(
    */
   modelOverride?: string;
 } | null {
+  const persistSessionBinding = options?.persistSessionBinding !== false;
   const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
-  const existingBoundId = getSessionProviderId(groupFolder, agentId);
+  const existingBoundId = persistSessionBinding
+    ? getSessionProviderId(groupFolder, agentId)
+    : undefined;
+  const persistSelectedProvider = (providerId: string): void => {
+    if (persistSessionBinding) {
+      setSessionProviderId(groupFolder, agentId, providerId);
+    }
+  };
   if (selectedModelConfigId) {
     // Agent/single-enabled selection is authoritative. Workspace credentials must
     // never move a Workspace away from the model configuration selected for
@@ -1332,7 +1431,7 @@ export function trySelectPoolProvider(
     providerPool.refreshFromConfig(providers, getBalancingConfig());
     const resolved = resolveProviderById(selected.id);
     providerPool.acquireSession(selected.id);
-    setSessionProviderId(groupFolder, agentId, selected.id);
+    persistSelectedProvider(selected.id);
     return {
       profileId: selected.id,
       resolved: { config: resolved.config, customEnv: resolved.customEnv },
@@ -1393,7 +1492,7 @@ export function trySelectPoolProvider(
       try {
         const resolved = resolveProviderById(transientRetryProfileId);
         providerPool.acquireSession(transientRetryProfileId);
-        setSessionProviderId(groupFolder, agentId, transientRetryProfileId);
+        persistSelectedProvider(transientRetryProfileId);
         logger.info(
           {
             groupFolder,
@@ -1498,7 +1597,7 @@ export function trySelectPoolProvider(
     try {
       const resolved = resolveProviderById(enabledProviders[0].id);
       providerPool.acquireSession(enabledProviders[0].id);
-      setSessionProviderId(groupFolder, agentId, enabledProviders[0].id);
+      persistSelectedProvider(enabledProviders[0].id);
       return {
         profileId: enabledProviders[0].id,
         resolved: { config: resolved.config, customEnv: resolved.customEnv },
@@ -1515,7 +1614,7 @@ export function trySelectPoolProvider(
     const profileId = providerPool.selectProvider(tier);
     const resolved = resolveProviderById(profileId);
     providerPool.acquireSession(profileId);
-    setSessionProviderId(groupFolder, agentId, profileId);
+    persistSelectedProvider(profileId);
     return {
       profileId,
       resolved: { config: resolved.config, customEnv: resolved.customEnv },
@@ -1768,18 +1867,13 @@ function prepareVolumeMounts(
   const ownerId = externalExecution ? undefined : group.created_by;
 
   if (externalExecution) {
-    // An external caller's documents never enter a normal workspace. The Agent
-    // only sees verified staged inputs read-only and an otherwise empty output
-    // directory as its cwd; it cannot browse tenant or project files.
+    // An external caller's documents never enter a normal workspace. Verified
+    // staged inputs are read-only; the writable cwd is a Docker size-limited
+    // tmpfs added by buildContainerArgs, not a Vault bind mount.
     mounts.push({
       hostPath: externalExecution.inputDirectory,
       containerPath: '/workspace/input',
       readonly: true,
-    });
-    mounts.push({
-      hostPath: externalExecution.outputDirectory,
-      containerPath: '/workspace/group',
-      readonly: false,
     });
   } else if (isAdminHome) {
     // Admin home gets the entire project root mounted
@@ -1854,11 +1948,19 @@ function prepareVolumeMounts(
     baseSettings: loadHostClaudeSettings(claudeContextPlan),
   });
 
-  mounts.push({
-    hostPath: groupSessionsDir,
-    containerPath: '/home/node/.claude',
-    readonly: false,
-  });
+  mounts.push(
+    externalExecution
+      ? {
+          hostPath: groupSessionsDir,
+          containerPath: '/workspace/external-bootstrap/claude',
+          readonly: true,
+        }
+      : {
+          hostPath: groupSessionsDir,
+          containerPath: '/home/node/.claude',
+          readonly: false,
+        },
+  );
 
   // 清理 session 目录中 SDK 遗留的 .claude.json（含 cachedGrowthBookFeatures，会导致初始化挂起）。
   // 精简版（不含 feature flags）约 200-400B，SDK 写回的完整版通常 > 10KB。
@@ -1881,7 +1983,9 @@ function prepareVolumeMounts(
     : getContainerClaudeJsonPath();
   mounts.push({
     hostPath: containerJson,
-    containerPath: '/home/node/.claude.json',
+    containerPath: externalExecution
+      ? '/workspace/external-bootstrap/.claude.json'
+      : '/home/node/.claude.json',
     readonly: true,
   });
 
@@ -2030,29 +2134,59 @@ function prepareVolumeMounts(
   // Sub-agents get their own IPC subdirectory under agents/{agentId}/
   // Isolated tasks get their own IPC subdirectory under tasks-run/{taskRunId}/
   // Keep host IPC roots owner-only; the entrypoint applies the selected bridge.
-  const groupIpcDir = externalExecution
-    ? path.join(externalExecution.runtimeDirectory, 'ipc')
-    : ipcAgentId
-      ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', ipcAgentId)
+  if (!externalExecution) {
+    const ipcRoot = path.join(DATA_DIR, 'ipc');
+    const groupIpcDir = ipcAgentId
+      ? path.join(ipcRoot, group.folder, 'agents', ipcAgentId)
       : taskRunId
-        ? path.join(DATA_DIR, 'ipc', group.folder, 'tasks-run', taskRunId)
-        : path.join(DATA_DIR, 'ipc', group.folder);
-  mkdirForContainer(groupIpcDir);
-  // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
-  for (const sub of ['messages', 'tasks', 'input', 'agents'] as const) {
-    const subDir = path.join(groupIpcDir, sub);
-    fs.mkdirSync(subDir, { recursive: true });
-    try {
-      fs.chmodSync(subDir, 0o700);
-    } catch {
-      /* ignore if already correct */
+        ? path.join(ipcRoot, group.folder, 'tasks-run', taskRunId)
+        : path.join(ipcRoot, group.folder);
+    ensureDirectoryTreeNoSymlinks(ipcRoot, groupIpcDir);
+    for (const sub of [
+      'messages',
+      'tasks',
+      'input',
+      'agents',
+      'tasks-run',
+    ] as const) {
+      ensureDirectoryTreeNoSymlinks(ipcRoot, path.join(groupIpcDir, sub));
+    }
+    mounts.push({
+      hostPath: groupIpcDir,
+      containerPath: '/workspace/ipc',
+      readonly: false,
+    });
+
+    // The current namespace is writable, but descendant runtime mount points
+    // are host-owned. Hide both trees behind an empty read-only overlay so a
+    // tenant cannot replace a future bind source with a symlink to another
+    // host directory (or inspect sibling session/task IPC payloads).
+    const opaqueRoot = path.join(DATA_DIR, 'container-opaque');
+    const opaqueEmptyDir = ensureDirectoryTreeNoSymlinks(
+      opaqueRoot,
+      path.join(opaqueRoot, 'empty'),
+    );
+    for (const child of ['agents', 'tasks-run'] as const) {
+      mounts.push({
+        hostPath: opaqueEmptyDir,
+        containerPath: `/workspace/ipc/${child}`,
+        readonly: true,
+      });
     }
   }
-  mounts.push({
-    hostPath: groupIpcDir,
-    containerPath: '/workspace/ipc',
-    readonly: false,
-  });
+  if (externalExecution) {
+    const authorizationDir = path.join(
+      externalExecution.runtimeDirectory,
+      'authorization',
+    );
+    mkdirForContainer(authorizationDir);
+    fs.chmodSync(authorizationDir, 0o755);
+    mounts.push({
+      hostPath: authorizationDir,
+      containerPath: '/workspace/external-authorization',
+      readonly: true,
+    });
+  }
 
   // Per-container environment file (keeps credentials out of process listings)
   // Global config merged with per-container overrides.
@@ -2068,6 +2202,13 @@ function prepareVolumeMounts(
       );
   fs.mkdirSync(envDir, { recursive: true });
   const rawGlobalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
+  if (externalExecution) {
+    assertExternalCapabilityProviderRoute({
+      anthropicBaseUrl: rawGlobalConfig.anthropicBaseUrl,
+      httpsProxy: CONTAINER_HTTPS_PROXY,
+      httpProxy: CONTAINER_HTTP_PROXY,
+    });
+  }
   const globalConfig = {
     ...rawGlobalConfig,
     anthropicBaseUrl: resolveCodexGatewayBaseUrl(
@@ -2087,7 +2228,12 @@ function prepareVolumeMounts(
   const envLines = buildContainerEnvLines(
     globalConfig,
     effectiveContainerOverride,
-    externalExecution ? undefined : resolvedProvider?.customEnv,
+    // External runs must never fall back to another enabled profile's custom
+    // environment. An explicit empty map also keeps the global-config fallback
+    // credential-free when no pool profile was selected.
+    externalExecution
+      ? (resolvedProvider?.customEnv ?? {})
+      : resolvedProvider?.customEnv,
   );
   const agentEffort = resolveAgentSdkEffort(agentProfile?.runtimePolicy);
   removeProviderEffortEnv(envLines, agentEffort);
@@ -2128,7 +2274,11 @@ function prepareVolumeMounts(
     envLines.push(`ANTHROPIC_MODEL=${containerTierEnv.model}`);
   }
   applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
-  applyContainerProxyEnvLines(envLines, containerProxy.envLines);
+  if (externalExecution) {
+    applyExternalProviderProxyFence(envLines, containerProxy.envLines);
+  } else {
+    applyContainerProxyEnvLines(envLines, containerProxy.envLines);
+  }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -2382,6 +2532,7 @@ export interface ContainerNetworkConfig {
   addHostGateway: boolean;
   externalExecution?: boolean;
   networkName?: string;
+  labels?: Record<string, string>;
 }
 
 function defaultContainerProxyConfig(): ContainerProxyConfig {
@@ -2451,6 +2602,11 @@ export function resolveContainerProxyConfig(
   return { envLines, addHostGateway };
 }
 
+function envLineKey(line: string): string {
+  const separator = line.indexOf('=');
+  return (separator > 0 ? line.slice(0, separator) : line).toLowerCase();
+}
+
 /** Apply proxy assignments last so host proxy configuration is authoritative. */
 export function applyContainerProxyEnvLines(
   envLines: string[],
@@ -2462,17 +2618,65 @@ export function applyContainerProxyEnvLines(
     const key = proxyLine.slice(0, separator);
     const lowerKey = key.toLowerCase();
     for (let index = envLines.length - 1; index >= 0; index -= 1) {
-      const existingLine = envLines[index] ?? '';
-      const existingSeparator = existingLine.indexOf('=');
-      const existingKey =
-        existingSeparator > 0
-          ? existingLine.slice(0, existingSeparator)
-          : existingLine;
-      if (existingKey?.toLowerCase() === lowerKey) envLines.splice(index, 1);
+      if (envLineKey(envLines[index] ?? '') === lowerKey) {
+        envLines.splice(index, 1);
+      }
     }
     envLines.push(proxyLine);
   }
 }
+
+const EXTERNAL_PROVIDER_PROXY_ENV_KEYS = new Set([
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+  'no_proxy',
+  'npm_config_proxy',
+  'npm_config_https_proxy',
+  'npm_config_noproxy',
+  'global_agent_http_proxy',
+  'global_agent_https_proxy',
+  'global_agent_no_proxy',
+]);
+
+/**
+ * External runners may use only the host-selected HTTP(S) proxy. Provider and
+ * workspace environment cannot add an alternate proxy or a bypass that reaches
+ * another peer on the dedicated Docker network.
+ */
+export function applyExternalProviderProxyFence(
+  envLines: string[],
+  proxyEnvLines: readonly string[],
+): void {
+  for (let index = envLines.length - 1; index >= 0; index -= 1) {
+    if (
+      EXTERNAL_PROVIDER_PROXY_ENV_KEYS.has(envLineKey(envLines[index] ?? ''))
+    ) {
+      envLines.splice(index, 1);
+    }
+  }
+  applyContainerProxyEnvLines(
+    envLines,
+    proxyEnvLines.filter((line) => {
+      const key = envLineKey(line);
+      return key === 'http_proxy' || key === 'https_proxy';
+    }),
+  );
+  envLines.push(
+    'NO_PROXY=',
+    'no_proxy=',
+    'npm_config_noproxy=',
+    'GLOBAL_AGENT_NO_PROXY=',
+  );
+}
+
+export const EXTERNAL_CONTAINER_HOME_TMPFS_BYTES = 128 * 1024 * 1024;
+export const EXTERNAL_CONTAINER_WORKSPACE_TMPFS_BYTES = 64 * 1024 * 1024;
+export const EXTERNAL_CONTAINER_TMP_TMPFS_BYTES = 64 * 1024 * 1024;
+// START, acknowledgement, confirmation, and the redacted close summary are all
+// fixed host-generated records. Reserve a conservative tail before Docker can
+// exist so later control publication cannot exceed the durable runtime charge.
+export const EXTERNAL_RUNTIME_FUTURE_HOST_BYTES = 64 * 1024;
 
 export function buildContainerArgs(
   mounts: VolumeMount[],
@@ -2482,13 +2686,29 @@ export function buildContainerArgs(
   networkConfig: ContainerNetworkConfig = { addHostGateway: false },
   containerImage = CONTAINER_IMAGE,
 ): string[] {
-  const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  const args: string[] = [
+    'run',
+    '-i',
+    '--rm',
+    '--name',
+    containerName,
+    ...ownedDockerLabelArgs(),
+    '--pids-limit',
+    '256',
+    '--memory',
+    '2g',
+    '--cpus',
+    '2',
+  ];
 
   // Set timezone so container Node.js processes use local time (Asia/Shanghai)
   args.push('-e', `TZ=${tz}`);
   args.push('-e', `HAPPYCLAW_AGENT_RUNNER_MODE=${resolveAgentRunnerMode()}`);
-  args.push('-e', `HAPPYCLAW_HOST_IDENTITY_MODE=${hostIdentity.mode}`);
-  if (hostIdentity.mode === 'direct') {
+  const identityMode = networkConfig.externalExecution
+    ? 'external'
+    : hostIdentity.mode;
+  args.push('-e', `HAPPYCLAW_HOST_IDENTITY_MODE=${identityMode}`);
+  if (identityMode === 'direct') {
     if (isPositiveUnixId(hostIdentity.uid)) {
       args.push('-e', `HAPPYCLAW_HOST_UID=${hostIdentity.uid}`);
     }
@@ -2510,15 +2730,40 @@ export function buildContainerArgs(
       networkConfig.networkName,
       '--cap-drop',
       'ALL',
+      // The immutable image starts with a root entrypoint that initializes
+      // node-owned tmpfs state and then drops privileges. Keep only the four
+      // capabilities required for that one-way transition; all other kernel
+      // capabilities remain absent and no-new-privileges prevents regaining
+      // them after exec.
+      '--cap-add',
+      'CHOWN',
+      '--cap-add',
+      'DAC_OVERRIDE',
+      '--cap-add',
+      'SETGID',
+      '--cap-add',
+      'SETUID',
       '--security-opt',
       'no-new-privileges:true',
-      '--pids-limit',
-      '256',
-      '--memory',
-      '2g',
-      '--cpus',
-      '2',
+      '--read-only',
+      '--tmpfs',
+      `/home/node:rw,nosuid,nodev,size=${EXTERNAL_CONTAINER_HOME_TMPFS_BYTES},uid=1000,gid=1000,mode=0700`,
+      '--tmpfs',
+      `/workspace:rw,nosuid,nodev,size=${EXTERNAL_CONTAINER_WORKSPACE_TMPFS_BYTES},uid=1000,gid=1000,mode=0755`,
+      '--tmpfs',
+      `/tmp:rw,nosuid,nodev,size=${EXTERNAL_CONTAINER_TMP_TMPFS_BYTES},mode=1777`,
+      '-e',
+      'HAPPYCLAW_EXTERNAL_EXECUTION=1',
     );
+    for (const [key, value] of Object.entries(networkConfig.labels ?? {})) {
+      if (
+        !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(key) ||
+        !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(value)
+      ) {
+        throw new Error('Invalid external container identity label');
+      }
+      args.push('--label', `${key}=${value}`);
+    }
   }
   if (networkConfig.addHostGateway) {
     args.push('--add-host', 'host.docker.internal:host-gateway');
@@ -2610,6 +2855,127 @@ export function reconcileDockerOAuthAfterExit(
   }
 }
 
+export function isRetryableExternalPreReadyOutput(
+  output: ContainerOutput,
+): boolean {
+  // A protocol-attested runner cannot call query() before READY/START. A
+  // terminal initialization error before READY is therefore provably
+  // pre-Provider and may use the bounded pre-START retry path. Any other frame
+  // remains an incompatible-protocol failure and is never replayed.
+  return output.runnerControl === undefined && output.status === 'error';
+}
+
+export function externalCapabilityContainerName(
+  runId: string,
+  attempt: number,
+  leaseToken: number,
+): string {
+  const safeRunId = runId.replace(/[^a-zA-Z0-9-]/g, '-');
+  return `happyclaw-${getInstallationNamespace()}-external-${safeRunId}-${attempt}-${leaseToken}`;
+}
+
+export function buildExternalContainerCreateArgs(
+  runArgs: readonly string[],
+): string[] {
+  if (runArgs[0] !== 'run') {
+    throw new Error('Expected Docker run arguments for external container');
+  }
+  return ['create', ...runArgs.slice(1)];
+}
+
+export function buildExternalContainerStartArgs(
+  containerName: string,
+): string[] {
+  return ['start', '--attach', '--interactive', containerName];
+}
+
+function createDockerContainerObject(
+  createArgs: string[],
+  onProcess: (process: ChildProcess) => void,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const process = execFile(
+      'docker',
+      createArgs,
+      { timeout: 30_000, maxBuffer: 1024 * 1024 },
+      (error) => {
+        if (error) reject(error);
+        else resolve();
+      },
+    );
+    onProcess(process);
+  });
+}
+
+async function waitForOrdinaryContainerCreateFence(
+  fence: OrdinaryContainerCreateFence,
+): Promise<void> {
+  const wait = (milliseconds: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+  do {
+    await new Promise<void>((resolve) => {
+      execFile(
+        'docker',
+        ['rm', '--force', fence.containerName],
+        { timeout: 5_000 },
+        () => resolve(),
+      );
+    });
+    const present = await new Promise<boolean>((resolve, reject) => {
+      execFile(
+        'docker',
+        [
+          'container',
+          'ls',
+          '--all',
+          '--quiet',
+          '--filter',
+          `name=^/${fence.containerName}$`,
+        ],
+        { timeout: 5_000 },
+        (error, stdout) => {
+          if (error) reject(error);
+          else resolve(Boolean(stdout.trim()));
+        },
+      );
+    });
+    if (Date.now() >= fence.expiresAt) {
+      if (present) {
+        throw new Error('Ordinary Docker container creation did not settle');
+      }
+      clearOrdinaryContainerCreateFence(fence);
+      return;
+    }
+    await wait(Math.min(1_000, Math.max(1, fence.expiresAt - Date.now())));
+  } while (true);
+}
+
+export class ExternalContainerSpawnError extends Error {
+  readonly code = 'EXTERNAL_CONTAINER_SPAWN_FAILED';
+}
+
+function createContainerSpawnFailure(
+  error: Error,
+  externalExecution: boolean,
+): ExternalContainerSpawnError | ContainerOutput {
+  if (externalExecution) {
+    return new ExternalContainerSpawnError('Container spawn failed');
+  }
+  return {
+    status: 'error',
+    result: null,
+    error: `Container spawn error: ${error.message}`,
+  };
+}
+
+/** Dependency-free seam for pre-spawn retry classification regressions. */
+export function createContainerSpawnFailureForTest(
+  error: Error,
+  externalExecution: boolean,
+): ExternalContainerSpawnError | ContainerOutput {
+  return createContainerSpawnFailure(error, externalExecution);
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
@@ -2633,6 +2999,7 @@ export async function runContainerAgent(
     sessionAgentId,
     input.agentProfile?.modelConfigId,
     transientRetryProfileForInput(input.turnId),
+    { persistSessionBinding: !input.externalExecution },
   );
   const selectedProfileId = poolResult?.profileId ?? null;
   const selectedProviderQuotaEpoch = selectedProfileId
@@ -2712,6 +3079,14 @@ export async function runContainerAgent(
     const containerImage = requiresHeadroom
       ? CONTAINER_IMAGE_HEADROOM
       : CONTAINER_IMAGE;
+    if (
+      input.externalExecution &&
+      !isExternalCapabilityContainerImagePinned(containerImage)
+    ) {
+      throw new Error(
+        'External capability execution requires a digest-pinned runner image',
+      );
+    }
     const contextAudit = {
       ...preparedLaunch.claudeContextPlan.audit,
       mcp: {
@@ -2724,7 +3099,14 @@ export async function runContainerAgent(
     const agentSuffix = sessionAgentId
       ? `-${sessionAgentId.replace(/[^a-zA-Z0-9-]/g, '-')}`
       : '';
-    const containerName = `happyclaw-${safeName}${agentSuffix}-${Date.now()}`;
+    const ordinaryContainerIdentity = `${safeName}${agentSuffix}`.slice(0, 180);
+    const containerName = input.externalExecution
+      ? externalCapabilityContainerName(
+          input.externalExecution.runId,
+          input.externalExecution.attempt,
+          input.externalExecution.leaseToken,
+        )
+      : `happyclaw-${getInstallationNamespace()}-${ordinaryContainerIdentity}-${Date.now()}`;
     const containerArgs = buildContainerArgs(
       mounts,
       containerName,
@@ -2737,6 +3119,21 @@ export async function runContainerAgent(
         externalExecution: Boolean(input.externalExecution),
         networkName: input.externalExecution
           ? (getExternalCapabilityDockerNetwork() ?? undefined)
+          : undefined,
+        labels: input.externalExecution
+          ? {
+              'com.happyclaw.external': 'true',
+              'com.happyclaw.external.protocol': String(
+                EXTERNAL_RUNNER_PROTOCOL_VERSION,
+              ),
+              'com.happyclaw.external.run-id': input.externalExecution.runId,
+              'com.happyclaw.external.attempt': String(
+                input.externalExecution.attempt,
+              ),
+              'com.happyclaw.external.lease-token': String(
+                input.externalExecution.leaseToken,
+              ),
+            }
           : undefined,
       },
       containerImage,
@@ -2779,12 +3176,161 @@ export async function runContainerAgent(
       : path.join(GROUPS_DIR, group.folder, 'logs');
     fs.mkdirSync(logsDir, { recursive: true });
 
-    const result = await new Promise<ContainerOutput>((resolve) => {
-      const container = spawn('docker', containerArgs, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+    let ordinaryCreateFence: OrdinaryContainerCreateFence | null = null;
+    if (input.externalExecution) {
+      input.externalExecution.assertRuntimeStorageBound(
+        EXTERNAL_RUNTIME_FUTURE_HOST_BYTES,
+      );
+      try {
+        const created =
+          await input.externalExecution.authorizeContainerCreation(async () => {
+            await createDockerContainerObject(
+              buildExternalContainerCreateArgs(containerArgs),
+              (process) =>
+                input.externalExecution?.onContainerCreationProcess?.(process),
+            );
+          });
+        if (!created) {
+          throw new ExternalContainerSpawnError(
+            'Container creation authorization was denied',
+          );
+        }
+      } catch (error) {
+        logger.error(
+          { group: group.name, containerName, err: error },
+          'External container creation failed',
+        );
+        if (error instanceof ExternalContainerSpawnError) throw error;
+        throw new ExternalContainerSpawnError('Container creation failed');
+      }
+    } else {
+      ordinaryCreateFence = createOrdinaryContainerCreateFence(containerName);
+      try {
+        await createDockerContainerObject(
+          buildExternalContainerCreateArgs(containerArgs),
+          (process) => onProcess(process, containerName, selectedProfileId),
+        );
+      } catch (error) {
+        logger.error(
+          { group: group.name, containerName, err: error },
+          'Container creation failed; waiting for the durable create fence',
+        );
+        await waitForOrdinaryContainerCreateFence(ordinaryCreateFence);
+        throw error;
+      }
+    }
+
+    const result = await new Promise<ContainerOutput>((resolve, reject) => {
+      const externalStartAuthorization = input.externalExecution
+        ? {
+            protocol: EXTERNAL_RUNNER_PROTOCOL_VERSION,
+            authorizationId: randomUUID(),
+            expiresAt: input.externalExecution.executionDeadline,
+          }
+        : undefined;
+      const externalAuthorizationDecisionPath = input.externalExecution
+        ? path.join(
+            input.externalExecution.runtimeDirectory,
+            'authorization',
+            'decision.json',
+          )
+        : null;
+      const externalAuthorizationConfirmationPath = input.externalExecution
+        ? path.join(
+            input.externalExecution.runtimeDirectory,
+            'authorization',
+            'acknowledged.json',
+          )
+        : null;
+      const externalAcknowledgementPath = input.externalExecution
+        ? path.join(
+            input.externalExecution.outputDirectory,
+            'start-consumed.json',
+          )
+        : null;
+      const externalStartController =
+        input.externalExecution &&
+        externalStartAuthorization &&
+        externalAuthorizationDecisionPath &&
+        externalAuthorizationConfirmationPath &&
+        externalAcknowledgementPath
+          ? new ExternalStartAuthorizationController(
+              externalStartAuthorization.authorizationId,
+              externalStartAuthorization.expiresAt,
+              input.externalExecution.authorizeStart,
+              (decision) => {
+                const payload = JSON.stringify({
+                  protocol: EXTERNAL_RUNNER_PROTOCOL_VERSION,
+                  authorizationId: externalStartAuthorization.authorizationId,
+                  decision,
+                });
+                input.externalExecution!.assertRuntimeStorageBound(
+                  Buffer.byteLength(payload, 'utf8') * 2,
+                );
+                writeAtomicFile(
+                  externalAuthorizationDecisionPath,
+                  payload,
+                  0o444,
+                );
+              },
+              () => {
+                const acknowledgement = JSON.stringify({
+                  protocol: EXTERNAL_RUNNER_PROTOCOL_VERSION,
+                  authorizationId: externalStartAuthorization.authorizationId,
+                  consumed: true,
+                });
+                const confirmation = JSON.stringify({
+                  protocol: EXTERNAL_RUNNER_PROTOCOL_VERSION,
+                  authorizationId: externalStartAuthorization.authorizationId,
+                  acknowledged: true,
+                });
+                input.externalExecution!.assertRuntimeStorageBound(
+                  Buffer.byteLength(acknowledgement, 'utf8') * 2 +
+                    Buffer.byteLength(confirmation, 'utf8') * 2,
+                );
+                // The runner cannot enter query() until the host-only durable ACK
+                // exists and the read-only confirmation has been published while
+                // cancellation and lifecycle changes remain serialized.
+                const acknowledged = input.externalExecution!.acknowledgeStart(
+                  () => {
+                    writeAtomicFile(
+                      externalAcknowledgementPath,
+                      acknowledgement,
+                      0o600,
+                    );
+                    writeAtomicFile(
+                      externalAuthorizationConfirmationPath,
+                      confirmation,
+                      0o444,
+                    );
+                  },
+                );
+                if (!acknowledged) {
+                  throw new Error(
+                    'External START acknowledgement was rejected',
+                  );
+                }
+              },
+            )
+          : null;
+      let container: ChildProcessWithoutNullStreams;
+      container = spawn(
+        'docker',
+        buildExternalContainerStartArgs(containerName),
+        { stdio: ['pipe', 'pipe', 'pipe'] },
+      );
 
       onProcess(container, containerName, selectedProfileId);
+      if (ordinaryCreateFence) {
+        try {
+          clearOrdinaryContainerCreateFence(ordinaryCreateFence);
+          ordinaryCreateFence = null;
+        } catch (error) {
+          container.kill('SIGKILL');
+          reject(error as Error);
+          return;
+        }
+      }
 
       const stdoutState = createStdoutParserState();
       const stderrState = createStderrState();
@@ -2805,6 +3351,7 @@ export async function runContainerAgent(
       const dockerInput: ContainerInput = {
         ...runnerInput,
         externalRestrictedExecution: Boolean(input.externalExecution),
+        ...(externalStartAuthorization && { externalStartAuthorization }),
         allowedTools: input.externalExecution ? [] : input.allowedTools,
         workspaceMemoryMutationSigningSecret,
         workspaceMemoryRunnerInstanceId,
@@ -2822,10 +3369,16 @@ export async function runContainerAgent(
 
       let timedOut = false;
       const systemSettings = getSystemSettings();
+      const externalDeadlineRemainingMs = input.externalExecution
+        ? Math.max(1, input.externalExecution.executionDeadline - Date.now())
+        : null;
       const timeoutMs = resolveRunnerLivenessTimeouts({
         executionTimeoutMs:
-          group.containerConfig?.timeout || systemSettings.containerTimeout,
-        idleTimeoutMs: systemSettings.idleTimeout,
+          externalDeadlineRemainingMs ??
+          group.containerConfig?.timeout ??
+          systemSettings.containerTimeout,
+        idleTimeoutMs:
+          externalDeadlineRemainingMs ?? systemSettings.idleTimeout,
       }).watchdogMs;
 
       const killOnTimeout = () => {
@@ -2850,12 +3403,11 @@ export async function runContainerAgent(
         );
       };
 
-      let timeout = setTimeout(killOnTimeout, timeoutMs);
+      const timeout = setTimeout(killOnTimeout, timeoutMs);
 
-      const resetTimeout = () => {
-        clearTimeout(timeout);
-        timeout = setTimeout(killOnTimeout, timeoutMs);
-      };
+      // `CONTAINER_TIMEOUT` is a hard wall-clock deadline. Output activity may
+      // reset the separate warm-runner idle timer, but never this watchdog.
+      const resetTimeout = () => {};
       const reconcileDockerOAuth = (
         phase: 'output' | 'exit',
       ): DockerOAuthReconcileOutcome | 'error' | null => {
@@ -2891,7 +3443,72 @@ export async function runContainerAgent(
         }
         return outcome;
       };
+      let externalControlFailed = false;
+      let externalStartPublished = false;
+      let externalStartHandshakeComplete = false;
+      const failExternalControl = (
+        error: unknown,
+        retryableBeforeStart = false,
+      ): void => {
+        if (externalControlFailed) return;
+        externalControlFailed = true;
+        logger.error(
+          { group: group.name, containerName, err: error },
+          'External runner start authorization failed closed',
+        );
+        input.externalExecution?.onProtocolFailure(error, retryableBeforeStart);
+      };
       const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        if (externalControlFailed) return;
+        if (output.runnerControl !== undefined) {
+          if (timedOut) {
+            failExternalControl(
+              new Error(
+                'External runner emitted READY after container timeout',
+              ),
+              true,
+            );
+            return;
+          }
+          if (!externalStartController) {
+            failExternalControl(
+              new Error('Unexpected external runner control frame'),
+            );
+            return;
+          }
+          try {
+            const outcome = externalStartController.handle(output);
+            if (outcome === 'abort') {
+              failExternalControl(
+                new Error('External runner start authorization was denied'),
+                true,
+              );
+              return;
+            }
+            if (outcome === 'start') externalStartPublished = true;
+            if (outcome === 'acknowledged') {
+              externalStartHandshakeComplete = true;
+            }
+            resetTimeout();
+          } catch (error) {
+            failExternalControl(
+              error,
+              !externalStartPublished &&
+                error instanceof ExternalStartAuthorizationExpiredError,
+            );
+          }
+          return;
+        }
+        if (externalStartController && !externalStartHandshakeComplete) {
+          failExternalControl(
+            new Error(
+              'External runner emitted output before START acknowledgement',
+            ),
+            !externalStartPublished &&
+              isRetryableExternalPreReadyOutput(output),
+          );
+          return;
+        }
         if (
           output.providerQuotaObservation ||
           output.inputTurnCompleted === true ||
@@ -3028,6 +3645,18 @@ export async function runContainerAgent(
         label: 'Container',
         onOutput: handleOutput,
         resetTimeout,
+        ...(input.externalExecution
+          ? {
+              maxFrameCharacters: 10 * 1024 * 1024,
+              onFrameOverflow: () => {
+                failExternalControl(
+                  new Error(
+                    'External runner output exceeded the safe frame limit',
+                  ),
+                );
+              },
+            }
+          : {}),
       });
       attachStderrHandler(
         container.stderr,
@@ -3041,6 +3670,14 @@ export async function runContainerAgent(
         clearTimeout(timeout);
         const duration = Date.now() - startTime;
         reconcileDockerOAuth('exit');
+        if (externalControlFailed) {
+          resolve({
+            status: 'error',
+            result: null,
+            error: 'External runner authorization protocol failed',
+          });
+          return;
+        }
 
         const closeCtx: CloseHandlerContext = {
           groupName: group.name,
@@ -3056,6 +3693,21 @@ export async function runContainerAgent(
           startTime,
           timeoutMs,
           redactSensitiveData: Boolean(input.externalExecution),
+          beforeNonZeroErrorResolve: input.externalExecution
+            ? () => {
+                if (
+                  externalStartController &&
+                  !externalStartHandshakeComplete
+                ) {
+                  failExternalControl(
+                    new Error(
+                      'External runner exited before START acknowledgement',
+                    ),
+                    !externalStartPublished,
+                  );
+                }
+              }
+            : undefined,
           extraSummaryLines: [
             ``,
             `=== Mounts ===`,
@@ -3090,11 +3742,15 @@ export async function runContainerAgent(
           { group: group.name, containerName, error: err },
           'Container spawn error',
         );
-        resolve({
-          status: 'error',
-          result: null,
-          error: `Container spawn error: ${err.message}`,
-        });
+        const failure = createContainerSpawnFailure(
+          err,
+          Boolean(input.externalExecution),
+        );
+        if (failure instanceof ExternalContainerSpawnError) {
+          reject(failure);
+          return;
+        }
+        resolve(failure);
       });
     });
 
@@ -3758,6 +4414,7 @@ export async function runHostAgent(
   // 5. 构建环境变量
   const hostEnv: Record<string, string> = {
     ...(process.env as Record<string, string>),
+    HAPPYCLAW_INSTALLATION_ID: getInstallationId(),
   };
   // Per-run policy must replace, never merge with, a parent process value.
   // Otherwise disabled/custom MCP can inherit servers from an earlier wrapper
@@ -3787,6 +4444,7 @@ export async function runHostAgent(
     sessionAgentId,
     input.agentProfile?.modelConfigId,
     transientRetryProfileForInput(input.turnId),
+    { persistSessionBinding: !input.externalExecution },
   );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const hostProviderQuotaEpoch = hostSelectedProfileId
@@ -4110,12 +4768,16 @@ export async function runHostAgent(
       // Resolve absolute node path: bare 'node' fails with ENOENT under
       // Process managers / launchd / GUI launchers where PATH lacks nvm/fnm dirs.
       const hostNodeBinary = resolveHostNodeBinary(hostEnv);
-      const proc = spawn(hostNodeBinary, [agentRunnerDist], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: hostEnv,
-        cwd: groupDir,
-        detached: true,
-      });
+      const proc = spawn(
+        hostNodeBinary,
+        [agentRunnerDist, hostRunnerOwnershipArgument()],
+        {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: hostEnv,
+          cwd: groupDir,
+          detached: true,
+        },
+      );
 
       const processId = `host-${group.folder}-${Date.now()}`;
       onProcess(proc, processId, hostSelectedProfileId);
@@ -4177,12 +4839,11 @@ export async function runHostAgent(
         }, 5000);
       };
 
-      let timeout = setTimeout(killOnTimeout, timeoutMs);
+      const timeout = setTimeout(killOnTimeout, timeoutMs);
 
-      const resetTimeout = () => {
-        clearTimeout(timeout);
-        timeout = setTimeout(killOnTimeout, timeoutMs);
-      };
+      // Keep the execution timeout absolute; output only affects the separate
+      // warm-runner idle lifecycle managed by the queue.
+      const resetTimeout = () => {};
       const handleOutput = async (output: ContainerOutput): Promise<void> => {
         if (
           consumeProviderQuotaControlOutput(

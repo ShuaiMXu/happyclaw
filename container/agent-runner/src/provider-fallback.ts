@@ -128,10 +128,13 @@ export function decideProviderLimitAction(input: {
   structuredRejection?: { rateLimitType?: ProviderRateLimitType };
   result: string | null;
   canFallback: boolean;
+  allowTextFallback?: boolean;
 }): { scope: ProviderLimitScope | null; action: ProviderLimitAction } {
   const scope = input.structuredRejection
     ? classifyProviderRateLimitType(input.structuredRejection.rateLimitType)
-    : classifyProviderLimitNotice(input.result);
+    : input.allowTextFallback === false
+      ? null
+      : classifyProviderLimitNotice(input.result);
   if (scope === 'account') {
     return { scope, action: 'provider_failure' };
   }

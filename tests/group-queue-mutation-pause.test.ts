@@ -32,6 +32,30 @@ const FOLDER = 'mutation-shared-folder';
 
 let queue: InstanceType<typeof GroupQueue>;
 
+function installRegistrationModel(
+  entries: Array<[string, string]> = [[WEB_JID, FOLDER]],
+): {
+  registrations: Map<string, string>;
+  isRegistered: ReturnType<typeof vi.fn>;
+} {
+  const registrations = new Map(entries);
+  const isRegistered = vi.fn((jid: string) => registrations.has(jid));
+  queue.setRegisteredGroupChecker(isRegistered);
+  queue.setSerializationKeyResolver(
+    (jid: string) => registrations.get(jid) ?? jid,
+  );
+  return { registrations, isRegistered };
+}
+
+function deleteAndTerminallyDiscard(
+  registrations: Map<string, string>,
+  jid = WEB_JID,
+): void {
+  const token = queue.pauseGroupsForMutation([jid]);
+  registrations.delete(jid);
+  queue.discardGroupsAfterMutation(token);
+}
+
 beforeEach(() => {
   fs.rmSync(DATA_DIR, { recursive: true, force: true });
   queue = new GroupQueue();
@@ -388,6 +412,75 @@ describe('GroupQueue mutation pause', () => {
     expect(dropped).toBe(2);
     expect(taskRuns).toBe(0);
   });
+
+  test('terminal discard releases when the same JID is registered again', async () => {
+    const { registrations } = installRegistrationModel();
+    const processMessages = vi.fn(async () => true);
+    queue.setProcessMessagesFn(processMessages);
+
+    deleteAndTerminallyDiscard(registrations);
+
+    queue.enqueueMessageCheck(WEB_JID);
+    await tick();
+    expect(processMessages).not.toHaveBeenCalled();
+
+    registrations.set(WEB_JID, FOLDER);
+    queue.enqueueMessageCheck(WEB_JID);
+    await tick();
+    await tick();
+
+    expect(processMessages).toHaveBeenCalledTimes(1);
+    expect(processMessages).toHaveBeenCalledWith(WEB_JID);
+  });
+
+  test('terminal discard releases for a different registered JID reusing the folder', async () => {
+    const { registrations } = installRegistrationModel();
+    deleteAndTerminallyDiscard(registrations);
+    registrations.set(IM_JID, FOLDER);
+
+    const run = vi.fn(async () => true);
+    const dropped = vi.fn();
+    const replacementVirtualJid = `${IM_JID}#task:fresh-generation`;
+
+    expect(
+      queue.enqueueTask(replacementVirtualJid, 'fresh-generation', run, {
+        onDropped: dropped,
+      }),
+    ).toBe(true);
+    await tick();
+    await tick();
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(dropped).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['task', `${WEB_JID}#task:stale-run`],
+    ['agent', `${WEB_JID}#agent:stale-agent`],
+  ])(
+    'rejects a stale old %s callback while its base registration is absent',
+    async (_kind, staleJid) => {
+      const { registrations, isRegistered } = installRegistrationModel();
+      deleteAndTerminallyDiscard(registrations);
+
+      const run = vi.fn(async () => true);
+      const dropped = vi.fn();
+      expect(
+        queue.enqueueTask(staleJid, `callback:${staleJid}`, run, {
+          onDropped: dropped,
+        }),
+      ).toBe(false);
+      await tick();
+
+      expect(isRegistered).toHaveBeenCalledWith(WEB_JID);
+      expect(run).not.toHaveBeenCalled();
+      expect(dropped).toHaveBeenCalledTimes(1);
+      expect(queue.getStatus()).toMatchObject({
+        activeCount: 0,
+        waitingCount: 0,
+      });
+    },
+  );
 
   test('runtime safety block parks new work until cleanup is explicitly confirmed', async () => {
     let runs = 0;

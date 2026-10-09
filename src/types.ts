@@ -739,6 +739,8 @@ export interface ExternalCapabilityRun {
   account_ref: string | null;
   callback_context: Record<string, unknown> | null;
   input_manifest: Record<string, unknown>;
+  /** Validated accepted bytes used for rolling intake admission. */
+  input_bytes: number;
   status:
     | 'queued'
     | 'running'
@@ -753,6 +755,11 @@ export interface ExternalCapabilityRun {
   lease_expires_at: string | null;
   started_at: string | null;
   completed_at: string | null;
+  retention_cleaned_at: string | null;
+  container_cleanup_attempt: number | null;
+  container_cleanup_lease_token: number | null;
+  /** Latest time at which an in-flight Docker create may still materialize. */
+  container_create_pending_until: string | null;
   result: Record<string, unknown> | null;
   error_code: string | null;
   error_message: string | null;

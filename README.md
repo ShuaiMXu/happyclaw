@@ -221,7 +221,7 @@ REST 接口和状态字段见 [API 文档](docs/API.md#任务)。
 ### 环境要求
 
 - macOS 或 Linux；Windows 推荐使用 WSL2。
-- [Node.js](https://nodejs.org/) 20 或更高版本，推荐使用 CI 同款 Node.js 24。
+- [Node.js](https://nodejs.org/) 24 或更高版本；三个 npm 项目与 CI、Runner 镜像统一使用 Node.js 24。
 - npm 与 GNU Make。
 - [Docker](https://www.docker.com/)：普通成员和 Container 工作区需要；仅使用管理员 Host 工作区时可不安装。
 
@@ -447,7 +447,7 @@ make typecheck        # 三端类型检查 + 共享类型/Prompt 引用校验
 make test             # 运行 Vitest 测试
 make format-check     # 检查本次改动涉及文件的格式
 make build            # 构建后端、Web 与 Agent Runner
-npm run self-test     # 构建 + Agent Runner 自检 + 全量测试
+npm run self-test     # 隔离构建（不覆盖 web/dist）+ Agent Runner 自检 + 全量测试
 ```
 
 项目只使用 Node.js/npm 工具链，不使用 Bun。主服务依赖 Node.js 的 HTTP Upgrade 与 `ws` 完成 WebSocket 握手。

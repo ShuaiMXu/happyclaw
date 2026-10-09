@@ -23,6 +23,7 @@
 | Invites  | `inviteManageMiddleware`     | `manage_invites`                       |
 | Audit    | `auditViewMiddleware`        | `view_audit_log`                       |
 | Billing  | Billing Middleware           | `manage_billing`                       |
+| External | `requirePermission()`        | `manage_external_capabilities`         |
 | IM Owner | `owner_im_id` 比对           | 当前渠道原生 sender 是记录的主人       |
 
 核心原则：
@@ -101,7 +102,7 @@ Host Workspace 在 Access 之外还要求 admin。
 - 重命名、切换 Agent、修改执行方式
 - stop、interrupt、reset-session、clear-history
 - 创建、修改、删除 Runtime Session
-- 写入工作区 Skills/MCP
+- 写入工作区 Skills/MCP；Host Workspace 还必须通过 admin/Host 边界
 - 修改群聊绑定、激活方式、响应对象和 owner
 - `/clear`、`/fresh` 的 HTTP 与 WebSocket 分支
 
@@ -215,6 +216,26 @@ read-only 投影按 host-issued turn ID 精确匹配当前或已接纳的 queued
 
 系统 MCP 默认仅 admin 可用；只有显式设置为 shared 后，普通成员的 Agent 才能进入
 有效能力清单。API 不回传 Secret 明文。
+
+### 6.1 外调能力
+
+外调控制面 `/api/external-capabilities*` 同时要求：
+
+1. 有效浏览器 Cookie Session；
+2. `manage_external_capabilities`；
+3. `canModifyGroup()` 证明当前用户是该能力耐久绑定 Workspace 的 owner。
+
+admin 或平台 Permission 不提供跨 owner bypass。列表只投影当前操作者拥有的目标；详情、Key
+列表/创建/撤销、Run 运营取消在资源不存在或 owner 校验失败时均返回 404。能力只有处于
+`active` 时才能创建 Key；`draft`、`paused` 和 `retired` 均拒绝。激活还要求宿主发布总闸、
+digest-pinned 且协议匹配的 Runner、Provider route、专用网络、目标 Container Workspace
+和 Vault readiness 全部通过；服务在关闭总闸启动时会把遗留 `active` 状态降为 `paused`，
+重新放量必须再次走完整激活探针。
+
+数据面 `/v1/external-capabilities/:slug/*` 不接受 Cookie，只接受能力专属 Bearer Key。Key
+只能提交、查询、取消和下载自身 capability scope 内、由同一 Key 创建的 Run；跨 slug 或跨
+Key 查询返回 404。失效 Key 不再允许新请求，但控制面的 Workspace owner 仍可执行事故取消。
+生命周期或 readiness 冲突返回 409，配额/速率限制返回 429，Vault 物理容量不足返回 507。
 
 ## 7. WebSocket
 

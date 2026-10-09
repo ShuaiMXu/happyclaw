@@ -1,0 +1,187 @@
+// 由 Microsoft Fluent Emoji（MIT License）3D 素材裁剪生成，见同目录 NOTICE.md
+// 头像可用值：'fe001'..'fe137'，避免与经典 Unicode emoji 字符冲突（存量数据仍按原始字符渲染）
+export interface FluentEmojiItem {
+  code: string;
+  category: string;
+  label: string;
+}
+
+export const FLUENT_EMOJI_CATEGORIES = [
+  '表情',
+  '动物',
+  '食物',
+  '自然',
+  '物品',
+  '符号',
+] as const;
+
+export const FLUENT_EMOJI_ITEMS: FluentEmojiItem[] = [
+  { code: 'fe001', category: '表情', label: '咧嘴笑' },
+  { code: 'fe002', category: '表情', label: '开心眯眼' },
+  { code: 'fe003', category: '表情', label: '笑哭' },
+  { code: 'fe004', category: '表情', label: '爆笑' },
+  { code: 'fe005', category: '表情', label: '眨眼' },
+  { code: 'fe006', category: '表情', label: '花痴' },
+  { code: 'fe007', category: '表情', label: '飞吻' },
+  { code: 'fe008', category: '表情', label: '亲亲' },
+  { code: 'fe009', category: '表情', label: '疯狂' },
+  { code: 'fe010', category: '表情', label: '吐舌' },
+  { code: 'fe011', category: '表情', label: '调皮吐舌' },
+  { code: 'fe012', category: '表情', label: '流口水' },
+  { code: 'fe013', category: '表情', label: '睡觉' },
+  { code: 'fe014', category: '表情', label: '如释重负' },
+  { code: 'fe015', category: '表情', label: '沉思' },
+  { code: 'fe016', category: '表情', label: '担心' },
+  { code: 'fe017', category: '表情', label: '困惑' },
+  { code: 'fe018', category: '表情', label: '皱眉' },
+  { code: 'fe019', category: '表情', label: '哭泣' },
+  { code: 'fe020', category: '表情', label: '大哭' },
+  { code: 'fe021', category: '表情', label: '生气' },
+  { code: 'fe022', category: '表情', label: '恶魔怒' },
+  { code: 'fe023', category: '表情', label: '呕吐' },
+  { code: 'fe024', category: '表情', label: '恶心' },
+  { code: 'fe025', category: '表情', label: '热到融化' },
+  { code: 'fe026', category: '表情', label: '冷到发抖' },
+  { code: 'fe027', category: '表情', label: '炸裂' },
+  { code: 'fe028', category: '表情', label: '震惊' },
+  { code: 'fe029', category: '表情', label: '脸红' },
+  { code: 'fe030', category: '表情', label: '祈求' },
+  { code: 'fe031', category: '表情', label: '单片镜' },
+  { code: 'fe032', category: '表情', label: '书呆子' },
+  { code: 'fe033', category: '表情', label: '小丑' },
+  { code: 'fe034', category: '表情', label: '幽灵' },
+  { code: 'fe035', category: '表情', label: '机器人' },
+  { code: 'fe036', category: '表情', label: '外星人' },
+  { code: 'fe037', category: '表情', label: '庆祝' },
+  { code: 'fe038', category: '动物', label: '猫' },
+  { code: 'fe039', category: '动物', label: '狗' },
+  { code: 'fe040', category: '动物', label: '狐狸' },
+  { code: 'fe041', category: '动物', label: '熊' },
+  { code: 'fe042', category: '动物', label: '熊猫' },
+  { code: 'fe043', category: '动物', label: '兔子' },
+  { code: 'fe044', category: '动物', label: '老虎' },
+  { code: 'fe045', category: '动物', label: '狮子' },
+  { code: 'fe046', category: '动物', label: '奶牛' },
+  { code: 'fe047', category: '动物', label: '猪' },
+  { code: 'fe048', category: '动物', label: '青蛙' },
+  { code: 'fe049', category: '动物', label: '猴子' },
+  { code: 'fe050', category: '动物', label: '仓鼠' },
+  { code: 'fe051', category: '动物', label: '考拉' },
+  { code: 'fe052', category: '动物', label: '小鸡' },
+  { code: 'fe053', category: '动物', label: '企鹅' },
+  { code: 'fe054', category: '动物', label: '独角兽' },
+  { code: 'fe055', category: '动物', label: '蜜蜂' },
+  { code: 'fe056', category: '动物', label: '蝴蝶' },
+  { code: 'fe057', category: '动物', label: '乌龟' },
+  { code: 'fe058', category: '动物', label: '蜗牛' },
+  { code: 'fe059', category: '动物', label: '鱼' },
+  { code: 'fe060', category: '动物', label: '海豚' },
+  { code: 'fe061', category: '动物', label: '鲸鱼' },
+  { code: 'fe062', category: '动物', label: '章鱼' },
+  { code: 'fe063', category: '动物', label: '螃蟹' },
+  { code: 'fe064', category: '动物', label: '蛇' },
+  { code: 'fe065', category: '动物', label: '猫头鹰' },
+  { code: 'fe066', category: '动物', label: '鸭子' },
+  { code: 'fe067', category: '动物', label: '大象' },
+  { code: 'fe068', category: '动物', label: '马' },
+  { code: 'fe069', category: '动物', label: '绵羊' },
+  { code: 'fe070', category: '动物', label: '龙' },
+  { code: 'fe071', category: '动物', label: '狼' },
+  { code: 'fe072', category: '动物', label: '鱿鱼' },
+  { code: 'fe073', category: '食物', label: '红苹果' },
+  { code: 'fe074', category: '食物', label: '青苹果' },
+  { code: 'fe075', category: '食物', label: '香蕉' },
+  { code: 'fe076', category: '食物', label: '葡萄' },
+  { code: 'fe077', category: '食物', label: '樱桃' },
+  { code: 'fe078', category: '食物', label: '草莓' },
+  { code: 'fe079', category: '食物', label: '西瓜' },
+  { code: 'fe080', category: '食物', label: '菠萝' },
+  { code: 'fe081', category: '食物', label: '桃子' },
+  { code: 'fe082', category: '食物', label: '柠檬' },
+  { code: 'fe083', category: '食物', label: '橘子' },
+  { code: 'fe084', category: '食物', label: '牛油果' },
+  { code: 'fe085', category: '食物', label: '猕猴桃' },
+  { code: 'fe086', category: '食物', label: '椰子' },
+  { code: 'fe087', category: '食物', label: '芒果' },
+  { code: 'fe088', category: '食物', label: '梨' },
+  { code: 'fe089', category: '食物', label: '甜瓜' },
+  { code: 'fe090', category: '食物', label: '蓝莓' },
+  { code: 'fe091', category: '食物', label: '番茄' },
+  { code: 'fe092', category: '食物', label: '胡萝卜' },
+  { code: 'fe093', category: '食物', label: '玉米' },
+  { code: 'fe094', category: '食物', label: '辣椒' },
+  { code: 'fe095', category: '食物', label: '西兰花' },
+  { code: 'fe096', category: '自然', label: '樱花' },
+  { code: 'fe097', category: '自然', label: '向日葵' },
+  { code: 'fe098', category: '自然', label: '玫瑰' },
+  { code: 'fe099', category: '自然', label: '郁金香' },
+  { code: 'fe100', category: '自然', label: '太阳' },
+  { code: 'fe101', category: '自然', label: '满月' },
+  { code: 'fe102', category: '自然', label: '星星' },
+  { code: 'fe103', category: '自然', label: '闪光' },
+  { code: 'fe104', category: '自然', label: '彩虹' },
+  { code: 'fe105', category: '自然', label: '云' },
+  { code: 'fe106', category: '自然', label: '雪花' },
+  { code: 'fe107', category: '自然', label: '火焰' },
+  { code: 'fe108', category: '自然', label: '水滴' },
+  { code: 'fe109', category: '自然', label: '四叶草' },
+  { code: 'fe110', category: '自然', label: '枫叶' },
+  { code: 'fe111', category: '物品', label: '火箭' },
+  { code: 'fe112', category: '物品', label: '气球' },
+  { code: 'fe113', category: '物品', label: '礼物' },
+  { code: 'fe114', category: '物品', label: '奖杯' },
+  { code: 'fe115', category: '物品', label: '皇冠' },
+  { code: 'fe116', category: '物品', label: '宝石' },
+  { code: 'fe117', category: '物品', label: '音符' },
+  { code: 'fe118', category: '物品', label: '骰子' },
+  { code: 'fe119', category: '物品', label: '游戏手柄' },
+  { code: 'fe120', category: '物品', label: '吉他' },
+  { code: 'fe121', category: '物品', label: '相机' },
+  { code: 'fe122', category: '物品', label: '灯泡' },
+  { code: 'fe123', category: '物品', label: '闹钟' },
+  { code: 'fe124', category: '物品', label: '雨伞' },
+  { code: 'fe125', category: '物品', label: '锚' },
+  { code: 'fe126', category: '物品', label: '飞机' },
+  { code: 'fe127', category: '符号', label: '红心' },
+  { code: 'fe128', category: '符号', label: '橙心' },
+  { code: 'fe129', category: '符号', label: '黄心' },
+  { code: 'fe130', category: '符号', label: '绿心' },
+  { code: 'fe131', category: '符号', label: '蓝心' },
+  { code: 'fe132', category: '符号', label: '紫心' },
+  { code: 'fe133', category: '符号', label: '闪亮爱心' },
+  { code: 'fe134', category: '符号', label: '心碎' },
+  { code: 'fe135', category: '符号', label: '满分' },
+  { code: 'fe136', category: '符号', label: '对勾' },
+  { code: 'fe137', category: '符号', label: '叉号' },
+];
+
+const FLUENT_EMOJI_MAP = new Map(FLUENT_EMOJI_ITEMS.map((it) => [it.code, it]));
+const FLUENT_EMOJI_CODE_PATTERN = /^fe\d{3}$/i;
+
+export function normalizeFluentEmojiCode(
+  value: string | null | undefined,
+): string | null {
+  const normalized = value?.trim().toLowerCase();
+  return normalized && FLUENT_EMOJI_MAP.has(normalized) ? normalized : null;
+}
+
+export function isFluentEmojiCode(
+  value: string | null | undefined,
+): value is string {
+  return normalizeFluentEmojiCode(value) !== null;
+}
+
+export function isFluentEmojiToken(value: string | null | undefined): boolean {
+  return !!value && FLUENT_EMOJI_CODE_PATTERN.test(value.trim());
+}
+
+export function getFluentEmojiSrc(code: string): string {
+  const normalized =
+    normalizeFluentEmojiCode(code) ?? code.trim().toLowerCase();
+  return `${import.meta.env.BASE_URL}emoji/fluent3d/${normalized}.png`;
+}
+
+export function getFluentEmojiItem(code: string): FluentEmojiItem | undefined {
+  const normalized = normalizeFluentEmojiCode(code);
+  return normalized ? FLUENT_EMOJI_MAP.get(normalized) : undefined;
+}

@@ -15,7 +15,7 @@ import {
 import {
   countChannelAccountBindings,
   createChannelAccount,
-  deleteChannelAccount,
+  deleteChannelAccountIfUnbound,
   getAllRegisteredGroups,
   getChannelAccountForUser,
   getRegisteredGroup,
@@ -1285,8 +1285,28 @@ routes.delete('/:id', authMiddleware, async (c) => {
     const message = error instanceof Error ? error.message : String(error);
     return c.json({ error: `Failed to stop channel account: ${message}` }, 502);
   }
+  const deletion = deleteChannelAccountIfUnbound(id, user.id);
+  if (deletion.status === 'bound') {
+    if (account.enabled) {
+      try {
+        await deps.reloadChannelAccount?.(id);
+      } catch {
+        // The account remains authoritative and can be reconnected separately.
+      }
+    }
+    return c.json(
+      {
+        error: 'Channel account acquired bindings while it was stopping',
+        binding_count: deletion.bindingCount,
+        retryable: true,
+      },
+      409,
+    );
+  }
+  if (deletion.status === 'not_found') {
+    return c.json({ error: 'Channel account not found' }, 404);
+  }
   pendingWeChatQr.delete(id);
-  deleteChannelAccount(id, user.id);
   deleteChannelAccountSecret(account.secret_ref);
   return c.json({ success: true });
 });

@@ -40,6 +40,37 @@ describe('Claude SDK compatibility adapter', () => {
     expect(result.audit.hash).toMatch(/^[a-f0-9]{64}$/);
   });
 
+  test('can omit the subagent compatibility surface for restricted runs', () => {
+    const baseOptions = { tools: [], env: { EXISTING: 'kept' } };
+    const result = withHappyClawSubagentContract(
+      baseOptions,
+      { PATH: '/bin' },
+      false,
+    );
+
+    expect(result.options).toBe(baseOptions);
+    expect(result.options).not.toHaveProperty('appendSubagentSystemPrompt');
+    expect(result.options.env).toEqual({ EXISTING: 'kept' });
+    expect(result.audit.enabled).toBe(false);
+  });
+
+  test('environment kill switch wins over the normal-run enable override', () => {
+    const baseOptions = { tools: [], env: { EXISTING: 'kept' } };
+    const result = withHappyClawSubagentContract(
+      baseOptions,
+      {
+        PATH: '/bin',
+        HAPPYCLAW_DISABLE_SUBAGENT_RUNTIME_CONTRACT: 'true',
+      },
+      true,
+    );
+
+    expect(result.options).toBe(baseOptions);
+    expect(result.options).not.toHaveProperty('appendSubagentSystemPrompt');
+    expect(result.options.env).toEqual({ EXISTING: 'kept' });
+    expect(result.audit.enabled).toBe(false);
+  });
+
   test('audits the SDK and CLI versions pinned by the runner build', () => {
     // The markers are persisted into run snapshots and shown in the Agent
     // capability preview, so they must move with every SDK/CLI bump.

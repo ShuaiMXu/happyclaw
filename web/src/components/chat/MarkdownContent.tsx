@@ -6,6 +6,11 @@ import {
   resolveMarkdownImageSrc,
   resolveMarkdownWorkspaceFileHref,
 } from '../../utils/markdownImageSrc';
+import { useFileStore } from '../../stores/files';
+import {
+  looksLikeWorkspaceFilePath,
+  workspaceFilePathFromMarkdownHref,
+} from '../../utils/fileKind';
 
 const MermaidDiagram = lazy(() =>
   import('./MermaidDiagram').then((module) => ({
@@ -139,10 +144,12 @@ function CodeBlock({
   className,
   children,
   variant = 'chat',
+  groupJid,
   ...props
 }: React.ComponentPropsWithoutRef<'code'> & {
   className?: string;
   variant?: 'chat' | 'docs';
+  groupJid?: string;
 }) {
   const [copied, setCopied] = useState(false);
   const match = /language-(\w+)/.exec(className || '');
@@ -194,15 +201,32 @@ function CodeBlock({
     );
   }
 
+  const inlineClassName =
+    variant === 'chat'
+      ? 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-[0.9em] leading-relaxed font-mono break-all'
+      : 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-sm font-mono break-all';
+
+  // 看起来像工作区文件路径的行内代码：点击等同于在项目文件面板里点开同名
+  // 文件——能预览的类型直接打开对应预览，压缩包等直接下载，找不到时提示。
+  if (groupJid && looksLikeWorkspaceFilePath(codeString)) {
+    return (
+      <button
+        type="button"
+        className={`${inlineClassName} cursor-pointer underline decoration-dotted underline-offset-2 hover:opacity-80`}
+        title="点击在项目文件中打开"
+        onClick={() =>
+          void useFileStore
+            .getState()
+            .openWorkspaceFileByAgentPath(groupJid, codeString)
+        }
+      >
+        {children}
+      </button>
+    );
+  }
+
   return (
-    <code
-      className={
-        variant === 'chat'
-          ? 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-[0.9em] leading-relaxed font-mono break-all'
-          : 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-sm font-mono break-all'
-      }
-      {...props}
-    >
+    <code className={inlineClassName} {...props}>
       {children}
     </code>
   );
@@ -220,7 +244,12 @@ export function MarkdownContent({
     variant === 'chat'
       ? 'text-base leading-[1.65] text-foreground'
       : 'text-sm leading-6 text-foreground';
-  const tableTextClass = variant === 'chat' ? 'text-[0.95em]' : 'text-sm';
+  // 手机屏幕（<640px）下表格字号/行距/字距整体缩小到桌面的一半左右，
+  // 让表格在窄屏里更紧凑；sm 断点及以上恢复原有大小。
+  const tableTextClass =
+    variant === 'chat'
+      ? 'text-[0.475em] leading-tight tracking-tight sm:text-[0.95em] sm:leading-[1.65] sm:tracking-normal'
+      : 'text-[0.4375rem] leading-tight tracking-tight sm:text-sm sm:leading-6 sm:tracking-normal';
 
   return (
     <div className={textSizeClass}>
@@ -236,7 +265,9 @@ export function MarkdownContent({
           >['rehypePlugins']
         }
         components={{
-          code: (props) => <CodeBlock {...props} variant={variant} />,
+          code: (props) => (
+            <CodeBlock {...props} variant={variant} groupJid={groupJid} />
+          ),
           img: ({ src, alt }) => (
             <MarkdownImage
               src={src ? resolveMarkdownImageSrc(src, groupJid) : undefined}
@@ -244,16 +275,42 @@ export function MarkdownContent({
               loading={eagerImages ? 'eager' : 'lazy'}
             />
           ),
-          a: ({ href, children }) => (
-            <a
-              href={resolveMarkdownWorkspaceFileHref(href, groupJid)}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-primary hover:text-primary underline break-all"
-            >
-              {children}
-            </a>
-          ),
+          a: ({ href, children }) => {
+            const workspaceFilePath = groupJid
+              ? workspaceFilePathFromMarkdownHref(href)
+              : null;
+
+            if (workspaceFilePath) {
+              return (
+                <button
+                  type="button"
+                  className="text-primary hover:text-primary underline break-all"
+                  title="点击在项目文件中打开"
+                  onClick={() =>
+                    void useFileStore
+                      .getState()
+                      .openWorkspaceFileByAgentPath(
+                        groupJid!,
+                        workspaceFilePath,
+                      )
+                  }
+                >
+                  {children}
+                </button>
+              );
+            }
+
+            return (
+              <a
+                href={resolveMarkdownWorkspaceFileHref(href, groupJid)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-primary hover:text-primary underline break-all"
+              >
+                {children}
+              </a>
+            );
+          },
           table: ({ children }) => (
             <div
               className="my-4 max-w-full overflow-x-auto overflow-y-hidden overscroll-x-contain [-webkit-overflow-scrolling:touch] [touch-action:pan-x_pan-y]"
@@ -275,14 +332,14 @@ export function MarkdownContent({
           ),
           th: ({ children }) => (
             <th
-              className={`px-4 py-2 text-left font-semibold text-foreground border border-border whitespace-nowrap align-top ${tableTextClass}`}
+              className={`px-[0.5ch] py-[0.5ch] text-left font-semibold text-foreground border border-border whitespace-normal break-words align-top ${tableTextClass}`}
             >
               {children}
             </th>
           ),
           td: ({ children }) => (
             <td
-              className={`px-4 py-2 text-foreground border border-border whitespace-nowrap align-top ${tableTextClass}`}
+              className={`px-[0.5ch] py-[0.5ch] text-foreground border border-border whitespace-normal break-words align-top ${tableTextClass}`}
             >
               {children}
             </td>

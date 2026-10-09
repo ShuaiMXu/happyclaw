@@ -217,7 +217,9 @@ export class GroupQueue {
   private groups = new Map<string, GroupState>();
   private activeCount = 0;
   private activeContainerCount = 0;
+  private containerAdmissionReady = true;
   private activeHostProcessCount = 0;
+  private detachedContainerSlotsByGroup = new Map<string, number>();
   private waitingGroups = new Set<string>();
   private mutationPauseCounts = new Map<string, number>();
   /** Persistent fail-closed gates used when a security-sensitive mutation was
@@ -245,6 +247,7 @@ export class GroupQueue {
   private hostModeChecker: ((groupJid: string) => boolean) | null = null;
   private serializationKeyResolver: ((groupJid: string) => string) | null =
     null;
+  private registeredGroupChecker: ((groupJid: string) => boolean) | null = null;
   private onMaxRetriesExceededFn:
     | ((
         groupJid: string,
@@ -426,9 +429,22 @@ export class GroupQueue {
   }
 
   private isTerminalMutationDiscarded(groupJid: string): boolean {
-    return this.terminalDiscardMutationKeys.has(
-      this.getMutationPauseKey(groupJid),
-    );
+    const key = this.getMutationPauseKey(groupJid);
+    if (!this.terminalDiscardMutationKeys.has(key)) return false;
+
+    const baseJid = this.getMutationBaseJid(groupJid);
+    if (!this.registeredGroupChecker?.(baseJid)) return true;
+
+    // A durable filesystem tombstone prevents publication until old artifacts
+    // are gone. Once a canonical registration exists again, this is a new
+    // workspace generation: release the process-local delete tombstone while
+    // stale callbacks for absent old JIDs remain rejected.
+    this.terminalDiscardMutationKeys.delete(key);
+    this.clearMutationAliasesForKeys(new Set([key]));
+    for (const state of this.groups.values()) {
+      if (state.mutationKey === key) state.mutationKey = null;
+    }
+    return false;
   }
 
   private waitForRunnerTeardown(
@@ -628,6 +644,10 @@ export class GroupQueue {
     this.serializationKeyResolver = fn;
   }
 
+  setRegisteredGroupChecker(fn: (groupJid: string) => boolean): void {
+    this.registeredGroupChecker = fn;
+  }
+
   setOnMaxRetriesExceeded(
     fn: (
       groupJid: string,
@@ -801,6 +821,67 @@ export class GroupQueue {
   }
 
   /**
+   * Gate queue-owned Docker launches until startup reconciliation has accounted
+   * for containers that survived the prior process. Detached reconciliation
+   * itself remains available so it can populate the shared count.
+   */
+  setContainerAdmissionReady(ready: boolean): void {
+    const changed = this.containerAdmissionReady !== ready;
+    this.containerAdmissionReady = ready;
+    if (changed && ready && !this.shuttingDown) this.drainWaiting();
+  }
+
+  /**
+   * Reserve shared Docker capacity for work whose lifecycle is managed outside
+   * GroupQueue. Admission and accounting are synchronous so detached and
+   * queue-owned launches cannot both consume the same final slot.
+   */
+  tryAcquireDetachedContainerSlot(groupJid: string): (() => void) | null {
+    if (this.shuttingDown || !this.hasContainerCapacityFor(groupJid)) {
+      return null;
+    }
+    return this.reserveDetachedContainerSlot(groupJid);
+  }
+
+  /**
+   * Adopt a container that already exists after process recovery. Adoption is
+   * accounting-only and intentionally may exceed configured admission limits:
+   * the physical container already consumes capacity, so undercounting it would
+   * allow an additional launch.
+   */
+  adoptDetachedContainerSlot(groupJid: string): () => void {
+    return this.reserveDetachedContainerSlot(groupJid);
+  }
+
+  private reserveDetachedContainerSlot(groupJid: string): () => void {
+    this.activeContainerCount += 1;
+    this.detachedContainerSlotsByGroup.set(
+      groupJid,
+      (this.detachedContainerSlotsByGroup.get(groupJid) ?? 0) + 1,
+    );
+
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+
+      const groupSlots = this.detachedContainerSlotsByGroup.get(groupJid) ?? 0;
+      if (groupSlots <= 1) {
+        this.detachedContainerSlotsByGroup.delete(groupJid);
+      } else {
+        this.detachedContainerSlotsByGroup.set(groupJid, groupSlots - 1);
+      }
+      this.activeContainerCount = Math.max(0, this.activeContainerCount - 1);
+
+      if (!this.shuttingDown) this.drainWaiting();
+    };
+  }
+
+  countDetachedContainerSlots(groupJid: string): number {
+    return this.detachedContainerSlotsByGroup.get(groupJid) ?? 0;
+  }
+
+  /**
    * Called when an agent runner exits with unconsumed IPC message files.
    * The callback should re-enqueue processAgentConversation for the agent.
    * See GitHub issue #240.
@@ -943,6 +1024,19 @@ export class GroupQueue {
     return null;
   }
 
+  private hasContainerCapacityFor(groupJid: string): boolean {
+    const systemCapacity =
+      this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
+    if (!systemCapacity) return false;
+
+    // User-level concurrent container limit (billing)
+    if (this.userConcurrentLimitFn) {
+      const result = this.userConcurrentLimitFn(groupJid);
+      if (!result.allowed) return false;
+    }
+    return true;
+  }
+
   private hasCapacityFor(groupJid: string): boolean {
     // Host mode mirrors the Claude Agent SDK's natural process model: the
     // serialization key is the only admission boundary. Different sessions
@@ -954,17 +1048,8 @@ export class GroupQueue {
     // turn consumes a managed Docker allocation. Host processes are governed
     // by the operating system instead of an application-level capacity pool.
     if (this.isHostMode(groupJid)) return true;
-
-    const systemCapacity =
-      this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
-    if (!systemCapacity) return false;
-
-    // User-level concurrent container limit (billing)
-    if (this.userConcurrentLimitFn) {
-      const result = this.userConcurrentLimitFn(groupJid);
-      if (!result.allowed) return false;
-    }
-    return true;
+    if (!this.containerAdmissionReady) return false;
+    return this.hasContainerCapacityFor(groupJid);
   }
 
   private resolveActiveState(groupJid: string): ActiveGroupState | null {
@@ -1480,7 +1565,7 @@ export class GroupQueue {
 
     const state = this.getGroup(groupJid);
     const mutationKey = this.getMutationPauseKey(groupJid);
-    if (this.terminalDiscardMutationKeys.has(mutationKey)) {
+    if (this.isTerminalMutationDiscarded(groupJid)) {
       state.mutationKey = mutationKey;
       state.pendingMessages = false;
       this.waitingGroups.delete(groupJid);
@@ -1545,7 +1630,7 @@ export class GroupQueue {
 
     const state = this.getGroup(groupJid);
     const mutationKey = this.getMutationPauseKey(groupJid);
-    if (this.terminalDiscardMutationKeys.has(mutationKey)) {
+    if (this.isTerminalMutationDiscarded(groupJid)) {
       state.mutationKey = mutationKey;
       try {
         options?.onDropped?.();
@@ -2435,23 +2520,28 @@ export class GroupQueue {
     }
 
     if (force) {
-      // Force mode: skip graceful stop, go straight to kill
+      // A Docker CLI can still be blocked in create before the named object is
+      // visible. Always terminate both authorities, then remove by name.
+      if (state.process && !state.process.killed) {
+        killProcessTree(state.process, 'SIGKILL');
+      }
       if (state.containerName) {
         const name = state.containerName;
         await new Promise<void>((resolve) => {
-          execFile('docker', ['kill', name], { timeout: 5000 }, () =>
+          execFile('docker', ['rm', '--force', name], { timeout: 5000 }, () =>
             resolve(),
           );
         });
-      } else if (state.process && !state.process.killed) {
-        killProcessTree(state.process, 'SIGKILL');
       }
 
       if (state.active) {
-        await this.waitForRunnerTeardown(state);
+        await this.waitForRunnerTeardown(state, 35_000);
       }
     } else {
-      // Graceful mode: try SIGTERM/docker stop first
+      // Graceful mode must signal the Docker client even before create finishes.
+      if (state.process && !state.process.killed) {
+        killProcessTree(state.process, 'SIGTERM');
+      }
       if (state.containerName) {
         const name = state.containerName;
         await new Promise<void>((resolve) => {
@@ -2459,8 +2549,6 @@ export class GroupQueue {
             resolve(),
           );
         });
-      } else if (state.process && !state.process.killed) {
-        killProcessTree(state.process, 'SIGTERM');
       }
 
       // Wait for state.active to become false (runForGroup/runTask finally block)
@@ -2468,22 +2556,26 @@ export class GroupQueue {
         await this.waitForRunnerTeardown(state, 10_000);
       }
 
-      // Graceful stop timed out — force-kill the container
-      if (state.active && state.containerName) {
-        const killName = state.containerName;
-        logger.warn(
-          { groupJid: targetJid, containerName: killName },
-          'Graceful stop timed out, force-killing container',
-        );
-        await new Promise<void>((resolve) => {
-          execFile('docker', ['kill', killName], { timeout: 5000 }, () =>
-            resolve(),
+      // Graceful stop timed out — kill the client and remove any object that
+      // became visible while the first stop attempt was in flight.
+      if (state.active) {
+        if (state.process) killProcessTree(state.process, 'SIGKILL');
+        if (state.containerName) {
+          const killName = state.containerName;
+          logger.warn(
+            { groupJid: targetJid, containerName: killName },
+            'Graceful stop timed out, force-removing container',
           );
-        });
-        await this.waitForRunnerTeardown(state);
-      } else if (state.active && state.process) {
-        killProcessTree(state.process, 'SIGKILL');
-        await this.waitForRunnerTeardown(state);
+          await new Promise<void>((resolve) => {
+            execFile(
+              'docker',
+              ['rm', '--force', killName],
+              { timeout: 5000 },
+              () => resolve(),
+            );
+          });
+        }
+        await this.waitForRunnerTeardown(state, 35_000);
       }
     }
 
@@ -3360,44 +3452,53 @@ export class GroupQueue {
 
       const stopPromises: Promise<void>[] = [];
       for (const [jid, state] of this.groups) {
-        if (state.containerName) {
-          const containerName = state.containerName;
-          const promise = new Promise<void>((resolve) => {
-            execFile(
-              'docker',
-              ['stop', '-t', '5', containerName],
-              { timeout: 10000 },
-              (err) => {
-                if (err) {
-                  logger.error(
-                    { jid, containerName, err },
-                    'Failed to stop container',
-                  );
+        if (state.process && !state.process.killed) {
+          const proc = state.process;
+          killProcessTree(proc, 'SIGTERM');
+          stopPromises.push(
+            new Promise<void>((resolve) => {
+              setTimeout(() => {
+                if (proc.exitCode === null && proc.signalCode === null) {
+                  killProcessTree(proc, 'SIGKILL');
                 }
                 resolve();
-              },
-            );
-          });
-          stopPromises.push(promise);
-        } else if (state.process && !state.process.killed) {
-          const proc = state.process;
-          const promise = new Promise<void>((resolve) => {
-            if (!killProcessTree(proc, 'SIGTERM')) {
-              resolve();
-              return;
-            }
-            setTimeout(() => {
-              if (proc.exitCode === null && proc.signalCode === null) {
-                killProcessTree(proc, 'SIGKILL');
-              }
-              resolve();
-            }, 3000);
-          });
-          stopPromises.push(promise);
+              }, 3000);
+            }),
+          );
+        }
+        if (state.containerName) {
+          const containerName = state.containerName;
+          stopPromises.push(
+            new Promise<void>((resolve) => {
+              execFile(
+                'docker',
+                ['rm', '--force', containerName],
+                { timeout: 10000 },
+                (err) => {
+                  if (err) {
+                    logger.warn(
+                      { jid, containerName, err },
+                      'Container removal is awaiting create-fence settlement',
+                    );
+                  }
+                  resolve();
+                },
+              );
+            }),
+          );
         }
       }
 
       await Promise.all(stopPromises);
+      const settleStartedAt = Date.now();
+      while (this.activeCount > 0 && Date.now() - settleStartedAt < 35_000) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (this.activeCount > 0) {
+        throw new Error(
+          `GroupQueue shutdown left ${this.activeCount} active runner(s)`,
+        );
+      }
     }
 
     logger.info(

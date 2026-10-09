@@ -190,6 +190,19 @@ async function waitForPath(target: string, timeoutMs = 5000): Promise<void> {
   }
 }
 
+async function waitForPathRemoval(
+  target: string,
+  timeoutMs = 1000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (fs.existsSync(target)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for removal of ${target}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 async function waitForDatabaseOwner(
   dbPath: string,
   pid: number,
@@ -358,6 +371,7 @@ describe.sequential('leftover direct mount maintenance CLI', () => {
       });
 
       expect(outcome).toEqual({ code: exitCode, signal: null });
+      await waitForPathRemoval(lockPath);
       expect(fs.existsSync(lockPath)).toBe(false);
       expect(databaseFingerprint(dbPath)).toEqual(before);
     },
@@ -439,6 +453,13 @@ describe.sequential('leftover direct mount maintenance CLI', () => {
       folder: 'apply-workspace',
       added_at: '2026-08-20T00:00:00.000Z',
       created_by: 'owner-a',
+    });
+    db.createChannelAccount({
+      id: 'apply-bot',
+      owner_user_id: 'owner-a',
+      provider: 'whatsapp',
+      name: 'Apply test bot',
+      secret_ref: 'channel-account:apply-bot',
     });
     db.setRegisteredGroup('whatsapp:123456789012345@lid#account:apply-bot', {
       name: 'Apply leftover LID',
@@ -547,6 +568,7 @@ describe.sequential('leftover direct mount maintenance CLI', () => {
       signalChild.once('exit', (code, signal) => resolve({ code, signal }));
     });
     expect(signalOutcome).toEqual({ code: 143, signal: null });
+    await waitForPathRemoval(lockPath);
     expect(fs.existsSync(lockPath)).toBe(false);
     const ownersAfterSignal = spawnSync(
       'lsof',
@@ -563,6 +585,13 @@ describe.sequential('leftover direct mount maintenance CLI', () => {
     expect(ownersAfterSignal.stdout).toBe('');
 
     db.initDatabase();
+    db.createChannelAccount({
+      id: 'conflict-bot',
+      owner_user_id: 'owner-a',
+      provider: 'whatsapp',
+      name: 'Conflict test bot',
+      secret_ref: 'channel-account:conflict-bot',
+    });
     const conflictCanonical =
       'whatsapp:17770001111@s.whatsapp.net#account:conflict-bot';
     const conflictAliases = [

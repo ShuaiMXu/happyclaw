@@ -44,13 +44,13 @@ const SCHEME_OPTIONS: {
 }[] = [
   {
     value: 'default',
-    label: '经典绿',
-    preview: { bg: '#f8fafc', accent: '#0d9488', text: '#0f172a' },
+    label: '经典橙',
+    preview: { bg: '#ffffff', accent: '#ff6600', text: '#0f172a' },
   },
   {
     value: 'orange',
-    label: '暖橙',
-    preview: { bg: '#faf9f5', accent: '#f97316', text: '#141413' },
+    label: '极客白',
+    preview: { bg: '#f9fafb', accent: '#ff6600', text: '#111827' },
   },
   {
     value: 'neutral',
@@ -67,7 +67,7 @@ const FONT_OPTIONS: {
 }[] = [
   {
     value: 'default',
-    label: 'HappyClaw',
+    label: 'SoftopiaAI',
     sample: 'Hello 你好',
     fontFamily: "'Inter Variable', system-ui, sans-serif",
   },

@@ -130,7 +130,9 @@ export function isRealpathInside(
     } catch {
       return false;
     }
-    return realTarget === realRoot || realTarget.startsWith(realRoot + path.sep);
+    return (
+      realTarget === realRoot || realTarget.startsWith(realRoot + path.sep)
+    );
   });
 }
 
@@ -162,8 +164,73 @@ export function isSecureRequest(c: any): boolean {
   try {
     const url = new URL(c.req.url, 'http://localhost');
     if (url.protocol === 'https:') return true;
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   return false;
+}
+
+/**
+ * Create a directory below a trusted root without following a pre-existing
+ * symlink in any descendant component. These paths later become Docker bind
+ * sources, so silently following a tenant-controlled link would turn a
+ * workspace-local mount into arbitrary host filesystem access.
+ */
+export function ensureDirectoryTreeNoSymlinks(
+  trustedRoot: string,
+  targetPath: string,
+  mode = 0o700,
+): string {
+  const root = path.resolve(trustedRoot);
+  const target = path.resolve(targetPath);
+  if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+    throw new Error(`Directory escapes trusted root: ${targetPath}`);
+  }
+
+  fs.mkdirSync(root, { recursive: true, mode });
+  const assertDirectory = (candidate: string): void => {
+    const stat = fs.lstatSync(candidate);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Unsafe directory component: ${candidate}`);
+    }
+  };
+  assertDirectory(root);
+
+  const relative = path.relative(root, target);
+  let current = root;
+  for (const component of relative ? relative.split(path.sep) : []) {
+    current = path.join(current, component);
+    try {
+      assertDirectory(current);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        'code' in error &&
+        (error as NodeJS.ErrnoException).code === 'ENOENT'
+      ) {
+        fs.mkdirSync(current, { mode });
+        assertDirectory(current);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  const realRoot = fs.realpathSync(root);
+  const realTarget = fs.realpathSync(target);
+  if (
+    realTarget !== realRoot &&
+    !realTarget.startsWith(`${realRoot}${path.sep}`)
+  ) {
+    throw new Error(`Directory resolves outside trusted root: ${targetPath}`);
+  }
+  try {
+    fs.chmodSync(target, mode);
+  } catch {
+    // The caller may be validating a read-only filesystem; containment and
+    // no-symlink checks remain authoritative.
+  }
+  return target;
 }
 
 /** Create IPC + session directories for an agent. */
@@ -171,13 +238,18 @@ export function ensureAgentDirectories(
   folder: string,
   agentId: string,
 ): string {
-  const agentIpcDir = path.join(DATA_DIR, 'ipc', folder, 'agents', agentId);
-  fs.mkdirSync(path.join(agentIpcDir, 'input'), { recursive: true });
-  fs.mkdirSync(path.join(agentIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(agentIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(
-    path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude'),
-    { recursive: true },
+  const ipcRoot = path.join(DATA_DIR, 'ipc');
+  const agentIpcDir = ensureDirectoryTreeNoSymlinks(
+    ipcRoot,
+    path.join(ipcRoot, folder, 'agents', agentId),
+  );
+  for (const child of ['input', 'messages', 'tasks'] as const) {
+    ensureDirectoryTreeNoSymlinks(ipcRoot, path.join(agentIpcDir, child));
+  }
+  const sessionsRoot = path.join(DATA_DIR, 'sessions');
+  ensureDirectoryTreeNoSymlinks(
+    sessionsRoot,
+    path.join(sessionsRoot, folder, 'agents', agentId, '.claude'),
   );
   return agentIpcDir;
 }

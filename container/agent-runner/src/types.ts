@@ -326,6 +326,12 @@ export interface ContainerInput {
   allowedTools?: string[];
   /** Non-secret marker that forces the runner's no-tool, no-MCP policy. */
   externalRestrictedExecution?: boolean;
+  /** Attempt-scoped nonce used by the fail-closed host start handshake. */
+  externalStartAuthorization?: {
+    protocol: 1;
+    authorizationId: string;
+    expiresAt: number;
+  };
   /** Host-bounded SDK limits used only by confined external executions. */
   externalQueryLimits?: {
     maxTurns: number;
@@ -336,6 +342,12 @@ export interface ContainerInput {
 export interface ContainerOutput {
   status: 'success' | 'error' | 'stream' | 'closed';
   result: string | null;
+  /** Host-consumed control frame; never projected to a chat or task result. */
+  runnerControl?: {
+    type: 'external_ready' | 'external_start_consumed';
+    protocol: 1;
+    authorizationId: string;
+  };
   /**
    * Non-empty SDK final text produced under the interactive Proactive contract.
    *

@@ -29,7 +29,7 @@ export function createAppearanceMutationQueue() {
 }
 
 interface BrandAssetUploadProps {
-  kind: 'icon' | 'banner';
+  kind: 'icon' | 'banner' | 'favicon' | 'loadingIcon';
   title: string;
   desc: string;
   url: string | null;
@@ -186,6 +186,10 @@ export function AppearanceSection() {
   const [appName, setAppName] = useState('');
   const [brandIconUrl, setBrandIconUrl] = useState<string | null>(null);
   const [brandBannerUrl, setBrandBannerUrl] = useState<string | null>(null);
+  const [faviconUrl, setFaviconUrl] = useState<string | null>(null);
+  const [brandLoadingIconUrl, setBrandLoadingIconUrl] = useState<string | null>(
+    null,
+  );
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [pendingMutations, setPendingMutations] = useState(0);
@@ -206,6 +210,8 @@ export function AppearanceSection() {
     if (updateNameDraft) setAppName(appearance.appName);
     setBrandIconUrl(appearance.brandIconUrl);
     setBrandBannerUrl(appearance.brandBannerUrl);
+    setFaviconUrl(appearance.faviconUrl);
+    setBrandLoadingIconUrl(appearance.brandLoadingIconUrl);
     useAuthStore.setState({ appearance });
   };
 
@@ -318,7 +324,7 @@ export function AppearanceSection() {
             value={appName}
             onChange={(e) => setAppName(e.target.value)}
             maxLength={32}
-            placeholder="HappyClaw"
+            placeholder="SoftopiaAI"
           />
         </div>
       </Section>
@@ -352,8 +358,32 @@ export function AppearanceSection() {
         canManageAssets={canManageAssets}
         mutationDisabled={pendingMutations > 0}
         executeMutation={(request) => executeMutation(request)}
-        previewClassName="h-[3.35rem] w-[10rem] justify-start px-2"
-        imageClassName="h-full w-full object-left"
+        previewClassName="h-[60px] w-[200px] justify-start px-2"
+        imageClassName="h-full w-full object-contain object-left"
+      />
+
+      <BrandAssetUpload
+        kind="favicon"
+        title="浏览器图标"
+        desc="建议尺寸 32x32 或以上的正方形图片，主站加载时显示在浏览器标签页，支持 PNG/JPG"
+        url={faviconUrl}
+        canManageAssets={canManageAssets}
+        mutationDisabled={pendingMutations > 0}
+        executeMutation={(request) => executeMutation(request)}
+        previewClassName="h-10 w-10 justify-center"
+        imageClassName="h-full w-full"
+      />
+
+      <BrandAssetUpload
+        kind="loadingIcon"
+        title="加载动画图标"
+        desc="建议尺寸 400x400 的正方形图片（透明底效果最佳），登录前和鉴权校验期间的全屏加载动画使用，支持 PNG/JPG"
+        url={brandLoadingIconUrl}
+        canManageAssets={canManageAssets}
+        mutationDisabled={pendingMutations > 0}
+        executeMutation={(request) => executeMutation(request)}
+        previewClassName="h-16 w-16 justify-center"
+        imageClassName="h-full w-full"
       />
     </div>
   );

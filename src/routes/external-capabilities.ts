@@ -1,28 +1,42 @@
 import { Hono } from 'hono';
 
 import type { Variables } from '../web-context.js';
+import { CONTAINER_IMAGE } from '../config.js';
 import { authMiddleware, requirePermission } from '../middleware/auth.js';
 import {
+  cancelExternalCapabilityRunByOperator,
   createExternalCapabilityKey,
   getExternalCapabilityKeys,
   getRegisteredGroup,
   revokeExternalCapabilityKey,
   setExternalCapabilityStatus,
 } from '../db.js';
+import { stopExternalCapabilityExecution } from '../external-capability-execution-control.js';
 import {
   getConfiguredExternalCapabilities,
   getConfiguredExternalCapability,
 } from '../external-capabilities.js';
 import { probeExternalCapabilityDockerNetwork } from '../external-capability-network.js';
+import { assertExternalCapabilityProviderRoutesReady } from '../external-capability-provider-route.js';
+import { EXTERNAL_CAPABILITY_MAX_RAW_IMAGE_BYTES } from '../external-capability-input-limits.js';
+import { getExternalCapabilityQuotaConfig } from '../external-capability-quota-config.js';
+import { isExternalCapabilityVaultCensusReady } from '../external-capability-storage-backfill.js';
+import {
+  assertExternalCapabilityRunnerImage,
+  isExternalCapabilityRunnerImageReady,
+} from '../external-capability-runner-image.js';
 import {
   getExternalCapabilityDockerNetwork,
+  isExternalCapabilityContainerImagePinned,
   isExternalCapabilityReleaseEnabled,
 } from '../external-capability-release-config.js';
 import { canModifyGroup } from '../group-acl.js';
+import { probeExternalCapabilityVaultWithCapacity } from '../external-capability-storage-capacity.js';
+import { getExternalCapabilityVaultRoot } from '../external-capability-storage.js';
 import {
-  getExternalCapabilityVaultRoot,
-  probeExternalCapabilityVault,
-} from '../external-capability-storage.js';
+  acquireExternalCapabilityVaultSharedLock,
+  type ExternalCapabilityVaultLock,
+} from '../external-capability-vault-lock.js';
 import type { AuthUser, ExternalCapability } from '../types.js';
 
 const externalCapabilitiesRoutes = new Hono<{ Variables: Variables }>();
@@ -37,18 +51,34 @@ function capabilityView(capability: ExternalCapability, user: AuthUser) {
   const workspaceMatchesTarget =
     workspace.folder === capability.workspace_folder &&
     workspace.executionMode === 'container';
-  let vaultReady = true;
-  try {
-    getExternalCapabilityVaultRoot();
-  } catch {
-    vaultReady = false;
-  }
+  const vaultReady = isExternalCapabilityVaultCensusReady();
   const releaseEnabled = isExternalCapabilityReleaseEnabled();
   const networkReady = getExternalCapabilityDockerNetwork() !== null;
+  const quotaConfig = getExternalCapabilityQuotaConfig();
+  const effectiveTotalBytes = Math.min(
+    capability.max_total_bytes,
+    quotaConfig.maxInputBytesPerRun,
+  );
+  const effectiveFileBytes = Math.min(
+    capability.max_file_bytes,
+    effectiveTotalBytes,
+  );
+  const maxFileBytesByMimeType = Object.fromEntries(
+    capability.allowed_mime_types.map((mimeType) => [
+      mimeType,
+      mimeType.startsWith('image/')
+        ? Math.min(effectiveFileBytes, EXTERNAL_CAPABILITY_MAX_RAW_IMAGE_BYTES)
+        : effectiveFileBytes,
+    ]),
+  );
+  const imageReady =
+    isExternalCapabilityContainerImagePinned(CONTAINER_IMAGE) &&
+    isExternalCapabilityRunnerImageReady(CONTAINER_IMAGE);
   const available =
     capability.status === 'active' &&
     releaseEnabled &&
     networkReady &&
+    imageReady &&
     workspaceMatchesTarget &&
     vaultReady &&
     capability.allowed_mime_types.length > 0;
@@ -67,13 +97,15 @@ function capabilityView(capability: ExternalCapability, user: AuthUser) {
       storageReady: vaultReady,
       releaseEnabled,
       networkReady,
+      imageReady,
     },
     inputs: {
       schemaVersion: capability.input_schema_version,
       acceptedMimeTypes: capability.allowed_mime_types,
-      maxFileBytes: capability.max_file_bytes,
+      maxFileBytes: effectiveFileBytes,
+      maxFileBytesByMimeType,
       maxFilesPerRun: capability.max_files_per_run,
-      maxTotalBytes: capability.max_total_bytes,
+      maxTotalBytes: effectiveTotalBytes,
     },
     createdAt: capability.created_at,
     updatedAt: capability.updated_at,
@@ -139,7 +171,7 @@ externalCapabilitiesRoutes.post(
     if (!capability || !capabilityView(capability, user)) {
       return c.json({ error: 'Capability not found' }, 404);
     }
-    if (capability.status === 'paused' || capability.status === 'retired') {
+    if (capability.status !== 'active') {
       return c.json({ error: 'Capability is not accepting new keys' }, 409);
     }
     const body = await c.req.json().catch(() => null);
@@ -173,6 +205,38 @@ externalCapabilitiesRoutes.delete(
   },
 );
 
+externalCapabilitiesRoutes.post(
+  '/:slug/runs/:runId/cancel',
+  authMiddleware,
+  externalCapabilityManage,
+  (c) => {
+    const capability = getConfiguredExternalCapability(c.req.param('slug'));
+    const user = c.get('user') as AuthUser;
+    if (!capability || !capabilityView(capability, user)) {
+      return c.json({ error: 'Capability not found' }, 404);
+    }
+    const cancelled = cancelExternalCapabilityRunByOperator(
+      capability.slug,
+      c.req.param('runId'),
+    );
+    if (!cancelled) return c.json({ error: 'Run not found' }, 404);
+    if (
+      cancelled.cancelled ||
+      cancelled.run.container_cleanup_attempt !== null ||
+      cancelled.run.container_cleanup_lease_token !== null ||
+      cancelled.run.container_create_pending_until !== null
+    ) {
+      stopExternalCapabilityExecution(cancelled.run.id);
+    }
+    return c.json({
+      runId: cancelled.run.id,
+      status: cancelled.run.status,
+      cancelled: cancelled.cancelled,
+      errorCode: cancelled.run.error_code,
+    });
+  },
+);
+
 externalCapabilitiesRoutes.patch(
   '/:slug',
   authMiddleware,
@@ -197,6 +261,35 @@ externalCapabilitiesRoutes.patch(
         409,
       );
     }
+    if (
+      status === 'active' &&
+      !isExternalCapabilityContainerImagePinned(CONTAINER_IMAGE)
+    ) {
+      return c.json(
+        { error: 'External capability runner image is not immutable' },
+        409,
+      );
+    }
+    if (status === 'active') {
+      try {
+        assertExternalCapabilityProviderRoutesReady();
+      } catch {
+        return c.json(
+          { error: 'External capability provider route is not ready' },
+          409,
+        );
+      }
+      try {
+        await assertExternalCapabilityRunnerImage(CONTAINER_IMAGE, {
+          force: true,
+        });
+      } catch {
+        return c.json(
+          { error: 'External capability runner image is not compatible' },
+          409,
+        );
+      }
+    }
     const networkName = getExternalCapabilityDockerNetwork();
     if (status === 'active' && !networkName) {
       return c.json(
@@ -216,9 +309,23 @@ externalCapabilitiesRoutes.patch(
           409,
         );
       }
+      let vaultLock: ExternalCapabilityVaultLock | null = null;
       try {
-        probeExternalCapabilityVault(getExternalCapabilityVaultRoot());
+        vaultLock = acquireExternalCapabilityVaultSharedLock();
+        if (!vaultLock || !isExternalCapabilityVaultCensusReady()) {
+          throw new Error('External capability Vault is under maintenance');
+        }
+        probeExternalCapabilityVaultWithCapacity(
+          getExternalCapabilityVaultRoot(),
+        );
+        vaultLock.release();
+        vaultLock = null;
       } catch {
+        try {
+          vaultLock?.release();
+        } catch {
+          // A surviving owner record blocks census fail-closed.
+        }
         return c.json(
           { error: 'External capability storage is not ready' },
           409,

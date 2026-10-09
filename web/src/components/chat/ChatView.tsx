@@ -12,9 +12,12 @@ import { toast } from 'sonner';
 import {
   useChatStore,
   type FollowUpMode,
+  type MessageImageAttachment,
+  type MessageUploadProgress,
   type QueuedFollowUp,
 } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
+import { useFileStore } from '../../stores/files';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
 import { FilePanel } from './FilePanel';
@@ -65,6 +68,7 @@ import {
 import { CHANNEL_LABEL } from '../settings/channel-meta';
 import { getAgentProfileDisplayName } from '../../utils/agent-product';
 import { normalizeInteractionMode } from '../../lib/interaction-mode';
+import { IMAGE_STUDIO_ENABLED } from '../../config/features';
 import { WorkspaceInteractionModeDialog } from './WorkspaceInteractionModeDialog';
 
 /** Sentinel value for binding the main conversation (vs. a specific agent) */
@@ -98,6 +102,20 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const [contextPanelView, setContextPanelView] = useState<'files' | 'env'>(
     'files',
   );
+
+  // 聊天消息里点击文件路径（见 MarkdownContent 的 CodeBlock）会往
+  // useFileStore.pendingFileOpen 里写一条待打开请求；这里负责把上下文面板
+  // 切到"项目文件"并展开，FilePanel 自己再去消费这条请求、定位到对应文件。
+  const pendingFileOpen = useFileStore((s) => s.pendingFileOpen[groupJid]);
+  useEffect(() => {
+    if (!pendingFileOpen) return;
+    setContextPanelView('files');
+    if (window.matchMedia('(min-width: 1024px)').matches) {
+      setPanelOpen(true);
+    } else {
+      setMobileContextOpen(true);
+    }
+  }, [pendingFileOpen]);
 
   // The nav rows eat ~11rem of an 80dvh sheet — a third of the file list on a
   // 390x844 viewport. Fold them into a single icon bar once the pane scrolls
@@ -405,7 +423,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const agentProfileLabel = group?.agent_profile_name
     ? getAgentProfileDisplayName(group.agent_profile_name)
     : group?.is_home
-      ? 'HappyClaw'
+      ? 'SoftopiaAI'
       : '智能体';
   const workspaceDisplayName = group?.is_my_home
     ? agentProfileLabel
@@ -568,24 +586,45 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
 
   const handleSend = async (
     content: string,
-    attachments?: Array<{ data: string; mimeType: string }>,
+    attachments?: MessageImageAttachment[],
     followUpBehavior?: FollowUpMode,
+    onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => {
     const ok = await sendMessage(
       groupJid,
       content,
       attachments,
       followUpBehavior,
+      onUploadProgress,
     );
     // 只有发送成功时才触发滚动；失败时保留当前视图位置，避免用户上下文切换。
     if (ok) setScrollTrigger((n) => n + 1);
     return ok;
   };
 
+  const handleGenerateImage = async (prompt: string) => {
+    try {
+      await api.post(
+        `/api/groups/${encodeURIComponent(groupJid)}/generate-image`,
+        { prompt },
+        130_000,
+      );
+      setScrollTrigger((value) => value + 1);
+      return { success: true };
+    } catch (error) {
+      const message =
+        typeof error === 'object' && error && 'message' in error
+          ? String(error.message)
+          : '图片生成失败，请稍后重试。';
+      return { success: false, error: message };
+    }
+  };
+
   const handleActiveAgentSend = async (
     content: string,
-    attachments?: Array<{ data: string; mimeType: string }>,
+    attachments?: MessageImageAttachment[],
     followUpBehavior?: FollowUpMode,
+    onUploadProgress?: (progress: MessageUploadProgress) => void,
   ) => {
     if (!activeAgentTab) return false;
     const ok = await sendAgentMessage(
@@ -594,6 +633,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       content,
       attachments,
       followUpBehavior,
+      onUploadProgress,
     );
     if (ok) setScrollTrigger((value) => value + 1);
     return ok;
@@ -1119,7 +1159,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               <Link className="w-4 h-4 flex-shrink-0" />
               <span className="flex-1 min-w-0">
                 未配置消息渠道（飞书 / Telegram / Discord / QQ / 微信 / 钉钉 /
-                WhatsApp），消息无法与 HappyClaw 的直接对话互通
+                WhatsApp），消息无法与 SoftopiaAI 的直接对话互通
               </span>
               <button
                 onClick={() => navigate('/setup/channels')}
@@ -1220,6 +1260,11 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 <MessageInput
                   onSend={handleSend}
                   groupJid={groupJid}
+                  imageGenerationEnabled={
+                    IMAGE_STUDIO_ENABLED &&
+                    group?.image_generation_enabled === true
+                  }
+                  onGenerateImage={handleGenerateImage}
                   isRunning={currentContextWaiting}
                   onStop={
                     mainInterrupted ? undefined : () => interruptQuery(groupJid)
@@ -1332,8 +1377,13 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         open={showInteractionModeDialog}
         workspaceName={workspaceDisplayName}
         currentMode={interactionMode}
+        currentLockedModelId={group?.locked_model_config_id}
+        currentImageGenerationEnabled={group?.image_generation_enabled}
+        currentImageGenerationModel={group?.image_generation_model}
         onClose={() => setShowInteractionModeDialog(false)}
-        onSave={(mode) => updateInteractionMode(groupJid, mode)}
+        onSave={(mode, lockedModelId, imageGeneration) =>
+          updateInteractionMode(groupJid, mode, lockedModelId, imageGeneration)
+        }
       />
 
       {/* Mobile: Terminal sheet */}

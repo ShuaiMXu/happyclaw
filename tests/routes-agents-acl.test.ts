@@ -80,6 +80,13 @@ const OUTSIDER_ID = 'charlie';
 const GROUP_JID = 'web:agents-acl-group';
 const GROUP_FOLDER = 'agents-acl-group';
 
+let queue: {
+  pauseGroupsForMutation: ReturnType<typeof vi.fn>;
+  stopGroup: ReturnType<typeof vi.fn>;
+  discardGroupsAfterMutation: ReturnType<typeof vi.fn>;
+  resumeGroupsAfterMutation: ReturnType<typeof vi.fn>;
+};
+
 function seedTestGroup(): void {
   db.setRegisteredGroup(GROUP_JID, {
     name: 'Agents ACL Group',
@@ -103,10 +110,17 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  queue = {
+    pauseGroupsForMutation: vi.fn(() => ({ id: 1 })),
+    stopGroup: vi.fn(async () => {}),
+    discardGroupsAfterMutation: vi.fn(),
+    resumeGroupsAfterMutation: vi.fn(),
+  };
   webContext.setWebDeps({
     getRegisteredGroups: () => ({}),
     broadcastAgentStatus: vi.fn(),
     broadcastAgentRemoved: vi.fn(),
+    queue,
   } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
   try {
     db.deleteRegisteredGroup(GROUP_JID);
@@ -215,6 +229,78 @@ describe('agents CRUD ACL', () => {
     expect(status).toBe(404);
     expect(body.error).toMatch(/not found/i);
   });
+
+  test('agent deletion waits for teardown and atomically removes state', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postAgent({ name: 'Delete agent' });
+    const agentId = created.body.agent.id as string;
+
+    const deletion = await deleteAgent(agentId);
+
+    expect(deletion.status, JSON.stringify(deletion.body)).toBe(200);
+    expect(queue.stopGroup).toHaveBeenCalledWith(
+      `${GROUP_JID}#agent:${agentId}`,
+      { force: true, preserveQueuedWork: true },
+    );
+    expect(queue.discardGroupsAfterMutation).toHaveBeenCalledWith({ id: 1 });
+    expect(db.getAgent(agentId)).toBeUndefined();
+  });
+
+  test.each(['agents', 'sessions'])(
+    'does not recreate orphan state when the workspace is deleted while POST /%s reads its body',
+    async (routeName) => {
+      seedTestGroup();
+      asUser(OWNER_ID);
+
+      let releaseBody!: () => void;
+      const bodyReleased = new Promise<void>((resolve) => {
+        releaseBody = resolve;
+      });
+      let markBodyRead!: () => void;
+      const bodyRead = new Promise<void>((resolve) => {
+        markBodyRead = resolve;
+      });
+      const stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          markBodyRead();
+          await bodyReleased;
+          controller.enqueue(
+            new TextEncoder().encode(JSON.stringify({ name: 'Too late' })),
+          );
+          controller.close();
+        },
+      });
+      const existingAgentIds = db
+        .listAgentsByJid(GROUP_JID)
+        .map((agent) => agent.id)
+        .sort();
+      const request = new Request(
+        `http://localhost/${encodeURIComponent(GROUP_JID)}/${routeName}`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: stream,
+          duplex: 'half',
+        } as RequestInit & { duplex: 'half' },
+      );
+
+      const responsePromise = agentRoutes.request(request);
+      await bodyRead;
+      db.deleteRegisteredGroup(GROUP_JID);
+      releaseBody();
+
+      const response = await responsePromise;
+      expect(response.status).toBe(404);
+      expect(
+        db
+          .listAgentsByJid(GROUP_JID)
+          .map((agent) => agent.id)
+          .sort(),
+      ).toEqual(existingAgentIds);
+      expect(db.getRegisteredGroup(GROUP_JID)).toBeUndefined();
+    },
+  );
 });
 
 describe('formal sessions API', () => {
@@ -326,6 +412,89 @@ describe('formal sessions API', () => {
     const deletion = await deleteSessionRoute(sessionId);
     expect(deletion.status).toBe(409);
     expect(deletion.body.error).toMatch(/managed by their channel container/i);
+  });
+
+  test('awaits forced runtime teardown and discards paused work after session deletion commits', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postSession({ name: 'Delete safely' });
+    const sessionId = created.body.session.id as string;
+    const ipcDir = path.join(
+      tmpDataDir,
+      'ipc',
+      GROUP_FOLDER,
+      'agents',
+      sessionId,
+    );
+    expect(fs.existsSync(ipcDir)).toBe(true);
+
+    const deletion = await deleteSessionRoute(sessionId);
+
+    expect(deletion.status, JSON.stringify(deletion.body)).toBe(200);
+    expect(queue.pauseGroupsForMutation).toHaveBeenCalledWith([
+      `${GROUP_JID}#agent:${sessionId}`,
+    ]);
+    expect(queue.stopGroup).toHaveBeenCalledWith(
+      `${GROUP_JID}#agent:${sessionId}`,
+      { force: true, preserveQueuedWork: true },
+    );
+    expect(queue.discardGroupsAfterMutation).toHaveBeenCalledWith({ id: 1 });
+    expect(queue.resumeGroupsAfterMutation).not.toHaveBeenCalled();
+    expect(db.getAgent(sessionId)).toBeUndefined();
+    expect(fs.existsSync(ipcDir)).toBe(false);
+  });
+
+  test('keeps the session and resumes queued work when runtime teardown fails', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postSession({ name: 'Stop failure' });
+    const sessionId = created.body.session.id as string;
+    queue.stopGroup.mockRejectedValueOnce(new Error('runner stuck'));
+
+    const deletion = await deleteSessionRoute(sessionId);
+
+    expect(deletion.status).toBe(500);
+    expect(db.getAgent(sessionId)).toBeTruthy();
+    expect(queue.resumeGroupsAfterMutation).toHaveBeenCalledWith({ id: 1 });
+    expect(queue.discardGroupsAfterMutation).not.toHaveBeenCalled();
+  });
+
+  test('rejects a late IM binding under the final database fence', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    const created = await postSession({ name: 'Late binding' });
+    const sessionId = created.body.session.id as string;
+
+    let signalStopStarted!: () => void;
+    const stopStarted = new Promise<void>((resolve) => {
+      signalStopStarted = resolve;
+    });
+    let releaseStop!: () => void;
+    const stopReleased = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    queue.stopGroup.mockImplementationOnce(async () => {
+      signalStopStarted();
+      await stopReleased;
+    });
+
+    const deletionPromise = deleteSessionRoute(sessionId);
+    await stopStarted;
+    db.setRegisteredGroup('telegram:bound-session', {
+      name: 'Late binding',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+      target_agent_id: sessionId,
+    } as any);
+    releaseStop();
+
+    const deletion = await deletionPromise;
+    expect(deletion.status).toBe(409);
+    expect(deletion.body.retryable).toBe(true);
+    expect(db.getAgent(sessionId)).toBeTruthy();
+    expect(queue.resumeGroupsAfterMutation).toHaveBeenCalledWith({ id: 1 });
+    expect(queue.discardGroupsAfterMutation).not.toHaveBeenCalled();
   });
 });
 

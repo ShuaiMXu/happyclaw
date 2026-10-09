@@ -285,6 +285,25 @@ describe('provider model fallback lifecycle', () => {
     }
   });
 
+  test('restricted execution ignores model-controlled compatibility notices', () => {
+    expect(
+      decideProviderLimitAction({
+        result: "You've reached your weekly limit.",
+        canFallback: false,
+        allowTextFallback: false,
+      }),
+    ).toEqual({ scope: null, action: 'none' });
+
+    expect(
+      decideProviderLimitAction({
+        structuredRejection: { rateLimitType: 'seven_day' },
+        result: "You've reached your weekly limit.",
+        canFallback: false,
+        allowTextFallback: false,
+      }),
+    ).toEqual({ scope: 'account', action: 'provider_failure' });
+  });
+
   test('structured rejection wins over text and preserves model-only errors without fallback', () => {
     expect(
       decideProviderLimitAction({

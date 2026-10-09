@@ -13,7 +13,9 @@ type DockerNetworkInspect = {
   Internal?: unknown;
   Ingress?: unknown;
   ConfigOnly?: unknown;
+  EnableIPv6?: unknown;
   Labels?: unknown;
+  Options?: unknown;
 };
 
 type NetworkInspectExecutor = (networkName: string) => Promise<string>;
@@ -61,6 +63,12 @@ export async function probeExternalCapabilityDockerNetwork(
 
   const network = parsed[0] as DockerNetworkInspect;
   const labels = isRecord(network.Labels) ? network.Labels : {};
+  const options = isRecord(network.Options) ? network.Options : {};
+  const ipv4GatewayIsolated =
+    options['com.docker.network.bridge.gateway_mode_ipv4'] === 'isolated';
+  const ipv6GatewayIsolated =
+    network.EnableIPv6 !== true ||
+    options['com.docker.network.bridge.gateway_mode_ipv6'] === 'isolated';
   if (
     network.Name !== networkName ||
     network.Scope !== 'local' ||
@@ -68,6 +76,8 @@ export async function probeExternalCapabilityDockerNetwork(
     network.Internal !== true ||
     network.Ingress !== false ||
     network.ConfigOnly !== false ||
+    !ipv4GatewayIsolated ||
+    !ipv6GatewayIsolated ||
     labels[EXTERNAL_EGRESS_LABEL] !== 'true' ||
     labels[EGRESS_POLICY_LABEL] !== 'provider-only'
   ) {

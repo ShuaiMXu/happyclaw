@@ -14,7 +14,11 @@ import path from 'path';
 import os from 'os';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import type { Variables } from '../web-context.js';
+import {
+  hasHostExecutionPermission,
+  isHostExecutionGroup,
+  type Variables,
+} from '../web-context.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { GROUPS_DIR } from '../config.js';
@@ -246,6 +250,9 @@ function resolveGroup(
   }
 
   if (!canAccessGroup(authUser, group)) {
+    return null;
+  }
+  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
     return null;
   }
 

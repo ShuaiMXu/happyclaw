@@ -7,10 +7,14 @@ import {
   createRoutesFromElements,
 } from 'react-router-dom';
 import { lazy, Suspense, type ReactNode } from 'react';
+import { AppBootGate } from './components/auth/AppBootGate';
 import { AuthGuard } from './components/auth/AuthGuard';
+import { LogoLoading } from './components/common/LogoLoading';
 import { APP_BASE, shouldUseHashRouter } from './utils/url';
 import { shouldPreloadChatRoute } from './utils/chat-route-preload';
+import { useDynamicFavicon } from './hooks/useDynamicFavicon';
 import { Toaster } from '@/components/ui/sonner';
+import { IMAGE_STUDIO_ENABLED } from './config/features';
 
 let chatPagePromise:
   | Promise<{ default: typeof import('./pages/ChatPage').ChatPage }>
@@ -91,6 +95,11 @@ const CapabilitiesPage = lazy(() =>
     default: m.CapabilitiesPage,
   })),
 );
+const ImageStudioPage = lazy(() =>
+  import('./pages/ImageStudioPage').then((m) => ({
+    default: m.ImageStudioPage,
+  })),
+);
 const ExternalCapabilitiesPage = lazy(() =>
   import('./pages/ExternalCapabilitiesPage').then((m) => ({
     default: m.ExternalCapabilitiesPage,
@@ -126,15 +135,7 @@ function AgentProfilesRouteFallback() {
 }
 
 function ShellFallback() {
-  return (
-    <div
-      className="flex min-h-screen items-center justify-center text-sm text-muted-foreground motion-safe:animate-pulse"
-      role="status"
-      aria-live="polite"
-    >
-      正在加载…
-    </div>
-  );
+  return <LogoLoading full />;
 }
 
 function lazyShell(element: ReactNode) {
@@ -183,6 +184,18 @@ const appRoutes = createRoutesFromElements(
           <Suspense fallback={<AgentProfilesRouteFallback />}>
             <AgentProfilesPage />
           </Suspense>
+        }
+      />
+      <Route
+        path="/image-studio"
+        element={
+          IMAGE_STUDIO_ENABLED ? (
+            <Suspense fallback={<LogoLoading full />}>
+              <ImageStudioPage />
+            </Suspense>
+          ) : (
+            <Navigate to="/chat" replace />
+          )
         }
       />
       <Route
@@ -306,10 +319,15 @@ function getAppRouter() {
 }
 
 export function App() {
+  useDynamicFavicon();
   return (
-    <>
+    <AppBootGate
+      onGoToLogin={() =>
+        void getAppRouter().navigate('/login', { replace: true })
+      }
+    >
       <Toaster position="top-right" richColors />
       <RouterProvider router={getAppRouter()} />
-    </>
+    </AppBootGate>
   );
 }

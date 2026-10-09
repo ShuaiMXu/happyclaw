@@ -138,7 +138,7 @@ export function AppLayout() {
   );
   const appearance = useAuthStore((s) => s.appearance);
   useEffect(() => {
-    const appName = appearance?.appName || 'HappyClaw';
+    const appName = appearance?.appName || 'SoftopiaAI';
     document.title = totalUnread > 0 ? `(${totalUnread}) ${appName}` : appName;
   }, [totalUnread, appearance?.appName]);
 

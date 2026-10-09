@@ -47,6 +47,10 @@ export interface AppearanceConfig {
   brandIconUrl: string | null;
   // 600x200 left-aligned wordmark shown above the workspace list.
   brandBannerUrl: string | null;
+  // Browser tab favicon shown when the site loads.
+  faviconUrl: string | null;
+  // Icon shown in the full-screen boot/auth-check loading animation.
+  brandLoadingIconUrl: string | null;
 }
 
 export interface SetupStatus {
@@ -96,11 +100,26 @@ interface AuthState {
 
 let checkAuthInFlight: Promise<void> | null = null;
 
+// index.html embeds the current appearance config as a plain (non-Promise)
+// global — see src/index-html-template.ts — so the store can start with the
+// real branding already in place instead of `null` until a fetch resolves.
+// Without this, anything rendered before that fetch resolves (the boot
+// loading screen, pre-login pages) briefly shows the built-in default
+// mark/name even when custom branding is configured, since neither of
+// those get `appearance` from the `/api/auth/me` prewarm (only an
+// authenticated session response includes it).
+function readAppearancePrewarm(): AppearanceConfig | null {
+  if (typeof window === 'undefined') return null;
+  const prewarm = (window as { __appearancePrewarm?: AppearanceConfig })
+    .__appearancePrewarm;
+  return prewarm ?? null;
+}
+
 export const useAuthStore = create<AuthState>((set, get) => ({
   authenticated: false,
   user: null,
   setupStatus: null,
-  appearance: null,
+  appearance: readAppearancePrewarm(),
   initialized: null,
   checking: true,
 

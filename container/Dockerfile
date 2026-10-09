@@ -46,6 +46,10 @@ RUN npm run build \
 
 FROM node:24-slim AS runtime-base
 
+# Image-owned attestation checked by the host before any restricted external
+# execution receives inputs, credentials, or network attachment.
+LABEL com.happyclaw.external-runner-protocol="1"
+
 # The publish workflow sets this to the main-branch commit SHA. Writing it into
 # the first layer intentionally invalidates all downstream "latest" tool
 # installs on every main push, while still allowing exact-version overrides for

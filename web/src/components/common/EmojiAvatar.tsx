@@ -1,5 +1,10 @@
 import { useState, useEffect } from 'react';
 import { cn } from '@/lib/utils';
+import {
+  getFluentEmojiSrc,
+  isFluentEmojiToken,
+  normalizeFluentEmojiCode,
+} from '@/data/fluent-emoji';
 
 export interface EmojiAvatarProps {
   emoji?: string | null;
@@ -37,7 +42,11 @@ export function EmojiAvatar({
   className,
 }: EmojiAvatarProps) {
   const [imgFailed, setImgFailed] = useState(false);
+  const [fluentImgFailed, setFluentImgFailed] = useState(false);
+  const fluentCode = normalizeFluentEmojiCode(emoji);
+  const fluentToken = isFluentEmojiToken(emoji);
   useEffect(() => setImgFailed(false), [imageUrl]);
+  useEffect(() => setFluentImgFailed(false), [fluentCode]);
 
   const base = cn(
     'rounded-full flex items-center justify-center flex-shrink-0',
@@ -58,12 +67,22 @@ export function EmojiAvatar({
     );
   }
 
-  if (emoji) {
+  if (fluentCode && !fluentImgFailed) {
     return (
-      <div
-        className={base}
-        style={{ backgroundColor: color || '#f97316' }}
-      >
+      <div className={base} style={{ backgroundColor: color || '#ff6600' }}>
+        <img
+          src={getFluentEmojiSrc(fluentCode)}
+          alt=""
+          className="h-[80%] w-[80%] object-contain"
+          onError={() => setFluentImgFailed(true)}
+        />
+      </div>
+    );
+  }
+
+  if (emoji && !fluentToken) {
+    return (
+      <div className={base} style={{ backgroundColor: color || '#ff6600' }}>
         <span>{emoji}</span>
       </div>
     );
@@ -73,7 +92,9 @@ export function EmojiAvatar({
 
   return (
     <div className={cn(base, 'bg-brand-100')}>
-      <span className={cn('font-medium text-brand-600', fallbackTextClasses[size])}>
+      <span
+        className={cn('font-medium text-brand-600', fallbackTextClasses[size])}
+      >
         {letter}
       </span>
     </div>

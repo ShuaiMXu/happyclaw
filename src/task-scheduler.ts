@@ -22,7 +22,10 @@ import {
 } from './container-runner.js';
 import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import { isProviderQuotaControlOutput } from './provider-quota-observation.js';
+import { stopExternalCapabilityExecution } from './external-capability-execution-control.js';
+import { verifyExternalCapabilityRunContainerAbsent } from './external-capability-container-verification.js';
 import {
+  beginExternalCapabilityWorkspaceDeletion,
   cancelDeliveredGroupTaskRunWithWorkspaceIntent,
   cancelTaskRun,
   claimNextTaskRunNotification,
@@ -36,6 +39,7 @@ import {
   finalizeDeliveredGroupTaskRun,
   finalizeExpiredTaskRunNotificationAttempts,
   finalizeTaskRunNotificationIfPending,
+  EXTERNAL_CAPABILITY_WORKSPACE_DELETION_LEASE_MS,
   getAllTasks,
   cleanupOldTaskRunLogs,
   cleanupStaleRunningLogs,
@@ -58,7 +62,10 @@ import {
   logTaskRunStart,
   markTaskRunExecutionStarted,
   materializeTaskOccurrence,
+  quarantineExternalCapabilityWorkspaceDeletion,
   releaseTaskRunForRetry,
+  renewExternalCapabilityWorkspaceDeletion,
+  restoreExternalCapabilityWorkspaceDeletion,
   recordTaskRunNotificationReceipt,
   replaceTaskRunNotificationReceipt,
   renewTaskRunNotificationLease,
@@ -76,8 +83,8 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
-import { removeFlowArtifacts } from './file-manager.js';
-import { runScript } from './script-runner.js';
+import { cleanupWorkspaceFilesystem } from './workspace-filesystem-cleanup.js';
+import { runScript, terminateAllScripts } from './script-runner.js';
 import type { StreamEvent } from './stream-event.types.js';
 import {
   AgentProfile,
@@ -838,6 +845,189 @@ function claimScheduledRun(taskId: string, label: string): boolean {
   return claimed;
 }
 
+function legacyOnceTaskWorkspace(task: ScheduledTask): {
+  jid: string;
+  folder: string;
+} {
+  return {
+    jid: task.workspace_jid ?? task.chat_jid,
+    folder: task.workspace_folder ?? task.group_folder,
+  };
+}
+
+function isLegacyOnceTaskCleanupEligible(
+  task: ScheduledTask | null | undefined,
+  expected: ScheduledTask,
+): task is ScheduledTask {
+  if (!task || task.deleted_at) return false;
+  const workspace = legacyOnceTaskWorkspace(task);
+  const expectedWorkspace = legacyOnceTaskWorkspace(expected);
+  return (
+    task.id === expected.id &&
+    task.revision === expected.revision &&
+    task.schedule_type === 'once' &&
+    task.status === 'completed' &&
+    workspace.jid === expectedWorkspace.jid &&
+    workspace.folder === expectedWorkspace.folder &&
+    workspace.folder.startsWith('task-')
+  );
+}
+
+export async function cleanupLegacyOnceTaskWorkspace(
+  expectedTask: ScheduledTask,
+  deps: SchedulerDependencies,
+): Promise<'cleaned' | 'pending' | 'skipped'> {
+  const { jid: workspaceJid, folder: workspaceFolder } =
+    legacyOnceTaskWorkspace(expectedTask);
+
+  const current = getTaskById(expectedTask.id);
+  const currentGroup = deps.registeredGroups()[workspaceJid];
+  if (
+    !isLegacyOnceTaskCleanupEligible(current, expectedTask) ||
+    !currentGroup ||
+    currentGroup.folder !== workspaceFolder
+  ) {
+    return 'skipped';
+  }
+
+  const siblingJids = Object.entries(deps.registeredGroups())
+    .filter(([, group]) => group.folder === workspaceFolder)
+    .map(([jid]) => jid);
+  const descendantJids = siblingJids.flatMap((jid) =>
+    deps.queue.listDescendantJids(jid),
+  );
+  const stopJids = Array.from(
+    new Set([workspaceJid, ...siblingJids, ...descendantJids]),
+  );
+  const pauseToken = deps.queue.pauseGroupsForMutation(stopJids);
+  let committed = false;
+  let deletionFence: ReturnType<
+    typeof beginExternalCapabilityWorkspaceDeletion
+  > | null = null;
+  let heartbeat: NodeJS.Timeout | null = null;
+  let fenceLost = false;
+  let restoreFence = true;
+
+  try {
+    deletionFence = beginExternalCapabilityWorkspaceDeletion(
+      workspaceJid,
+      workspaceFolder,
+    );
+    restoreFence = !deletionFence.initiallyQuarantined;
+    if (deletionFence.capabilitySlugs.length > 0) {
+      heartbeat = setInterval(
+        () => {
+          try {
+            if (
+              deletionFence &&
+              !renewExternalCapabilityWorkspaceDeletion(deletionFence)
+            ) {
+              fenceLost = true;
+            }
+          } catch (error) {
+            fenceLost = true;
+            logger.error(
+              { taskId: expectedTask.id, workspaceJid, error },
+              'Failed to renew legacy once-task cleanup fence',
+            );
+          }
+        },
+        Math.floor(EXTERNAL_CAPABILITY_WORKSPACE_DELETION_LEASE_MS / 3),
+      );
+      heartbeat.unref?.();
+    }
+
+    await Promise.all(
+      stopJids.map((jid) =>
+        deps.queue.stopGroup(jid, {
+          force: true,
+          preserveQueuedWork: true,
+        }),
+      ),
+    );
+
+    // The delayed callback is only an optimization. Re-read after every await
+    // so an owner who edited/reactivated the once-task cannot lose the new
+    // definition or a runner that started under its newer revision.
+    const freshTask = getTaskById(expectedTask.id);
+    const freshGroup = deps.registeredGroups()[workspaceJid];
+    if (
+      !isLegacyOnceTaskCleanupEligible(freshTask, expectedTask) ||
+      !freshGroup ||
+      freshGroup.folder !== workspaceFolder
+    ) {
+      return 'skipped';
+    }
+
+    const verifiedRunIds = new Set<string>();
+    const stopResults = await Promise.all(
+      deletionFence.runningRunIds.map(async (runId) => {
+        const stopped = await stopExternalCapabilityExecution(runId);
+        const absent = await verifyExternalCapabilityRunContainerAbsent(runId);
+        return { runId, stopped, absent };
+      }),
+    );
+    if (fenceLost || !renewExternalCapabilityWorkspaceDeletion(deletionFence)) {
+      throw new Error('Legacy once-task cleanup fence lease was lost');
+    }
+    const unverified = stopResults.filter((result) => !result.absent);
+    if (unverified.length > 0) {
+      restoreFence = false;
+      if (!quarantineExternalCapabilityWorkspaceDeletion(deletionFence)) {
+        throw new Error('Legacy once-task cleanup quarantine was lost');
+      }
+      logger.error(
+        { taskId: expectedTask.id, workspaceJid, stopResults: unverified },
+        'Legacy once-task external execution could not be verified absent',
+      );
+      return 'pending';
+    }
+    for (const result of stopResults) verifiedRunIds.add(result.runId);
+
+    const finalRunIds = deleteGroupData(workspaceJid, workspaceFolder, {
+      externalDeletionOperationId: deletionFence.operationId,
+      externalDeletionOwnerId: deletionFence.ownerId,
+    });
+    committed = true;
+
+    let finalCleanupVerified = true;
+    for (const runId of finalRunIds) {
+      if (verifiedRunIds.has(runId)) continue;
+      await stopExternalCapabilityExecution(runId);
+      if (!(await verifyExternalCapabilityRunContainerAbsent(runId))) {
+        finalCleanupVerified = false;
+      }
+    }
+    delete deps.registeredGroups()[workspaceJid];
+    if (!finalCleanupVerified) return 'pending';
+    return cleanupWorkspaceFilesystem(workspaceFolder).status === 'cleaned'
+      ? 'cleaned'
+      : 'pending';
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
+    if (!committed && deletionFence && restoreFence) {
+      try {
+        if (!restoreExternalCapabilityWorkspaceDeletion(deletionFence)) {
+          logger.error(
+            { taskId: expectedTask.id, workspaceJid },
+            'Legacy once-task cleanup fence ownership changed during restore',
+          );
+        }
+      } catch (error) {
+        logger.error(
+          { taskId: expectedTask.id, workspaceJid, error },
+          'Failed to restore legacy once-task cleanup fence',
+        );
+      }
+    }
+    if (committed) {
+      deps.queue.discardGroupsAfterMutation(pauseToken);
+    } else {
+      deps.queue.resumeGroupsAfterMutation(pauseToken);
+    }
+  }
+}
+
 async function runTask(
   staleTask: ScheduledTask,
   deps: SchedulerDependencies,
@@ -1531,28 +1721,29 @@ async function runTaskInner(
   if (
     task.schedule_type === 'once' &&
     !options?.manualRun &&
-    task.workspace_jid &&
-    task.workspace_folder &&
-    task.workspace_folder.startsWith('task-')
+    legacyOnceTaskWorkspace(task).folder.startsWith('task-')
   ) {
     setTimeout(() => {
-      try {
-        const groups = deps.registeredGroups();
-        if (groups[task.workspace_jid!]) {
-          deleteGroupData(task.workspace_jid!, task.workspace_folder!);
-          delete groups[task.workspace_jid!];
-          removeFlowArtifacts(task.workspace_folder!);
+      void cleanupLegacyOnceTaskWorkspace(task, deps)
+        .then((status) => {
+          if (status === 'skipped') return;
           logger.info(
-            { taskId: task.id, folder: task.workspace_folder },
-            'Cleaned up once-task workspace',
+            {
+              taskId: task.id,
+              folder: legacyOnceTaskWorkspace(task).folder,
+              cleanupStatus: status,
+            },
+            status === 'cleaned'
+              ? 'Cleaned up once-task workspace'
+              : 'Once-task workspace cleanup remains pending',
           );
-        }
-      } catch (err) {
-        logger.error(
-          { taskId: task.id, err },
-          'Failed to cleanup once-task workspace',
-        );
-      }
+        })
+        .catch((err) => {
+          logger.error(
+            { taskId: task.id, err },
+            'Failed to cleanup once-task workspace',
+          );
+        });
     }, 60_000);
   }
 }
@@ -3489,6 +3680,30 @@ export async function stopSchedulerLoop(
     clearTimeout(schedulerTimer);
     schedulerTimer = null;
   }
+  // Script tasks are detached process groups and are not owned by GroupQueue.
+  // Abort them before draining so graceful shutdown cannot leave shell children
+  // running after the main process exits. Use both registries: the durable map
+  // preserves task-run semantics, while script-runner is the physical-process
+  // authority if a run is between registration/cleanup steps.
+  for (const execution of activeDurableExecutions.values()) {
+    if (execution.kind !== 'script') continue;
+    try {
+      void execution.stop?.();
+    } catch (err) {
+      logger.warn(
+        { taskId: execution.taskId, err },
+        'Failed to abort script task during scheduler shutdown',
+      );
+    }
+  }
+  try {
+    await terminateAllScripts();
+  } catch (err) {
+    logger.warn(
+      { err },
+      'Failed to terminate every script task during shutdown',
+    );
+  }
   const deadline = Date.now() + (options.drainMs ?? 10_000);
   for (let round = 0; round < 8; round++) {
     if (detachedSchedulerWork.size === 0) break;
@@ -3511,7 +3726,9 @@ export async function stopSchedulerLoop(
   schedulerDepsRef = null;
 }
 
-export function startSchedulerLoop(deps: SchedulerDependencies): void {
+export async function startSchedulerLoop(
+  deps: SchedulerDependencies,
+): Promise<void> {
   if (schedulerRunning) {
     logger.debug('Scheduler loop already running, skipping duplicate start');
     return;
@@ -3541,33 +3758,32 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   // (covers the case where process restarted before setTimeout cleanup fired).
   // New scheduled tasks run inside the source workspace and must never delete
   // the source workspace during task cleanup.
-  try {
-    const allTasks = getAllTasks();
-    const groups = deps.registeredGroups();
-    let cleaned = 0;
-    for (const t of allTasks) {
-      if (
-        t.schedule_type === 'once' &&
-        t.status === 'completed' &&
-        t.workspace_jid &&
-        t.workspace_folder &&
-        t.workspace_folder.startsWith('task-') &&
-        groups[t.workspace_jid]
-      ) {
-        deleteGroupData(t.workspace_jid, t.workspace_folder);
-        delete groups[t.workspace_jid];
-        removeFlowArtifacts(t.workspace_folder);
-        cleaned++;
-      }
+  let cleanedLegacyWorkspaces = 0;
+  for (const task of getAllTasks()) {
+    if (
+      task.schedule_type !== 'once' ||
+      task.status !== 'completed' ||
+      !legacyOnceTaskWorkspace(task).folder.startsWith('task-')
+    ) {
+      continue;
     }
-    if (cleaned > 0) {
-      logger.info(
-        { cleaned },
-        'Cleaned up orphaned once-task workspaces from previous session',
+    try {
+      const status = await cleanupLegacyOnceTaskWorkspace(task, deps);
+      if (status === 'cleaned') cleanedLegacyWorkspaces++;
+    } catch (err) {
+      // Continue through the remaining workspaces. The durable cleanup tombstone
+      // and the next startup retain retryability for every committed deletion.
+      logger.error(
+        { taskId: task.id, err },
+        'Failed to cleanup orphaned once-task workspace',
       );
     }
-  } catch (err) {
-    logger.error({ err }, 'Failed to cleanup orphaned once-task workspaces');
+  }
+  if (cleanedLegacyWorkspaces > 0) {
+    logger.info(
+      { cleaned: cleanedLegacyWorkspaces },
+      'Cleaned up orphaned once-task workspaces from previous session',
+    );
   }
 
   logger.info('Task Scheduler V2 started');

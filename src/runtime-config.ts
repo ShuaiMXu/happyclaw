@@ -6,6 +6,7 @@ import os from 'os';
 import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
 import { clearProviderQuotaObservation } from './provider-quota-observation.js';
+import { assertValidWorkspaceFolderName } from './workspace-folder.js';
 import type { CodexOAuthCredentials } from './codex-gateway/types.js';
 
 const MAX_FIELD_LENGTH = 2000;
@@ -2263,10 +2264,8 @@ export interface ContainerEnvPublicConfig {
   customEnv: Record<string, string>;
 }
 
-function containerEnvPath(folder: string): string {
-  if (folder.includes('..') || folder.includes('/')) {
-    throw new Error('Invalid folder name');
-  }
+export function containerEnvPath(folder: string): string {
+  assertValidWorkspaceFolderName(folder);
   return path.join(CONTAINER_ENV_DIR, `${folder}.json`);
 }
 
@@ -2341,9 +2340,9 @@ export function saveContainerEnvConfig(
 export function deleteContainerEnvConfig(folder: string): void {
   const filePath = containerEnvPath(folder);
   try {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch {
-    // ignore
+    fs.unlinkSync(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
 }
 

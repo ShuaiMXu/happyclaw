@@ -200,6 +200,7 @@ monitorRoutes.get('/health', async (c) => {
   const checks = {
     database: false,
     queue: false,
+    startup: false,
     uptime: 0,
   };
 
@@ -222,6 +223,8 @@ monitorRoutes.get('/health', async (c) => {
     } else {
       healthy = false;
     }
+    checks.startup = deps?.startupReady === true;
+    if (!checks.startup) healthy = false;
   } catch (err) {
     healthy = false;
     logger.warn({ err }, '健康检查：队列不可用');

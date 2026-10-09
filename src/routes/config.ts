@@ -16,6 +16,7 @@ import type { Variables } from '../web-context.js';
 import { getWebDeps } from '../web-context.js';
 import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import { recordLegacyUserImRoute } from '../legacy-route-telemetry.js';
+import { stopExternalCapabilityExecution } from '../external-capability-execution-control.js';
 import { extractChatId, getChannelType } from '../im-channel.js';
 import {
   deleteRegisteredGroup,
@@ -3497,7 +3498,9 @@ configRoutes.delete(
       return c.json({ error: 'Not authorized to remove this chat' }, 403);
     }
 
-    deleteRegisteredGroup(jid);
+    for (const runId of deleteRegisteredGroup(jid)) {
+      stopExternalCapabilityExecution(runId);
+    }
     deleteChatHistory(jid);
     delete groups[jid];
     logger.info({ jid, userId: user.id }, 'Telegram chat unpaired');
@@ -3817,7 +3820,9 @@ configRoutes.delete('/user-im/qq/paired-chats/:jid', authMiddleware, (c) => {
     return c.json({ error: 'Not authorized to remove this chat' }, 403);
   }
 
-  deleteRegisteredGroup(jid);
+  for (const runId of deleteRegisteredGroup(jid)) {
+    stopExternalCapabilityExecution(runId);
+  }
   deleteChatHistory(jid);
   delete groups[jid];
   logger.info({ jid, userId: user.id }, 'QQ chat unpaired');

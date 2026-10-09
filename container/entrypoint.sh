@@ -29,7 +29,36 @@ happyclaw_startup_metric entrypoint_start
 # This root-owned helper accepts no runtime-configurable path.
 # shellcheck source=session-permissions.sh
 source /app/session-permissions.sh
+if [ "${HAPPYCLAW_EXTERNAL_EXECUTION:-}" = 1 ]; then
+  # The external sandbox has a read-only image root and therefore must never
+  # rewrite /etc/passwd or /etc/group to mirror a host identity.
+  HAPPYCLAW_HOST_IDENTITY_MODE=external
+fi
 happyclaw_configure_node_identity
+
+# Confined external runs place every container-writable tree on Docker tmpfs.
+# Only read-only bootstrap/input mounts and the single fixed acknowledgement
+# file reach the host Vault, so model/runtime growth has an enforced ceiling.
+if [ "${HAPPYCLAW_EXTERNAL_EXECUTION:-}" = 1 ]; then
+  install -d -o node -g node -m 0700 \
+    /home/node/.claude \
+    /workspace/group \
+    /workspace/ipc/messages \
+    /workspace/ipc/tasks \
+    /workspace/ipc/input \
+    /workspace/ipc/agents \
+    /workspace/extra
+  if [ -d /workspace/external-bootstrap/claude ]; then
+    cp -a /workspace/external-bootstrap/claude/. /home/node/.claude/
+  fi
+  if [ -f /workspace/external-bootstrap/.claude.json ]; then
+    cp /workspace/external-bootstrap/.claude.json /home/node/.claude.json
+  fi
+  # This tree lives on a fresh, bounded tmpfs. Traverse it without following
+  # symlinks instead of applying an unbounded recursive ownership fallback.
+  find /home/node/.claude -xdev -exec chown -h node:node {} +
+  chown -h node:node /home/node/.claude.json
+fi
 
 # Prepare only explicit writable roots. Direct mode touches roots and performs
 # a separate one-time legacy migration below; rootless defers to its verified
@@ -184,7 +213,9 @@ fi
 
 # Install a root-owned PATH wrapper. It starts one deterministic browser on the
 # first agent-browser invocation, then delegates to the real target-architecture
-# CLI. Binding to loopback keeps raw CDP private to the container.
+# CLI. Binding to loopback keeps raw CDP private to the container. External
+# executions expose no browser tool and keep /app immutable under --read-only.
+if [ "${HAPPYCLAW_EXTERNAL_EXECUTION:-}" != 1 ]; then
 HAPPYCLAW_CHROMIUM_CDP_HOST="${HAPPYCLAW_CHROMIUM_CDP_HOST:-127.0.0.1}"
 HAPPYCLAW_CHROMIUM_CDP_PORT="${HAPPYCLAW_CHROMIUM_CDP_PORT:-9222}"
 export AGENT_BROWSER_CDP="$HAPPYCLAW_CHROMIUM_CDP_PORT"
@@ -325,6 +356,7 @@ LAZY_AGENT_BROWSER
 chmod 0555 "$AGENT_BROWSER_WRAPPER"
 export PATH="/app/node_modules/.bin:$PATH"
 happyclaw_startup_metric browser_deferred
+fi
 
 # Buffer stdin to file (container requires EOF to flush stdin pipe)
 cat > /tmp/input.json

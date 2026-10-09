@@ -9,7 +9,7 @@ const read = (file: string) =>
   fs.readFileSync(path.join(process.cwd(), file), 'utf8');
 
 describe('builtin Skill catalog bootstrap contract', () => {
-  test('standard install and supported start paths materialize the pinned catalog', () => {
+  test('supported start paths materialize the pinned catalog only after the old service is stopped', () => {
     const makefile = read('Makefile');
     const install = makefile.slice(
       makefile.indexOf('install: ##'),
@@ -24,7 +24,10 @@ describe('builtin Skill catalog bootstrap contract', () => {
       makefile.indexOf('# ─── Internal build checks'),
     );
 
-    expect(install).toContain('_ensure-builtin-skills');
+    expect(install).not.toContain('_ensure-builtin-skills');
+    expect(install).toContain(
+      '不得让在线旧进程在依赖安装期间观察到新版本 payload',
+    );
     expect(dev).toContain('_ensure-builtin-skills');
     expect(start).toContain('_ensure-builtin-skills');
     expect(makefile).toContain('./scripts/install-host-tools.sh skills');

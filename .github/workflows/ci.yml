@@ -12,6 +12,9 @@ jobs:
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      NPM_CONFIG_ENGINE_STRICT: 'true'
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,14 +44,38 @@ jobs:
         env:
           FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
 
+      - name: Check documentation
+        run: npm run docs:check
+
       - name: Audit production dependency trees
         run: npm run audit:prod
 
       - name: Verify generated type sources
         run: |
+          ./scripts/check-stream-event-sync.sh
           make sync-types
-          git diff --exit-code -- shared/stream-event.ts src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts
-          npx prettier --check shared/stream-event.ts src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts
+          git diff --exit-code -- \
+            shared/stream-event.ts \
+            shared/image-detector.ts \
+            shared/channel-prefixes.ts \
+            src/stream-event.types.ts \
+            src/image-detector.ts \
+            src/channel-prefixes.ts \
+            web/src/stream-event.types.ts \
+            container/agent-runner/src/stream-event.types.ts \
+            container/agent-runner/src/image-detector.ts \
+            container/agent-runner/src/channel-prefixes.ts
+          npx prettier --check \
+            shared/stream-event.ts \
+            shared/image-detector.ts \
+            shared/channel-prefixes.ts \
+            src/stream-event.types.ts \
+            src/image-detector.ts \
+            src/channel-prefixes.ts \
+            web/src/stream-event.types.ts \
+            container/agent-runner/src/stream-event.types.ts \
+            container/agent-runner/src/image-detector.ts \
+            container/agent-runner/src/channel-prefixes.ts
 
       - name: Typecheck
         run: make typecheck
@@ -70,3 +97,6 @@ jobs:
 
       - name: Agent runner self-test
         run: npm run self-test:agent-runner
+
+      - name: Verify clean patch formatting
+        run: git diff --check

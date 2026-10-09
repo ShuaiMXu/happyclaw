@@ -8,8 +8,15 @@ import { afterEach, describe, expect, test } from 'vitest';
 import {
   deleteExternalCapabilityArtifact,
   deleteExternalCapabilityRunArtifacts,
+  deleteExternalCapabilityRunArtifactsAsync,
+  ExternalCapabilityArtifactIntegrityError,
   deleteExternalCapabilityRuntimeDirectory,
+  deleteExternalCapabilityRuntimeDirectoryAsync,
+  EXTERNAL_CAPABILITY_LEGACY_RUN_OBJECT_KEY,
   getExternalCapabilityVaultRoot,
+  inventoryExternalCapabilityVault,
+  iterateExternalCapabilityRunDirectories,
+  iterateExternalCapabilityRuntimeDirectories,
   listExternalCapabilityRunDirectories,
   listExternalCapabilityRuntimeDirectories,
   probeExternalCapabilityVault,
@@ -26,6 +33,14 @@ function createVaultRoot(): string {
   );
   roots.push(root);
   return root;
+}
+
+async function collectDirectories(
+  directories: AsyncGenerator<{ name: string; runId: string; mtimeMs: number }>,
+) {
+  const collected = [];
+  for await (const directory of directories) collected.push(directory);
+  return collected;
 }
 
 afterEach(() => {
@@ -73,6 +88,71 @@ describe('external capability private input vault', () => {
     expect(listExternalCapabilityRunDirectories(root)).toEqual([]);
     expect(fs.statSync(root).mode & 0o777).toBe(0o700);
     expect(fs.statSync(path.join(root, 'runs')).mode & 0o777).toBe(0o700);
+  });
+
+  test('strictly inventories legacy run and runtime bytes', () => {
+    const root = createVaultRoot();
+    const runId = crypto.randomUUID();
+    const runDirectory = path.join(root, 'runs', runId);
+    const runtimeName = `${runId}-a1-l1-ABC123`;
+    const runtimeDirectory = path.join(root, 'runtime', runtimeName);
+    fs.mkdirSync(runDirectory, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.join(runtimeDirectory, 'input'), {
+      recursive: true,
+      mode: 0o700,
+    });
+    fs.mkdirSync(path.join(runtimeDirectory, 'output'), {
+      mode: 0o700,
+    });
+    fs.writeFileSync(path.join(runDirectory, 'source_1'), '1234', {
+      mode: 0o600,
+    });
+    fs.writeFileSync(
+      path.join(runtimeDirectory, 'input', 'source.bin'),
+      '123',
+      {
+        mode: 0o600,
+      },
+    );
+    fs.writeFileSync(path.join(runtimeDirectory, 'output', 'ack.json'), '12', {
+      mode: 0o600,
+    });
+
+    expect(inventoryExternalCapabilityVault(root)).toEqual([
+      {
+        runId,
+        kind: 'input',
+        objectKey: EXTERNAL_CAPABILITY_LEGACY_RUN_OBJECT_KEY,
+        occupiedBytes: 4,
+      },
+      {
+        runId,
+        kind: 'runtime',
+        objectKey: runtimeName,
+        occupiedBytes: 5,
+      },
+    ]);
+  });
+
+  test('fails closed on unknown and symbolic-link inventory entries', () => {
+    const unknownRoot = createVaultRoot();
+    fs.writeFileSync(path.join(unknownRoot, 'unknown'), 'x');
+    expect(() => inventoryExternalCapabilityVault(unknownRoot)).toThrow(
+      'unknown root entry',
+    );
+
+    const symlinkRoot = createVaultRoot();
+    const runId = crypto.randomUUID();
+    const runtimeDirectory = path.join(
+      symlinkRoot,
+      'runtime',
+      `${runId}-a1-l1-ABC123`,
+    );
+    fs.mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 });
+    fs.symlinkSync('/tmp', path.join(runtimeDirectory, 'escape'));
+    expect(() => inventoryExternalCapabilityVault(symlinkRoot)).toThrow(
+      'symbolic link',
+    );
   });
 
   test('deletes only the selected immutable artifact', () => {
@@ -191,6 +271,44 @@ describe('external capability private input vault', () => {
       deleteExternalCapabilityRuntimeDirectory(root, runtimeName),
     ).toThrow(/real directory/);
     expect(fs.readFileSync(sentinel, 'utf8')).toBe('safe');
+  });
+
+  test('streams and asynchronously deletes only managed directories', async () => {
+    const root = createVaultRoot();
+    const runId = '33333333-3333-4333-8333-333333333333';
+    const runtimeName = `${runId}-ASYNC1`;
+    storeExternalCapabilityArtifact(root, {
+      runId,
+      artifactId: 'artifact_async',
+      bytes: Buffer.from('private'),
+    });
+    fs.mkdirSync(path.join(root, 'runtime', runtimeName), {
+      recursive: true,
+      mode: 0o700,
+    });
+    fs.mkdirSync(path.join(root, 'runtime', 'unknown'), { mode: 0o700 });
+
+    expect(
+      await collectDirectories(iterateExternalCapabilityRunDirectories(root)),
+    ).toMatchObject([{ name: runId, runId }]);
+    expect(
+      await collectDirectories(
+        iterateExternalCapabilityRuntimeDirectories(root),
+      ),
+    ).toMatchObject([{ name: runtimeName, runId }]);
+
+    await deleteExternalCapabilityRunArtifactsAsync(root, runId);
+    await expect(
+      deleteExternalCapabilityRunArtifactsAsync(root, runId),
+    ).resolves.toBeUndefined();
+    await deleteExternalCapabilityRuntimeDirectoryAsync(root, runtimeName);
+    await expect(
+      deleteExternalCapabilityRuntimeDirectoryAsync(root, runtimeName),
+    ).resolves.toBeUndefined();
+    await expect(
+      deleteExternalCapabilityRuntimeDirectoryAsync(root, 'unknown'),
+    ).rejects.toThrow(/server-generated/);
+    expect(fs.existsSync(path.join(root, 'runtime', 'unknown'))).toBe(true);
   });
 
   test('does not overwrite a duplicate server-generated artifact ID', () => {
@@ -318,12 +436,15 @@ describe('external capability private input vault', () => {
     });
     fs.writeFileSync(path.join(root, 'runs', 'run_05', 'artifact_05'), 'evil');
 
-    expect(() =>
+    const readChangedArtifact = () =>
       readExternalCapabilityArtifact(root, {
         storageRef: stored.storageRef,
         byteLength: stored.byteLength,
         sha256: stored.sha256,
-      }),
-    ).toThrow(/digest no longer matches/);
+      });
+    expect(readChangedArtifact).toThrow(
+      ExternalCapabilityArtifactIntegrityError,
+    );
+    expect(readChangedArtifact).toThrow(/digest no longer matches/);
   });
 });

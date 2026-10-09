@@ -51,12 +51,9 @@ function killScriptProcessTree(child: ChildProcess): void {
   }
 }
 
-export async function terminateScriptsForOwner(
-  userId: string,
+async function terminateScriptRuns(
+  targets: ActiveScriptRun[],
 ): Promise<number> {
-  const targets = [...activeScriptRuns.values()].filter(
-    (run) => run.ownerId === userId,
-  );
   // Use the same state transition as AbortSignal cancellation. Killing the
   // process tree directly would leave `aborted=false`; a SIGKILL close event
   // with a null exit code could then be misclassified as a successful script.
@@ -75,6 +72,18 @@ export async function terminateScriptsForOwner(
     ),
   );
   return targets.length;
+}
+
+export async function terminateScriptsForOwner(
+  userId: string,
+): Promise<number> {
+  return terminateScriptRuns(
+    [...activeScriptRuns.values()].filter((run) => run.ownerId === userId),
+  );
+}
+
+export async function terminateAllScripts(): Promise<number> {
+  return terminateScriptRuns([...activeScriptRuns.values()]);
 }
 
 const MAX_BUFFER = 1024 * 1024; // 1MB

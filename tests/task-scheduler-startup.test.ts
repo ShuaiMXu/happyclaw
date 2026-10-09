@@ -70,7 +70,7 @@ describe('task scheduler startup recovery', () => {
       notify_channels: null,
     });
 
-    startSchedulerLoop({
+    await startSchedulerLoop({
       registeredGroups: () => ({}),
       getSessions: () => ({}),
       queue: {

@@ -79,12 +79,25 @@ const leftoverDirectJids = [
   ...waLegacyOnlyAliases,
 ] as const;
 
+function ensureChannelAccount(id: string, ownerUserId = 'owner-a'): void {
+  if (db.getChannelAccount(id)) return;
+  db.createChannelAccount({
+    id,
+    owner_user_id: ownerUserId,
+    provider: 'whatsapp',
+    name: `${id} test account`,
+    secret_ref: `channel-account:${id}`,
+  });
+}
+
 afterAll(() => {
   db.closeDatabase();
   fs.rmSync(root, { recursive: true, force: true });
 });
 
 function seedLeftoverDirectState(): void {
+  ensureChannelAccount('bot-a');
+  ensureChannelAccount('legacy-only-bot');
   db.setRegisteredGroup(workspaceJid, {
     name: 'Leftover repair workspace',
     folder,
@@ -417,6 +430,7 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
     const secondAlias = 'whatsapp:16660001111@c.us#account:conflict-bot';
     const canonical =
       'whatsapp:16660001111@s.whatsapp.net#account:conflict-bot';
+    ensureChannelAccount('conflict-bot');
     db.setRegisteredGroup(firstWorkspace, {
       name: 'Alias conflict A',
       folder: firstFolder,
@@ -509,6 +523,7 @@ describe.sequential('leftover classifiable DM diagnostic/repair tool', () => {
     const siblingFolder = 'v73-remount-only';
     const leftoverJid = 'whatsapp:15551238888@lid#account:bot-b';
     const groupJid = 'whatsapp:120363111111111111@g.us#account:bot-b';
+    ensureChannelAccount('bot-b', 'owner-b');
     db.setRegisteredGroup(siblingWorkspaceJid, {
       name: 'v73 remount-only workspace',
       folder: siblingFolder,

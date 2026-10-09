@@ -56,37 +56,133 @@ git fetch --prune origin \
 test "$(git rev-parse "origin/$HAPPYCLAW_DEPLOY_REF")" = "$HAPPYCLAW_EXPECTED_SHA"
 ```
 
-所有者已明确选择不保留部署备份。部署期间不得运行 `make backup`，不得创建 SQLite
-快照、完整运行数据归档或 `.env` 备份副本，除非所有者在未来明确撤销该策略。禁止运行
-`make reset-init`、`git clean`、`git reset --hard`，也不要用带 `--delete` 的 rsync 同步
-生产目录。Mac mini 的现有 `.env` 必须原地配置
-`HAPPYCLAW_SKIP_MIGRATION_BACKUP=1`；它只关闭启动时的 schema 迁移快照，其他安装默认仍会
-在迁移前创建并校验快照。
+禁止运行 `make reset-init`、`git clean`、`git reset --hard`，也不要用带 `--delete` 的
+rsync 同步生产目录。所有者已明确选择不保留部署备份，因此不得运行 `make backup`，也不得
+创建 SQLite 快照、完整运行时归档或 `.env` 副本。部署时必须显式设置
+`HAPPYCLAW_SKIP_MIGRATION_BACKUP=1`，这只跳过 schema 升级前的 `VACUUM INTO` 快照，不会
+绕过迁移事务、前向升级或拒绝降级检查。该选择意味着数据库迁移后没有数据级回滚路径；若
+迁移失败或新代码不兼容，只能保持服务停止并通过前向修复恢复。
+
+### 2.1 外调能力额外发布门槛
+
+代码中存在外调能力路由不等于允许生产启用。除非发布负责人另行完成并记录真实 Docker
+隔离哨兵、Provider/Container 演练、跨进程生命周期围栏、容量与成本压力测试、清理和升级
+恢复演练、监控告警、事故 Runbook、调用方秘密管理与灰度审批，否则生产环境必须保持
+`EXTERNAL_CAPABILITY_RELEASE_ENABLED=false`，`quote-document-process` 必须保持
+`draft` 或 `paused`，且不得创建或发放生产 `ec_...` Key。普通 HappyClaw 部署验证不得
+顺带打开该闸门，也不得把真实 Provider 调用当作默认 smoke test。
+
+独立发布时还必须校验：Vault 位于项目根目录外；Runner 使用 digest-pinned 镜像且协议
+OCI label 匹配；专用 Docker 网络是带受控出口标签的 internal local bridge；全局、能力和
+Key 级 intake/queue/concurrency/Provider-cost 配额均已显式评审；
+`EXTERNAL_CAPABILITY_VAULT_ID` 必须与目标卷根目录中预置、仅所有者可读的
+`.happyclaw-external-vault-id` 身份哨兵精确一致；`EXTERNAL_CAPABILITY_VAULT_MAX_BYTES` 与
+`EXTERNAL_CAPABILITY_VAULT_MIN_FREE_BYTES` 已按目标卷容量、备份/日志共用空间和告警阈值显式评审；终态文件清理、孤儿目录清理、耐久字节账本
+释放及失败后的短间隔重试已在目标文件系统验证。释放顺序必须是先确认物理对象删除或不存在，
+再释放账本占用；不能通过清零预留来掩盖删除失败。首次使用某个 Vault 身份时，服务会先取得
+按 Vault 物理路径命名的跨进程独占锁并发布 owner-fenced 维护标记；intake、执行、保留期清理、
+普通容器 reconciliation 和激活写探针必须在完整文件系统及账本 finalizer 周期内持有共享锁。
+锁 owner 由 PID 与随机 token 共同标识，只有确认 PID 已不存在时才能回收遗留 owner；PID 重用、
+锁目录/owner 文件畸形、权限或属主异常一律 fail closed。预期 Vault ID 变化不能形成另一套锁并绕过
+同一物理路径上的活动 producer。独占锁内会停止陈旧外部容器并拒绝保留任何仍存活或状态未知的
+外部容器，然后在 Web 发布前通过目录描述符固定目标卷，严格盘点 `runs/` 与 `runtime/`，将逐对象
+占用和 v2 完成标记原子写入账本；最终卷身份复验失败时必须把完成标记恢复为本 owner 的 blocked
+标记后才能释放独占锁。旧 v1 路径标记、缺失或替换的卷、未知名称、符号/硬链接、特殊文件、
+权限/属主异常、算术溢出或账本冲突都会阻止启动，不能手工跳过该盘点。外部容器的 rootfs 只读，
+`HOME`、`/workspace` 与 `/tmp` 必须使用带明确 size 的 tmpfs；Vault 对容器只允许只读输入和只读
+授权目录，禁止任何容器可写 Vault 挂载。Runner 通过 stdout 报告 START 已消费，宿主先持久化
+固定大小的 ACK，再发布只读确认文件，确认可见后 Runner 才能进入 `query()`。能力定义不存在尚未
+完成迁移的耐久目标漂移。READY/START 演练必须覆盖截止时间前的发布余量，不能把“宿主已写
+START”当作 Provider 一定未执行或一定已执行的证明。
+
+专用网络还必须显式设置 Docker bridge gateway mode：
+
+```text
+com.docker.network.bridge.gateway_mode_ipv4=isolated
+```
+
+若网络启用了 IPv6，还必须同时设置：
+
+```text
+com.docker.network.bridge.gateway_mode_ipv6=isolated
+```
+
+该 internal 网络内必须运行经审核的代理服务，Runner 只能通过 `HTTPS_PROXY` / `HTTP_PROXY`
+访问允许的 Provider 目标。直接连接公网 Provider、绕过代理的路由，以及 Provider 或代理使用
+IP literal 的配置都会被有意拒绝；不要通过放宽 DNS 名称校验、关闭 internal 网络或添加宿主机
+路由来规避 readiness 失败。发布前应从能力容器内分别验证：允许的 Provider 请求经过代理成功，
+宿主机、云元数据、私网横向地址和其他公网目标全部失败。
+
+预认证入口还必须根据压测和调用方规模显式评审以下固定窗口限流变量，而不是依赖默认值：
+
+```text
+EXTERNAL_CAPABILITY_UNAUTH_REQUESTS_PER_MINUTE
+EXTERNAL_CAPABILITY_UNAUTH_PER_CLIENT_REQUESTS_PER_MINUTE
+```
+
+具体变量和默认值以 `src/external-capability-*.ts`、
+`src/routes/external-capability-invoke.ts` 和控制面 readiness 响应为准，不在部署文档复制第二套
+配置真相源。
 
 ## 3. 构建与切换
 
-使用远程分支的精确提交，以 detached HEAD 部署，避免意外推进 Mac mini 上的 `main`：
+不得在在线目录中执行 `npm ci` 或重建 `web/dist`。先在同机独立 worktree 验证精确提交；
+只有全部门槛通过后，才进入明确的维护窗口。这样旧服务不会读取一半更新的依赖、静态资源、
+Runner 或 builtin Skills。
 
 ```bash
+export HAPPYCLAW_RELEASE_ROOT="${HOME}/happyclaw-releases"
+export HAPPYCLAW_RELEASE_DIR="${HAPPYCLAW_RELEASE_ROOT}/${HAPPYCLAW_EXPECTED_SHA}"
+mkdir -p "$HAPPYCLAW_RELEASE_ROOT"
+git worktree add --detach "$HAPPYCLAW_RELEASE_DIR" "$HAPPYCLAW_EXPECTED_SHA"
+cd "$HAPPYCLAW_RELEASE_DIR"
+
+NPM_CONFIG_ENGINE_STRICT=true NPM_CONFIG_REGISTRY=https://registry.npmjs.org \
+  /bin/zsh -lic 'make install'
+/bin/zsh -lic 'npm run docs:check'
+/bin/zsh -lic './scripts/check-stream-event-sync.sh'
+/bin/zsh -lic 'make typecheck'
+/bin/zsh -lic 'npm run audit:prod'
+/bin/zsh -lic 'npm test -- --run'
+/bin/zsh -lic 'npm run build:all:check'
+/bin/zsh -lic 'npm run self-test:agent-runner'
+git diff --check
+/bin/zsh -lic "docker pull '$HAPPYCLAW_AGENT_IMAGE'"
+```
+
+`HAPPYCLAW_AGENT_IMAGE` 必须使用已记录的 manifest digest（`name@sha256:...`），不能把
+`latest` 当作实际部署输入。记录 core 与 headroom digest、应用完整 SHA、当前 schema 版本和
+外调协议 OCI label；回滚时这四项必须作为同一个发布单元恢复。
+
+验证完成后进入维护窗口，先停止 launchd 单元，再更新在线目录。停止后才能物化
+`data/builtin-skills`；`make install` 已不再在旧服务在线时改写该目录。
+
+```bash
+export HAPPYCLAW_APP_DIR='/Users/riba2534/airepo/happyclaw'
+export HAPPYCLAW_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/com.riba2534.happyclaw.plist"
+launchctl bootout "gui/$(id -u)" "$HAPPYCLAW_LAUNCHD_PLIST"
+
+cd "$HAPPYCLAW_APP_DIR"
 git switch --detach "$HAPPYCLAW_EXPECTED_SHA"
 test "$(git rev-parse HEAD)" = "$HAPPYCLAW_EXPECTED_SHA"
 
+# 服务已停止；此时重建依赖、产物和版本化 builtin Skills 不会形成混合版本。
+NPM_CONFIG_ENGINE_STRICT=true NPM_CONFIG_REGISTRY=https://registry.npmjs.org \
+  /bin/zsh -lic 'make install'
+/bin/zsh -lic 'npm run build:all'
+/bin/zsh -lic 'make _ensure-builtin-skills'
+```
+
+若本次使用不可变镜像，只原地更新现有 `.env` 中的 `CONTAINER_IMAGE`；不得覆盖其他环境变量
+或把 `.env` 提交到 Git。按所有者的无备份策略，生产配置必须固定
+`HAPPYCLAW_SKIP_MIGRATION_BACKUP=1`：
+
+```bash
 if grep -q '^HAPPYCLAW_SKIP_MIGRATION_BACKUP=' .env 2>/dev/null; then
   sed -i '' 's/^HAPPYCLAW_SKIP_MIGRATION_BACKUP=.*$/HAPPYCLAW_SKIP_MIGRATION_BACKUP=1/' .env
 else
   printf '\nHAPPYCLAW_SKIP_MIGRATION_BACKUP=1\n' >> .env
 fi
-chmod 600 .env
-
-/bin/zsh -lic 'make install'
-/bin/zsh -lic 'npm run build:all'
-/bin/zsh -lic "docker pull '$HAPPYCLAW_AGENT_IMAGE'"
-```
-
-若本次使用不可变分支镜像，只原地更新现有 `.env` 中的 `CONTAINER_IMAGE`；不得创建
-备份副本、覆盖其他环境变量或把 `.env` 提交到 Git：
-
-```bash
 if grep -q '^CONTAINER_IMAGE=' .env 2>/dev/null; then
   sed -i '' "s|^CONTAINER_IMAGE=.*$|CONTAINER_IMAGE=$HAPPYCLAW_AGENT_IMAGE|" .env
 else
@@ -95,7 +191,8 @@ fi
 chmod 600 .env
 ```
 
-构建失败时不要重启服务；旧进程仍在使用此前的 `dist/`。修复分支后重新从预检开始。
+任一安装或构建步骤失败时保持服务停止，修复后重新从只读预检开始；不得在半成品目录上启动。
+切换成功并完成生产验证后，使用 `git worktree remove "$HAPPYCLAW_RELEASE_DIR"` 清理候选 worktree。
 
 ## 4. 重启与生产验证
 

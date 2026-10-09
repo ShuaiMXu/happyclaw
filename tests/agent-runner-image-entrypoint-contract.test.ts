@@ -11,6 +11,10 @@ const entrypoint = fs.readFileSync(
   path.join(root, 'container', 'entrypoint.sh'),
   'utf8',
 );
+const sessionPermissions = fs.readFileSync(
+  path.join(root, 'container', 'session-permissions.sh'),
+  'utf8',
+);
 const runnerSource = fs.readFileSync(
   path.join(root, 'container', 'agent-runner', 'src', 'index.ts'),
   'utf8',
@@ -61,6 +65,21 @@ describe('Agent runner image artifact contract', () => {
     );
     expect(containerRunnerSource).toContain(
       '`HAPPYCLAW_AGENT_RUNNER_MODE=${resolveAgentRunnerMode()}`',
+    );
+  });
+
+  test('keeps confined external startup compatible with a read-only image root', () => {
+    expect(entrypoint).toContain('HAPPYCLAW_HOST_IDENTITY_MODE=external');
+    expect(entrypoint).toContain(
+      'if [ "${HAPPYCLAW_EXTERNAL_EXECUTION:-}" != 1 ]; then',
+    );
+    expect(entrypoint).toContain(
+      'cp -a /workspace/external-bootstrap/claude/. /home/node/.claude/',
+    );
+    expect(sessionPermissions).toContain('external)');
+    expect(sessionPermissions).toContain('External mounts are read-only.');
+    expect(sessionPermissions).toContain(
+      'Generated external paths live only on node-owned bounded tmpfs.',
     );
   });
 

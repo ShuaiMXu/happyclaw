@@ -63,12 +63,14 @@ export function withHappyClawSubagentContract<
 >(
   options: T,
   inheritedEnv: NodeJS.ProcessEnv = process.env,
+  enabledOverride?: boolean,
 ): {
   options: T & SdkOptionsWithEnv & HiddenSubagentPromptOption;
   audit: SubagentRuntimeContractAudit;
 } {
-  const enabled =
-    process.env.HAPPYCLAW_DISABLE_SUBAGENT_RUNTIME_CONTRACT !== 'true';
+  const disabledByEnvironment =
+    inheritedEnv.HAPPYCLAW_DISABLE_SUBAGENT_RUNTIME_CONTRACT === 'true';
+  const enabled = enabledOverride !== false && !disabledByEnvironment;
   const existingEnv = (options as T & SdkOptionsWithEnv).env;
   const hash = contractHash();
   const audit: SubagentRuntimeContractAudit = {

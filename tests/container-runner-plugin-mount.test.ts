@@ -40,6 +40,8 @@ vi.mock('../src/config.js', async (importOriginal) => {
     CONTAINER_IMAGE: 'happyclaw-agent:test',
     TIMEZONE: 'UTC',
     MAIN_GROUP_FOLDER: 'main',
+    CONTAINER_HTTPS_PROXY: 'http://external-proxy.internal:8080',
+    CONTAINER_HTTP_PROXY: 'http://external-proxy.internal:8080',
   };
 });
 
@@ -58,6 +60,7 @@ const utils = await import('../src/plugin-utils.js');
 const materializer = await import('../src/plugin-materializer.js');
 
 const {
+  applyExternalProviderProxyFence,
   buildContainerArgs,
   buildVolumeMounts,
   prepareHostPlugins,
@@ -202,6 +205,31 @@ describe('buildVolumeMounts — container proxy secret boundary', () => {
     expect(args.join(' ')).not.toContain(secret);
     expect(args.join(' ')).not.toContain('HTTPS_PROXY=');
   });
+
+  test('removes provider-controlled proxy routes and all bypass variables for external runs', () => {
+    const envLines = [
+      'HTTPS_PROXY=http://attacker.invalid:8080',
+      'all_proxy=http://attacker.invalid:8081',
+      'NO_PROXY=*',
+      'npm_config_noproxy=provider.internal',
+      'GLOBAL_AGENT_NO_PROXY=provider.internal',
+      'SAFE_VALUE=kept',
+    ];
+
+    applyExternalProviderProxyFence(envLines, [
+      'HTTPS_PROXY=http://approved-proxy.internal:8080',
+      'NO_PROXY=localhost,.internal',
+    ]);
+
+    expect(envLines).toEqual([
+      'SAFE_VALUE=kept',
+      'HTTPS_PROXY=http://approved-proxy.internal:8080',
+      'NO_PROXY=',
+      'no_proxy=',
+      'npm_config_noproxy=',
+      'GLOBAL_AGENT_NO_PROXY=',
+    ]);
+  });
 });
 
 describe('buildVolumeMounts — confined external execution', () => {
@@ -236,7 +264,18 @@ describe('buildVolumeMounts — confined external execution', () => {
       undefined,
       undefined,
       undefined,
-      undefined,
+      {
+        config: {
+          anthropicBaseUrl: 'https://provider.external.test',
+          anthropicAuthToken: 'test-token',
+          anthropicApiKey: '',
+          claudeCodeOauthToken: '',
+          claudeOAuthCredentials: null,
+          anthropicModel: 'test-model',
+          updatedAt: null,
+        },
+        customEnv: {},
+      },
       undefined,
       undefined,
       undefined,
@@ -252,10 +291,24 @@ describe('buildVolumeMounts — confined external execution', () => {
       readonly: true,
     });
     expect(mounts).toContainEqual({
-      hostPath: outputDirectory,
-      containerPath: '/workspace/group',
-      readonly: false,
+      hostPath: path.join(runtimeDirectory, 'authorization'),
+      containerPath: '/workspace/external-authorization',
+      readonly: true,
     });
+    expect(
+      mounts.some(
+        (mount) =>
+          mount.containerPath === '/workspace/external-control' ||
+          mount.hostPath.startsWith(outputDirectory),
+      ),
+    ).toBe(false);
+    expect(mounts.every((mount) => mount.readonly)).toBe(true);
+    expect(
+      mounts.some((mount) => mount.containerPath === '/workspace/group'),
+    ).toBe(false);
+    expect(
+      mounts.some((mount) => mount.containerPath === '/workspace/ipc'),
+    ).toBe(false);
     for (const forbiddenPath of [
       '/workspace/project',
       '/workspace/extra',
@@ -282,6 +335,11 @@ describe('buildVolumeMounts — confined external execution', () => {
         addHostGateway: false,
         externalExecution: true,
         networkName: 'external-capability-egress',
+        labels: {
+          'com.happyclaw.external': 'true',
+          'com.happyclaw.external.protocol': '1',
+          'com.happyclaw.external.run-id': 'run-123',
+        },
       },
     );
 
@@ -291,6 +349,14 @@ describe('buildVolumeMounts — confined external execution', () => {
         'external-capability-egress',
         '--cap-drop',
         'ALL',
+        '--cap-add',
+        'CHOWN',
+        '--cap-add',
+        'DAC_OVERRIDE',
+        '--cap-add',
+        'SETGID',
+        '--cap-add',
+        'SETUID',
         '--security-opt',
         'no-new-privileges:true',
         '--pids-limit',
@@ -299,9 +365,32 @@ describe('buildVolumeMounts — confined external execution', () => {
         '2g',
         '--cpus',
         '2',
+        '--read-only',
+        '--tmpfs',
+        expect.stringContaining('/home/node:'),
+        '--tmpfs',
+        expect.stringContaining('/workspace:'),
+        '--tmpfs',
+        expect.stringContaining('/tmp:'),
+        '-e',
+        'HAPPYCLAW_EXTERNAL_EXECUTION=1',
+        '-e',
+        'HAPPYCLAW_HOST_IDENTITY_MODE=external',
+        '--label',
+        'com.happyclaw.external=true',
+        '--label',
+        'com.happyclaw.external.protocol=1',
+        '--label',
+        'com.happyclaw.external.run-id=run-123',
       ]),
     );
     expect(args).not.toContain('host.docker.internal:host-gateway');
+    expect(args.some((arg) => arg.startsWith('HAPPYCLAW_HOST_UID='))).toBe(
+      false,
+    );
+    expect(args.some((arg) => arg.startsWith('HAPPYCLAW_HOST_GID='))).toBe(
+      false,
+    );
   });
 });
 

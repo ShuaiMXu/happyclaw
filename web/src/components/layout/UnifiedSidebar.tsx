@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import { NavLink, useNavigate, useLocation } from 'react-router-dom';
-import { PanelLeftClose, Bug, LogOut, Plus, UserCog } from 'lucide-react';
+import { PanelLeftClose, SquarePen, LogOut, Plus, UserCog } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { useBillingStore } from '../../stores/billing';
@@ -232,62 +232,88 @@ export function UnifiedSidebar({
   return (
     <TooltipProvider delayDuration={200}>
       <div className="h-full flex flex-shrink-0">
-        <nav className="w-[4.5rem] h-full bg-muted/30 flex flex-col items-center py-3 gap-1 flex-shrink-0">
-          <div className="w-11 h-11 rounded-xl overflow-hidden mb-3 flex-shrink-0">
+        <nav className="w-[4.5rem] h-full bg-sidebar border-r border-border flex flex-col items-center py-3 gap-1 flex-shrink-0">
+          <button
+            type="button"
+            onClick={() => {
+              navigate('/chat');
+              void loadGroups();
+            }}
+            title="返回首页并刷新"
+            aria-label="返回首页并刷新"
+            className="mt-[5px] w-[50px] h-[50px] mb-3 flex-shrink-0 flex items-center justify-center rounded-xl transition-opacity hover:opacity-80 cursor-pointer"
+          >
             <img
               src={
                 appearance?.brandIconUrl
                   ? withBasePath(appearance.brandIconUrl)
                   : `${import.meta.env.BASE_URL}icons/icon-192.png`
               }
-              alt={appearance?.appName || 'HappyClaw'}
+              alt={appearance?.appName || 'SoftopiaAI'}
               className="w-full h-full object-cover"
             />
+          </button>
+
+          <div className="mt-[5px] flex flex-col items-center gap-1">
+            {navItems.map(({ path, icon: Icon, label, description }) => {
+              const isChatItem = path === '/chat';
+              const isActive = location.pathname.startsWith(path);
+              const baseClass =
+                'w-12 h-12 rounded-xl flex flex-col items-center justify-center gap-0.5 transition-colors';
+              const activeClass = isActive
+                ? 'bg-accent text-primary'
+                : 'text-muted-foreground hover:bg-accent hover:text-primary';
+
+              return (
+                <Tooltip key={path}>
+                  <TooltipTrigger asChild>
+                    {isChatItem && isChatRoute ? (
+                      <button
+                        onClick={onToggleCollapse}
+                        className={cn(baseClass, activeClass)}
+                      >
+                        <Icon
+                          className="w-[20px] h-[20px]"
+                          strokeWidth={isActive ? 2 : 1.75}
+                        />
+                        <span className="text-[10px] leading-tight">
+                          {label}
+                        </span>
+                      </button>
+                    ) : (
+                      <NavLink to={path} className={cn(baseClass, activeClass)}>
+                        <Icon
+                          className="w-[20px] h-[20px]"
+                          strokeWidth={isActive ? 2 : 1.75}
+                        />
+                        <span className="text-[10px] leading-tight">
+                          {label}
+                        </span>
+                      </NavLink>
+                    )}
+                  </TooltipTrigger>
+                  <TooltipContent side="right" className="max-w-[200px]">
+                    {isChatItem && isChatRoute ? (
+                      collapsed ? (
+                        '展开智能体工作台'
+                      ) : (
+                        '收起智能体工作台'
+                      )
+                    ) : (
+                      <div className="flex flex-col gap-0.5 py-0.5">
+                        <span className="font-medium">{label}</span>
+                        {description && (
+                          <span className="text-[11px] font-normal leading-snug text-background/70">
+                            {description}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </TooltipContent>
+                </Tooltip>
+              );
+            })}
           </div>
-
-          {navItems.map(({ path, icon: Icon, label }) => {
-            const isChatItem = path === '/chat';
-            const isActive = location.pathname.startsWith(path);
-            const baseClass =
-              'w-12 h-12 rounded-xl flex flex-col items-center justify-center gap-0.5 transition-colors';
-            const activeClass = isActive
-              ? 'bg-brand-50 text-primary'
-              : 'text-muted-foreground hover:bg-accent';
-
-            return (
-              <Tooltip key={path}>
-                <TooltipTrigger asChild>
-                  {isChatItem && isChatRoute ? (
-                    <button
-                      onClick={onToggleCollapse}
-                      className={cn(baseClass, activeClass)}
-                    >
-                      <Icon
-                        className="w-[20px] h-[20px]"
-                        strokeWidth={isActive ? 2 : 1.75}
-                      />
-                      <span className="text-[10px] leading-tight">{label}</span>
-                    </button>
-                  ) : (
-                    <NavLink to={path} className={cn(baseClass, activeClass)}>
-                      <Icon
-                        className="w-[20px] h-[20px]"
-                        strokeWidth={isActive ? 2 : 1.75}
-                      />
-                      <span className="text-[10px] leading-tight">{label}</span>
-                    </NavLink>
-                  )}
-                </TooltipTrigger>
-                <TooltipContent side="right">
-                  {isChatItem && isChatRoute
-                    ? collapsed
-                      ? '展开智能体工作台'
-                      : '收起智能体工作台'
-                    : label}
-                </TooltipContent>
-              </Tooltip>
-            );
-          })}
 
           {/* Spacer */}
           <div className="flex-1" />
@@ -297,9 +323,9 @@ export function UnifiedSidebar({
             <TooltipTrigger asChild>
               <button
                 onClick={() => setShowBugReport(true)}
-                className="w-10 h-10 rounded-lg flex items-center justify-center text-muted-foreground hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/30 transition-colors"
+                className="w-10 h-10 rounded-lg flex items-center justify-center text-muted-foreground hover:text-primary hover:bg-accent transition-colors"
               >
-                <Bug className="w-4 h-4" />
+                <SquarePen className="w-4 h-4" strokeWidth={1.75} />
               </button>
             </TooltipTrigger>
             <TooltipContent side="right">报告问题</TooltipContent>
@@ -308,7 +334,7 @@ export function UnifiedSidebar({
           {/* User avatar popover */}
           <Popover>
             <PopoverTrigger asChild>
-              <button className="rounded-full hover:ring-2 hover:ring-brand-200 transition-all cursor-pointer mb-2">
+              <button className="rounded-full hover:ring-2 hover:ring-orange-200 transition-all cursor-pointer mb-2">
                 <EmojiAvatar
                   imageUrl={user?.avatar_url}
                   emoji={user?.avatar_emoji}
@@ -346,16 +372,25 @@ export function UnifiedSidebar({
           className="h-full overflow-hidden transition-[width] duration-200 ease-linear"
           style={{ width: panelWidth }}
         >
-          <div className="w-[16.5rem] h-full flex flex-col bg-muted/30">
-            <div className="flex items-center gap-2 px-4 pt-6 pb-3 mb-3 flex-shrink-0">
+          <div className="w-[16.5rem] h-full flex flex-col bg-sidebar border-r border-border">
+            <div className="flex items-center gap-1 px-4 pt-3 mb-3 flex-shrink-0">
               <img
                 src={
                   appearance?.brandBannerUrl
                     ? withBasePath(appearance.brandBannerUrl)
                     : `${import.meta.env.BASE_URL}icons/logo-text.svg`
                 }
-                alt={appearance?.appName || 'HappyClaw'}
-                className="h-10 max-w-[12.5rem] object-contain object-left"
+                alt={appearance?.appName || 'SoftopiaAI'}
+                className={cn(
+                  'h-[60px] w-[200px] flex-none object-contain object-left',
+                  // Custom-uploaded wordmarks are typically drawn in a fixed
+                  // dark color for a light background; the built-in default
+                  // (orange "S" wordmark) already reads fine on dark
+                  // backgrounds, so only force-invert the custom asset —
+                  // `brightness(0) invert(1)` turns any opaque color into
+                  // solid white while leaving transparency untouched.
+                  appearance?.brandBannerUrl && 'dark:brightness-0 dark:invert',
+                )}
               />
               <div className="flex-1" />
               <button
@@ -369,7 +404,7 @@ export function UnifiedSidebar({
               <button
                 type="button"
                 onClick={() => setCreateOpen(true)}
-                className="flex min-h-9 w-full items-center justify-start gap-2 rounded-md border border-border bg-background px-3 text-xs font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
+                className="flex h-12 w-full items-center justify-start gap-2 rounded-md border border-border bg-background px-3 text-xs font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
               >
                 <Plus className="h-3.5 w-3.5" />
                 新建工作区
@@ -377,7 +412,7 @@ export function UnifiedSidebar({
             </div>
 
             {/* Workspace list */}
-            <div className="flex-1 overflow-y-auto px-1.5">
+            <div className="hc-scroll-pane flex-1 overflow-y-auto px-1.5">
               {loading && allGroups.length === 0 ? (
                 <SkeletonCardList count={6} compact />
               ) : agentSections.length === 0 ? (
@@ -389,13 +424,7 @@ export function UnifiedSidebar({
               ) : (
                 <div className="pt-1">
                   {agentPartitions.primary && (
-                    <section aria-labelledby="primary-agent-heading">
-                      <h2
-                        id="primary-agent-heading"
-                        className="px-3 pb-1 pt-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
-                      >
-                        主智能体 · {agentPartitions.primary.name}
-                      </h2>
+                    <section aria-label="主智能体工作区">
                       {renderPrimaryAgentWorkspaces(agentPartitions.primary)}
                     </section>
                   )}

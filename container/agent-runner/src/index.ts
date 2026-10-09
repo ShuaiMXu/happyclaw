@@ -113,7 +113,12 @@ import {
   resolveProviderReportedModelTier,
 } from './provider-runtime.js';
 import { resolveAgentSdkEffort } from './agent-effort.js';
-import { resolveExternalRestrictedSdkPolicy } from './external-restricted-execution.js';
+import {
+  assertExternalRestrictedSdkOptions,
+  EXTERNAL_RESTRICTED_CAN_USE_TOOL,
+  resolveExternalRestrictedSdkPolicy,
+} from './external-restricted-execution.js';
+import { ExternalStartAuthorizationGate } from './external-start-authorization.js';
 import {
   resolveAssistantErrorAttemptBoundary,
   decideProviderLimitAction,
@@ -200,6 +205,10 @@ const MODEL_LIMIT_EXHAUSTED_NOTICE =
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
+const EXTERNAL_START_AUTHORIZATION_PATH =
+  '/workspace/external-authorization/decision.json';
+const EXTERNAL_START_CONFIRMATION_PATH =
+  '/workspace/external-authorization/acknowledged.json';
 const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事件丢失）
 const ipcInputClaims = new IpcInputClaimStore(IPC_INPUT_DIR);
 
@@ -211,6 +220,8 @@ let latestSessionId: string | undefined;
 // writeOutput snapshots it into every frame so direct status/error/session
 // frames cannot silently lose correlation just because they bypass emit().
 let activeOutputInputTurnId: string | undefined;
+let externalStartAuthorizationGate: ExternalStartAuthorizationGate | null =
+  null;
 
 const DEFAULT_ALLOWED_TOOLS = [
   'Bash',
@@ -241,6 +252,7 @@ const DEFAULT_ALLOWED_TOOLS = [
 let activeAgentMcpPolicy = resolveAgentMcpPolicy('inherit');
 
 const IMAGE_MAX_DIMENSION = 8000; // Anthropic API 限制
+const IMAGE_MAX_BASE64_BYTES = 10 * 1024 * 1024;
 
 // ── 系统提示词从独立 Markdown 文件加载（启动期一次性 readFileSync 缓存到模块级常量）──
 // 文件位于 container/agent-runner/prompts/，便于改提示词无需重编译 + CR 友好。
@@ -705,7 +717,11 @@ function filterOversizedImages(
   const rejected: string[] = [];
   for (const img of images) {
     const dims = getImageDimensions(img.data);
-    if (
+    if (Buffer.byteLength(img.data, 'ascii') > IMAGE_MAX_BASE64_BYTES) {
+      const reason = `图片编码大小超过 API 限制（最大 ${IMAGE_MAX_BASE64_BYTES} bytes），已跳过`;
+      log(reason);
+      rejected.push(reason);
+    } else if (
       dims &&
       (dims.width > IMAGE_MAX_DIMENSION || dims.height > IMAGE_MAX_DIMENSION)
     ) {
@@ -1692,6 +1708,14 @@ async function runQueryAttempt(
   providerFailureTurn?: ProviderFallbackRetryTurn;
   providerAccountFailure?: boolean;
 }> {
+  if (containerInput.externalRestrictedExecution) {
+    // External one-shot runs have no HappyClaw IPC/MCP control plane. Avoid
+    // memory/profile fetch waits and do not poll an unscanned private IPC root.
+    mcpServerConfig = undefined;
+    mcpToolsContext = undefined;
+    workspaceMemoryInstructions = '';
+    acceptIpcMessagesDuringQuery = false;
+  }
   const queryModelRuntime = resolveClaudeQueryModelRuntime(
     CLAUDE_PROVIDER_RUNTIME,
     PROVIDER_FALLBACK_MODELS.activeModelOverride,
@@ -1984,14 +2008,17 @@ async function runQueryAttempt(
   };
   let firstResponseWatchdog: SdkFirstResponseWatchdog | undefined;
 
-  // 如果有图片被拒绝，立即通知用户
-  for (const reason of initialRejected) {
-    emit({
-      status: 'success',
-      result: `\u26a0\ufe0f ${reason}`,
-      newSessionId: undefined,
-      sourceKind: 'input_rejection_warning',
-    });
+  // Regular interactive runs preserve the existing warning behavior. External
+  // restricted runs must emit READY first and fail before query() instead.
+  if (!externalSdkPolicy.restricted) {
+    for (const reason of initialRejected) {
+      emit({
+        status: 'success',
+        result: `\u26a0\ufe0f ${reason}`,
+        newSessionId: undefined,
+        sourceKind: 'input_rejection_warning',
+      });
+    }
   }
 
   // Poll IPC for follow-up messages and _close/_interrupt sentinel during the query
@@ -2802,93 +2829,122 @@ async function runQueryAttempt(
         ? `Agent effort override: ${agentEffort}`
         : 'Agent effort: inherit Provider/SDK default',
     );
-    const sdkCompat = withHappyClawSubagentContract({
-      ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
-      ...queryModelRuntime.queryModelOptions,
-      cwd: WORKSPACE_GROUP,
-      resume: sessionId,
-      ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
-      systemPrompt,
-      allowedTools,
-      ...(externalSdkPolicy.tools !== undefined && {
-        tools: externalSdkPolicy.tools,
-      }),
-      ...(effectiveDisallowedTools && {
-        disallowedTools: effectiveDisallowedTools,
-      }),
-      thinking: { type: 'adaptive' as const, display: 'summarized' as const },
-      ...(agentEffort ? { effort: agentEffort } : {}),
-      ...(externalSdkPolicy.restricted &&
-        containerInput.externalQueryLimits && {
-          maxTurns: containerInput.externalQueryLimits.maxTurns,
-          maxBudgetUsd: containerInput.externalQueryLimits.maxBudgetUsd,
+    const sdkCompat = withHappyClawSubagentContract(
+      {
+        ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
+        ...queryModelRuntime.queryModelOptions,
+        cwd: WORKSPACE_GROUP,
+        ...(!externalSdkPolicy.restricted && sessionId
+          ? { resume: sessionId }
+          : {}),
+        ...(!externalSdkPolicy.restricted && sessionId && resumeAt
+          ? { resumeSessionAt: resumeAt }
+          : {}),
+        systemPrompt,
+        allowedTools: externalSdkPolicy.allowedTools,
+        ...(externalSdkPolicy.tools !== undefined && {
+          tools: externalSdkPolicy.tools,
         }),
-      permissionMode: externalSdkPolicy.restricted
-        ? ('dontAsk' as const)
-        : ('bypassPermissions' as const),
-      ...(!externalSdkPolicy.restricted && {
-        allowDangerouslySkipPermissions: true,
-      }),
-      ...(externalSdkPolicy.restricted && {
-        canUseTool: async (toolName: string) => ({
-          behavior: 'deny' as const,
-          message: `Tool ${toolName} is disabled for external capability execution.`,
+        ...(!externalSdkPolicy.restricted &&
+          effectiveDisallowedTools && {
+            disallowedTools: effectiveDisallowedTools,
+          }),
+        thinking: { type: 'adaptive' as const, display: 'summarized' as const },
+        ...(agentEffort ? { effort: agentEffort } : {}),
+        ...(externalSdkPolicy.restricted &&
+          containerInput.externalQueryLimits && {
+            maxTurns: containerInput.externalQueryLimits.maxTurns,
+            maxBudgetUsd: containerInput.externalQueryLimits.maxBudgetUsd,
+          }),
+        permissionMode: externalSdkPolicy.restricted
+          ? ('dontAsk' as const)
+          : ('bypassPermissions' as const),
+        ...(externalSdkPolicy.restricted
+          ? {
+              permissionPrompts: 'none' as const,
+              canUseTool: EXTERNAL_RESTRICTED_CAN_USE_TOOL,
+              persistSession: false,
+              verbatimPrompts: true,
+            }
+          : { allowDangerouslySkipPermissions: true }),
+        ...(!externalSdkPolicy.restricted && { agentProgressSummaries: true }),
+        settingSources:
+          externalSdkPolicy.settingSources ??
+          activeAgentMcpPolicy.settingSources,
+        // New hosts pass the canonical manifest. Undefined preserves compatibility
+        // with older hosts; an explicit [] intentionally enables no Skills.
+        skills:
+          externalSdkPolicy.skills ??
+          containerInput.skillManifest?.selectedSkillIds ??
+          ('all' as const),
+        includePartialMessages: true,
+        // Forward sub-agent (Task) text/thinking as stream events so the card's
+        // sub-agent transcript lights up live instead of only filling in when the
+        // Task completes.
+        ...(!externalSdkPolicy.restricted && { forwardSubagentText: true }),
+        ...(!externalSdkPolicy.restricted &&
+          Object.keys(flagSettings).length > 0 && {
+            settings: flagSettings as any,
+          }),
+        ...(externalSdkPolicy.allowPlugins &&
+          userPlugins && {
+            plugins: userPlugins,
+          }),
+        ...((externalSdkPolicy.restricted ||
+          activeAgentMcpPolicy.strictMcpConfig) && {
+          strictMcpConfig: true,
         }),
-      }),
-      agentProgressSummaries: true,
-      settingSources:
-        externalSdkPolicy.settingSources ?? activeAgentMcpPolicy.settingSources,
-      // New hosts pass the canonical manifest. Undefined preserves compatibility
-      // with older hosts; an explicit [] intentionally enables no Skills.
-      skills:
-        externalSdkPolicy.skills ??
-        containerInput.skillManifest?.selectedSkillIds ??
-        ('all' as const),
-      includePartialMessages: true,
-      // Forward sub-agent (Task) text/thinking as stream events so the card's
-      // sub-agent transcript lights up live instead of only filling in when the
-      // Task completes.
-      forwardSubagentText: true,
-      ...(Object.keys(flagSettings).length > 0
-        ? { settings: flagSettings as any }
-        : {}),
-      ...(externalSdkPolicy.allowPlugins &&
-        userPlugins && {
-          plugins: userPlugins,
-        }),
-      ...(activeAgentMcpPolicy.strictMcpConfig
-        ? { strictMcpConfig: true }
-        : {}),
-      mcpServers: externalSdkPolicy.mcpServers ?? {
-        ...userMcpServers,
-        ...(mcpServerConfig ? { happyclaw: mcpServerConfig } : {}),
-      },
-      hooks: {
-        PreToolUse: [
-          {
-            hooks: [createWorkspaceMemoryWriteGuard()],
-          },
-        ],
-        PreCompact: [
-          {
-            hooks: [
-              createPreCompactHook({
-                emit,
-                getFullText: () => processor.getFullText(),
-                resetFullText: () => processor.resetFullTextAccumulator(),
-                onCompactionStart: () =>
-                  firstResponseWatchdog?.beginCompaction(
-                    SDK_COMPACTION_RESPONSE_TIMEOUT_MS,
-                  ),
-              }),
+        mcpServers: externalSdkPolicy.mcpServers ?? {
+          ...userMcpServers,
+          ...(mcpServerConfig ? { happyclaw: mcpServerConfig } : {}),
+        },
+        ...(!externalSdkPolicy.restricted && {
+          hooks: {
+            PreToolUse: [
+              {
+                hooks: [createWorkspaceMemoryWriteGuard()],
+              },
+            ],
+            PreCompact: [
+              {
+                hooks: [
+                  createPreCompactHook({
+                    emit,
+                    getFullText: () => processor.getFullText(),
+                    resetFullText: () => processor.resetFullTextAccumulator(),
+                    onCompactionStart: () =>
+                      firstResponseWatchdog?.beginCompaction(
+                        SDK_COMPACTION_RESPONSE_TIMEOUT_MS,
+                      ),
+                  }),
+                ],
+              },
             ],
           },
-        ],
+        }),
       },
-    });
+      undefined,
+      !externalSdkPolicy.restricted,
+    );
     log(
       `Subagent runtime contract: ${sdkCompat.audit.enabled ? 'enabled' : 'disabled'} (${sdkCompat.audit.hash.slice(0, 12)})`,
     );
+    if (externalSdkPolicy.requiresStartAuthorization) {
+      if (!containerInput.externalQueryLimits) {
+        throw new Error('External query limits are unavailable');
+      }
+      assertExternalRestrictedSdkOptions(
+        sdkCompat.options as Record<string, unknown>,
+        containerInput.externalQueryLimits,
+      );
+      if (!externalStartAuthorizationGate) {
+        throw new Error('External start authorization gate is unavailable');
+      }
+      if (initialRejected.length > 0) {
+        throw new Error('External input image was rejected before query');
+      }
+      await externalStartAuthorizationGate.authorize();
+    }
     const q = query({
       prompt: stream,
       options: sdkCompat.options,
@@ -2974,7 +3030,9 @@ async function runQueryAttempt(
           const limitDecision = decideProviderLimitAction({
             structuredRejection: { rateLimitType: info.rateLimitType },
             result: null,
-            canFallback: PROVIDER_FALLBACK_MODELS.canActivateFallback,
+            canFallback:
+              PROVIDER_FALLBACK_MODELS.canActivateFallback &&
+              !externalSdkPolicy.restricted,
           });
           if (limitDecision.action === 'provider_failure') {
             log(
@@ -3567,7 +3625,13 @@ async function runQueryAttempt(
         const resultMsg = message as unknown as Record<string, unknown>;
         const limitDecision = decideProviderLimitAction({
           result: textResult ?? null,
-          canFallback: PROVIDER_FALLBACK_MODELS.canActivateFallback,
+          canFallback:
+            PROVIDER_FALLBACK_MODELS.canActivateFallback &&
+            !externalSdkPolicy.restricted,
+          // External results are model-controlled output derived from untrusted
+          // source material. Only structured SDK rate-limit events may affect
+          // shared Provider health in restricted execution.
+          allowTextFallback: !externalSdkPolicy.restricted,
         });
 
         // Account/session limits apply to every model on this OAuth profile.
@@ -4160,6 +4224,11 @@ async function runQuery(
   );
   const failed = first.providerFailureTurn;
   if (!failed) return first;
+  if (containerInput.externalRestrictedExecution) {
+    throw new Error(
+      'Automatic Provider replay is disabled for external restricted executions',
+    );
+  }
 
   if (failed.laterIpcMessages.length > 0) {
     log(
@@ -4288,6 +4357,16 @@ async function main(): Promise<void> {
   );
   const externalRestrictedExecution = externalSdkPolicy.restricted;
   const effectiveAllowedTools = externalSdkPolicy.allowedTools;
+  externalStartAuthorizationGate = externalSdkPolicy.requiresStartAuthorization
+    ? new ExternalStartAuthorizationGate(
+        containerInput.externalStartAuthorization,
+        {
+          emit: writeOutput,
+          decisionPath: EXTERNAL_START_AUTHORIZATION_PATH,
+          confirmationPath: EXTERNAL_START_CONFIRMATION_PATH,
+        },
+      )
+    : null;
 
   // Create in-process SDK MCP server (replaces the stdio subprocess)
   // NOTE: chatJid and currentTaskId are mutated in-place by the main loop
@@ -4458,6 +4537,21 @@ async function main(): Promise<void> {
     }
   }
 
+  if (
+    externalRestrictedExecution &&
+    promptImages?.some(
+      (image) =>
+        Buffer.byteLength(image.data, 'ascii') > IMAGE_MAX_BASE64_BYTES,
+    )
+  ) {
+    writeOutput({
+      status: 'error',
+      result: null,
+      error: 'external_input_invalid: encoded image exceeds API limit',
+    });
+    return;
+  }
+
   // Query loop: run query -> wait for IPC message -> run new query -> repeat
   let resumeAt: string | undefined;
   let overflowRetryCount = 0;
@@ -4532,6 +4626,20 @@ async function main(): Promise<void> {
           status: 'error',
           result: null,
           error: `context_budget_exceeded: ${queryResult.contextBudgetExceeded.message}`,
+          newSessionId: sessionId,
+        });
+        process.exit(1);
+      }
+
+      if (
+        externalRestrictedExecution &&
+        (queryResult.sessionResumeFailed || queryResult.contextOverflow)
+      ) {
+        writeOutput({
+          status: 'error',
+          result: null,
+          error:
+            'external_replay_disabled: external restricted executions cannot automatically replay Provider attempts',
           newSessionId: sessionId,
         });
         process.exit(1);

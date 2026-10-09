@@ -1,14 +1,62 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { apiFetch } from './client';
+import {
+  apiFetch,
+  postFormDataWithUploadProgress,
+  postJsonWithUploadProgress,
+} from './client';
 
 const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.unstubAllGlobals();
   vi.useRealTimers();
 });
+
+describe('apiFetch authentication errors', () => {
+  test('preserves a 401 response so the login page can show a helpful message', async () => {
+    window.history.replaceState({}, '', '/login');
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Invalid credentials' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    ) as typeof fetch;
+
+    await expect(apiFetch('/api/auth/login')).rejects.toEqual({
+      status: 401,
+      message: 'Invalid credentials',
+      body: { error: 'Invalid credentials' },
+    });
+  });
+});
+
+class MockXmlHttpRequest {
+  static latest: MockXmlHttpRequest | undefined;
+
+  upload: { onprogress: ((event: ProgressEvent) => void) | null } = {
+    onprogress: null,
+  };
+  withCredentials = false;
+  timeout = 0;
+  status = 0;
+  statusText = '';
+  responseText = '';
+  onerror: (() => void) | null = null;
+  ontimeout: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  onload: (() => void) | null = null;
+  readonly open = vi.fn();
+  readonly setRequestHeader = vi.fn();
+  readonly send = vi.fn();
+  readonly abort = vi.fn();
+
+  constructor() {
+    MockXmlHttpRequest.latest = this;
+  }
+}
 
 describe('apiFetch cancellation', () => {
   test('调用方 AbortSignal 会中断底层 fetch，并与请求超时区分', async () => {
@@ -156,5 +204,113 @@ describe('apiFetch cancellation', () => {
       status: 499,
       message: 'Request cancelled',
     });
+  });
+});
+
+describe('postJsonWithUploadProgress', () => {
+  test('reports browser upload bytes and resolves the JSON response', async () => {
+    vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
+
+    const progress = vi.fn();
+    const pending = postJsonWithUploadProgress<{ success: boolean }>(
+      '/api/messages',
+      { content: 'hello' },
+      { onProgress: progress, timeoutMs: 30_000 },
+    );
+    const request = MockXmlHttpRequest.latest!;
+
+    expect(request.open).toHaveBeenCalledWith('POST', '/api/messages', true);
+    expect(request.withCredentials).toBe(true);
+    expect(request.timeout).toBe(30_000);
+    expect(request.setRequestHeader).toHaveBeenCalledWith(
+      'Content-Type',
+      'application/json',
+    );
+    expect(request.send).toHaveBeenCalledWith('{"content":"hello"}');
+
+    request.upload.onprogress?.({
+      loaded: 25,
+      total: 100,
+      lengthComputable: true,
+    } as ProgressEvent);
+    expect(progress).toHaveBeenCalledWith({ loaded: 25, total: 100 });
+
+    request.status = 201;
+    request.responseText = '{"success":true}';
+    request.onload?.();
+    await expect(pending).resolves.toEqual({ success: true });
+  });
+
+  test('preserves failed response details for attachment send retries', async () => {
+    vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
+
+    const pending = postJsonWithUploadProgress('/api/messages', {
+      content: 'hello',
+    });
+    const request = MockXmlHttpRequest.latest!;
+    request.status = 413;
+    request.statusText = 'Payload Too Large';
+    request.responseText = '{"error":"Attachment too large"}';
+    request.onload?.();
+
+    await expect(pending).rejects.toEqual({
+      status: 413,
+      message: 'Attachment too large',
+      body: { error: 'Attachment too large' },
+    });
+  });
+
+  test('uploads staged images as multipart without overriding its boundary', async () => {
+    vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
+    const formData = new FormData();
+    formData.append(
+      'file',
+      new File(['image'], 'photo.png', { type: 'image/png' }),
+    );
+    const progress = vi.fn();
+
+    const pending = postFormDataWithUploadProgress<{ attachment: string }>(
+      '/api/groups/web%3Ag1/chat-attachments',
+      formData,
+      { onProgress: progress, timeoutMs: 30_000 },
+    );
+    const request = MockXmlHttpRequest.latest!;
+    expect(request.open).toHaveBeenCalledWith(
+      'POST',
+      '/api/groups/web%3Ag1/chat-attachments',
+      true,
+    );
+    expect(request.setRequestHeader).not.toHaveBeenCalled();
+    expect(request.send).toHaveBeenCalledWith(formData);
+
+    request.upload.onprogress?.({
+      loaded: 40,
+      total: 100,
+      lengthComputable: true,
+    } as ProgressEvent);
+    expect(progress).toHaveBeenCalledWith({ loaded: 40, total: 100 });
+
+    request.status = 201;
+    request.responseText = '{"attachment":"staged"}';
+    request.onload?.();
+    await expect(pending).resolves.toEqual({ attachment: 'staged' });
+  });
+
+  test('rejects an already-aborted caller signal without waiting for XHR events', async () => {
+    vi.stubGlobal('XMLHttpRequest', MockXmlHttpRequest);
+    const controller = new AbortController();
+    controller.abort();
+
+    const pending = postFormDataWithUploadProgress(
+      '/api/groups/web%3Ag1/chat-attachments',
+      new FormData(),
+      { signal: controller.signal },
+    );
+
+    await expect(pending).rejects.toEqual({
+      status: 499,
+      message: 'Request cancelled',
+    });
+    expect(MockXmlHttpRequest.latest!.send).not.toHaveBeenCalled();
   });
 });

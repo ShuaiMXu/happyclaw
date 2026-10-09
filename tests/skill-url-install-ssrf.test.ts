@@ -160,6 +160,8 @@ vi.mock('../src/web-context.js', () => ({
       isGroupRuntimeSafetyBlocked: () => false,
     },
   }),
+  hasHostExecutionPermission: () => true,
+  isHostExecutionGroup: () => false,
 }));
 vi.mock('../src/agent-profile-runtime.js', () => {
   class WorkspaceRuntimeQuiesceError extends Error {

@@ -11,17 +11,12 @@ import {
 import { authMiddleware } from '../middleware/auth.js';
 import { canAccessGroup, canModifyGroup } from '../group-acl.js';
 import {
-  clearSessionChannelOwner,
   getRegisteredGroup,
   getAllRegisteredGroups,
   listAgentsByJid,
   getAgent,
-  deleteAgent,
-  updateAgentStatus,
-  createAgent,
-  ensureChatExists,
-  deleteMessagesForChatJid,
-  deleteSession,
+  createWorkspaceConversation,
+  deleteWorkspaceAgentIfUnbound,
   getGroupsByTargetAgent,
   setRegisteredGroup,
   getJidsByFolder,
@@ -258,6 +253,25 @@ function isNativeManagedSession(
   );
 }
 
+function removeConversationDirectories(
+  groupFolder: string,
+  agentId: string,
+): void {
+  for (const dir of [
+    path.join(DATA_DIR, 'ipc', groupFolder, 'agents', agentId),
+    path.join(DATA_DIR, 'sessions', groupFolder, 'agents', agentId),
+  ]) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (error) {
+      logger.warn(
+        { groupFolder, agentId, dir, error },
+        'Failed to remove deleted conversation directory',
+      );
+    }
+  }
+}
+
 async function unbindBinding(
   user: Pick<AuthUser, 'id' | 'role'>,
   imJid: string,
@@ -452,35 +466,38 @@ router.post('/:jid/agents', authMiddleware, async (c) => {
   const agentId = crypto.randomUUID();
   const now = new Date().toISOString();
 
-  const agent: SubAgent = {
-    id: agentId,
-    group_folder: group.folder,
-    chat_jid: jid,
-    name,
-    prompt: description,
-    status: 'idle',
-    kind: 'conversation',
-    created_by: user.id,
-    created_at: now,
-    completed_at: null,
-    result_summary: null,
-    last_im_jid: null,
-    spawned_from_jid: null,
-    // Channel-native topics and Web-created conversations intentionally
-    // coexist in one workspace. The source belongs to the session, not to
-    // the workspace-wide navigation mode.
-    source_kind: 'manual',
-    title_source: isAutoTitle ? 'auto_pending' : 'manual',
-  };
-
-  createAgent(agent);
-
-  // Create IPC + session directories
-  ensureAgentDirectories(group.folder, agentId);
-
-  // Create virtual chat record for this agent's messages
-  const virtualChatJid = `${jid}#agent:${agentId}`;
-  ensureChatExists(virtualChatJid);
+  const creation = createWorkspaceConversation(
+    jid,
+    user.id,
+    {
+      id: agentId,
+      name,
+      prompt: description,
+      status: 'idle',
+      kind: 'conversation',
+      created_at: now,
+      completed_at: null,
+      result_summary: null,
+      last_im_jid: null,
+      spawned_from_jid: null,
+      // Channel-native topics and Web-created conversations intentionally
+      // coexist in one workspace. The source belongs to the session, not to
+      // the workspace-wide navigation mode.
+      source_kind: 'manual',
+      title_source: isAutoTitle ? 'auto_pending' : 'manual',
+    },
+    ensureAgentDirectories,
+  );
+  if (creation.status === 'workspace_not_found') {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (creation.status === 'forbidden') {
+    return c.json(
+      { error: 'Only the workspace owner can manage conversations' },
+      403,
+    );
+  }
+  const agent = creation.agent;
 
   // Broadcast through the injected Web projection boundary.
   projectWebAgentStatus(jid, agentId, 'idle', name, description);
@@ -537,30 +554,38 @@ router.post('/:jid/sessions', authMiddleware, async (c) => {
 
   const sessionId = crypto.randomUUID();
   const now = new Date().toISOString();
-  const session: SubAgent = {
-    id: sessionId,
-    group_folder: group.folder,
-    chat_jid: jid,
-    name,
-    prompt: description,
-    status: 'idle',
-    kind: 'conversation',
-    created_by: user.id,
-    created_at: now,
-    completed_at: null,
-    result_summary: null,
-    last_im_jid: null,
-    spawned_from_jid: null,
-    // A thread-mapped channel only controls its own native sessions. It must
-    // not remove the workspace owner's ability to create independent Web
-    // sessions in the same workspace.
-    source_kind: 'manual',
-    title_source: isAutoTitle ? 'auto_pending' : 'manual',
-  };
-
-  createAgent(session);
-  ensureAgentDirectories(group.folder, sessionId);
-  ensureChatExists(`${jid}#agent:${sessionId}`);
+  const creation = createWorkspaceConversation(
+    jid,
+    user.id,
+    {
+      id: sessionId,
+      name,
+      prompt: description,
+      status: 'idle',
+      kind: 'conversation',
+      created_at: now,
+      completed_at: null,
+      result_summary: null,
+      last_im_jid: null,
+      spawned_from_jid: null,
+      // A thread-mapped channel only controls its own native sessions. It must
+      // not remove the workspace owner's ability to create independent Web
+      // sessions in the same workspace.
+      source_kind: 'manual',
+      title_source: isAutoTitle ? 'auto_pending' : 'manual',
+    },
+    ensureAgentDirectories,
+  );
+  if (creation.status === 'workspace_not_found') {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (creation.status === 'forbidden') {
+    return c.json(
+      { error: 'Only the workspace owner can manage sessions' },
+      403,
+    );
+  }
+  const session = creation.agent;
 
   projectWebAgentStatus(jid, sessionId, 'idle', name, description);
 
@@ -785,63 +810,79 @@ router.delete('/:jid/agents/:agentId', authMiddleware, async (c) => {
     }
   }
 
-  // If the agent is still running or idle, stop the process
-  if (agent.status === 'running' || agent.status === 'idle') {
-    updateAgentStatus(agentId, 'error', '用户手动停止');
-    // Stop running process via queue
-    const deps = getWebDeps();
-    if (deps) {
-      const virtualJid = `${jid}#agent:${agentId}`;
-      deps.queue.stopGroup(virtualJid);
+  const deps = getWebDeps();
+  if (!deps?.queue) {
+    return c.json({ error: 'Server not initialized' }, 503);
+  }
+  const virtualJid = `${jid}#agent:${agentId}`;
+  const pauseToken = deps.queue.pauseGroupsForMutation([virtualJid]);
+  let deleteCommitted = false;
+  try {
+    try {
+      await deps.queue.stopGroup(virtualJid, {
+        force: true,
+        preserveQueuedWork: true,
+      });
+    } catch (error) {
+      logger.error(
+        { agentId, jid, error },
+        'Failed to stop conversation before deletion',
+      );
+      return c.json(
+        { error: 'Failed to stop conversation; it was not deleted' },
+        500,
+      );
+    }
+
+    const deletion = deleteWorkspaceAgentIfUnbound(jid, agentId, user.id);
+    if (deletion.status === 'workspace_not_found') {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (deletion.status === 'forbidden') {
+      return c.json(
+        { error: 'Only the workspace owner can manage conversations' },
+        403,
+      );
+    }
+    if (deletion.status === 'agent_not_found') {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+    if (deletion.status === 'native_managed') {
+      return c.json(
+        {
+          error:
+            'Native thread conversations are managed by their channel container and cannot be deleted directly',
+        },
+        409,
+      );
+    }
+    if (deletion.status === 'bound') {
+      return c.json(
+        {
+          error:
+            'Session acquired an active IM binding while it was stopping. Unbind it before deleting.',
+          retryable: true,
+        },
+        409,
+      );
+    }
+    if (deletion.status === 'not_conversation') {
+      return c.json({ error: 'Agent type changed during deletion' }, 409);
+    }
+
+    deleteCommitted = true;
+    removeConversationDirectories(deletion.groupFolder, agentId);
+    projectWebAgentRemoved(jid, agentId, deletion.agent.name);
+
+    logger.info({ agentId, jid, userId: user.id }, 'Agent deleted by user');
+    return c.json({ success: true });
+  } finally {
+    if (deleteCommitted) {
+      deps.queue.discardGroupsAfterMutation(pauseToken);
+    } else {
+      deps.queue.resumeGroupsAfterMutation(pauseToken);
     }
   }
-
-  // Clean up IPC/session directories
-  const agentIpcDir = path.join(
-    DATA_DIR,
-    'ipc',
-    group.folder,
-    'agents',
-    agentId,
-  );
-  try {
-    fs.rmSync(agentIpcDir, { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
-  const agentSessionDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agents',
-    agentId,
-  );
-  try {
-    fs.rmSync(agentSessionDir, { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
-
-  // Delete virtual chat messages for conversation agents
-  if (agent.kind === 'conversation') {
-    const virtualChatJid = `${jid}#agent:${agentId}`;
-    deleteMessagesForChatJid(virtualChatJid);
-
-    // Note: IM bindings are checked above and block deletion if present.
-    // No auto-clear here — user must unbind explicitly before deleting.
-  }
-
-  // Delete session records
-  deleteSession(group.folder, agentId);
-  clearSessionChannelOwner(group.folder, agentId);
-
-  deleteAgent(agentId);
-
-  // Broadcast removal
-  projectWebAgentRemoved(jid, agentId, agent.name);
-
-  logger.info({ agentId, jid, userId: user.id }, 'Agent deleted by user');
-  return c.json({ success: true });
 });
 
 // DELETE /api/groups/:jid/sessions/:sessionId — delete a workspace session
@@ -927,32 +968,81 @@ router.delete('/:jid/sessions/:sessionId', authMiddleware, async (c) => {
     );
   }
 
-  if (session.status === 'running' || session.status === 'idle') {
-    updateAgentStatus(sessionId, 'error', '用户手动停止');
-    const deps = getWebDeps();
-    if (deps) deps.queue.stopGroup(`${jid}#agent:${sessionId}`);
+  const deps = getWebDeps();
+  if (!deps?.queue) {
+    return c.json({ error: 'Server not initialized' }, 503);
   }
-
-  for (const dir of [
-    path.join(DATA_DIR, 'ipc', group.folder, 'agents', sessionId),
-    path.join(DATA_DIR, 'sessions', group.folder, 'agents', sessionId),
-  ]) {
+  const virtualJid = `${jid}#agent:${sessionId}`;
+  const pauseToken = deps.queue.pauseGroupsForMutation([virtualJid]);
+  let deleteCommitted = false;
+  try {
     try {
-      fs.rmSync(dir, { recursive: true, force: true });
-    } catch {
-      /* ignore */
+      await deps.queue.stopGroup(virtualJid, {
+        force: true,
+        preserveQueuedWork: true,
+      });
+    } catch (error) {
+      logger.error(
+        { sessionId, jid, error },
+        'Failed to stop session before deletion',
+      );
+      return c.json(
+        { error: 'Failed to stop session; it was not deleted' },
+        500,
+      );
+    }
+
+    const deletion = deleteWorkspaceAgentIfUnbound(jid, sessionId, user.id, {
+      requireConversation: true,
+    });
+    if (deletion.status === 'workspace_not_found') {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (deletion.status === 'forbidden') {
+      return c.json(
+        { error: 'Only the workspace owner can manage sessions' },
+        403,
+      );
+    }
+    if (
+      deletion.status === 'agent_not_found' ||
+      deletion.status === 'not_conversation'
+    ) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+    if (deletion.status === 'native_managed') {
+      return c.json(
+        {
+          error:
+            'Native thread sessions are managed by their channel container and cannot be deleted directly',
+        },
+        409,
+      );
+    }
+    if (deletion.status === 'bound') {
+      return c.json(
+        {
+          error:
+            'Session acquired an active IM binding while it was stopping. Unbind it before deleting.',
+          retryable: true,
+        },
+        409,
+      );
+    }
+
+    deleteCommitted = true;
+    removeConversationDirectories(deletion.groupFolder, sessionId);
+    projectWebAgentRemoved(jid, sessionId, deletion.agent.name);
+
+    logger.info({ sessionId, jid, userId: user.id }, 'Session deleted by user');
+    return c.json({ success: true });
+  } finally {
+    if (deleteCommitted) {
+      deps.queue.discardGroupsAfterMutation(pauseToken);
+    } else {
+      deps.queue.resumeGroupsAfterMutation(pauseToken);
     }
   }
-
-  deleteMessagesForChatJid(`${jid}#agent:${sessionId}`);
-  deleteSession(group.folder, sessionId);
-  clearSessionChannelOwner(group.folder, sessionId);
-  deleteAgent(sessionId);
-
-  projectWebAgentRemoved(jid, sessionId, session.name);
-
-  logger.info({ sessionId, jid, userId: user.id }, 'Session deleted by user');
-  return c.json({ success: true });
 });
 
 // POST /api/groups/:jid/im-groups/sync — actively discover chats from every

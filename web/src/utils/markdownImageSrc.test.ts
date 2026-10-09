@@ -15,9 +15,7 @@ describe('resolveMarkdownWorkspaceFileHref', () => {
         'output/T2-%E6%B5%99%E6%B1%9F%E6%8A%A5%E4%BB%B7%E4%B8%A4%E9%A1%B5%E8%AF%84%E4%BC%B0%E6%8A%A5%E5%91%8A.pdf',
         'web:quote-workspace#agent:session-1',
       ),
-    ).toBe(
-      `/api/groups/web%3Aquote-workspace/files/preview/${expected}`,
-    );
+    ).toBe(`/api/groups/web%3Aquote-workspace/files/preview/${expected}`);
   });
 
   test('supports percent-encoded spaces and Unicode in nested paths', () => {
@@ -29,9 +27,7 @@ describe('resolveMarkdownWorkspaceFileHref', () => {
         'output/%E6%9C%80%E7%BB%88%E6%8A%A5%E5%91%8A/final%20report%202026.pdf',
         'web:quote-workspace#agent:session-1',
       ),
-    ).toBe(
-      `/api/groups/web%3Aquote-workspace/files/preview/${expected}`,
-    );
+    ).toBe(`/api/groups/web%3Aquote-workspace/files/preview/${expected}`);
   });
 
   test('leaves external, SPA-relative, traversal, and non-file links untouched', () => {
@@ -80,10 +76,7 @@ describe('resolveMarkdownWorkspaceFileHref', () => {
     );
 
     expect(
-      resolveWithBasePath(
-        'output/final%20report.pdf',
-        'web:quote-workspace',
-      ),
+      resolveWithBasePath('output/final%20report.pdf', 'web:quote-workspace'),
     ).toBe(
       `/happyclaw/api/groups/web%3Aquote-workspace/files/preview/${expected}`,
     );

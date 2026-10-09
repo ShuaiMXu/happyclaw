@@ -37,6 +37,15 @@ const SHARED_TMP =
 
 const tmpDataDir = SHARED_TMP;
 
+const externalContainerMocks = vi.hoisted(() => ({
+  verifyAbsent: vi.fn(async () => true),
+}));
+
+vi.mock('../src/external-capability-container-verification.js', () => ({
+  verifyExternalCapabilityRunContainerAbsent:
+    externalContainerMocks.verifyAbsent,
+}));
+
 vi.mock('../src/config.js', async (importOriginal) => {
   const real = (await importOriginal()) as Record<string, unknown>;
   const dataDir = process.env.HAPPYCLAW_TEST_DATA_DIR!;
@@ -80,12 +89,27 @@ const webContext = await import('../src/web-context.js');
 const agentProfileRuntime = await import('../src/agent-profile-runtime.js');
 const runtimeConfig = await import('../src/runtime-config.js');
 const { GroupQueue } = await import('../src/group-queue.js');
+const { registerExternalCapabilityExecution } =
+  await import('../src/external-capability-execution-control.js');
 
 const groupRoutes = groupRoutesModule.default;
 const agentProfileRoutes = agentProfileRoutesModule.default;
 
 const OWNER_ID = 'alice';
 const ADMIN_ID = 'zadmin';
+const EXTERNAL_CAPABILITY = 'quote-document-process';
+const EXTERNAL_WORKSPACE_JID = 'web:6241df8f-b015-472e-9083-6c4ec31eedc1';
+const EXTERNAL_WORKSPACE_FOLDER = 'flow-munrwfg2-u6u8';
+const EXTERNAL_BINDING_JID = 'telegram:external-deletion-race';
+let externalRouteSequence = 0;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 function asUser(userId: string, role: 'admin' | 'member' = 'member'): void {
   process.env.HAPPYCLAW_TEST_USER_ID = userId;
@@ -99,6 +123,20 @@ beforeAll(() => {
   fs.mkdirSync(path.join(tmpDataDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDataDir, 'groups'), { recursive: true });
   db.initDatabase();
+  if (!db.getUserById(OWNER_ID)) {
+    const now = new Date().toISOString();
+    db.createUser({
+      id: OWNER_ID,
+      username: OWNER_ID,
+      password_hash: 'hash',
+      display_name: 'Alice',
+      role: 'member',
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+      must_change_password: false,
+    });
+  }
   // Routes guard on getWebDeps(); they only touch getRegisteredGroups().
   // Back the stub with a single persistent object (not a fresh {} per call) so
   // reset-owner's persistGroupUpdate cache-sync writes to a stable map, matching
@@ -112,6 +150,54 @@ afterEach(() => {
   delete process.env.HAPPYCLAW_TEST_USER_ID;
   delete process.env.HAPPYCLAW_TEST_USER_ROLE;
 });
+
+function installExternalDeleteDeps() {
+  const pauseToken = { id: ++externalRouteSequence };
+  const resumeGroupsAfterMutation = vi.fn();
+  const discardGroupsAfterMutation = vi.fn();
+  const stopGroup = vi.fn(async () => {});
+  const pauseGroupsForMutation = vi.fn(() => pauseToken);
+  webContext.setWebDeps({
+    getRegisteredGroups: () => webDepsCache,
+    getSessions: () => ({}),
+    setLastAgentTimestamp: vi.fn(),
+    queue: {
+      pauseGroupsForMutation,
+      resumeGroupsAfterMutation,
+      discardGroupsAfterMutation,
+      listDescendantJids: () => [],
+      stopGroup,
+    },
+  } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+  return {
+    pauseToken,
+    pauseGroupsForMutation,
+    resumeGroupsAfterMutation,
+    discardGroupsAfterMutation,
+    stopGroup,
+  };
+}
+
+function createRunningExternalRouteRun(label: string) {
+  externalRouteSequence += 1;
+  const keyId = db.createExternalCapabilityKey({
+    capabilitySlug: EXTERNAL_CAPABILITY,
+    label: `route deletion ${label}`,
+  }).key.id;
+  const run = db.createExternalCapabilityRun({
+    capabilitySlug: EXTERNAL_CAPABILITY,
+    keyId,
+    externalTaskId: `route-delete-task-${label}-${externalRouteSequence}`,
+    idempotencyKey: `route-delete-key-${label}-${externalRouteSequence}`,
+    inputManifest: { version: 1 },
+  }).run;
+  const claim = db.claimNextExternalCapabilityRun(
+    `route-delete-worker-${label}`,
+    60_000,
+  );
+  expect(claim?.id).toBe(run.id);
+  return { keyId, run };
+}
 
 describe('POST /:jid/reset-owner (admin break-glass)', () => {
   const JID = 'feishu:stuck-group';
@@ -296,6 +382,99 @@ describe('PATCH /:jid execution mode runtime boundary', () => {
   });
 });
 
+describe('DELETE /:jid quiesces IM group runners', () => {
+  const JID = 'telegram:delete-live-runner';
+  const FOLDER = 'owner-home';
+
+  beforeEach(() => {
+    asUser(OWNER_ID);
+    db.setRegisteredGroup(JID, {
+      name: 'Live Telegram Group',
+      folder: FOLDER,
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+    } as any);
+    webDepsCache[JID] = db.getRegisteredGroup(JID)!;
+  });
+
+  test('holds the folder mutation gate through teardown and discards late IM arrivals', async () => {
+    const pauseToken = { id: 9001 };
+    const pauseGroupsForMutation = vi.fn(() => pauseToken);
+    const resumeGroupsAfterMutation = vi.fn();
+    const stopGroup = vi.fn(async () => {
+      if (stopGroup.mock.calls.length === 1) {
+        expect(db.getRegisteredGroup(JID)).toBeDefined();
+      } else {
+        expect(db.getRegisteredGroup(JID)).toBeUndefined();
+      }
+    });
+    const removeImGroupRecord = vi.fn(() => {
+      expect(stopGroup).toHaveBeenCalledTimes(1);
+      db.deleteImGroupRecord(JID);
+      delete webDepsCache[JID];
+    });
+    const setLastAgentTimestamp = vi.fn();
+    webContext.setWebDeps({
+      getRegisteredGroups: () => webDepsCache,
+      setLastAgentTimestamp,
+      removeImGroupRecord,
+      queue: {
+        pauseGroupsForMutation,
+        resumeGroupsAfterMutation,
+        stopGroup,
+      },
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    const response = await groupRoutes.request(`/${encodeURIComponent(JID)}`, {
+      method: 'DELETE',
+    });
+
+    expect(response.status).toBe(200);
+    expect(pauseGroupsForMutation).toHaveBeenCalledWith([JID]);
+    expect(stopGroup).toHaveBeenNthCalledWith(1, JID, {
+      force: true,
+      preserveQueuedWork: true,
+    });
+    expect(removeImGroupRecord).toHaveBeenCalledWith(
+      JID,
+      'Manually deleted via API',
+    );
+    expect(stopGroup).toHaveBeenNthCalledWith(2, JID, { force: true });
+    expect(setLastAgentTimestamp).toHaveBeenCalledWith(JID, {
+      timestamp: '',
+      id: '',
+    });
+    expect(resumeGroupsAfterMutation).toHaveBeenCalledWith(pauseToken);
+  });
+
+  test('preserves the registration and releases the mutation gate if teardown fails', async () => {
+    const pauseToken = { id: 9002 };
+    const resumeGroupsAfterMutation = vi.fn();
+    const removeImGroupRecord = vi.fn();
+    webContext.setWebDeps({
+      getRegisteredGroups: () => webDepsCache,
+      setLastAgentTimestamp: vi.fn(),
+      removeImGroupRecord,
+      queue: {
+        pauseGroupsForMutation: vi.fn(() => pauseToken),
+        resumeGroupsAfterMutation,
+        stopGroup: vi.fn(async () => {
+          throw new Error('runner did not settle');
+        }),
+      },
+    } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
+
+    const response = await groupRoutes.request(`/${encodeURIComponent(JID)}`, {
+      method: 'DELETE',
+    });
+
+    expect(response.status).toBe(503);
+    expect(removeImGroupRecord).not.toHaveBeenCalled();
+    expect(db.getRegisteredGroup(JID)).toBeDefined();
+    expect(resumeGroupsAfterMutation).toHaveBeenCalledWith(pauseToken);
+  });
+});
+
 describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
   const JID = 'web:mounted-delete-block';
   const FOLDER = 'mounted-delete-block';
@@ -446,7 +625,7 @@ describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
       owner_user_id: OWNER_ID,
       provider: 'wecom',
       name: 'Delete workspace WeCom Bot',
-      secret_ref: 'test-secret',
+      secret_ref: 'test-secret-wecom',
       default_workspace_jid: JID,
     });
     db.createAgent({
@@ -521,6 +700,175 @@ describe('DELETE /:jid blocks channel_mounts-bound workspaces', () => {
 });
 
 describe('DELETE /:jid mutation pause', () => {
+  test('rejects a shared-folder alias before touching sibling state', async () => {
+    const jid = 'web:shared-folder-delete-target';
+    const siblingJid = 'web:shared-folder-survivor';
+    const folder = 'shared-folder-delete-storage';
+    const agentId = 'shared-folder-surviving-agent';
+    const taskId = 'shared-folder-surviving-task';
+    const now = new Date().toISOString();
+    const profile = db.createAgentProfile({
+      ownerUserId: OWNER_ID,
+      name: 'Shared Folder Agent',
+    });
+    for (const [workspaceJid, name] of [
+      [jid, 'Shared Folder Delete Target'],
+      [siblingJid, 'Shared Folder Survivor'],
+    ] as const) {
+      db.setRegisteredGroup(workspaceJid, {
+        name,
+        folder,
+        added_at: now,
+        executionMode: 'container',
+        created_by: OWNER_ID,
+        is_home: false,
+      } as any);
+      webDepsCache[workspaceJid] = db.getRegisteredGroup(workspaceJid)!;
+    }
+    db.assignWorkspaceAgentProfile(folder, profile.id);
+    db.setSession(folder, 'shared-folder-session');
+    db.createAgent({
+      id: agentId,
+      group_folder: folder,
+      chat_jid: siblingJid,
+      name: 'Shared Folder Session',
+      prompt: '',
+      status: 'idle',
+      kind: 'conversation',
+      created_by: OWNER_ID,
+      created_at: now,
+      completed_at: null,
+      result_summary: null,
+      last_im_jid: null,
+      spawned_from_jid: null,
+      source_kind: 'web',
+    });
+    db.createTask({
+      id: taskId,
+      group_folder: folder,
+      chat_jid: siblingJid,
+      prompt: 'keep sibling state',
+      schedule_type: 'cron',
+      schedule_value: '0 * * * *',
+      context_mode: 'isolated',
+      execution_type: 'agent',
+      execution_mode: 'container',
+      script_command: null,
+      next_run: now,
+      status: 'active',
+      created_at: now,
+      created_by: OWNER_ID,
+      notify_channels: null,
+    } as Parameters<typeof db.createTask>[0]);
+    const workspaceDir = path.join(tmpDataDir, 'groups', folder);
+    const sentinelPath = path.join(workspaceDir, 'surviving-data.txt');
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    fs.writeFileSync(sentinelPath, 'preserve');
+    const {
+      pauseGroupsForMutation,
+      resumeGroupsAfterMutation,
+      discardGroupsAfterMutation,
+      stopGroup,
+    } = installExternalDeleteDeps();
+
+    try {
+      expect(() => db.deleteGroupData(jid, folder)).toThrow(
+        db.SharedWorkspaceFolderDeletionError,
+      );
+
+      asUser(OWNER_ID);
+      const response = await groupRoutes.request(
+        `/${encodeURIComponent(jid)}`,
+        {
+          method: 'DELETE',
+        },
+      );
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        shared_workspace_count: 1,
+      });
+      expect(pauseGroupsForMutation).not.toHaveBeenCalled();
+      expect(stopGroup).not.toHaveBeenCalled();
+      expect(discardGroupsAfterMutation).not.toHaveBeenCalled();
+      expect(resumeGroupsAfterMutation).not.toHaveBeenCalled();
+      expect(db.getRegisteredGroup(jid)).toBeDefined();
+      expect(db.getRegisteredGroup(siblingJid)).toBeDefined();
+      expect(db.getWorkspaceAgentProfileId(folder)).toBe(profile.id);
+      expect(db.getSession(folder)).toBe('shared-folder-session');
+      expect(db.getAgent(agentId)).toBeDefined();
+      expect(db.getTaskById(taskId)).toBeDefined();
+      expect(fs.readFileSync(sentinelPath, 'utf8')).toBe('preserve');
+    } finally {
+      delete webDepsCache[jid];
+      delete webDepsCache[siblingJid];
+      db.deleteRegisteredGroup(siblingJid);
+      db.deleteGroupData(jid, folder);
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  test('transaction fence rejects a shared-folder alias created during runner stop', async () => {
+    const jid = 'web:shared-folder-race-target';
+    const siblingJid = 'web:shared-folder-race-survivor';
+    const folder = 'shared-folder-race-storage';
+    const now = new Date().toISOString();
+    db.setRegisteredGroup(jid, {
+      name: 'Shared Folder Race Target',
+      folder,
+      added_at: now,
+      executionMode: 'container',
+      created_by: OWNER_ID,
+      is_home: false,
+    } as any);
+    webDepsCache[jid] = db.getRegisteredGroup(jid)!;
+    const {
+      pauseToken,
+      pauseGroupsForMutation,
+      resumeGroupsAfterMutation,
+      discardGroupsAfterMutation,
+      stopGroup,
+    } = installExternalDeleteDeps();
+    stopGroup.mockImplementationOnce(async () => {
+      db.setRegisteredGroup(siblingJid, {
+        name: 'Shared Folder Late Survivor',
+        folder,
+        added_at: now,
+        executionMode: 'container',
+        created_by: OWNER_ID,
+        is_home: false,
+      } as any);
+      webDepsCache[siblingJid] = db.getRegisteredGroup(siblingJid)!;
+    });
+
+    try {
+      asUser(OWNER_ID);
+      const response = await groupRoutes.request(
+        `/${encodeURIComponent(jid)}`,
+        { method: 'DELETE' },
+      );
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        shared_workspace_count: 1,
+      });
+      expect(pauseGroupsForMutation).toHaveBeenCalledWith([jid]);
+      expect(stopGroup).toHaveBeenCalledWith(jid, {
+        force: true,
+        preserveQueuedWork: true,
+      });
+      expect(resumeGroupsAfterMutation).toHaveBeenCalledWith(pauseToken);
+      expect(discardGroupsAfterMutation).not.toHaveBeenCalled();
+      expect(db.getRegisteredGroup(jid)).toBeDefined();
+      expect(db.getRegisteredGroup(siblingJid)).toBeDefined();
+    } finally {
+      delete webDepsCache[jid];
+      delete webDepsCache[siblingJid];
+      db.deleteRegisteredGroup(siblingJid);
+      db.deleteGroupData(jid, folder);
+    }
+  });
+
   test('work accepted during pre-stop is discarded and never runs after deletion', async () => {
     const jid = 'web:delete-mutation-race';
     const folder = 'delete-mutation-race';
@@ -747,6 +1095,238 @@ describe('DELETE /:jid mutation pause', () => {
     } finally {
       db.deleteGroupData(jid, folder);
       fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('DELETE /:jid external capability fence', () => {
+  beforeEach(() => {
+    externalContainerMocks.verifyAbsent.mockReset();
+    externalContainerMocks.verifyAbsent.mockResolvedValue(true);
+    db.setRegisteredGroup(EXTERNAL_WORKSPACE_JID, {
+      name: 'External capability workspace',
+      folder: EXTERNAL_WORKSPACE_FOLDER,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OWNER_ID,
+      is_home: false,
+    } as any);
+    webDepsCache[EXTERNAL_WORKSPACE_JID] = db.getRegisteredGroup(
+      EXTERNAL_WORKSPACE_JID,
+    )!;
+    db.setRegisteredGroup(EXTERNAL_BINDING_JID, {
+      name: 'External deletion binding',
+      folder: 'owner-home',
+      added_at: new Date().toISOString(),
+      created_by: OWNER_ID,
+    } as any);
+    webDepsCache[EXTERNAL_BINDING_JID] =
+      db.getRegisteredGroup(EXTERNAL_BINDING_JID)!;
+    expect(db.setExternalCapabilityStatus(EXTERNAL_CAPABILITY, 'active')).toBe(
+      true,
+    );
+  });
+
+  test('fences START before asynchronous ordinary runner shutdown', async () => {
+    const { keyId, run } = createRunningExternalRouteRun('pre-stop-start-race');
+    const claimed = db.getExternalCapabilityRunById(run.id)!;
+    const stopEntered = deferred<void>();
+    const releaseStop = deferred<void>();
+    const { stopGroup } = installExternalDeleteDeps();
+    stopGroup.mockImplementation(async () => {
+      stopEntered.resolve();
+      await releaseStop.promise;
+      throw new Error('injected stop failure after START race check');
+    });
+
+    try {
+      asUser(OWNER_ID);
+      const request = groupRoutes.request(
+        `/${encodeURIComponent(EXTERNAL_WORKSPACE_JID)}`,
+        { method: 'DELETE' },
+      );
+      await stopEntered.promise;
+
+      expect(db.getExternalCapabilityBySlug(EXTERNAL_CAPABILITY)?.status).toBe(
+        'paused',
+      );
+      expect(
+        db.authorizeExternalCapabilityRunExecutionStart(
+          claimed.id,
+          claimed.lease_owner!,
+          claimed.lease_token,
+          {
+            reserveUsd: 2,
+            globalUsdPerDay: 100,
+            capabilityUsdPerDay: 100,
+            keyUsdPerDay: 100,
+          },
+        ),
+      ).toEqual({ outcome: 'denied' });
+      expect(db.getExternalCapabilityRunById(run.id)?.started_at).toBeNull();
+
+      releaseStop.resolve();
+      const response = await request;
+      expect(response.status).toBe(500);
+      expect(db.getExternalCapabilityBySlug(EXTERNAL_CAPABILITY)?.status).toBe(
+        'active',
+      );
+      expect(db.getExternalCapabilityRunById(run.id)?.started_at).toBeNull();
+    } finally {
+      releaseStop.resolve();
+      db.cancelExternalCapabilityRun(EXTERNAL_CAPABILITY, keyId, run.id);
+    }
+  });
+
+  test('leaves a durable quarantine when execution termination is unverified', async () => {
+    const { keyId, run } = createRunningExternalRouteRun('unverified');
+    externalContainerMocks.verifyAbsent.mockResolvedValue(false);
+    const unregister = registerExternalCapabilityExecution(run.id, () => false);
+    const {
+      pauseToken,
+      resumeGroupsAfterMutation,
+      discardGroupsAfterMutation,
+    } = installExternalDeleteDeps();
+
+    try {
+      asUser(OWNER_ID);
+      const response = await groupRoutes.request(
+        `/${encodeURIComponent(EXTERNAL_WORKSPACE_JID)}`,
+        { method: 'DELETE' },
+      );
+
+      expect(response.status).toBe(503);
+      expect(db.getRegisteredGroup(EXTERNAL_WORKSPACE_JID)).toBeDefined();
+      expect(
+        db
+          .getExternalCapabilityKeys(EXTERNAL_CAPABILITY)
+          .find((key) => key.id === keyId)?.status,
+      ).toBe('active');
+      expect(db.getExternalCapabilityRunById(run.id)?.status).toBe('running');
+      expect(db.getExternalCapabilityBySlug(EXTERNAL_CAPABILITY)?.status).toBe(
+        'paused',
+      );
+      expect(discardGroupsAfterMutation).not.toHaveBeenCalled();
+      expect(resumeGroupsAfterMutation).toHaveBeenCalledWith(pauseToken);
+    } finally {
+      unregister();
+      db.cancelExternalCapabilityRun(EXTERNAL_CAPABILITY, keyId, run.id);
+      // A deliberate quarantine survives startup recovery. Explicitly restore
+      // it only after this test has removed the simulated failed execution.
+      db.closeDatabase();
+      db.initDatabase();
+      expect(db.getExternalCapabilityBySlug(EXTERNAL_CAPABILITY)?.status).toBe(
+        'paused',
+      );
+      const fence = db.beginExternalCapabilityWorkspaceDeletion(
+        EXTERNAL_WORKSPACE_JID,
+        EXTERNAL_WORKSPACE_FOLDER,
+      );
+      db.restoreExternalCapabilityWorkspaceDeletion(fence);
+      expect(db.getExternalCapabilityBySlug(EXTERNAL_CAPABILITY)?.status).toBe(
+        'active',
+      );
+    }
+  });
+
+  test('rejects deletion of an alias while the canonical workspace survives', async () => {
+    const aliasJid = 'web:external-capability-secondary-alias';
+    db.setRegisteredGroup(aliasJid, {
+      name: 'External capability alias',
+      folder: EXTERNAL_WORKSPACE_FOLDER,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OWNER_ID,
+      is_home: false,
+    } as any);
+    webDepsCache[aliasJid] = db.getRegisteredGroup(aliasJid)!;
+    const { resumeGroupsAfterMutation, discardGroupsAfterMutation, stopGroup } =
+      installExternalDeleteDeps();
+
+    try {
+      asUser(OWNER_ID);
+      const response = await groupRoutes.request(
+        `/${encodeURIComponent(aliasJid)}`,
+        { method: 'DELETE' },
+      );
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        canonical_workspace_jid: EXTERNAL_WORKSPACE_JID,
+      });
+      expect(db.getRegisteredGroup(aliasJid)).toBeDefined();
+      expect(db.getRegisteredGroup(EXTERNAL_WORKSPACE_JID)).toBeDefined();
+      expect(db.getExternalCapabilityBySlug(EXTERNAL_CAPABILITY)?.status).toBe(
+        'active',
+      );
+      expect(stopGroup).not.toHaveBeenCalled();
+      expect(discardGroupsAfterMutation).not.toHaveBeenCalled();
+      expect(resumeGroupsAfterMutation).not.toHaveBeenCalled();
+    } finally {
+      delete webDepsCache[aliasJid];
+      db.deleteRegisteredGroup(aliasJid);
+    }
+  });
+
+  test('rejects a channel binding after the deletion fence without aborting deletion', async () => {
+    const { run } = createRunningExternalRouteRun('binding-race');
+    const termination = deferred<boolean>();
+    const stop = vi.fn(() => termination.promise);
+    const unregister = registerExternalCapabilityExecution(run.id, stop);
+    const { resumeGroupsAfterMutation, discardGroupsAfterMutation } =
+      installExternalDeleteDeps();
+    const originalImGroup = db.getRegisteredGroup(EXTERNAL_BINDING_JID)!;
+    let requestSettled = false;
+
+    try {
+      asUser(OWNER_ID);
+      const request = groupRoutes
+        .request(`/${encodeURIComponent(EXTERNAL_WORKSPACE_JID)}`, {
+          method: 'DELETE',
+        })
+        .then((response) => {
+          requestSettled = true;
+          return response;
+        });
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledOnce());
+      expect(requestSettled).toBe(false);
+      expect(db.getRegisteredGroup(EXTERNAL_WORKSPACE_JID)).toBeDefined();
+      expect(db.getExternalCapabilityRunById(run.id)?.status).toBe('running');
+
+      expect(() =>
+        db.setRegisteredGroup(EXTERNAL_BINDING_JID, {
+          ...originalImGroup,
+          target_main_jid: EXTERNAL_WORKSPACE_JID,
+          binding_mode: 'single_context',
+        }),
+      ).toThrow('External capability workspace deletion is in progress');
+      expect(
+        db.getRegisteredGroup(EXTERNAL_BINDING_JID)?.target_main_jid,
+      ).toBeUndefined();
+      termination.resolve(true);
+
+      const response = await request;
+      expect(response.status).toBe(200);
+      expect(db.getRegisteredGroup(EXTERNAL_WORKSPACE_JID)).toBeUndefined();
+      expect(db.getExternalCapabilityRunById(run.id)).toMatchObject({
+        status: 'cancelled',
+        error_code: 'WORKSPACE_DELETED',
+      });
+      expect(resumeGroupsAfterMutation).not.toHaveBeenCalled();
+      expect(discardGroupsAfterMutation).toHaveBeenCalled();
+    } finally {
+      unregister();
+      const currentImGroup = db.getRegisteredGroup(EXTERNAL_BINDING_JID);
+      if (currentImGroup) {
+        db.setRegisteredGroup(EXTERNAL_BINDING_JID, {
+          ...currentImGroup,
+          target_main_jid: undefined,
+          target_agent_id: undefined,
+        });
+        webDepsCache[EXTERNAL_BINDING_JID] =
+          db.getRegisteredGroup(EXTERNAL_BINDING_JID)!;
+      }
+      delete webDepsCache[EXTERNAL_WORKSPACE_JID];
     }
   });
 });

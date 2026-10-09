@@ -125,6 +125,14 @@ happyclaw_configure_node_identity() {
       HAPPYCLAW_INTERNAL_RUNTIME_UID="$current_uid"
       HAPPYCLAW_INTERNAL_RUNTIME_GID="$current_gid"
       ;;
+    external)
+      # Confined external executions never mutate the image passwd/group files
+      # and expose no writable host directory. Every writable tree is tmpfs;
+      # host-owned inputs and control records are read-only mounts.
+      HAPPYCLAW_INTERNAL_IDENTITY_MODE=external
+      HAPPYCLAW_INTERNAL_RUNTIME_UID="$current_uid"
+      HAPPYCLAW_INTERNAL_RUNTIME_GID="$current_gid"
+      ;;
     userns)
       happyclaw_permission_fatal \
         "rootful userns-remap has no safe host/session identity bridge; refusing to start"
@@ -153,6 +161,10 @@ happyclaw_prepare_mounted_paths() {
       /usr/local/bin/node /app/session-permissions-watcher.mjs \
         --normalize-node-owned-mounts
       ;;
+    external)
+      # External mounts are read-only. Root copies bootstrap state into tmpfs
+      # before the non-root runner starts, so no ownership bridge is required.
+      ;;
     *)
       happyclaw_permission_fatal "mount preparation attempted before safe identity setup"
       return 1
@@ -173,6 +185,9 @@ happyclaw_prepare_generated_path() {
     direct | host-root | virtualized)
       /usr/local/bin/node /app/session-permissions-watcher.mjs \
         "--normalize-generated=$generated_key"
+      ;;
+    external)
+      # Generated external paths live only on node-owned bounded tmpfs.
       ;;
     rootless)
       case "$generated_key" in

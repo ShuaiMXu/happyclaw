@@ -24,7 +24,11 @@ function getErrorMessage(err: unknown, fallback: string): string {
 
 export function SetupPage() {
   const navigate = useNavigate();
-  const { initialized, authenticated, setupAdmin, checkStatus } = useAuthStore();
+  const { initialized, authenticated, setupAdmin, checkStatus, appearance } =
+    useAuthStore();
+  const brandIconSrc =
+    appearance?.brandIconUrl || `${import.meta.env.BASE_URL}icons/icon-192.png`;
+  const brandName = appearance?.appName || 'SoftopiaAI';
 
   // Check initialization status on mount (this is a public page, no AuthGuard)
   useEffect(() => {
@@ -56,11 +60,19 @@ export function SetupPage() {
         <div className="text-center mb-8">
           <div className="flex justify-center mb-4">
             <div className="w-16 h-16 rounded-2xl overflow-hidden">
-              <img src={`${import.meta.env.BASE_URL}icons/icon-192.png`} alt="HappyClaw" className="w-full h-full object-cover" />
+              <img
+                src={brandIconSrc}
+                alt={brandName}
+                className="w-full h-full object-cover"
+              />
             </div>
           </div>
-          <h1 className="text-2xl font-bold text-foreground mb-1">HappyClaw 初始设置</h1>
-          <p className="text-sm text-muted-foreground">先创建管理员账号，完成后进入后台继续配置飞书 Token 与 Claude Key</p>
+          <h1 className="text-2xl font-bold text-foreground mb-1">
+            {brandName} 初始设置
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            先创建管理员账号，完成后进入后台继续配置飞书 Token 与 Claude Key
+          </p>
         </div>
 
         {/* Step card */}
@@ -128,7 +140,9 @@ function CreateAdminStep({
           : NaN;
       if (status === 403) {
         setError('系统已被其他管理员初始化，即将跳转到登录页...');
-        setTimeout(() => { navigate('/login', { replace: true }); }, 2000);
+        setTimeout(() => {
+          navigate('/login', { replace: true });
+        }, 2000);
         return;
       }
       setError(getErrorMessage(err, '创建管理员失败'));
@@ -139,11 +153,17 @@ function CreateAdminStep({
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-foreground mb-1">创建管理员账号</h2>
-      <p className="text-sm text-muted-foreground mb-4">首次使用请先创建管理员，提交后进入系统接入配置向导。</p>
+      <h2 className="text-lg font-semibold text-foreground mb-1">
+        创建管理员账号
+      </h2>
+      <p className="text-sm text-muted-foreground mb-4">
+        首次使用请先创建管理员，提交后进入系统接入配置向导。
+      </p>
 
       {error && (
-        <div className="mb-4 p-3 rounded-lg bg-error-bg border border-error/30 text-error text-sm">{error}</div>
+        <div className="mb-4 p-3 rounded-lg bg-error-bg border border-error/30 text-error text-sm">
+          {error}
+        </div>
       )}
 
       <div className="space-y-3">
@@ -172,7 +192,11 @@ function CreateAdminStep({
               onClick={() => setShowPassword(!showPassword)}
               className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
             >
-              {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              {showPassword ? (
+                <EyeOff className="w-4 h-4" />
+              ) : (
+                <Eye className="w-4 h-4" />
+              )}
             </button>
           </div>
         </div>
@@ -191,11 +215,19 @@ function CreateAdminStep({
               onClick={() => setShowConfirm(!showConfirm)}
               className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
             >
-              {showConfirm ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              {showConfirm ? (
+                <EyeOff className="w-4 h-4" />
+              ) : (
+                <Eye className="w-4 h-4" />
+              )}
             </button>
           </div>
         </div>
-        <Button onClick={handleSubmit} disabled={saving} className="w-full mt-2">
+        <Button
+          onClick={handleSubmit}
+          disabled={saving}
+          className="w-full mt-2"
+        >
           {saving && <Loader2 className="size-4 animate-spin" />}
           创建账号并下一步
           <ChevronRight className="w-4 h-4" />

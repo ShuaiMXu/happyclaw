@@ -19,7 +19,7 @@ export function MainAgentIdentitySection() {
   const fetchAppearance = useAuthStore((state) => state.fetchAppearance);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const [emoji, setEmoji] = useState('🐱');
-  const [color, setColor] = useState('#0d9488');
+  const [color, setColor] = useState('#ff6600');
   const [mode, setMode] = useState<'brand' | 'emoji'>('brand');
   const [styleEditorOpen, setStyleEditorOpen] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -29,7 +29,7 @@ export function MainAgentIdentitySection() {
   useEffect(() => {
     setAvatarUrl(appearance?.aiAvatarUrl ?? null);
     setEmoji(appearance?.aiAvatarEmoji || '🐱');
-    setColor(appearance?.aiAvatarColor || '#0d9488');
+    setColor(appearance?.aiAvatarColor || '#ff6600');
     setMode(appearance?.aiAvatarMode || 'brand');
     setStyleEditorOpen(appearance?.aiAvatarMode === 'emoji');
   }, [appearance]);

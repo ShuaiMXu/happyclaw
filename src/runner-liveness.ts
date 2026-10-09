@@ -3,7 +3,7 @@ export const RUNNER_SHUTDOWN_GRACE_MS = 15_000;
 export interface RunnerLivenessTimeouts {
   /** Warm runner retention after the latest output. */
   idleCloseMs: number;
-  /** Outer process/container watchdog after the latest stdout activity. */
+  /** Absolute outer process/container watchdog from runner launch. */
   watchdogMs: number;
 }
 

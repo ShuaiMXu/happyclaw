@@ -9,6 +9,7 @@ const repoRoot = path.resolve(import.meta.dirname, '..');
 const testRoot = fs.mkdtempSync(
   path.join(os.tmpdir(), 'happyclaw-container-permissions-'),
 );
+fs.mkdirSync(path.join(testRoot, 'data'), { recursive: true });
 
 vi.mock('../src/config.js', async (importOriginal) => {
   const real = (await importOriginal()) as Record<string, unknown>;

@@ -93,7 +93,7 @@ _build-web-if-stale: ## (内部) 前端变更时重新编译
 	@NEED_WEB=0; \
 	if [ ! -f web/dist/index.html ]; then NEED_WEB=1; \
 	else \
-	  for f in web/package.json web/vite.config.ts web/index.html web/tsconfig.json; do \
+	  for f in web/package.json web/package-lock.json web/vite.config.ts web/index.html web/tsconfig.json; do \
 	    if [ -f "$$f" ] && [ "$$f" -nt web/dist/index.html ]; then NEED_WEB=1; break; fi; \
 	  done; \
 	  if [ "$$NEED_WEB" = "0" ] && [ -n "$$(find web/src/ web/public/ -type f -newer web/dist/index.html 2>/dev/null | head -1)" ]; then NEED_WEB=1; fi; \
@@ -233,7 +233,8 @@ install: ## 安装全部依赖并编译 agent-runner
 	cd container/agent-runner && $(PKG) ci
 	cd container/agent-runner && $(PKG) run build
 	cd web && $(PKG) ci
-	@$(MAKE) _ensure-builtin-skills
+	@# builtin-skills 属于运行时能力快照，只能在服务停机后的发布切换阶段更新；
+	@# 不得让在线旧进程在依赖安装期间观察到新版本 payload。
 	@# 更新目录 mtime 以配合 start 中的依赖变更检测（[ package.json -nt node_modules ]）
 	@touch node_modules web/node_modules container/agent-runner/node_modules
 

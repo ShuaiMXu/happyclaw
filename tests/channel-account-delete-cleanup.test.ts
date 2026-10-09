@@ -58,6 +58,14 @@ afterAll(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 async function create(
   provider: 'telegram' | 'wechat' | 'whatsapp',
   name: string,
@@ -96,6 +104,66 @@ describe('channel-account deletion cleanup', () => {
     expect(secrets.loadChannelAccountSecret(ref)).not.toBeNull();
     expect(logoutWhatsApp).not.toHaveBeenCalledWith('delete-owner', account.id);
     expect(disconnect).not.toHaveBeenCalledWith(account.id);
+  });
+
+  test('atomically rejects a binding committed while connector cleanup is pending', async () => {
+    const account = await create('telegram', 'Delete Race Telegram');
+    const ref = db.getChannelAccount(account.id)!.secret_ref;
+    const jid = `telegram:delete-race#account:${account.id}`;
+    const cleanupEntered = deferred<void>();
+    const releaseCleanup = deferred<void>();
+    disconnect.mockImplementationOnce(async () => {
+      cleanupEntered.resolve();
+      await releaseCleanup.promise;
+    });
+
+    try {
+      const request = routes.request(`/${account.id}`, { method: 'DELETE' });
+      await cleanupEntered.promise;
+      db.setRegisteredGroup(jid, {
+        name: 'Late Telegram binding',
+        folder: 'delete-race-folder',
+        added_at: new Date().toISOString(),
+        created_by: 'delete-owner',
+        channel_account_id: account.id,
+        target_main_jid: 'web:delete-race-folder',
+      });
+      releaseCleanup.resolve();
+
+      const response = await request;
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        binding_count: 1,
+        retryable: true,
+      });
+      expect(db.getChannelAccount(account.id)).toBeDefined();
+      expect(db.getRegisteredGroup(jid)?.channel_account_id).toBe(account.id);
+      expect(secrets.loadChannelAccountSecret(ref)).not.toBeNull();
+      expect(db.deleteChannelAccount(account.id, 'delete-owner')).toBe(false);
+    } finally {
+      releaseCleanup.resolve();
+      db.deleteRegisteredGroup(jid);
+      db.deleteChannelAccount(account.id, 'delete-owner');
+      secrets.deleteChannelAccountSecret(ref);
+    }
+  });
+
+  test('rejects bindings that lose the account-delete serialization race', async () => {
+    const account = await create('telegram', 'Delete First Telegram');
+    const ref = db.getChannelAccount(account.id)!.secret_ref;
+    expect(db.deleteChannelAccount(account.id, 'delete-owner')).toBe(true);
+
+    expect(() =>
+      db.setRegisteredGroup(`telegram:deleted#account:${account.id}`, {
+        name: 'Orphan attempt',
+        folder: 'deleted-account-folder',
+        added_at: new Date().toISOString(),
+        created_by: 'delete-owner',
+        channel_account_id: account.id,
+        target_main_jid: 'web:deleted-account-folder',
+      }),
+    ).toThrow('Channel account does not exist');
+    secrets.deleteChannelAccountSecret(ref);
   });
 
   test('unbound WhatsApp deletion logs out the exact account and removes metadata and secret', async () => {

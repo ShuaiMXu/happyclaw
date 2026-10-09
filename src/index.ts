@@ -139,6 +139,7 @@ import {
   getAllRegisteredGroups,
   getAllSessions,
   hasContainerModeGroups,
+  hasExternalCapabilityContainerLifecycleDebt,
   getAllTasks,
   getDeletedTasks,
   getJidsByFolder,
@@ -165,6 +166,8 @@ import {
   getUserHomeGroup,
   forceActiveAdminRuntimesToHost,
   initDatabase,
+  pauseActiveExternalCapabilitiesForClosedReleaseGate,
+  recoverWorkspaceFilesystemCleanupClaimsOnStartup,
   listUsers,
   setLastGroupSync,
   setRegisteredGroup,
@@ -519,9 +522,26 @@ import {
   resolveScheduledTaskIpcRunId,
 } from './task-scheduler.js';
 import {
+  backfillConfiguredExternalCapabilityVaultOccupancy,
+  beginConfiguredExternalCapabilityVaultCensus,
+} from './external-capability-storage-backfill.js';
+import { isExternalCapabilityReleaseEnabled } from './external-capability-release-config.js';
+import {
+  quiesceExternalCapabilityContainersForVaultCensus,
   startExternalCapabilityWorker,
   stopExternalCapabilityWorker,
 } from './external-capability-worker.js';
+import {
+  buildLegacyStartupContainerListArgs,
+  buildStartupContainerListArgs,
+  legacyContainerInspectionBelongsToInstallation,
+  removeAndVerifyStartupContainer,
+  selectStoppableStartupContainers,
+  settleOrdinaryContainerCreateFencesAtStartup,
+  type StartupDockerCommand,
+} from './startup-container-cleanup.js';
+import { cleanupOwnedHostRunnerProcessGroups } from './startup-host-cleanup.js';
+import { sweepPendingWorkspaceFilesystemCleanups } from './workspace-filesystem-cleanup.js';
 import { getMergedTaskRunHistory } from './task-run-history.js';
 import { findDuplicateActiveAgentTask } from './task-definition-fingerprint.js';
 import {
@@ -5983,8 +6003,10 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     group = { ...group, containerConfig: parsedContainerConfig.config };
   }
 
-  registeredGroups[jid] = group;
+  // Publish durably before exposing the group in the live router cache. The
+  // canonical writer also rejects folders with pending cleanup tombstones.
   setRegisteredGroup(jid, group);
+  registeredGroups[jid] = group;
 
   // Create group folder
   const groupDir = path.join(GROUPS_DIR, group.folder);
@@ -19453,79 +19475,139 @@ function recoverStartupTypedIpcDeliveries(): void {
   }
 }
 
-async function ensureDockerRunning(): Promise<void> {
-  // Skip all Docker checks when no groups use container mode
-  if (!hasContainerModeGroups()) {
-    logger.info('All groups use host execution mode, skipping Docker checks');
-    return;
-  }
-
-  if (!(await isDockerAvailable())) {
-    logger.warn(
-      'Docker is not available — container-mode workspaces will fail at message time. ' +
-        'Start Docker if you need container execution (macOS: Docker Desktop, Linux: sudo systemctl start docker).',
-    );
-    return;
-  }
-  logger.debug('Docker daemon is running');
-
-  // Kill orphaned host agent-runner processes from previous runs
+async function ensureDockerRunning(): Promise<boolean> {
+  // Host runners are independent from Docker and must be reclaimed even for a
+  // Host-only installation or while the Docker daemon is unavailable.
   try {
-    const { stdout: psOut } = await execFileAsync(
-      'pgrep',
-      ['-f', 'node.*container/agent-runner/dist/index\\.js'],
-      { timeout: 5000 },
-    );
-    const pids = (typeof psOut === 'string' ? psOut : String(psOut))
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .map(Number)
-      .filter((pid) => pid !== process.pid && !isNaN(pid));
-    for (const pid of pids) {
-      try {
-        process.kill(pid, 'SIGKILL');
-      } catch {
-        /* already dead */
-      }
-    }
+    const pids = await cleanupOwnedHostRunnerProcessGroups();
     if (pids.length > 0) {
       logger.info(
         { count: pids.length, pids },
-        'Killed orphaned host agent-runner processes',
-      );
-    }
-  } catch (err: any) {
-    // pgrep exits 1 when no matches — that's fine
-    if (err?.code !== 1) {
-      logger.warn({ err }, 'Failed to clean up orphaned host processes');
-    }
-  }
-
-  // Kill and clean up orphaned happyclaw containers from previous runs
-  try {
-    const { stdout } = await execFileAsync(
-      'docker',
-      ['ps', '--filter', 'name=happyclaw-', '--format', '{{.Names}}'],
-      { timeout: 10000 },
-    );
-    const output = typeof stdout === 'string' ? stdout : String(stdout);
-    const orphans = output.trim().split('\n').filter(Boolean);
-    for (const name of orphans) {
-      try {
-        await execFileAsync('docker', ['stop', name], { timeout: 10000 });
-      } catch {
-        /* already stopped */
-      }
-    }
-    if (orphans.length > 0) {
-      logger.info(
-        { count: orphans.length, names: orphans },
-        'Stopped orphaned containers',
+        'Killed orphaned owned host agent-runner process groups',
       );
     }
   } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned containers');
+    logger.warn({ err }, 'Failed to clean up owned orphaned host processes');
+  }
+
+  if (!(await isDockerAvailable())) {
+    if (hasContainerModeGroups()) {
+      logger.warn(
+        'Docker is not available — container-mode workspaces will fail at message time. ' +
+          'Start Docker if you need container execution (macOS: Docker Desktop, Linux: sudo systemctl start docker).',
+      );
+    } else {
+      logger.info(
+        'Docker is unavailable; Host-only execution remains available',
+      );
+    }
+    return false;
+  }
+  logger.debug('Docker daemon is running');
+
+  const runDockerCommand: StartupDockerCommand = async (args, timeoutMs) => {
+    try {
+      const { stdout } = await execFileAsync('docker', args, {
+        timeout: timeoutMs,
+      });
+      return {
+        ok: true,
+        stdout: typeof stdout === 'string' ? stdout : String(stdout),
+      };
+    } catch (err) {
+      const stdout =
+        typeof (err as { stdout?: unknown }).stdout === 'string'
+          ? ((err as { stdout: string }).stdout ?? '')
+          : '';
+      return { ok: false, stdout };
+    }
+  };
+
+  // Reconcile create-pending fences before listing ordinary containers. A
+  // killed `docker create` client may still publish its object after the old
+  // process exits; the durable deadline is the only safe absence boundary.
+  try {
+    const settledFences =
+      await settleOrdinaryContainerCreateFencesAtStartup(runDockerCommand);
+
+    const ownedList = await runDockerCommand(
+      buildStartupContainerListArgs(),
+      10_000,
+    );
+    if (!ownedList.ok) {
+      throw new Error('Could not enumerate owned Docker containers');
+    }
+    const preserveExternalContainers = Boolean(
+      process.env.EXTERNAL_CAPABILITY_VAULT_DIR?.trim() &&
+      process.env.EXTERNAL_CAPABILITY_VAULT_ID?.trim(),
+    );
+    const orphans = selectStoppableStartupContainers(
+      ownedList.stdout,
+      preserveExternalContainers,
+    );
+    for (const name of orphans) {
+      await removeAndVerifyStartupContainer(name, runDockerCommand);
+    }
+
+    // Upgrade recovery for pre-label releases. Names alone never establish
+    // ownership: only an unlabeled container with a bind source under this
+    // installation's canonical DATA_DIR may be reclaimed.
+    const legacyList = await runDockerCommand(
+      buildLegacyStartupContainerListArgs(),
+      10_000,
+    );
+    if (!legacyList.ok) {
+      throw new Error('Could not enumerate legacy Docker containers');
+    }
+    const reclaimedLegacy: string[] = [];
+    for (const name of legacyList.stdout
+      .split('\n')
+      .map((entry) => entry.trim())
+      .filter(Boolean)) {
+      const inspection = await runDockerCommand(['inspect', name], 10_000);
+      if (!inspection.ok) {
+        throw new Error(`Could not inspect legacy Docker container ${name}`);
+      }
+      if (!legacyContainerInspectionBelongsToInstallation(inspection.stdout)) {
+        continue;
+      }
+      await removeAndVerifyStartupContainer(name, runDockerCommand);
+      reclaimedLegacy.push(name);
+    }
+
+    if (
+      settledFences.length > 0 ||
+      orphans.length > 0 ||
+      reclaimedLegacy.length > 0
+    ) {
+      logger.info(
+        {
+          settledCreateFences: settledFences,
+          removedOwned: orphans,
+          removedLegacy: reclaimedLegacy,
+        },
+        'Reconciled startup Docker containers',
+      );
+    }
+    return true;
+  } catch (err) {
+    // Keep Docker admission fenced unless every owned create/cleanup operation
+    // has a verified all-state absence proof. Container-backed installations
+    // must not become ready with unknown capacity or a late-create hazard.
+    if (
+      hasContainerModeGroups() ||
+      Boolean(
+        process.env.EXTERNAL_CAPABILITY_VAULT_DIR?.trim() &&
+        process.env.EXTERNAL_CAPABILITY_VAULT_ID?.trim(),
+      )
+    ) {
+      throw err;
+    }
+    logger.warn(
+      { err },
+      'Docker startup reconciliation failed; container admission remains closed',
+    );
+    return false;
   }
 }
 
@@ -21515,8 +21597,49 @@ function migrateDataDirectories(): void {
 }
 
 async function main(): Promise<void> {
+  // Web can begin receiving requests before startup recovery completes. Keep
+  // queue-owned Docker launches fenced until surviving external containers are
+  // reflected in GroupQueue's shared capacity count.
+  queue.setContainerAdmissionReady(false);
   migrateDataDirectories();
   initDatabase();
+  const recoveredWorkspaceCleanupClaims =
+    recoverWorkspaceFilesystemCleanupClaimsOnStartup();
+  if (recoveredWorkspaceCleanupClaims > 0) {
+    logger.warn(
+      { recoveredWorkspaceCleanupClaims },
+      'Recovered workspace filesystem cleanup claims from the previous process',
+    );
+  }
+  if (!isExternalCapabilityReleaseEnabled()) {
+    const pausedCapabilities =
+      pauseActiveExternalCapabilitiesForClosedReleaseGate();
+    if (pausedCapabilities.length > 0) {
+      logger.warn(
+        { capabilitySlugs: pausedCapabilities },
+        'Paused active external capabilities because the release gate is closed',
+      );
+    }
+  }
+  const externalCapabilityVaultConfigured = Boolean(
+    process.env.EXTERNAL_CAPABILITY_VAULT_DIR?.trim() &&
+    process.env.EXTERNAL_CAPABILITY_VAULT_ID?.trim(),
+  );
+  const vaultCensus = beginConfiguredExternalCapabilityVaultCensus();
+  if (vaultCensus) {
+    try {
+      await quiesceExternalCapabilityContainersForVaultCensus({
+        allowDockerUnavailable:
+          !hasContainerModeGroups() &&
+          !hasExternalCapabilityContainerLifecycleDebt(),
+      });
+      backfillConfiguredExternalCapabilityVaultOccupancy(
+        vaultCensus.blockedValue,
+      );
+    } finally {
+      vaultCensus.release();
+    }
+  }
   logger.info('Database initialized');
 
   const migratedAutoCompactProfiles = migrateAgentProfileAutoCompactWindow(
@@ -21614,21 +21737,26 @@ async function main(): Promise<void> {
     }
     shutdownInProgress = true;
     shuttingDown = true;
+    webRuntimeDeps.startupReady = false;
     // Stop every account-scoped inbound callback immediately while retaining
     // the live clients for card finalization and other shutdown-time outbound
     // acknowledgements. disconnectAll runs only after those are settled.
     imManager.pauseInbound();
+    // Fence every new queue-owned Docker launch before the external worker can
+    // release adopted container slots back into the shared capacity pool.
+    queue.setContainerAdmissionReady(false);
     logger.info({ signal }, 'Shutdown signal received, cleaning up...');
 
-    // Force exit after 30s if graceful shutdown hangs.
-    // Must be longer than queue.shutdown() grace period (15s) plus container
-    // force-stop time (~10s) to avoid killing the process while agents are
-    // still shutting down gracefully.
+    // The queue may spend 15s on graceful drain and another 35s proving that
+    // a killed Docker create cannot publish a late object. External cleanup and
+    // channel finalization run around that boundary, so keep the hard watchdog
+    // comfortably beyond every bounded settlement phase.
     const forceExitTimer = setTimeout(() => {
       logger.warn('Graceful shutdown timed out, force exiting');
       process.exit(1);
-    }, 30_000);
+    }, 120_000);
     forceExitTimer.unref();
+    let shutdownFailed = false;
 
     if (feishuSyncInterval) {
       clearInterval(feishuSyncInterval);
@@ -21647,12 +21775,14 @@ async function main(): Promise<void> {
     // does not track. Stop external capability claims before the database drain.
     // Delivery stays available throughout so those can settle.
     await Promise.all([
-      stopSchedulerLoop().catch((err) =>
-        logger.warn({ err }, 'Error stopping scheduler loop'),
-      ),
-      stopExternalCapabilityWorker().catch((err) =>
-        logger.warn({ err }, 'Error stopping external capability worker'),
-      ),
+      stopSchedulerLoop().catch((err) => {
+        shutdownFailed = true;
+        logger.error({ err }, 'Error stopping scheduler loop');
+      }),
+      stopExternalCapabilityWorker().catch((err) => {
+        shutdownFailed = true;
+        logger.error({ err }, 'Error stopping external capability worker');
+      }),
     ]);
 
     try {
@@ -21668,9 +21798,10 @@ async function main(): Promise<void> {
       shutdownWebServer().catch((err) =>
         logger.warn({ err }, 'Error shutting down web server'),
       ),
-      queue
-        .shutdown(15_000)
-        .catch((err) => logger.warn({ err }, 'Error shutting down queue')),
+      queue.shutdown(15_000).catch((err) => {
+        shutdownFailed = true;
+        logger.error({ err }, 'Error shutting down queue');
+      }),
     ]);
 
     // IPC watchers are the *outbound* consumer, so they must outlive the drain
@@ -21708,9 +21839,14 @@ async function main(): Promise<void> {
     try {
       closeDatabase();
     } catch (err) {
-      logger.warn({ err }, 'Error closing database');
+      shutdownFailed = true;
+      logger.error({ err }, 'Error closing database');
     }
 
+    if (shutdownFailed) {
+      logger.error('Shutdown completed with unsettled lifecycle work');
+      process.exit(1);
+    }
     logger.info('Shutdown complete');
     process.exit(0);
   };
@@ -22180,6 +22316,7 @@ async function main(): Promise<void> {
 
   // Start Web server early so frontend auth/API isn't blocked by Feishu readiness.
   const webRuntimeDeps: WebDeps = {
+    startupReady: false,
     queue,
     getRegisteredGroups: () => registeredGroups,
     sessions,
@@ -22438,7 +22575,7 @@ async function main(): Promise<void> {
   setTimeout(runChannelReliabilityCleanup, 5 * 60 * 1000);
   setInterval(runChannelReliabilityCleanup, 24 * 60 * 60 * 1000);
 
-  await ensureDockerRunning();
+  const dockerAdmissionReady = await ensureDockerRunning();
 
   queue.setProcessMessagesFn(processGroupMessages);
   queue.setOnRunnerQueryTeardown((chatJid) => {
@@ -22467,6 +22604,9 @@ async function main(): Promise<void> {
     const { effectiveGroup } = resolveEffectiveGroup(group);
     return effectiveGroup.executionMode === 'host';
   });
+  queue.setRegisteredGroupChecker((groupJid: string) =>
+    Boolean(registeredGroups[groupJid]),
+  );
   queue.setSerializationKeyResolver((groupJid: string) => {
     // Agent virtual JIDs: {chatJid}#agent:{agentId} → separate serialization key
     const agentSep = groupJid.indexOf('#agent:');
@@ -22567,7 +22707,7 @@ async function main(): Promise<void> {
   queue.setUserConcurrentLimitChecker((groupJid: string) => {
     if (!isBillingEnabled()) return { allowed: true };
     const baseJid = stripVirtualJidSuffix(groupJid);
-    const group = registeredGroups[baseJid];
+    const group = registeredGroups[baseJid] ?? getRegisteredGroup(baseJid);
     if (!group?.created_by) return { allowed: true };
     const owner = getUserById(group.created_by);
     if (!owner || owner.role === 'admin') return { allowed: true };
@@ -22579,6 +22719,7 @@ async function main(): Promise<void> {
       if (g.created_by !== owner.id) continue;
       if (queue.hasDirectActiveRunner(jid)) userActive++;
       userActive += queue.countActiveTaskRunners(jid);
+      userActive += queue.countDetachedContainerSlots(jid);
     }
     return { allowed: userActive < limit };
   });
@@ -23371,13 +23512,51 @@ async function main(): Promise<void> {
   // with the Runner-side deadline.
   startIpcWatcher();
   recoverStartupTypedIpcDeliveries();
+  // Reconcile surviving external containers into the shared GroupQueue count
+  // before any recovery path can reserve and launch another Docker container.
+  if (externalCapabilityVaultConfigured) {
+    await startExternalCapabilityWorker(
+      {
+        tryAcquireContainerSlot: (workspaceJid) =>
+          queue.tryAcquireDetachedContainerSlot(workspaceJid),
+        adoptContainerSlot: (workspaceJid) =>
+          queue.adoptDetachedContainerSlot(workspaceJid),
+      },
+      {
+        // Docker-free Host-only installations must still start. Reconciliation
+        // remains not-ready and retries in the background, so external execution
+        // stays blocked until Docker becomes reachable.
+        failClosedReconciliation: hasContainerModeGroups(),
+      },
+    );
+  } else {
+    logger.info(
+      'External capability worker disabled because no complete Vault configuration is present',
+    );
+  }
+
+  // Retry committed workspace cleanup debt only after orphaned host processes,
+  // ordinary containers and durable external-container state have been
+  // reconciled. Keep container admission closed until the sweep finishes so no
+  // surviving execution can recreate a folder after absence was verified.
+  const workspaceCleanupSweep = sweepPendingWorkspaceFilesystemCleanups();
+  if (
+    workspaceCleanupSweep.cleaned > 0 ||
+    workspaceCleanupSweep.pending > 0 ||
+    workspaceCleanupSweep.blocked > 0
+  ) {
+    logger.info(
+      workspaceCleanupSweep,
+      'Completed startup workspace filesystem cleanup sweep',
+    );
+  }
+  queue.setContainerAdmissionReady(dockerAdmissionReady);
   recoverPendingMessages();
   recoverConversationAgents();
   // Start new scheduled work only after every persisted IPC receipt has been
   // rewound/discarded and conversation recovery has normalized its cursors.
   // Otherwise an overdue task can race startup recovery with a fresh Runner.
-  startSchedulerLoop(schedulerDeps);
-  startExternalCapabilityWorker();
+  await startSchedulerLoop(schedulerDeps);
   streamingBuffer.start();
   startMessageLoop();
 
@@ -23399,6 +23578,9 @@ async function main(): Promise<void> {
   setInterval(() => {
     void checkImBindingsHealth();
   }, IM_BINDING_HEALTH_CHECK_INTERVAL);
+
+  webRuntimeDeps.startupReady = true;
+  logger.info('Startup recovery complete; service is ready');
 }
 
 async function checkImBindingsHealth(): Promise<void> {

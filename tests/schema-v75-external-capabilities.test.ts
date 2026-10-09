@@ -63,5 +63,108 @@ describe('schema v75 external capability foundation', () => {
     expect(
       db.getExternalCapabilityBySlug('missing-capability'),
     ).toBeUndefined();
+
+    const definition = db.getExternalCapabilityBySlug(
+      'quote-document-process',
+    )!;
+    const now = new Date().toISOString();
+    db.createUser({
+      id: 'contract-drift-owner',
+      username: 'contract-drift-owner',
+      password_hash: 'hash',
+      display_name: 'Contract drift owner',
+      role: 'member',
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+      must_change_password: false,
+    });
+    db.setRegisteredGroup(definition.workspace_jid, {
+      name: 'Configured external target',
+      folder: definition.workspace_folder,
+      added_at: now,
+      executionMode: 'container',
+      created_by: 'contract-drift-owner',
+    });
+    expect(
+      db.setExternalCapabilityStatus('quote-document-process', 'active'),
+    ).toBe(true);
+
+    const drifted = new Database(databasePath);
+    drifted
+      .prepare(
+        `UPDATE external_capabilities
+         SET workspace_jid = ?, workspace_folder = ?, status = 'active'
+         WHERE slug = ?`,
+      )
+      .run(
+        'web:previous-external-target',
+        'previous-external-target',
+        'quote-document-process',
+      );
+    drifted.close();
+
+    db.setRegisteredGroup('web:previous-external-target', {
+      name: 'Previous external target',
+      folder: 'previous-external-target',
+      added_at: now,
+      executionMode: 'container',
+      created_by: 'contract-drift-owner',
+    });
+
+    const key = db.createExternalCapabilityKey({
+      capabilitySlug: 'quote-document-process',
+      label: 'contract drift test',
+    }).key;
+    const run = db.createExternalCapabilityRun({
+      capabilitySlug: 'quote-document-process',
+      keyId: key.id,
+      externalTaskId: 'contract-drift-task',
+      idempotencyKey: 'contract-drift-key',
+      inputManifest: { version: 1 },
+    }).run;
+    const claim = db.claimNextExternalCapabilityRun(
+      'contract-drift-worker',
+      60_000,
+    )!;
+    expect(claim.id).toBe(run.id);
+    expect(
+      db.markExternalCapabilityRunExecutionStarted(
+        claim.id,
+        claim.lease_owner,
+        claim.lease_token,
+      ),
+    ).toBe(true);
+
+    db.closeDatabase();
+    db.initDatabase();
+    expect(
+      db.getExternalCapabilityBySlug('quote-document-process'),
+    ).toMatchObject({
+      workspace_jid: 'web:previous-external-target',
+      workspace_folder: 'previous-external-target',
+      status: 'paused',
+    });
+    expect(
+      db.setExternalCapabilityStatus('quote-document-process', 'active'),
+    ).toBe(false);
+    expect(
+      db.cancelExternalCapabilityRun('quote-document-process', key.id, run.id)
+        ?.cancelled,
+    ).toBe(true);
+
+    expect(db.reconcileDeferredExternalCapabilityDefinitions()).toEqual([
+      'quote-document-process',
+    ]);
+    expect(
+      db.getExternalCapabilityBySlug('quote-document-process'),
+    ).toMatchObject({
+      workspace_jid: definition.workspace_jid,
+      workspace_folder: definition.workspace_folder,
+      status: 'paused',
+    });
+    expect(
+      db.setExternalCapabilityStatus('quote-document-process', 'active'),
+    ).toBe(true);
   });
 });

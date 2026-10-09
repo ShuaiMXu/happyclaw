@@ -24,6 +24,7 @@ import { mediumTap } from '../../hooks/useHaptic';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { formatThinkingDuration } from '../../utils/thinking-duration';
 import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
+import { resolveMarkdownImageSrc } from '../../utils/markdownImageSrc';
 import { getPresentedMessageContent } from '../../lib/message-presentation';
 import { getMessageDisplayTimestamp } from '../../lib/message-timeline';
 import {
@@ -53,12 +54,11 @@ interface MessageBubbleProps {
 interface MessageAttachment {
   type: 'image';
   /**
-   * base64. For stored history this is a downscaled thumbnail — a page of
-   * full-resolution photos reached tens of MB and the browser failed the whole
-   * request, blanking the history. `hasOriginal` marks the ones whose full
-   * image must be fetched separately.
+   * Base64 data for legacy inline images or a downscaled history thumbnail.
+   * Staged uploads use `path`; `hasOriginal` marks server-backed originals.
    */
-  data: string;
+  data?: string;
+  path?: string;
   mimeType?: string;
   name?: string;
   hasOriginal?: boolean;
@@ -291,14 +291,17 @@ export const MessageBubble = memo(
     // a mixed-attachment message at the wrong entry.
     const images = attachments
       .map((att, attachmentIndex) => ({ ...att, attachmentIndex }))
-      .filter((att) => att.type === 'image');
-    // Inline `src` stays the thumbnail; the lightbox is what needs full
-    // resolution, so it pulls the original on open instead of inflating the
-    // history payload for every image on screen.
+      .filter(
+        (att) =>
+          att.type === 'image' &&
+          Boolean(att.path || att.data || att.hasOriginal),
+      );
     const allImageSrcs = images.map((img) =>
-      img.hasOriginal
-        ? `/api/groups/${encodeURIComponent(message.chat_jid)}/messages/${encodeURIComponent(message.id)}/attachments/${img.attachmentIndex}/original`
-        : `data:${img.mimeType || 'image/png'};base64,${img.data}`,
+      img.path
+        ? resolveMarkdownImageSrc(img.path, message.chat_jid)
+        : img.hasOriginal
+          ? `/api/groups/${encodeURIComponent(message.chat_jid)}/messages/${encodeURIComponent(message.id)}/attachments/${img.attachmentIndex}/original`
+          : `data:${img.mimeType || 'image/png'};base64,${img.data}`,
     );
 
     // Check if content is empty (only whitespace) and we have images
@@ -498,7 +501,7 @@ export const MessageBubble = memo(
               {images.map((img, i) => (
                 <img
                   key={i}
-                  src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
+                  src={allImageSrcs[i]}
                   alt={img.name || `图片 ${i + 1}`}
                   className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-border hover:border-primary transition-colors"
                   onClick={() =>
@@ -580,7 +583,7 @@ export const MessageBubble = memo(
                   {images.map((img, i) => (
                     <img
                       key={i}
-                      src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
+                      src={allImageSrcs[i]}
                       alt={img.name || `图片 ${i + 1}`}
                       className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border-2 border-primary hover:border-primary transition-colors"
                       onClick={() =>
@@ -698,7 +701,7 @@ export const MessageBubble = memo(
                   {images.map((img, i) => (
                     <img
                       key={i}
-                      src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
+                      src={allImageSrcs[i]}
                       alt={img.name || `图片 ${i + 1}`}
                       className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border border-border hover:border-primary transition-colors"
                       onClick={() =>

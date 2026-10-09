@@ -115,9 +115,9 @@ retry_wait ──> queued
 
 - `queued`：输入已安全存储并持久化，等待领取。
 - `running`：Worker 已持有 lease 和 fencing token。
-- `started_at`：模型执行前的不可逆边界。此前中断可安全接管；此后中断必须 `failed(PROCESSING_INTERRUPTED)`，不得自动重放。
-- `succeeded`、`failed`、`cancelled`：终态。
-- 调用方取消会先持久化为 `cancelled` 并提升 fencing token；本进程中的执行容器随后收到立即停止请求。跨进程 Worker 最迟在 lease 续约失败后停止，且不得再结算结果。
+- `started_at`：模型执行前的不可逆边界。宿主在同一个 `synchronous=FULL` immediate transaction 中写入该字段和本次最大 Provider 成本预留，然后才向 Runner 原子发布 START。此前且 START 可证明未发布时允许安全回滚；此后中断必须 `failed(PROCESSING_INTERRUPTED)`，不得自动重放。
+- `succeeded`、`failed`、`cancelled`：终态。正常终态把成本预留结算为已记录的实际 usage；已开始后的崩溃或取消在实际成本不完整时保留 `uncertain` 暴露。
+- 调用方取消会先持久化为 `cancelled` 并提升 fencing token；本进程中的执行容器随后收到立即停止请求。跨进程 Worker 最迟在 lease 续约失败后停止，且不得再结算结果。未开始任务释放零 usage 预留；已开始任务不得假定 Provider 未收费。
 - V1 的暂停与 Key 撤销以**执行边界**划分：`queued`、`retry_wait` 会取消；已领取但 `started_at` 为空的任务不得跨越模型调用边界，并在恢复后由正常 lease 机制重新领取；`started_at` 已写入的运行任务可以结算，避免中断后产生无法判断的重复模型调用。紧急中止已开始任务必须使用显式取消/事故处置，不可把暂停或撤销当作隐式强杀。
 
 ## 7. 接口契约
@@ -133,14 +133,18 @@ retry_wait ──> queued
 
 ### 7.1 提交字段
 
-| 字段                      | 必填 | 约束                                                                                                                                                                               |
-| ------------------------- | ---: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `externalTaskId`          |   是 | 调用方范围内不透明 ID，1–128 字符                                                                                                                                                  |
-| `idempotencyKey`          | 建议 | 重试时稳定复用，1–128 字符                                                                                                                                                         |
-| `tenantRef`、`accountRef` |   否 | 不透明、非 PII 标签                                                                                                                                                                |
-| `instructions`            |   否 | 最多 8,000 字符，只是任务数据                                                                                                                                                      |
-| `outputSchema`            |   是 | 1–100 个唯一字段 Key，可选合法 Sheet 名                                                                                                                                            |
-| `files`                   |   是 | 1–10 个 JPEG/PNG/WebP/XLSX；单个 ≤20 MiB，总量 ≤50 MiB；图片必须可解码、单帧、边长 ≤10,000 px、总像素 ≤25 MiPx；XLSX 必须是受限解压规模、无宏、无嵌入对象和外部链接的 OOXML 工作簿 |
+| 字段                      | 必填 | 约束                                                                                                                                                                                           |
+| ------------------------- | ---: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `externalTaskId`          |   是 | 调用方范围内不透明 ID，1–128 字符                                                                                                                                                              |
+| `idempotencyKey`          | 建议 | 重试时稳定复用，1–128 字符                                                                                                                                                                     |
+| `tenantRef`、`accountRef` |   否 | 不透明、非 PII 标签                                                                                                                                                                            |
+| `instructions`            |   否 | 最多 8,000 字符，只是任务数据                                                                                                                                                                  |
+| `outputSchema`            |   是 | V1 schema；1–100 个唯一字段 Key，可选合法 Sheet 名；列可含 `required` 与受限 `description`，不得请求身份、联系方式、账号、凭据、路径或原文件名等敏感输出                                       |
+| `files`                   |   是 | 1–10 个 JPEG/PNG/WebP/XLSX；单个 ≤20 MiB，总量 ≤50 MiB；图片必须完整解码、单帧、边长 ≤8,000 px、总像素 ≤25 MiPx；XLSX 必须是受限解压规模、无 DTD/entity、宏、嵌入对象和外部链接的 OOXML 工作簿 |
+
+`outputSchema` 的 V1 列由 `key`、`name`、可选 `required` 和可选 `description` 组成。服务端拒绝未知字段、重复 Key、不支持的 schema 版本、非法 Sheet 名，以及明确要求输出客户身份、联系方式、证件、详细地址、银行/卡号、凭据、内部路径或原文件名的列。`required: true` 不会因源资料缺失而让整个任务失败：服务端写入 `null`，并生成结构化 `MISSING_REQUIRED_VALUE` warning。
+
+成功状态中的 warning 只能是 `{code, rowIndex?, columnKey?}` 结构，最多 100 条；行号从 1 开始，列引用必须属于已接受的 schema。模型只可使用服务端枚举的非敏感 warning code，不能返回 warning 文案、源资料摘录、原文件名或路径；`MISSING_REQUIRED_VALUE` 仅由服务端确定性生成。
 
 ### 7.2 幂等性
 
@@ -162,6 +166,7 @@ retry_wait ──> queued
 |  413 | `PAYLOAD_TOO_LARGE`                                                                    |
 |  429 | `RATE_LIMITED`、`QUOTA_EXCEEDED`                                                       |
 |  503 | `PROCESSING_UNAVAILABLE`                                                               |
+|  507 | `VAULT_CAPACITY_EXCEEDED`                                                              |
 
 错误响应不得返回内部异常、Vault 路径、工作区标识、容器名、模型原始错误或原始文件名。
 
@@ -174,12 +179,17 @@ retry_wait ──> queued
 - 写入采用服务端生成 ID、`O_CREAT | O_EXCL | O_NOFOLLOW`；读取重新验证普通文件、长度与 SHA-256。
 - 不透明的 `ecv1:<runId>:<artifactId>` 引用不是文件路径，永不对外暴露。
 - 输入、输出和 per-run runtime 目录均不可从普通 Workspace、公开上传或浏览器文件面板访问。
+- 输入、每次执行的 runtime 副本和输出必须在首次物理写入前创建耐久字节预留，并在 fsync 后按实际占用结算。`reserved`、`occupied` 和无法证明已删除的 `quarantined` 对象都占用容量。
+- `EXTERNAL_CAPABILITY_VAULT_MAX_BYTES` 限制逻辑占用；`EXTERNAL_CAPABILITY_VAULT_MIN_FREE_BYTES` 是基于同一文件系统 `statfs.bavail * bsize` 的不可申领安全余量。默认分别为 100 GiB 和 1 GiB，非法配置回退到默认值。
+- 容量准入在 SQLite immediate transaction 中串行化，并扣除其他进程尚未物化的预留；逻辑上限或文件系统余量不足必须以 `507 VAULT_CAPACITY_EXCEEDED` 失败关闭。
 
 ### 8.2 清理规则
 
-- 默认保留期为任务终态后最多 24 小时；部署可缩短到 1–24 小时。
+- 默认保留期为任务终态后最多 24 小时；部署可缩短到 1–24 小时。到期边界按 `<= cutoff` 判定，不能把恰好到期的对象推迟到下一轮。
+- 清理器每 30 秒扫描，并以 1 分钟调度安全余量让对象提前具备清理资格；正常调度下即使任务刚错过上一轮也不会越过配置的保留上限。单项或整轮失败在 5 秒后重试，且同一时刻只有一轮清理。
 - 清理器删除终态任务的输入、结果、运行目录、入队失败残留与无数据库归属的孤儿目录。
-- 清理必须文件系统优先、数据库记录随后，并可安全重试。
+- 清理必须文件系统优先、数据库记录随后，并可安全重试。只有物理删除成功或精确对象已确认不存在后，才能释放对应耐久字节占用；删除失败、状态不确定或账本更新失败时保持计费并由后续扫描重试。
+- 清理器还会分页核对老化但未释放的预留：精确物理对象不存在时才释放，用于恢复“准入后、首个文件创建前崩溃”和“删除成功、账本更新前崩溃”。数据库墓碑删除原始私有请求上下文，但保留组合 SHA-256 等值收据，使保留前的幂等冲突不会在保留后变成重复命中。
 - 过期后下载返回受限的 `404`/`410`，不透露底层存储细节。
 - 生产环境需要加密卷和与备份一致的到期策略；文件删除不等于物理介质覆盖。
 
@@ -193,13 +203,20 @@ retry_wait ──> queued
 
 外调任务不得继承普通 Workspace/project 挂载、用户环境变量、额外挂载、飞书 CLI、用户 Skills、MCP、Plugins、原会话目录或其他 run。每个 run 使用运行目录内的新建最小 `.claude.json`，不共享宿主派生的身份文件；外调任务只允许不可变镜像模式，开发热重载模式必须拒绝执行，避免挂载项目源码。Agent Profile 固定，`allowedTools` 为空；调用方不能注入 Agent、Prompt、工具或环境配置。容器必须使用预创建、经审核且非默认的专用 Docker 网络，并启用 capability drop、`no-new-privileges`、PID、内存和 CPU 限制。
 
-所有上传资料、解析出的表格文本和任务说明均是不可信数据。服务端策略优先，明确要求模型只返回受限 JSON；结果必须再经过 JSON、部署配置的最大行数、单元格类型、列白名单和长度校验。导出的 XLSX 对以 `= + - @` 开头的值添加前导单引号，防止公式注入。
+所有上传资料、解析出的表格文本和任务说明均是不可信数据。服务端策略优先，明确要求模型只返回受限 JSON；结果必须再经过 JSON、部署配置的最大行数、单元格类型、列白名单、长度、有限数值、结构化 warning 和敏感值模式校验。未知列、自由文本 warning、非有限数值和命中敏感值规则的单元格均使结果失败关闭。服务端在创建 ExcelJS 工作簿前以行列数量和字符串字节数估算物化堆内存，超过固定内存预算时先失败，序列化后仍执行实际 XLSX 字节上限检查。导出的 XLSX 对以 `= + - @` 开头的值添加前导单引号，防止公式注入。
 
 代码已要求 `EXTERNAL_CAPABILITY_DOCKER_NETWORK` 指向预创建、经审核的专用网络，并在激活、受理和 Worker 调度时检查 Docker inspect 结果：网络必须是 local bridge、`Internal=true`、非 ingress/config-only，且带有 `com.happyclaw.external-capability-egress=true` 和 `com.happyclaw.egress-policy=provider-only` 标签。Provider 必须通过同网络内的受控代理访问；这些结构与标签仍不能代替 V1 发布前的真实出口哨兵测试：仅允许 Provider 所需受控出口，禁止访问宿主机、元数据服务、内网横向地址和其他公网地址。
 
 ## 10. 容量、成本和可观测性
 
 发布配置必须提供全局、能力级和 Key 级限制：并发执行数、排队数、请求速率、日文件量、单次运行时长、最大输出行数和模型费用预算。达到限制时必须安全拒绝而不是无限排队或绕过配额。
+
+Provider 成本保护按滚动 24 小时计算，START 在不可逆边界内为单次最大预算创建耐久
+预留。暴露值对 `active`/`uncertain` 取 `max(预留, 已知实际)`，对 `settled` 取实际
+成本，对明确未发布的 `released` 取零。usage event 使用稳定 ID 恰好一次累加；过期
+started lease、已开始取消和 Workspace 删除保留 `uncertain`，不得因最终 usage 不完整
+而释放全部成本空间。该账本保护平台 Provider 暴露；若产品要求向工作区 owner 钱包计费，
+仍需单独定义与统一 `usage_events`/余额账本一致的 escrow 或 held-balance 语义。
 
 最小指标包括：受理数、幂等命中、状态分布、队列深度、排队/运行耗时、失败率、lease 过期、容器数、Vault 容量、清理结果、认证失败、Key 撤销命中、模型 token/成本。
 
@@ -209,16 +226,16 @@ retry_wait ──> queued
 
 ## 11. 当前实现进度与剩余问题
 
-已完成的基础能力：专属 Key、受理/轮询/下载、私有 Vault、防路径与链接攻击、任务租约和 fencing（含过期 lease 不得续租或结算）、隔离 execution 目录与只读输入物化、保留清理、Worker 并发槽位、取消 API、可中止本进程执行容器、稳定请求指纹、宿主发布闸门、专用 Docker 网络强制和基础容器进程/资源硬化、单次输入/Key 日输入量/最大输出行数配额、Runner 零工具/零 MCP/零 Skills/Plugins 回归测试、专项自动化测试。
+已完成的基础能力：专属 Key、受理/轮询/下载、私有 Vault、防路径与链接攻击、耐久 intake admission 与独立状态/取消/下载限流、任务租约和 fencing（含过期 lease 不得续租或结算）、能力暂停/退役、Key 撤销和 Workspace owner 停用围栏、隔离 execution 目录与只读输入物化、精确到期边界和短重试的保留清理、Worker 并发槽位、调用方和运营方取消 API、可中止本进程执行容器、稳定请求指纹与保留后私有上下文等值收据、宿主发布闸门、专用 Docker 网络强制和基础容器进程/资源硬化、镜像 digest/协议 label 证明、带发布余量的 READY/START/ABORT 授权协议、启动与周期孤儿容器协调、执行中不可变目标漂移的暂停与延迟迁移、单次输入/Key 日输入量/最大输出行数和输出字节配额、输入/runtime/输出的跨进程耐久 Vault 容量预留与文件系统优先释放、全局/能力/Key Provider 成本预留与 usage 结算、图片完整解码、namespace-aware OOXML 校验、受限输出 schema、结构化 warning、敏感输出防护、XLSX 物化前内存预算、Runner 零工具/零 MCP/零 Skills/Plugins 回归测试，以及 Key/生命周期/就绪度控制面 UI。
 
 仍是发布阻断项：
 
 1. 在真实 Docker 环境补齐端到端和隔离哨兵测试，证明容器无法读取项目、普通 Workspace 或其他任务。
-2. 对 pause/retired/Key revoked 后的 queued、running、下载行为实施并测试三阶段围栏。
-3. 已将 V1 收缩到图片和 XLSX：拒绝旧版 XLS、宏、嵌入对象、外部链接、加密复合文档和超出解压规模/比例限制的 OOXML；仍需以恶意样本库补充真实解析压力测试。图片已实施真实解码、单帧、边长与像素总量限制。
-4. 实施全局/能力/Key 级速率、队列、并发与成本配额，并完成压力测试。
+2. 在真实并发和跨进程条件下补齐 pause/retired/Key revoked/owner inactive 的三阶段围栏 E2E，覆盖 READY 前后的取消、lease 丢失和下载失效。
+3. 已将 V1 收缩到图片和 XLSX：拒绝旧版 XLS、DTD/entity、宏、嵌入对象、外部链接、加密复合文档和超出解压规模/比例限制的 OOXML；仍需以恶意样本库补充真实解析压力测试。图片已实施完整解码、单帧、边长与像素总量限制。
+4. 全局/能力/Key 级速率、队列、并发和 Provider 成本配额已实现；仍需真实并发压力测试、成本拒绝/恢复可观测性，并决定是否把外调 usage 接入统一用户钱包 escrow。
 5. 对错误响应和持久化错误做统一安全映射，禁止向调用方回传内部异常消息。
-6. 完成 Key 管理、生命周期确认、审计与运营状态的控制面 UI。
+6. 不可变 run/attempt/lease 标签、启动扫描、周期孤儿协调和删除前容器不存在性确认已实现；仍需在真实 Docker daemon 故障和跨进程恢复演练中验证。
 7. 完成真实 Provider + Container 演练、数据库升级恢复演练、监控告警和事故 Runbook。
 
 ## 12. 发布阶段与验收
@@ -244,9 +261,9 @@ retry_wait ──> queued
 
 1. 是否统一以终态后 24 小时作为输入与结果保留期？
 2. 已决定 V1 仅接受图片和受限 XLSX；旧版 XLS 需独立安全评审后才可进入后续版本。
-3. `required: true` 是失败条件，还是允许 `null + warning`？
-4. `paused`/`retired` 后 queued 与 running 任务的最终处置策略是什么？
-5. Key 撤销后，历史任务的查询与下载是否立即失效？
+3. 已决定 `required: true` 在源资料缺失时采用 `null + MISSING_REQUIRED_VALUE`，不让整批任务失败。
+4. 已决定 `paused` 将 queued/未开始的 running 任务置为可恢复等待；`retired` 取消 queued/未开始任务；已跨过执行边界的任务不自动重放，只允许安全结算或显式事故取消。
+5. 已决定 Key 撤销后立即阻断该 Key 的查询、取消与下载，并取消 queued/未开始任务；已开始任务仍按 at-most-once 规则安全结算，必要时由运营方事故取消。
 6. 一个业务系统一个 Key，还是一个租户一个 Key；是否增加 IP allowlist/mTLS？
 7. 每 Key 的 QPS、并发、运行时长和费用上限由谁审批？
 8. 输出是仅供人工复核的草稿，还是可直接写入业务流程？

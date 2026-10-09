@@ -38,4 +38,22 @@ describe('script run cancellation', () => {
     });
     expect(Date.now() - startedAt).toBeLessThan(2_000);
   });
+
+  test('terminates every detached script during graceful shutdown', async () => {
+    const { getActiveScriptCount, runScript, terminateAllScripts } =
+      await import('../src/script-runner.js');
+    const first = runScript('sleep 10', 'workspace');
+    const second = runScript('sleep 10', 'workspace');
+    await vi.waitFor(() => expect(getActiveScriptCount()).toBe(2));
+
+    const terminated = await terminateAllScripts();
+    const results = await Promise.all([first, second]);
+
+    expect(terminated).toBe(2);
+    expect(results).toEqual([
+      expect.objectContaining({ aborted: true, exitCode: null }),
+      expect.objectContaining({ aborted: true, exitCode: null }),
+    ]);
+    expect(getActiveScriptCount()).toBe(0);
+  });
 });

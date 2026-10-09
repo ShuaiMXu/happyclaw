@@ -130,12 +130,11 @@ test.each(surfaces)(
     const write = fs.writeFileSync;
     let injected = false;
     vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
-      if (
-        !injected &&
-        typeof file === 'string' &&
-        file.endsWith('.tmp') &&
-        file !== planted
-      ) {
+      const isNamedTemp =
+        typeof file === 'string' && file.endsWith('.tmp') && file !== planted;
+      const isSessionTempDescriptor =
+        surface === 'session-settings' && typeof file === 'number';
+      if (!injected && (isNamedTemp || isSessionTempDescriptor)) {
         injected = true;
         write(file, String(data).slice(0, 12), options);
         throw Object.assign(new Error('Simulated short write'), {

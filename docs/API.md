@@ -376,10 +376,12 @@ PATCH 修改 `chat_jid` 时会同时更新任务的具体 `delivery_route_jid`�
 控制面要求浏览器 Cookie、`manage_external_capabilities` 权限，以及目标 Workspace 的
 修改权：
 
+- `GET /api/external-capabilities`：仅返回当前操作者有目标 Workspace 修改权的能力
 - `GET|PATCH /api/external-capabilities/:slug`
 - `GET /api/external-capabilities/:slug/keys`
 - `POST /api/external-capabilities/:slug/keys`：创建响应仅返回一次明文 Key
 - `DELETE /api/external-capabilities/:slug/keys/:keyId`
+- `POST /api/external-capabilities/:slug/runs/:runId/cancel`：运营事故中止；先持久化围栏，再停止本进程执行容器，Key 已撤销时仍可使用
 
 数据面只接受能力专属的 `Authorization: Bearer ec_...`，不接受 Cookie：
 
@@ -387,9 +389,49 @@ PATCH 修改 `chat_jid` 时会同时更新任务的具体 `delivery_route_jid`�
 - `GET|DELETE /v1/external-capabilities/:slug/runs/:runId`：查询或取消同一 Key 的任务
 - `GET /v1/external-capabilities/:slug/runs/:runId/output`：下载同一 Key 的 XLSX 结果
 
-外部提交的文件和说明均是不可信数据；调用方不能指定 Workspace、模型、Prompt、工具、
-挂载或环境。能力默认不会接收流量，只有宿主发布闸门、专用 Docker 网络和生命周期状态
-都允许时才会受理。
+提交字段包括不透明 `externalTaskId`、可选 `idempotencyKey`/`tenantRef`/`accountRef`、
+最多 8,000 字符的 `instructions`、1–10 个受支持文件，以及 JSON `outputSchema`。
+`outputSchema.columns` 必须包含 1–100 个唯一列，每列形如
+`{ key, name, required?, description? }`：`key` 是最长 64 字符的 ASCII 标识符，
+`name` 最长 120 字符，`description` 最长 500 字符，`required` 只能是布尔值。
+未知字段、敏感数据列、非法 Sheet 名和不受支持的 schema version 均以
+`INVALID_OUTPUT_SCHEMA` 拒绝。缺失的 required 值保留为 `null`，并产生服务器生成的
+`MISSING_REQUIRED_VALUE` 结构化 warning。
+
+成功状态中的 `warnings` 只包含服务器允许的结构化 `{ code, rowIndex?, columnKey? }`
+对象，不回传模型自由文本、源文档摘录、原文件名或内部路径。外部提交的文件和说明均是
+不可信数据；调用方不能指定 Workspace、模型、Prompt、工具、挂载或环境。能力默认不会
+接收流量，只有宿主发布闸门、专用 Docker 网络和生命周期状态都允许时才会受理。
+
+V1 只接受 JPEG、PNG、WebP 和受限 XLSX。图片由 libvips 完整解码，必须是单帧、边长不
+超过 8,000 像素且总像素不超过 25 MiPx；XLSX 会执行 namespace-aware OOXML、DTD/entity、
+宏、嵌入对象、外部链接和解压规模检查。XLS、PDF、DOC/DOCX、CSV、压缩包和任意二进制
+均不接受。受理阶段在读取大请求体前鉴权，并同时受耐久 intake reservation、流式字节
+计数、请求超时和进程内非排队 semaphore 保护。输入、每次执行的 runtime 副本和输出还会
+在写入前占用耐久 Vault 字节预留；`EXTERNAL_CAPABILITY_VAULT_MAX_BYTES` 限制逻辑占用，
+`EXTERNAL_CAPABILITY_VAULT_MIN_FREE_BYTES` 保留文件系统不可申领的安全余量。逻辑容量或
+`statfs` 可用空间不足时返回 HTTP `507` 与 `VAULT_CAPACITY_EXCEEDED`，区别于 `429` 的请求/
+业务配额。状态、取消和下载分别使用独立的每 Key 限流窗口；下载另受本地并发和
+`EXTERNAL_CAPABILITY_MAX_OUTPUT_BYTES` 限制，提交流量不能耗尽控制或结果通道。
+
+隔离 Runner 镜像必须是 digest-pinned，且 OCI label 中的外调协议版本必须与宿主一致。
+Runner 先发布 READY；宿主在 `synchronous=FULL` 的 immediate transaction 中重新校验
+能力、Key、Workspace、owner、lease 和成本额度，并同时写入 `started_at` 与 Provider
+成本预留，然后才原子发布 START。READY 或耐久授权进入 Runner 截止时间前最后 5 秒时
+失败关闭，不再开始 START 发布；START 尚未对 Runner 可见时允许窄回滚，一旦可能已到达
+Provider 就不自动重放。启动和周期孤儿协调依据不可变 run/attempt/lease label 保留仍有
+有效 lease 的容器，只在能够确认容器不存在后释放本地容量和 runtime 目录。服务端能力定义
+发生目标 Workspace 等不可变契约漂移时，能力自动暂停；已有 `started_at` 的执行继续按原耐久
+目标计费和协调，待其终态后才能在后续启动中应用新目标。
+
+Provider 成本采用滚动 24 小时的全局、能力和 Key 三级暴露额度。配置项为
+`EXTERNAL_CAPABILITY_GLOBAL_PROVIDER_COST_USD_PER_DAY`、
+`EXTERNAL_CAPABILITY_CAPABILITY_PROVIDER_COST_USD_PER_DAY`、
+`EXTERNAL_CAPABILITY_KEY_PROVIDER_COST_USD_PER_DAY`，单次 START 预留
+`EXTERNAL_CAPABILITY_MAX_BUDGET_USD_PER_RUN`。流式 usage event 以稳定事件 ID
+恰好一次累加；正常终态按实际成本结算，明确未发布的 START 释放预留，已开始后的崩溃、
+取消或 Workspace 删除保留 `uncertain` 暴露，避免在成本未知时重新放量。该专用账本用于
+Provider 暴露围栏，不等同于用户余额或订阅钱包扣费账本。
 
 ## Skills、MCP 和 Plugins
 
@@ -598,7 +640,8 @@ Web 和 Runtime 不再把它们当作第二个可写真相源。
 
 监控：
 
-- `GET /api/health`，Public
+- `GET /api/health`，Public readiness：数据库、队列及启动恢复全部就绪时返回 200；
+  启动恢复期间或优雅关机排空期间返回 503。响应不包含凭据或渠道明细。
 - `GET /api/status`
 - `POST /api/status/groups/:folder/switch-provider`
 - `GET /api/status/channel-outbox/uncertain`

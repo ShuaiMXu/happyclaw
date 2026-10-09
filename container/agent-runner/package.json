@@ -1,6 +1,10 @@
 {
   "name": "happyclaw-agent-runner",
   "version": "1.0.0",
+  "packageManager": "npm@11.19.0",
+  "engines": {
+    "node": ">=24"
+  },
   "type": "module",
   "description": "Container-side agent runner for HappyClaw",
   "main": "dist/index.js",

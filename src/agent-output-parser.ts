@@ -40,11 +40,18 @@ function isJsonWhitespace(ch: string): boolean {
  * the brace depth, so this is never fooled by an embedded marker — even when a
  * second frame trails in the same buffer. O(buf length), single pass.
  */
-function findJsonObjectEnd(buf: string, start: number): number {
+const JSON_OBJECT_LIMIT_EXCEEDED = -2;
+
+function findJsonObjectEnd(
+  buf: string,
+  start: number,
+  maxCharacters = Number.POSITIVE_INFINITY,
+): number {
   let depth = 0;
   let inStr = false;
   let escaped = false;
   for (let i = start; i < buf.length; i++) {
+    if (i - start >= maxCharacters) return JSON_OBJECT_LIMIT_EXCEEDED;
     const ch = buf[i];
     if (inStr) {
       if (escaped) escaped = false;
@@ -111,6 +118,10 @@ export interface StdoutParserOptions {
   label: string;
   onOutput?: (output: ContainerOutput) => Promise<void>;
   resetTimeout: () => void;
+  /** Hard JSON-object character ceiling for a framed output. */
+  maxFrameCharacters?: number;
+  /** Called once when a framed output exceeds maxFrameCharacters. */
+  onFrameOverflow?: () => void;
 }
 
 export function createStdoutParserState(): StdoutParserState {
@@ -173,6 +184,17 @@ export function attachStdoutHandler(
   state: StdoutParserState,
   opts: StdoutParserOptions,
 ): void {
+  let frameOverflowed = false;
+  const overflowFrame = (): void => {
+    if (frameOverflowed) return;
+    frameOverflowed = true;
+    state.parseBuffer = '';
+    logger.warn(
+      { group: opts.groupName, maxFrameCharacters: opts.maxFrameCharacters },
+      'Framed output exceeded the parser safety limit',
+    );
+    opts.onFrameOverflow?.();
+  };
   stream.on('data', (data) => {
     const chunk = data.toString();
 
@@ -192,11 +214,21 @@ export function attachStdoutHandler(
       }
     }
 
-    // Stream-parse for output markers
-    if (opts.onOutput) {
+    // Stream-parse for output markers. Once an externally bounded frame
+    // overflows, stop retaining parser input while the caller terminates the
+    // process; stdout logging remains independently bounded above.
+    if (opts.onOutput && !frameOverflowed) {
       state.parseBuffer += chunk;
       const MAX_PARSE_BUFFER = 10 * 1024 * 1024; // 10MB
-      if (state.parseBuffer.length > MAX_PARSE_BUFFER) {
+      if (opts.maxFrameCharacters !== undefined) {
+        const firstMarkerIdx = state.parseBuffer.indexOf(OUTPUT_START_MARKER);
+        if (
+          firstMarkerIdx === -1 &&
+          state.parseBuffer.length > opts.maxFrameCharacters
+        ) {
+          state.parseBuffer = state.parseBuffer.slice(-512);
+        }
+      } else if (state.parseBuffer.length > MAX_PARSE_BUFFER) {
         logger.warn(
           { group: opts.groupName },
           'Parse buffer overflow, truncating',
@@ -279,7 +311,15 @@ export function attachStdoutHandler(
           break;
         }
 
-        const objEnd = findJsonObjectEnd(state.parseBuffer, objStart);
+        const objEnd = findJsonObjectEnd(
+          state.parseBuffer,
+          objStart,
+          opts.maxFrameCharacters,
+        );
+        if (objEnd === JSON_OBJECT_LIMIT_EXCEEDED) {
+          overflowFrame();
+          return;
+        }
         if (objEnd === -1) break; // object still streaming in — wait
         const endIdx = state.parseBuffer.indexOf(OUTPUT_END_MARKER, objEnd);
         if (endIdx === -1) break; // object complete, END marker not here yet
@@ -438,6 +478,8 @@ export interface CloseHandlerContext {
   extraVerboseLines?: string[];
   /** Never persist or emit caller-controlled input/output for sensitive executions. */
   redactSensitiveData?: boolean;
+  /** Run after pending output callbacks settle and before a hard error resolves. */
+  beforeNonZeroErrorResolve?: () => void;
   /** Custom error enrichment: given stderr, return { result, error } overrides */
   enrichError?: (
     stderr: string,
@@ -487,11 +529,27 @@ export function handleTimeoutClose(
     `${ctx.label} timed out`,
   );
 
-  ctx.resolvePromise({
-    status: 'error',
-    result: null,
-    error: `${ctx.label} timed out after ${ctx.timeoutMs}ms`,
-  });
+  const finalizeTimeout = () => {
+    ctx.beforeNonZeroErrorResolve?.();
+    ctx.resolvePromise({
+      status: 'error',
+      result: null,
+      error: `${ctx.label} timed out after ${ctx.timeoutMs}ms`,
+    });
+  };
+
+  // Match non-zero exits: READY/protocol output already read from stdout must
+  // settle before classifying the timeout as a pre-READY retryable failure.
+  if (ctx.onOutput) {
+    waitForOutputChain(
+      ctx.stdoutState.outputChain,
+      ctx.groupName,
+      `${ctx.filePrefix} timeout path`,
+      finalizeTimeout,
+    );
+  } else {
+    finalizeTimeout();
+  }
   return true;
 }
 
@@ -735,6 +793,7 @@ export function handleNonZeroExit(
   );
 
   const finalizeError = () => {
+    ctx.beforeNonZeroErrorResolve?.();
     ctx.resolvePromise({
       status: 'error',
       result: enriched.result,

@@ -253,13 +253,30 @@ export function ChatPage() {
       {/* Mobile workspace list when no group selected */}
       {!groupFolder && (
         <div className="block lg:hidden w-full overflow-y-auto">
-          {/* Mobile header: horizontal logo + actions */}
+          {/* Mobile header: square brand mark + actions. Uses the same
+              400x400 square icon as the desktop collapsed sidebar rail
+              (UnifiedSidebar.tsx) rather than the wordmark banner — it's a
+              self-contained colored mark, so no dark-mode inversion. */}
           <div className="flex items-center gap-3 px-4 pt-5 pb-3">
-            <img
-              src={`${import.meta.env.BASE_URL}icons/logo-text.svg`}
-              alt={appearance?.appName || 'HappyClaw'}
-              className="h-8"
-            />
+            <button
+              type="button"
+              onClick={() => {
+                navigate('/chat');
+                void loadGroups();
+              }}
+              title="返回首页并刷新"
+              aria-label="返回首页并刷新"
+              className="cursor-pointer transition-opacity hover:opacity-80"
+            >
+              <img
+                src={
+                  appearance?.brandIconUrl ||
+                  `${import.meta.env.BASE_URL}icons/icon-192.png`
+                }
+                alt={appearance?.appName || 'SoftopiaAI'}
+                className="h-10 w-10 rounded-xl object-cover"
+              />
+            </button>
             <div className="flex-1" />
             <button
               type="button"
@@ -317,13 +334,7 @@ export function ChatPage() {
           {hasAnyGroup ? (
             <div className="px-2 pb-nav-safe">
               {agentPartitions.primary && (
-                <section aria-labelledby="mobile-primary-agent-heading">
-                  <h2
-                    id="mobile-primary-agent-heading"
-                    className="px-3 pb-1 pt-1 text-[10px] font-medium tracking-[0.08em] text-muted-foreground"
-                  >
-                    主智能体 · {agentPartitions.primary.name}
-                  </h2>
+                <section aria-label="主智能体工作区">
                   {renderMobilePrimaryAgentWorkspaces(agentPartitions.primary)}
                 </section>
               )}
@@ -344,11 +355,22 @@ export function ChatPage() {
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center h-64 px-4">
-              <img
-                src={`${import.meta.env.BASE_URL}icons/logo-text.svg`}
-                alt={appearance?.appName || 'HappyClaw'}
-                className="h-12 mb-6"
-              />
+              <button
+                type="button"
+                onClick={() => void loadGroups()}
+                title="刷新"
+                aria-label="刷新"
+                className="cursor-pointer transition-opacity hover:opacity-80"
+              >
+                <img
+                  src={
+                    appearance?.brandIconUrl ||
+                    `${import.meta.env.BASE_URL}icons/icon-192.png`
+                  }
+                  alt={appearance?.appName || 'SoftopiaAI'}
+                  className="mb-6 h-16 w-16 rounded-xl object-cover"
+                />
+              </button>
               <p className="text-muted-foreground text-sm">暂无智能体工作区</p>
             </div>
           )}
@@ -369,13 +391,16 @@ export function ChatPage() {
             {/* Logo */}
             <div className="w-16 h-16 rounded-2xl overflow-hidden mx-auto mb-6">
               <img
-                src={`${import.meta.env.BASE_URL}icons/icon-192.png`}
-                alt="HappyClaw"
-                className="w-full h-full object-cover"
+                src={
+                  appearance?.brandLoadingIconUrl ||
+                  `${import.meta.env.BASE_URL}icons/loading-mark.png`
+                }
+                alt={appearance?.appName || 'SoftopiaAI'}
+                className="w-full h-full object-contain"
               />
             </div>
             <h2 className="text-xl font-semibold text-foreground mb-2">
-              欢迎使用 {appearance?.appName || 'HappyClaw'}
+              欢迎使用 {appearance?.appName || 'SoftopiaAI'}
             </h2>
             <p className="text-muted-foreground text-sm">
               从左侧选择一个工作区开始对话

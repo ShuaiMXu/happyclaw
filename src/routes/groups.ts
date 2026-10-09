@@ -33,6 +33,8 @@ import {
   canDeleteGroup,
 } from '../group-acl.js';
 import { MAX_GROUP_NAME_LEN } from '../group-constants.js';
+import { verifyExternalCapabilityRunContainerAbsent } from '../external-capability-container-verification.js';
+import { stopExternalCapabilityExecution } from '../external-capability-execution-control.js';
 import {
   clearSessionChannelOwner,
   getRegisteredGroup,
@@ -46,10 +48,17 @@ import {
   deleteSession,
   deleteWorkspaceSessions,
   deleteChatHistory,
+  beginExternalCapabilityWorkspaceDeletion,
+  EXTERNAL_CAPABILITY_WORKSPACE_DELETION_LEASE_MS,
+  quarantineExternalCapabilityWorkspaceDeletion,
+  renewExternalCapabilityWorkspaceDeletion,
+  restoreExternalCapabilityWorkspaceDeletion,
+  getSurvivingExternalCapabilityCanonicalWorkspace,
   pauseWorkspaceTasksForRebuild,
   rebuildWorkspacePersistentState,
   restoreWorkspaceTasksAfterFailedRebuild,
   deleteGroupData,
+  SharedWorkspaceFolderDeletionError,
   deleteImGroupRecord,
   ensureChatExists,
   storeMessageDirect,
@@ -79,6 +88,7 @@ import {
   getWorkspaceInteractionMode,
   setWorkspaceInteractionMode,
   getUserById,
+  hasWorkspaceFilesystemCleanupTombstone,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
@@ -201,6 +211,13 @@ function resolveMessageExecutionGroup(
 function normalizeGroupName(name: unknown): string {
   if (typeof name !== 'string') return '';
   return name.trim().slice(0, MAX_GROUP_NAME_LEN);
+}
+
+class WorkspaceDeleteBindingConfirmationError extends Error {
+  constructor(readonly summary: WorkspaceDeleteBindingSummary) {
+    super('Workspace channel bindings require explicit unbind confirmation');
+    this.name = 'WorkspaceDeleteBindingConfirmationError';
+  }
 }
 
 interface WorkspaceDeleteBindingSummary {
@@ -457,6 +474,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
 }
 
 import { removeFlowArtifacts } from '../file-manager.js';
+import { cleanupWorkspaceFilesystem } from '../workspace-filesystem-cleanup.js';
 import { clearSessionFiles } from '../session-files.js';
 export { removeFlowArtifacts };
 
@@ -937,6 +955,15 @@ groupRoutes.post('/', authMiddleware, async (c) => {
 
   const jid = `web:${crypto.randomUUID()}`;
   const folder = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  if (hasWorkspaceFilesystemCleanupTombstone(folder)) {
+    return c.json(
+      {
+        error: 'Workspace folder cleanup is still pending; retry creation.',
+        code: 'WORKSPACE_FOLDER_CLEANUP_PENDING',
+      },
+      409,
+    );
+  }
   const now = new Date().toISOString();
 
   const group: RegisteredGroup = {
@@ -1743,17 +1770,48 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     if (!getChannelType(jid)) {
       return c.json({ error: 'This group cannot be deleted' }, 403);
     }
-    // Reuse the shared helper so the manual delete path also resets
-    // imSendFailCounts / imHealthCheckFailCounts, matching the auto-cleanup
-    // paths (bot removed / health check / send fail).
-    if (deps.removeImGroupRecord) {
-      deps.removeImGroupRecord(jid, 'Manually deleted via API');
-    } else {
-      deleteImGroupRecord(jid);
-      delete deps.getRegisteredGroups()[jid];
+    // Freeze the shared workspace serialization family before the first await.
+    // The IM registration must remain present until teardown finishes so sibling
+    // work keeps resolving to the same folder key. Preserve accepted work on a
+    // failed delete, but discard this IM JID's parked arrivals after commit.
+    const pauseToken = deps.queue.pauseGroupsForMutation([jid]);
+    let deleted = false;
+    try {
+      await deps.queue.stopGroup(jid, {
+        force: true,
+        preserveQueuedWork: true,
+      });
+
+      // Reuse the shared helper so the manual delete path also resets
+      // imSendFailCounts / imHealthCheckFailCounts, matching the auto-cleanup
+      // paths (bot removed / health check / send fail).
+      if (deps.removeImGroupRecord) {
+        deps.removeImGroupRecord(jid, 'Manually deleted via API');
+      } else {
+        deleteImGroupRecord(jid);
+        delete deps.getRegisteredGroups()[jid];
+      }
+      deleted = true;
+
+      // Messages accepted while the mutation gate was held belong to the
+      // deleted channel route. Clear only this JID; do not terminal-discard the
+      // folder key because the owner's Web workspace shares it.
+      await deps.queue.stopGroup(jid, { force: true });
+      deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
+      return c.json({ success: true });
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to quiesce IM group deletion');
+      return c.json(
+        {
+          error: deleted
+            ? 'Group was deleted but runner cleanup did not settle'
+            : 'Failed to stop active group execution',
+        },
+        503,
+      );
+    } finally {
+      deps.queue.resumeGroupsAfterMutation(pauseToken);
     }
-    deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
-    return c.json({ success: true });
   }
 
   if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
@@ -1764,6 +1822,36 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
   }
 
   const confirmedChannelUnbind = c.req.query('unbind_channels') === 'true';
+  // Reject secondary aliases before pausing or stopping the shared serialization
+  // family. A canonical external-capability workspace that survives this
+  // request owns the folder's runners and queued work; touching them before
+  // this deterministic check would make a rejected delete destructive.
+  const survivingCapabilityWorkspace =
+    getSurvivingExternalCapabilityCanonicalWorkspace(jid, existing.folder);
+  if (survivingCapabilityWorkspace) {
+    return c.json(
+      {
+        error:
+          'This workspace alias cannot be deleted while the canonical external-capability workspace survives.',
+        canonical_workspace_jid: survivingCapabilityWorkspace,
+      },
+      409,
+    );
+  }
+  const survivingWebWorkspaceCount = getJidsByFolder(existing.folder).filter(
+    (candidateJid) => candidateJid !== jid && candidateJid.startsWith('web:'),
+  ).length;
+  if (survivingWebWorkspaceCount > 0) {
+    return c.json(
+      {
+        error:
+          'This workspace cannot be deleted while another Web workspace shares its storage folder.',
+        shared_workspace_count: survivingWebWorkspaceCount,
+      },
+      409,
+    );
+  }
+
   const initialBindingSummary = collectWorkspaceDeleteBindings(jid, existing);
   if (initialBindingSummary.hasChannelBindings && !confirmedChannelUnbind) {
     return c.json(
@@ -1796,13 +1884,55 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
   // individual stopGroup calls.
   const deletePauseToken = deps.queue.pauseGroupsForMutation(deleteStopJids);
   let deleteCommitted = false;
+  let externalDeletionFence: ReturnType<
+    typeof beginExternalCapabilityWorkspaceDeletion
+  > | null = null;
+  let externalDeletionHeartbeat: NodeJS.Timeout | null = null;
+  let externalDeletionFenceLeaseLost = false;
+  let restoreExternalFenceOnFailure = true;
   try {
+    // The ordinary queue pause does not cover detached external intake, claims,
+    // or START publication. Install the durable lifecycle fence before the
+    // first await so runner shutdown cannot leave a Provider-execution window.
+    externalDeletionFence = beginExternalCapabilityWorkspaceDeletion(
+      jid,
+      existing.folder,
+    );
+    restoreExternalFenceOnFailure = !externalDeletionFence.initiallyQuarantined;
+    if (externalDeletionFence.capabilitySlugs.length > 0) {
+      externalDeletionHeartbeat = setInterval(
+        () => {
+          try {
+            if (
+              externalDeletionFence &&
+              !renewExternalCapabilityWorkspaceDeletion(externalDeletionFence)
+            ) {
+              externalDeletionFenceLeaseLost = true;
+            }
+          } catch (error) {
+            externalDeletionFenceLeaseLost = true;
+            logger.error(
+              { jid, error },
+              'Failed to renew external capability workspace deletion fence',
+            );
+          }
+        },
+        Math.floor(EXTERNAL_CAPABILITY_WORKSPACE_DELETION_LEASE_MS / 3),
+      );
+      externalDeletionHeartbeat.unref?.();
+    }
+
     try {
-      // Do not preserve queued work for permanent deletion. stopGroup clears
-      // work that was already known; discardGroupsAfterMutation below clears
-      // anything newly parked while these asynchronous stops were in flight.
+      // A stop or database failure still leaves this workspace valid. Preserve
+      // all accepted work until the delete commits; the finally block discards
+      // it only after success and otherwise resumes it behind the pause token.
       await Promise.all(
-        deleteStopJids.map((j) => deps.queue.stopGroup(j, { force: true })),
+        deleteStopJids.map((j) =>
+          deps.queue.stopGroup(j, {
+            force: true,
+            preserveQueuedWork: true,
+          }),
+        ),
       );
     } catch (err) {
       logger.error(
@@ -1837,23 +1967,133 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
       );
     }
 
+    const verifiedExternalRunIds = new Set<string>();
+    const externalStopResults = await Promise.all(
+      externalDeletionFence.runningRunIds.map(async (runId) => {
+        const stopResult = await stopExternalCapabilityExecution(runId);
+        const absent = await verifyExternalCapabilityRunContainerAbsent(runId);
+        return { runId, stopResult, verified: absent };
+      }),
+    );
+    if (
+      externalDeletionFenceLeaseLost ||
+      !renewExternalCapabilityWorkspaceDeletion(externalDeletionFence)
+    ) {
+      throw new Error(
+        'External capability workspace deletion fence lease was lost',
+      );
+    }
+    const unverifiedExternalStops = externalStopResults.filter(
+      (result) => !result.verified,
+    );
+    if (unverifiedExternalStops.length > 0) {
+      restoreExternalFenceOnFailure = false;
+      if (
+        !quarantineExternalCapabilityWorkspaceDeletion(externalDeletionFence)
+      ) {
+        throw new Error(
+          'External capability workspace deletion quarantine was lost',
+        );
+      }
+      logger.error(
+        { jid, stopResults: unverifiedExternalStops },
+        'Could not verify external capability execution stopped before workspace deletion',
+      );
+      return c.json(
+        {
+          error:
+            'Failed to verify external processing stopped; capability left paused and workspace not deleted',
+        },
+        503,
+      );
+    }
+    // A retry of a prior fail-closed quarantine may restore the capability only
+    // after every physical execution has now been proven absent.
+    restoreExternalFenceOnFailure = true;
+    for (const result of externalStopResults) {
+      verifiedExternalRunIds.add(result.runId);
+    }
+
     const channelUpdates: Array<{ jid: string; group: RegisteredGroup }> = [];
-    deleteGroupData(jid, freshExisting.folder, {
-      channelUpdates: () => {
-        if (!confirmedChannelUnbind) return channelUpdates;
-        for (const channelJid of freshBindingSummary.mountedChannelJids) {
-          const channelGroup = getRegisteredGroup(channelJid);
-          if (channelGroup) {
-            channelUpdates.push({
-              jid: channelJid,
-              group: buildUnmountUpdate(channelGroup),
-            });
+    let finalBindingSummary = freshBindingSummary;
+    let finalExternalRunIds: string[];
+    try {
+      if (
+        externalDeletionFenceLeaseLost ||
+        !renewExternalCapabilityWorkspaceDeletion(externalDeletionFence)
+      ) {
+        throw new Error(
+          'External capability workspace deletion fence lease was lost',
+        );
+      }
+      finalExternalRunIds = deleteGroupData(jid, freshExisting.folder, {
+        externalDeletionOperationId: externalDeletionFence.operationId,
+        externalDeletionOwnerId: externalDeletionFence.ownerId,
+        channelUpdates: () => {
+          // deleteGroupData invokes this only after BEGIN IMMEDIATE owns the
+          // SQLite writer lock, making this the authoritative binding snapshot.
+          finalBindingSummary = collectWorkspaceDeleteBindings(
+            jid,
+            freshExisting,
+          );
+          if (
+            finalBindingSummary.hasChannelBindings &&
+            !confirmedChannelUnbind
+          ) {
+            throw new WorkspaceDeleteBindingConfirmationError(
+              finalBindingSummary,
+            );
           }
-        }
-        return channelUpdates;
-      },
-    });
+          if (!confirmedChannelUnbind) return channelUpdates;
+          for (const channelJid of finalBindingSummary.mountedChannelJids) {
+            const channelGroup = getRegisteredGroup(channelJid);
+            if (channelGroup) {
+              channelUpdates.push({
+                jid: channelJid,
+                group: buildUnmountUpdate(channelGroup),
+              });
+            }
+          }
+          return channelUpdates;
+        },
+      });
+    } catch (error) {
+      if (error instanceof WorkspaceDeleteBindingConfirmationError) {
+        return c.json(
+          {
+            error: '该工作区新增了渠道绑定，请确认解绑后再删除。',
+            requires_unbind_confirmation: true,
+            ...workspaceDeleteImpactPayload(error.summary),
+          },
+          409,
+        );
+      }
+      if (error instanceof SharedWorkspaceFolderDeletionError) {
+        return c.json(
+          {
+            error:
+              'This workspace cannot be deleted while another registration shares its storage folder.',
+            shared_workspace_count: error.survivingWorkspaceJids.length,
+          },
+          409,
+        );
+      }
+      throw error;
+    }
     deleteCommitted = true;
+    let finalExternalCleanupUnverified = false;
+    for (const runId of finalExternalRunIds) {
+      if (verifiedExternalRunIds.has(runId)) continue;
+      const stopped = await stopExternalCapabilityExecution(runId);
+      const absent = await verifyExternalCapabilityRunContainerAbsent(runId);
+      if (!absent) {
+        logger.error(
+          { jid, runId, stopResult: stopped },
+          'Workspace was deleted but final external execution cleanup could not be verified',
+        );
+        finalExternalCleanupUnverified = true;
+      }
+    }
 
     const registeredGroups = deps.getRegisteredGroups();
     for (const update of channelUpdates) {
@@ -1866,23 +2106,76 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     delete deps.getSessions()[freshExisting.folder];
     deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
 
-    removeFlowArtifacts(freshExisting.folder);
+    const filesystemCleanup = finalExternalCleanupUnverified
+      ? {
+          status: 'pending' as const,
+          folder: freshExisting.folder,
+          error: 'External capability execution cleanup is not verified',
+        }
+      : cleanupWorkspaceFilesystem(freshExisting.folder);
 
     logger.info(
       {
         jid,
         userId: authUser.id,
-        channelBindingCount: freshBindingSummary.channelBindingCount,
+        channelBindingCount: finalBindingSummary.channelBindingCount,
         reroutedChannels: channelUpdates.length,
+        finalExternalCleanupUnverified,
+        filesystemCleanup: filesystemCleanup.status,
       },
       'Workspace deleted with confirmed channel cleanup',
     );
+
+    if (finalExternalCleanupUnverified) {
+      return c.json(
+        {
+          error:
+            'Workspace deleted, but final external processing cleanup could not be verified',
+          cleanup_pending: filesystemCleanup.status !== 'cleaned',
+        },
+        503,
+      );
+    }
+    if (filesystemCleanup.status !== 'cleaned') {
+      return c.json(
+        {
+          success: true,
+          cleanup_pending: true,
+          unbound_channel_count: channelUpdates.length,
+        },
+        202,
+      );
+    }
 
     return c.json({
       success: true,
       unbound_channel_count: channelUpdates.length,
     });
   } finally {
+    if (externalDeletionHeartbeat) {
+      clearInterval(externalDeletionHeartbeat);
+    }
+    if (
+      !deleteCommitted &&
+      externalDeletionFence &&
+      restoreExternalFenceOnFailure
+    ) {
+      try {
+        if (
+          !restoreExternalCapabilityWorkspaceDeletion(externalDeletionFence)
+        ) {
+          logger.error(
+            { jid },
+            'External capability workspace deletion fence was no longer owned during restore',
+          );
+        }
+      } catch (error) {
+        logger.error(
+          { jid, error },
+          'Failed to restore external capability after workspace deletion failure',
+        );
+      }
+    }
     if (deleteCommitted) {
       deps.queue.discardGroupsAfterMutation(deletePauseToken);
     } else {

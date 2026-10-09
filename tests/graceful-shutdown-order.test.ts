@@ -17,7 +17,7 @@ describe('graceful shutdown lifecycle order', () => {
     const rejectIntake = shutdown.indexOf('shuttingDown = true');
     const pauseInbound = shutdown.indexOf('imManager.pauseInbound()');
     const stopWeb = shutdown.indexOf('shutdownWebServer()');
-    const stopAgents = shutdown.indexOf('queue\n        .shutdown(15_000)');
+    const stopAgents = shutdown.indexOf('queue.shutdown(15_000)');
     const finalizeCards = shutdown.indexOf(
       "abortAllStreamingSessions('服务维护中')",
     );
@@ -45,5 +45,30 @@ describe('graceful shutdown lifecycle order', () => {
     // abort promise would keep running after the transport had been closed.
     const cardPhase = shutdown.slice(finalizeCards, disconnectIm);
     expect(cardPhase).not.toContain('Promise.race');
+  });
+
+  test('keeps the hard deadline beyond bounded drains and exits nonzero on lifecycle debt', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'src/index.ts'),
+      'utf8',
+    );
+    const shutdownStart = source.indexOf(
+      'const shutdown = async (signal: string)',
+    );
+    const shutdownEnd = source.indexOf("process.on('SIGTERM'", shutdownStart);
+    const shutdown = source.slice(shutdownStart, shutdownEnd);
+
+    expect(shutdown).toContain('}, 120_000)');
+    expect(shutdown).toContain('let shutdownFailed = false');
+    expect(shutdown).toContain("'Error stopping scheduler loop'");
+    expect(shutdown).toContain("'Error stopping external capability worker'");
+    expect(shutdown).toContain("'Error shutting down queue'");
+    expect(shutdown).toContain("'Error closing database'");
+    expect(shutdown).toContain(
+      "logger.error('Shutdown completed with unsettled lifecycle work')",
+    );
+    expect(shutdown.indexOf('process.exit(1)')).toBeLessThan(
+      shutdown.lastIndexOf('process.exit(0)'),
+    );
   });
 });

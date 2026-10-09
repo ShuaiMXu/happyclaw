@@ -4,24 +4,46 @@
  * registry only lets the current process stop an already-running container
  * promptly instead of waiting for its lease heartbeat.
  */
-const activeExecutionStops = new Map<string, () => void>();
+type ExternalCapabilityExecutionStop = () => boolean | Promise<boolean>;
+
+const activeExecutionStops = new Map<
+  string,
+  Set<ExternalCapabilityExecutionStop>
+>();
 
 export function registerExternalCapabilityExecution(
   runId: string,
-  stop: () => void,
+  stop: ExternalCapabilityExecutionStop,
 ): () => void {
-  activeExecutionStops.set(runId, stop);
+  const stops = activeExecutionStops.get(runId) ?? new Set();
+  stops.add(stop);
+  activeExecutionStops.set(runId, stops);
   return () => {
-    if (activeExecutionStops.get(runId) === stop) {
-      activeExecutionStops.delete(runId);
-    }
+    const current = activeExecutionStops.get(runId);
+    if (!current) return;
+    current.delete(stop);
+    if (current.size === 0) activeExecutionStops.delete(runId);
   };
 }
 
-/** Returns true only when this process was actively executing the run. */
-export function stopExternalCapabilityExecution(runId: string): boolean {
-  const stop = activeExecutionStops.get(runId);
-  if (!stop) return false;
-  stop();
-  return true;
+export type ExternalCapabilityExecutionStopResult =
+  | 'not_found'
+  | 'stopped'
+  | 'unverified';
+
+/**
+ * Stop a process-local execution and report whether container absence was
+ * verified. Durable cancellation remains the cross-process source of truth.
+ */
+export async function stopExternalCapabilityExecution(
+  runId: string,
+): Promise<ExternalCapabilityExecutionStopResult> {
+  const stops = activeExecutionStops.get(runId);
+  if (!stops || stops.size === 0) return 'not_found';
+  const results = await Promise.allSettled([...stops].map((stop) => stop()));
+  return results.every(
+    (result) => result.status === 'fulfilled' && result.value === true,
+  )
+    ? 'stopped'
+    : 'unverified';
 }

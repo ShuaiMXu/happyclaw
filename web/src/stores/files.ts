@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { api, apiFetch, computeUploadTimeoutMs } from '../api/client';
 import { showToast } from '../utils/toast';
+import { downloadFromUrlWithProgress } from '../utils/download';
+import { classifyFileKind } from '../utils/fileKind';
 
 /**
  * 上传重试。慢速或不稳定链路上单次上传失败非常常见（反代读请求体超时 → 408，
@@ -68,6 +70,94 @@ function waitForUploadRetry(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+// 大文件走分片上传：固定 4MB 一片，与后端 FILE_CHUNK_MAX_BYTES 校验对齐
+// （见 src/http-upload-policy.ts）。每片是独立的小请求，超时窗口固定且很短，
+// 不随文件总大小增长；单片失败只重试这一片，不用整份重传；每片写盘成功
+// 就能推进进度条，慢网络下也能连续看到进度在走，而不是长时间原地不动。
+const CHUNK_SIZE = 4 * 1024 * 1024;
+// 超过这个阈值才走分片；小文件直接单次上传，省掉分片/拼接的开销和请求数。
+const CHUNKED_UPLOAD_THRESHOLD = 8 * 1024 * 1024;
+const CHUNK_MAX_RETRIES = 3;
+
+function generateUploadId(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID().replace(/-/g, '');
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 把一个大文件按 CHUNK_SIZE 切片依次上传。每片成功后通过 onChunkUploaded
+ * 上报本片字节数，调用方据此推进 uploadedBytes，让进度条连续走动。
+ * 单片失败会退避重试（1s/3s/9s），仍失败则清理服务端已收分片并抛错，
+ * 让调用方按整份文件失败处理（用户可以重新发起这一个文件的上传）。
+ */
+async function uploadFileInChunks(
+  jid: string,
+  file: File,
+  uploadPath: string,
+  onChunkUploaded: (bytes: number) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const uploadId = generateUploadId();
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  const chunkUrl = `/api/groups/${encodeURIComponent(jid)}/files/chunk`;
+
+  for (let index = 0; index < totalChunks; index++) {
+    if (signal?.aborted) throw UPLOAD_CANCELLED;
+    const start = index * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, file.size);
+    const blob = file.slice(start, end);
+
+    let succeeded = false;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < CHUNK_MAX_RETRIES; attempt++) {
+      if (signal?.aborted) throw UPLOAD_CANCELLED;
+      try {
+        const formData = new FormData();
+        formData.append('uploadId', uploadId);
+        formData.append('chunkIndex', String(index));
+        formData.append('totalChunks', String(totalChunks));
+        formData.append('fileName', file.name);
+        formData.append('fileSize', String(file.size));
+        if (uploadPath) formData.append('path', uploadPath);
+        formData.append('chunk', blob, file.name);
+
+        await apiFetch(chunkUrl, {
+          method: 'POST',
+          body: formData,
+          headers: {},
+          timeoutMs: computeUploadTimeoutMs(blob.size),
+          signal,
+        });
+        succeeded = true;
+        break;
+      } catch (err) {
+        if (signal?.aborted) throw UPLOAD_CANCELLED;
+        lastError = err;
+        if (attempt < CHUNK_MAX_RETRIES - 1) {
+          await sleep(1000 * 3 ** attempt);
+        }
+      }
+    }
+
+    if (!succeeded) {
+      // 尽力清理服务端已接收的分片，释放临时磁盘占用；清理失败也不影响
+      // 把原始错误抛给调用方。
+      apiFetch(`${chunkUrl}/${uploadId}`, { method: 'DELETE' }).catch(() => {});
+      throw lastError instanceof Error
+        ? lastError
+        : new Error('Chunk upload failed');
+    }
+
+    onChunkUploaded(blob.size);
+  }
+}
+
 export interface FileEntry {
   name: string;
   path: string;
@@ -78,6 +168,13 @@ export interface FileEntry {
   /** 后端是否允许编辑内容。系统文件默认 false，工作区 CLAUDE.md 是例外。 */
   editable?: boolean;
   absolutePath?: string;
+}
+
+/** 批量删除/移动的结果：一项失败不影响其它项，前端据此告诉用户哪些没成功。 */
+export interface BatchFileOpResult {
+  success: boolean;
+  succeeded: string[];
+  failed: { path: string; error: string }[];
 }
 
 export interface UploadProgress {
@@ -110,6 +207,12 @@ export function formatUploadRetryStatus(
   return null;
 }
 
+/** 待 FilePanel 消费的"打开这个文件"请求；见 openWorkspaceFileByAgentPath。 */
+export interface PendingFileOpen {
+  file: FileEntry;
+  token: number;
+}
+
 interface FileState {
   files: Record<string, FileEntry[]>;
   currentPath: Record<string, string>;
@@ -117,6 +220,7 @@ interface FileState {
   uploading: boolean;
   uploadProgress: UploadProgress | null;
   error: string | null;
+  pendingFileOpen: Record<string, PendingFileOpen | undefined>;
 
   loadFiles: (jid: string, path?: string) => Promise<void>;
   uploadFiles: (
@@ -126,6 +230,15 @@ interface FileState {
   ) => Promise<boolean>;
   cancelUpload: () => void;
   deleteFile: (jid: string, filePath: string) => Promise<boolean>;
+  batchDeleteFiles: (
+    jid: string,
+    paths: string[],
+  ) => Promise<BatchFileOpResult>;
+  moveFiles: (
+    jid: string,
+    paths: string[],
+    destination: string,
+  ) => Promise<BatchFileOpResult>;
   createDirectory: (
     jid: string,
     parentPath: string,
@@ -138,6 +251,17 @@ interface FileState {
     filePath: string,
     content: string,
   ) => Promise<boolean>;
+  /**
+   * 把聊天消息里提到的一个路径（Agent 视角的绝对路径或相对路径）解析成工作区
+   * 文件，等同于用户在项目文件面板里点开了同名文件：能直接预览的类型交给
+   * FilePanel（通过 pendingFileOpen 通知它打开对应预览），不能预览的类型
+   * （压缩包等）直接触发下载。找不到匹配文件时提示用户。
+   */
+  openWorkspaceFileByAgentPath: (
+    jid: string,
+    agentPath: string,
+  ) => Promise<void>;
+  clearPendingFileOpen: (jid: string) => void;
 }
 
 export function toBase64Url(str: string): string {
@@ -156,6 +280,7 @@ export const useFileStore = create<FileState>((set, get) => ({
   uploading: false,
   uploadProgress: null,
   error: null,
+  pendingFileOpen: {},
 
   cancelUpload: () => activeUploadController?.abort(),
 
@@ -242,55 +367,36 @@ export const useFileStore = create<FileState>((set, get) => ({
           },
         });
 
-        // 每轮重建 FormData：body 已被上一次 fetch 消费，不能复用。
-        let lastErr: unknown;
-        for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
-          if (uploadController.signal.aborted) throw UPLOAD_CANCELLED;
-          set({
-            uploadProgress: {
-              total,
-              completed: i,
-              currentFile: file.name,
-              totalBytes,
-              uploadedBytes,
-              attempt,
-              maxAttempts: UPLOAD_MAX_ATTEMPTS,
-              retrying: false,
+        if (file.size > CHUNKED_UPLOAD_THRESHOLD) {
+          // 分片上传自己按片重试（见 uploadFileInChunks），不复用这里的整文件
+          // 重试循环；取消信号仍然共享，中途 cancelUpload() 会中断分片上传。
+          requestStarted = true;
+          await uploadFileInChunks(
+            jid,
+            file,
+            uploadPath,
+            (bytes) => {
+              uploadedBytes += bytes;
+              set({
+                uploadProgress: {
+                  total,
+                  completed: i,
+                  currentFile: file.name,
+                  totalBytes,
+                  uploadedBytes,
+                  attempt: 1,
+                  maxAttempts: UPLOAD_MAX_ATTEMPTS,
+                  retrying: false,
+                },
+              });
             },
-          });
-
-          const formData = new FormData();
-          formData.append('files', file);
-          if (uploadPath) formData.append('path', uploadPath);
-
-          try {
-            // Once the request starts, aborting the browser fetch cannot prove
-            // that the server did not commit the atomic file write before its
-            // response was lost. Reconcile the directory on cancellation even
-            // when this is the first file and uploadedBytes is still zero.
-            requestStarted = true;
-            await apiFetch(apiUrl, {
-              method: 'POST',
-              body: formData,
-              headers: {},
-              timeoutMs: computeUploadTimeoutMs(file.size),
-              signal: uploadController.signal,
-            });
+            uploadController.signal,
+          );
+        } else {
+          // 每轮重建 FormData：body 已被上一次 fetch 消费，不能复用。
+          let lastErr: unknown;
+          for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
             if (uploadController.signal.aborted) throw UPLOAD_CANCELLED;
-            lastErr = undefined;
-            break;
-          } catch (err) {
-            if (uploadController.signal.aborted || err === UPLOAD_CANCELLED) {
-              throw UPLOAD_CANCELLED;
-            }
-            lastErr = err;
-            if (
-              attempt === UPLOAD_MAX_ATTEMPTS ||
-              !isRetriableUploadError(err)
-            ) {
-              break;
-            }
-            const retryDelayMs = UPLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 5000;
             set({
               uploadProgress: {
                 total,
@@ -300,17 +406,62 @@ export const useFileStore = create<FileState>((set, get) => ({
                 uploadedBytes,
                 attempt,
                 maxAttempts: UPLOAD_MAX_ATTEMPTS,
-                retrying: true,
-                nextAttempt: attempt + 1,
-                retryDelayMs,
+                retrying: false,
               },
             });
-            await waitForUploadRetry(retryDelayMs, uploadController.signal);
-          }
-        }
-        if (lastErr) throw lastErr;
 
-        uploadedBytes += file.size;
+            const formData = new FormData();
+            formData.append('files', file);
+            if (uploadPath) formData.append('path', uploadPath);
+
+            try {
+              // Once the request starts, aborting the browser fetch cannot prove
+              // that the server did not commit the atomic file write before its
+              // response was lost. Reconcile the directory on cancellation even
+              // when this is the first file and uploadedBytes is still zero.
+              requestStarted = true;
+              await apiFetch(apiUrl, {
+                method: 'POST',
+                body: formData,
+                headers: {},
+                timeoutMs: computeUploadTimeoutMs(file.size),
+                signal: uploadController.signal,
+              });
+              if (uploadController.signal.aborted) throw UPLOAD_CANCELLED;
+              lastErr = undefined;
+              break;
+            } catch (err) {
+              if (uploadController.signal.aborted || err === UPLOAD_CANCELLED) {
+                throw UPLOAD_CANCELLED;
+              }
+              lastErr = err;
+              if (
+                attempt === UPLOAD_MAX_ATTEMPTS ||
+                !isRetriableUploadError(err)
+              ) {
+                break;
+              }
+              const retryDelayMs = UPLOAD_RETRY_DELAYS_MS[attempt - 1] ?? 5000;
+              set({
+                uploadProgress: {
+                  total,
+                  completed: i,
+                  currentFile: file.name,
+                  totalBytes,
+                  uploadedBytes,
+                  attempt,
+                  maxAttempts: UPLOAD_MAX_ATTEMPTS,
+                  retrying: true,
+                  nextAttempt: attempt + 1,
+                  retryDelayMs,
+                },
+              });
+              await waitForUploadRetry(retryDelayMs, uploadController.signal);
+            }
+          }
+          if (lastErr) throw lastErr;
+          uploadedBytes += file.size;
+        }
 
         set({
           uploadProgress: {
@@ -368,6 +519,63 @@ export const useFileStore = create<FileState>((set, get) => ({
     }
   },
 
+  batchDeleteFiles: async (jid: string, paths: string[]) => {
+    try {
+      const data = await api.post<{
+        success: boolean;
+        deleted: string[];
+        failed: { path: string; error: string }[];
+      }>(`/api/groups/${encodeURIComponent(jid)}/files/batch-delete`, {
+        paths,
+      });
+      const currentPath = get().currentPath[jid] || '';
+      await get().loadFiles(jid, currentPath);
+      return {
+        success: data.success,
+        succeeded: data.deleted,
+        failed: data.failed,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to delete files';
+      console.error('Failed to batch delete files:', err);
+      set({ error: msg });
+      return {
+        success: false,
+        succeeded: [],
+        failed: paths.map((path) => ({ path, error: msg })),
+      };
+    }
+  },
+
+  moveFiles: async (jid: string, paths: string[], destination: string) => {
+    try {
+      const data = await api.post<{
+        success: boolean;
+        moved: string[];
+        failed: { path: string; error: string }[];
+      }>(`/api/groups/${encodeURIComponent(jid)}/files/move`, {
+        paths,
+        destination,
+      });
+      const currentPath = get().currentPath[jid] || '';
+      await get().loadFiles(jid, currentPath);
+      return {
+        success: data.success,
+        succeeded: data.moved,
+        failed: data.failed,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to move files';
+      console.error('Failed to move files:', err);
+      set({ error: msg });
+      return {
+        success: false,
+        succeeded: [],
+        failed: paths.map((path) => ({ path, error: msg })),
+      };
+    }
+  },
+
   createDirectory: async (jid: string, parentPath: string, name: string) => {
     try {
       await api.post(`/api/groups/${encodeURIComponent(jid)}/directories`, {
@@ -421,5 +629,44 @@ export const useFileStore = create<FileState>((set, get) => ({
       set({ error: msg });
       return false;
     }
+  },
+
+  openWorkspaceFileByAgentPath: async (jid: string, agentPath: string) => {
+    try {
+      const params = new URLSearchParams({ path: agentPath });
+      const data = await api.get<{ file: FileEntry }>(
+        `/api/groups/${encodeURIComponent(jid)}/files/resolve?${params}`,
+      );
+      const { file } = data;
+
+      if (file.type === 'file' && classifyFileKind(file.name) === 'download') {
+        const encoded = toBase64Url(file.path);
+        const url = `/api/groups/${encodeURIComponent(jid)}/files/download/${encoded}`;
+        await downloadFromUrlWithProgress(url, file.name);
+        return;
+      }
+
+      set((s) => ({
+        pendingFileOpen: {
+          ...s.pendingFileOpen,
+          [jid]: { file, token: Date.now() + Math.random() },
+        },
+      }));
+    } catch (err) {
+      console.error('Failed to resolve workspace file path:', err);
+      showToast(
+        '未找到文件',
+        err instanceof Error ? err.message : '无法在项目文件中定位该路径',
+      );
+    }
+  },
+
+  clearPendingFileOpen: (jid: string) => {
+    set((s) => {
+      if (!(jid in s.pendingFileOpen)) return s;
+      const next = { ...s.pendingFileOpen };
+      delete next[jid];
+      return { pendingFileOpen: next };
+    });
   },
 }));

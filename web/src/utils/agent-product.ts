@@ -1,5 +1,6 @@
 import type { GroupInfo } from '../types';
 import type { GroupEntry } from './group-utils';
+import { naturalCompare } from './naturalSort';
 
 export interface AgentWorkspaceSection {
   id: string;
@@ -9,8 +10,13 @@ export interface AgentWorkspaceSection {
   items: GroupEntry[];
 }
 
+// Legacy built-in profile names (pre-rebrand) shown as the current brand.
+const LEGACY_DEFAULT_AGENT_NAMES = ['Default Agent', 'HappyClaw'];
+
 export function getAgentProfileDisplayName(name?: string | null): string {
-  return !name || name === 'Default Agent' ? 'HappyClaw' : name;
+  return !name || LEGACY_DEFAULT_AGENT_NAMES.includes(name)
+    ? 'SoftopiaAI'
+    : name;
 }
 
 export function getCustomAgentProfiles<T extends { is_default: boolean }>(
@@ -49,7 +55,7 @@ export function groupWorkspacesByAgent(
     }))
     .sort((a, b) => {
       const defaultOrder = Number(b.isDefault) - Number(a.isDefault);
-      return defaultOrder || a.name.localeCompare(b.name, 'zh-CN');
+      return defaultOrder || naturalCompare(a.name, b.name, 'zh-CN');
     });
 }
 

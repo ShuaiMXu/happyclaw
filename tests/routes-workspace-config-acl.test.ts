@@ -80,6 +80,7 @@ const OWNER_ID = 'alice';
 const OUTSIDER_ID = 'charlie';
 const GROUP_JID = 'web:test-group';
 const GROUP_FOLDER = 'test-group';
+const HOST_ROOT = path.join(tmpDataDir, 'host-workspace');
 
 function seedTestGroup(): void {
   db.setRegisteredGroup(GROUP_JID, {
@@ -87,6 +88,19 @@ function seedTestGroup(): void {
     folder: GROUP_FOLDER,
     added_at: new Date().toISOString(),
     executionMode: 'container',
+    created_by: OWNER_ID,
+    is_home: false,
+  } as any);
+}
+
+function seedHostGroup(): void {
+  fs.mkdirSync(HOST_ROOT, { recursive: true });
+  db.setRegisteredGroup(GROUP_JID, {
+    name: 'Host Group',
+    folder: GROUP_FOLDER,
+    added_at: new Date().toISOString(),
+    executionMode: 'host',
+    customCwd: HOST_ROOT,
     created_by: OWNER_ID,
     is_home: false,
   } as any);
@@ -118,6 +132,7 @@ beforeEach(() => {
     fs.rmSync(groupsDir, { recursive: true, force: true });
   }
   fs.mkdirSync(groupsDir, { recursive: true });
+  fs.rmSync(HOST_ROOT, { recursive: true, force: true });
 });
 
 afterEach(() => {
@@ -163,6 +178,14 @@ async function deleteMcp(id: string): Promise<{ status: number; body: any }> {
 async function getMcp(): Promise<{ status: number; body: any }> {
   const res = await workspaceConfigRoutes.request(
     `/${encodeURIComponent(GROUP_JID)}/workspace-config/mcp-servers`,
+    { method: 'GET' },
+  );
+  return { status: res.status, body: await res.json().catch(() => ({})) };
+}
+
+async function getSkills(): Promise<{ status: number; body: any }> {
+  const res = await workspaceConfigRoutes.request(
+    `/${encodeURIComponent(GROUP_JID)}/workspace-config/skills`,
     { method: 'GET' },
   );
   return { status: res.status, body: await res.json().catch(() => ({})) };
@@ -228,6 +251,27 @@ describe('workspace-config ACL — MCP servers', () => {
     const { status, body } = await postMcp({ id: 'srv5', command: 'echo' });
     expect(status).toBe(404);
     expect(body.error).toMatch(/not found/i);
+  });
+});
+
+describe('workspace-config ACL — Host execution boundary', () => {
+  test('demoted Host owner cannot read or mutate Skills and MCP config', async () => {
+    seedHostGroup();
+    asUser(OWNER_ID, 'member');
+
+    expect((await getMcp()).status).toBe(404);
+    expect((await getSkills()).status).toBe(404);
+    expect((await postMcp({ id: 'blocked', command: 'echo' })).status).toBe(
+      404,
+    );
+  });
+
+  test('Host owner with admin permission can access workspace config', async () => {
+    seedHostGroup();
+    asUser(OWNER_ID, 'admin');
+
+    expect((await getMcp()).status).toBe(200);
+    expect((await getSkills()).status).toBe(200);
   });
 });
 

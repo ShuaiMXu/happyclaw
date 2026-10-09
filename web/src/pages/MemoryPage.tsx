@@ -77,6 +77,7 @@ import {
   type WorkspaceMemoryVersionsResult,
   type WorkspaceSummary,
 } from '@/features/workspace-memory/model';
+import { getAgentProfileDisplayName } from '@/utils/agent-product';
 
 type KindFilter = 'all' | WorkspaceMemoryKind;
 
@@ -999,7 +1000,11 @@ export function MemoryPage() {
                 </span>
                 <span>·</span>
                 <span>
-                  {selectedWorkspace.agent_profile?.name || '主智能体'}
+                  {selectedWorkspace.agent_profile?.name
+                    ? getAgentProfileDisplayName(
+                        selectedWorkspace.agent_profile.name,
+                      )
+                    : '主智能体'}
                 </span>
                 <span>·</span>
                 <span>{canModify ? '可编辑' : '只读'}</span>

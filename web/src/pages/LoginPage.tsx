@@ -5,6 +5,7 @@ import { useAuthStore } from '../stores/auth';
 import { LogoLoading } from '../components/common/LogoLoading';
 import { api } from '../api/client';
 import { extractErrorMessage } from '../utils/error';
+import { getLoginErrorMessage } from '../utils/login-error';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -32,7 +33,7 @@ export function LoginPage() {
   const appearance = useAuthStore((state) => state.appearance);
   const fetchAppearance = useAuthStore((state) => state.fetchAppearance);
 
-  const appName = appearance?.appName.trim() || 'HappyClaw';
+  const appName = appearance?.appName.trim() || 'SoftopiaAI';
   const brandIconUrl = withBasePath(
     appearance?.brandIconUrl || '/icons/icon-192.png',
   );
@@ -97,7 +98,7 @@ export function LoginPage() {
       const mustChange = useAuthStore.getState().user?.must_change_password;
       navigate(mustChange ? '/settings' : '/chat');
     } catch (err) {
-      setError(extractErrorMessage(err) || '登录失败');
+      setError(getLoginErrorMessage(err));
     } finally {
       setLoading(false);
     }

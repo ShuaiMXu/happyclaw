@@ -3,8 +3,12 @@ import fs from 'fs';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { DATA_DIR, GROUPS_DIR, MAX_FILE_SIZE } from './config.js';
-import { deleteContainerEnvConfig } from './runtime-config.js';
+import {
+  containerEnvPath,
+  deleteContainerEnvConfig,
+} from './runtime-config.js';
 import { logger } from './logger.js';
+import { assertValidWorkspaceFolderName } from './workspace-folder.js';
 
 // --- Storage usage cache (5 minute TTL) ---
 const _storageCache = new Map<string, { bytes: number; expires: number }>();
@@ -537,24 +541,127 @@ function calculateDirSize(dirPath: string, depth = 0): number {
   return total;
 }
 
-/** Remove all runtime artifacts for a group folder (workspace, sessions, ipc, env, memory). */
+function workspaceResetBackupPaths(folder: string): string[] {
+  const backups: string[] = [];
+  for (const parentPath of [
+    GROUPS_DIR,
+    path.join(DATA_DIR, 'sessions'),
+    path.join(DATA_DIR, 'ipc'),
+    path.join(DATA_DIR, 'memory'),
+  ]) {
+    let names: string[];
+    try {
+      names = fs.readdirSync(parentPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    const prefix = `${folder}.rebuild-backup-`;
+    for (const name of names) {
+      if (name.startsWith(prefix)) backups.push(path.join(parentPath, name));
+    }
+  }
+  return backups;
+}
+
+function workspaceArtifactPaths(folder: string): string[] {
+  assertValidWorkspaceFolderName(folder);
+  return [
+    path.join(GROUPS_DIR, folder),
+    path.join(DATA_DIR, 'sessions', folder),
+    path.join(DATA_DIR, 'ipc', folder),
+    path.join(DATA_DIR, 'env', folder),
+    path.join(DATA_DIR, 'memory', folder),
+    path.join(DATA_DIR, 'extra', folder),
+    ...workspaceResetBackupPaths(folder),
+    containerEnvPath(folder),
+    `${containerEnvPath(folder)}.tmp`,
+  ];
+}
+
+function fsyncDirectoryIfPresent(directoryPath: string): void {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(directoryPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(
+      `Workspace artifact parent is not a directory: ${directoryPath}`,
+    );
+  }
+  if (process.platform === 'win32') return;
+  const fd = fs.openSync(
+    directoryPath,
+    fs.constants.O_RDONLY | fs.constants.O_DIRECTORY,
+  );
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function assertStrictlyAbsent(targetPath: string): void {
+  try {
+    fs.lstatSync(targetPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error(
+    `Workspace artifact still exists after cleanup: ${targetPath}`,
+  );
+}
+
+/**
+ * Idempotently remove and strictly verify every folder-owned runtime artifact.
+ * All failures are retained so a durable cleanup tombstone can be retried; in
+ * particular, the per-workspace container-env unlink is never ignored.
+ */
 export function removeFlowArtifacts(folder: string): void {
-  fs.rmSync(path.join(GROUPS_DIR, folder), { recursive: true, force: true });
-  fs.rmSync(path.join(DATA_DIR, 'sessions', folder), {
-    recursive: true,
-    force: true,
-  });
-  fs.rmSync(path.join(DATA_DIR, 'ipc', folder), {
-    recursive: true,
-    force: true,
-  });
-  fs.rmSync(path.join(DATA_DIR, 'env', folder), {
-    recursive: true,
-    force: true,
-  });
-  fs.rmSync(path.join(DATA_DIR, 'memory', folder), {
-    recursive: true,
-    force: true,
-  });
-  deleteContainerEnvConfig(folder);
+  const failures: unknown[] = [];
+  const artifactPaths = workspaceArtifactPaths(folder);
+  const directoryPaths = artifactPaths.slice(0, -2);
+  for (const targetPath of directoryPaths) {
+    try {
+      fs.rmSync(targetPath, { recursive: true, force: true });
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  try {
+    deleteContainerEnvConfig(folder);
+  } catch (error) {
+    failures.push(error);
+  }
+  try {
+    fs.unlinkSync(`${containerEnvPath(folder)}.tmp`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      failures.push(error);
+    }
+  }
+  for (const parentPath of new Set(artifactPaths.map(path.dirname))) {
+    try {
+      fsyncDirectoryIfPresent(parentPath);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  for (const targetPath of artifactPaths) {
+    try {
+      assertStrictlyAbsent(targetPath);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      `Workspace filesystem cleanup failed for ${folder}`,
+    );
+  }
 }

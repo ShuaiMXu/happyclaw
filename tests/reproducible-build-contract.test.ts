@@ -35,7 +35,10 @@ describe('reproducible build contract', () => {
         packages: Record<string, { resolved?: string }>;
       };
       for (const dependency of Object.values(lock.packages)) {
-        expect(dependency.resolved ?? '').not.toMatch(/^git\+ssh:/);
+        if (!dependency.resolved) continue;
+        const resolved = new URL(dependency.resolved);
+        expect(resolved.protocol).toBe('https:');
+        expect(resolved.hostname).toBe('registry.npmjs.org');
       }
     }
 

@@ -31,7 +31,10 @@ describe('frontend workspace interaction mode contract', () => {
 
     expect(store).toContain('body.interaction_mode = normalizeInteractionMode');
     expect(store).toContain('updateInteractionMode: async');
-    expect(store).toContain('{ interaction_mode: interactionMode }');
+    expect(store).toContain('interaction_mode: interactionMode');
+    expect(store).toContain(
+      'body.locked_model_config_id = lockedModelConfigId',
+    );
     expect(createDialog).toContain("useState<InteractionMode>('assistant')");
     expect(createDialog).toContain(
       'options.interaction_mode = interactionMode',
@@ -57,9 +60,14 @@ describe('frontend workspace interaction mode contract', () => {
     );
     expect(settingsDialog).toContain('切换会安全重启该工作区的智能体');
     expect(settingsDialog).toContain('身份、Skills、记忆与渠道绑定保持不变');
-    expect(settingsDialog).toContain('后续消息按新模式处理');
+    expect(settingsDialog).toContain('后续消息按新设置处理');
     expect(settingsDialog).toContain("saving ? '正在保存…' : '保存更改'");
     expect(settingsDialog).toContain('aria-busy={saving}');
+    // Model lock: options come from the auth-only provider list, the sentinel
+    // default maps to null, and the lock semantics are stated in the copy.
+    expect(settingsDialog).toContain('/api/config/claude/providers/options');
+    expect(settingsDialog).toContain('默认（多个模型按需调配）');
+    expect(settingsDialog).toContain('锁定后，工作区的所有对话都经过所选模型');
     expect(selector).toContain('Assistant 模式（推荐）');
     expect(selector).toContain('主动模式');
     expect(selector).toContain('一轮可以发送多条');

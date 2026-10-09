@@ -5,6 +5,8 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterAll, describe, expect, test, vi } from 'vitest';
 
+import { CURRENT_SCHEMA_VERSION } from '../src/schema-version.js';
+
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'schema-v76-external-'));
 const storeDir = path.join(root, 'store');
 const groupsDir = path.join(root, 'groups');
@@ -122,6 +124,88 @@ describe('schema v76 external capability credential scope', () => {
       lease_owner: null,
       lease_expires_at: null,
     });
+
+    const intakeColumns = migrated
+      .prepare('PRAGMA table_info(external_capability_intake_reservations)')
+      .all() as Array<{ name: string }>;
+    expect(intakeColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        'id',
+        'capability_slug',
+        'key_id',
+        'state',
+        'outcome',
+        'quota_scope',
+        'reserved_raw_bytes',
+        'observed_raw_bytes',
+        'lease_token',
+        'expires_at',
+      ]),
+    );
+    const intakeIndexes = migrated
+      .prepare(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'index'
+           AND name LIKE 'idx_external_capability_intake_%'`,
+      )
+      .all() as Array<{ name: string }>;
+    expect(intakeIndexes.map((index) => index.name)).toEqual(
+      expect.arrayContaining([
+        'idx_external_capability_intake_active',
+        'idx_external_capability_intake_capability_active',
+        'idx_external_capability_intake_key_active',
+        'idx_external_capability_intake_key_created',
+      ]),
+    );
+
+    const apiRateColumns = migrated
+      .prepare('PRAGMA table_info(external_capability_api_rate_windows)')
+      .all() as Array<{ name: string }>;
+    expect(apiRateColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        'key_id',
+        'operation',
+        'window_started_at',
+        'request_count',
+      ]),
+    );
+
+    const costReservationColumns = migrated
+      .prepare('PRAGMA table_info(external_capability_cost_reservations)')
+      .all() as Array<{ name: string }>;
+    expect(costReservationColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        'run_id',
+        'capability_slug',
+        'key_id',
+        'state',
+        'reserved_microusd',
+        'actual_microusd',
+        'lease_token',
+        'settled_at',
+      ]),
+    );
+    const usageEventColumns = migrated
+      .prepare('PRAGMA table_info(external_capability_usage_events)')
+      .all() as Array<{ name: string }>;
+    expect(usageEventColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        'event_id',
+        'run_id',
+        'provider_cost_microusd',
+        'input_tokens',
+        'output_tokens',
+        'cache_read_input_tokens',
+        'cache_creation_input_tokens',
+        'reasoning_tokens',
+      ]),
+    );
+    expect(
+      migrated
+        .prepare("SELECT value FROM router_state WHERE key = 'schema_version'")
+        .pluck()
+        .get(),
+    ).toBe(String(CURRENT_SCHEMA_VERSION));
 
     const insert = migrated.prepare(`
       INSERT INTO external_capability_runs (

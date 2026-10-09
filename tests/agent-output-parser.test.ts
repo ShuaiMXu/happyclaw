@@ -10,6 +10,7 @@ import {
   attachStdoutHandler,
   handleNonZeroExit,
   handleSuccessClose,
+  handleTimeoutClose,
   type CloseHandlerContext,
 } from '../src/agent-output-parser.js';
 import type { ContainerOutput } from '../src/container-runner.js';
@@ -273,6 +274,91 @@ describe('handleNonZeroExit — provider failure lifecycle', () => {
       }
     },
   );
+
+  test('runs the pre-resolution hook for a timeout after output settles', async () => {
+    const stdoutState = createStdoutParserState();
+    const order: string[] = [];
+    const resolved: ContainerOutput[] = [];
+
+    expect(
+      handleTimeoutClose(
+        {
+          groupName: 'external-pre-ready-timeout',
+          label: 'Container',
+          filePrefix: 'container',
+          identifier: 'container-id',
+          logsDir: '/tmp',
+          input: { prompt: 'prompt', isMain: true },
+          stdoutState,
+          stderrState: createStderrState(),
+          onOutput: async () => {},
+          beforeNonZeroErrorResolve: () => order.push('hook'),
+          resolvePromise: (output) => {
+            order.push('resolve');
+            resolved.push(output);
+          },
+          startTime: Date.now(),
+          timeoutMs: 1_000,
+        },
+        137,
+        1_000,
+        true,
+      ),
+    ).toBe(true);
+
+    await stdoutState.outputChain;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(order).toEqual(['hook', 'resolve']);
+    expect(resolved).toEqual([
+      expect.objectContaining({
+        status: 'error',
+        error: expect.stringContaining('timed out'),
+      }),
+    ]);
+  });
+
+  test('runs the pre-resolution hook for docker exit 125 after output settles', async () => {
+    const stdoutState = createStdoutParserState();
+    const order: string[] = [];
+    const resolved: ContainerOutput[] = [];
+
+    expect(
+      handleNonZeroExit(
+        {
+          groupName: 'external-pre-ready-exit',
+          label: 'Container',
+          filePrefix: 'container',
+          identifier: 'container-id',
+          logsDir: '/tmp',
+          input: { prompt: 'prompt', isMain: true },
+          stdoutState,
+          stderrState: createStderrState(),
+          onOutput: async () => {},
+          beforeNonZeroErrorResolve: () => order.push('hook'),
+          resolvePromise: (output) => {
+            order.push('resolve');
+            resolved.push(output);
+          },
+          startTime: Date.now(),
+          timeoutMs: 1_000,
+        },
+        125,
+        null,
+        10,
+        '/tmp/external-pre-ready-exit.log',
+      ),
+    ).toBe(true);
+
+    await stdoutState.outputChain;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(order).toEqual(['hook', 'resolve']);
+    expect(resolved).toEqual([
+      expect.objectContaining({
+        status: 'error',
+        error: expect.stringContaining('code 125'),
+      }),
+    ]);
+  });
 
   test('code 2 after a closed stream keeps closed, not a hard error', async () => {
     const stdoutState = createStdoutParserState();
@@ -553,10 +639,18 @@ describe('close handlers — provider failure classification carryover', () => {
 
 describe('attachStdoutHandler — framed output parsing (marker collision)', () => {
   // Helper: feed chunks through the parser and collect emitted outputs.
-  async function runParser(chunks: string[]): Promise<ContainerOutput[]> {
+  async function runBoundedParser(
+    chunks: string[],
+    maxFrameCharacters?: number,
+  ): Promise<{
+    collected: ContainerOutput[];
+    state: ReturnType<typeof createStdoutParserState>;
+    overflows: number;
+  }> {
     const stream = new PassThrough();
     const state = createStdoutParserState();
     const collected: ContainerOutput[] = [];
+    let overflows = 0;
     attachStdoutHandler(stream, state, {
       groupName: 'test',
       label: 'Test',
@@ -564,13 +658,25 @@ describe('attachStdoutHandler — framed output parsing (marker collision)', () 
       onOutput: async (o) => {
         collected.push(o);
       },
+      ...(maxFrameCharacters === undefined
+        ? {}
+        : {
+            maxFrameCharacters,
+            onFrameOverflow: () => {
+              overflows += 1;
+            },
+          }),
     });
     for (const c of chunks) stream.write(c);
     stream.end();
     // Let the stream 'data' handlers and the outputChain promise settle.
     await new Promise((r) => setTimeout(r, 10));
     await state.outputChain;
-    return collected;
+    return { collected, state, overflows };
+  }
+
+  async function runParser(chunks: string[]): Promise<ContainerOutput[]> {
+    return (await runBoundedParser(chunks)).collected;
   }
 
   const S = '---HAPPYCLAW_OUTPUT_START---';
@@ -732,6 +838,34 @@ describe('attachStdoutHandler — framed output parsing (marker collision)', () 
     expect(out).toHaveLength(1);
     expect(out[0].result).toBe(result);
     expect(out[0].newSessionId).toBe('sid-1');
+  });
+
+  test('fails closed on a one-chunk oversized framed output', async () => {
+    const frame = `${S}${JSON.stringify({
+      status: 'success',
+      result: `${S}${E}${'x'.repeat(256)}`,
+    })}${E}`;
+    const parsed = await runBoundedParser([frame, `${S}ignored`], 128);
+
+    expect(parsed.collected).toEqual([]);
+    expect(parsed.overflows).toBe(1);
+    expect(parsed.state.parseBuffer).toBe('');
+  });
+
+  test('fails closed without retaining a split oversized framed output', async () => {
+    const frame = `${S}${JSON.stringify({
+      status: 'success',
+      result: `quoted ${S} and ${E} ${'y'.repeat(256)}`,
+    })}${E}`;
+    const splitAt = frame.indexOf('y'.repeat(32)) + 64;
+    const parsed = await runBoundedParser(
+      [frame.slice(0, splitAt), frame.slice(splitAt)],
+      128,
+    );
+
+    expect(parsed.collected).toEqual([]);
+    expect(parsed.overflows).toBe(1);
+    expect(parsed.state.parseBuffer).toBe('');
   });
 
   test('emits BOTH frames when the first packs many END markers and a second frame trails', async () => {

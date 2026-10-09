@@ -26,6 +26,12 @@ export interface ProviderQuotaObservation {
   hasChargeableSavedPaymentMethod?: boolean;
 }
 
+export interface ExternalRunnerStartControl {
+  type: 'external_ready' | 'external_start_consumed';
+  protocol: 1;
+  authorizationId: string;
+}
+
 /** Framed host/runner output shared without coupling the parser to a launcher. */
 export interface ContainerOutput {
   status: 'success' | 'error' | 'stream' | 'closed';
@@ -34,6 +40,8 @@ export interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   providerFailure?: boolean;
+  /** Control-plane only; consumed by the host and never projected to chat. */
+  runnerControl?: ExternalRunnerStartControl;
   /** Control-plane only; consumed by the host and never projected to chat. */
   providerQuotaObservation?: ProviderQuotaObservation;
   providerRateLimitResetsAt?: number;

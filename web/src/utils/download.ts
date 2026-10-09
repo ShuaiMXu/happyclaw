@@ -93,6 +93,121 @@ export async function downloadFromUrl(
   triggerBlobDownload(blob, filename);
 }
 
+/** `loaded`/`total` in bytes; `total` is null when the server doesn't send Content-Length. */
+export type DownloadProgressCallback = (
+  loaded: number,
+  total: number | null,
+) => void;
+
+/**
+ * Like `downloadFromUrl`, but streams the response body so the caller can
+ * report byte-level progress — `fetch().blob()` only resolves once the whole
+ * response has arrived, giving no feedback for large files. Falls back to a
+ * single `onProgress(0, null)` call and a plain blob download on browsers/
+ * responses without a readable stream body (e.g. very old browsers or an
+ * opaque proxy that strips it) so the download still completes either way.
+ */
+export async function downloadFromUrlWithProgress(
+  url: string,
+  filename: string,
+  onProgress?: DownloadProgressCallback,
+): Promise<void> {
+  const fullUrl = url.startsWith('http') ? url : withBasePath(url);
+  const res = await fetch(fullUrl, { credentials: 'include' });
+  if (!res.ok) {
+    throw new DownloadError(res.status, await readDownloadErrorMessage(res));
+  }
+
+  const totalHeader = res.headers.get('content-length');
+  const total = totalHeader ? Number(totalHeader) : null;
+
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    onProgress?.(0, null);
+    const blob = await res.blob();
+    triggerBlobDownload(blob, filename);
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+  onProgress?.(0, total);
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      loaded += value.byteLength;
+      onProgress?.(loaded, total);
+    }
+  }
+
+  const blob = new Blob(chunks as BlobPart[], {
+    type: res.headers.get('content-type') || 'application/octet-stream',
+  });
+  triggerBlobDownload(blob, filename);
+}
+
+/**
+ * Save a Blob via the native share sheet when available, falling back to
+ * the synthetic `<a download>` blob click otherwise.
+ *
+ * On mobile — especially iOS Safari, including installed-PWA mode — the
+ * `<a download>` blob-click pattern above does NOT reliably save into the
+ * Photos/相册 app; it tends to just open the file in-place or silently do
+ * nothing. `navigator.share({ files })` surfaces the OS share sheet, which
+ * offers "存储图像/Save Image" straight into the photo library — the
+ * standard, reliable way to get this on mobile. Desktop browsers mostly
+ * don't implement file sharing (or don't have a photo library to save
+ * into), so they fall through to the existing blob-download path.
+ */
+export async function shareOrDownloadFile(
+  blob: Blob,
+  filename: string,
+): Promise<void> {
+  if (
+    typeof navigator !== 'undefined' &&
+    typeof navigator.share === 'function' &&
+    typeof navigator.canShare === 'function'
+  ) {
+    try {
+      const file = new File([blob], filename, {
+        type: blob.type || 'application/octet-stream',
+      });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file] });
+        return;
+      }
+    } catch (err) {
+      // The user dismissing the share sheet throws AbortError — that's a
+      // deliberate cancel, not a failure, so don't fall through to also
+      // triggering a second (blob-download) save attempt.
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      // Any other share failure (unsupported file type, etc.): fall
+      // through to the blob-download path below.
+    }
+  }
+  triggerBlobDownload(blob, filename);
+}
+
+/**
+ * Like `downloadFromUrl`, but saves via `shareOrDownloadFile` — prefer this
+ * for user-facing "save this image" actions (see its docs above).
+ */
+export async function shareOrDownloadFromUrl(
+  url: string,
+  filename: string,
+): Promise<void> {
+  const fullUrl = url.startsWith('http') ? url : withBasePath(url);
+  const res = await fetch(fullUrl, { credentials: 'include' });
+  if (!res.ok) {
+    throw new DownloadError(res.status, await readDownloadErrorMessage(res));
+  }
+  const blob = await res.blob();
+  await shareOrDownloadFile(blob, filename);
+}
+
 /**
  * Download a data-URL (e.g. from html-to-image / canvas) as a file.
  * Converts to Blob first to avoid browser data-URL size limits.
@@ -104,4 +219,14 @@ export async function downloadFromDataUrl(
   const res = await fetch(dataUrl);
   const blob = await res.blob();
   triggerBlobDownload(blob, filename);
+}
+
+/** Like `downloadFromDataUrl`, but saves via `shareOrDownloadFile`. */
+export async function shareOrDownloadFromDataUrl(
+  dataUrl: string,
+  filename: string,
+): Promise<void> {
+  const res = await fetch(dataUrl);
+  const blob = await res.blob();
+  await shareOrDownloadFile(blob, filename);
 }

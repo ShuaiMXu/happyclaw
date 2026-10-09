@@ -184,6 +184,38 @@ describe('automatic enabled-model pool', () => {
     }
   });
 
+  test('nonpersistent selection ignores and does not create durable bindings', () => {
+    const staleFolder = 'external-nonpersistent-stale';
+    const freshFolder = 'external-nonpersistent-fresh';
+    const agentId = 'external-run';
+    db.setSessionProviderId(staleFolder, agentId, created[2]);
+
+    try {
+      const selected = trySelectPoolProvider(staleFolder, agentId, null, null, {
+        persistSessionBinding: false,
+      });
+      expect(selected).not.toBeNull();
+      expect(selected?.previousProviderId).toBeUndefined();
+      expect(selected?.resetSession ?? false).toBe(false);
+      expect(db.getSessionProviderId(staleFolder, agentId)).toBe(created[2]);
+
+      const pinned = trySelectPoolProvider(
+        freshFolder,
+        agentId,
+        created[1],
+        null,
+        { persistSessionBinding: false },
+      );
+      expect(pinned?.profileId).toBe(created[1]);
+      expect(pinned?.previousProviderId).toBeUndefined();
+      expect(pinned?.resetSession ?? false).toBe(false);
+      expect(db.getSessionProviderId(freshFolder, agentId)).toBeUndefined();
+    } finally {
+      db.deleteSession(staleFolder, agentId);
+      db.deleteSession(freshFolder, agentId);
+    }
+  });
+
   test('a single enabled provider still resolves through the default', () => {
     runtimeConfig.setProviderEnabled(created[1], false);
     runtimeConfig.setProviderEnabled(created[2], false);

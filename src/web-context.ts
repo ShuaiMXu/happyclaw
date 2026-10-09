@@ -27,6 +27,8 @@ export interface WsClientInfo {
 }
 
 export interface WebDeps {
+  /** Process-local readiness; false until all durable startup recovery completes. */
+  startupReady: boolean;
   queue: GroupQueue;
   getRegisteredGroups: () => Record<string, RegisteredGroup>;
   sessions: Record<string, string>;
