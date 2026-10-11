@@ -2288,6 +2288,7 @@ export function providerHasCredentials(provider: UnifiedProvider): boolean {
   }
   return !!(
     provider.anthropicApiKey ||
+    provider.anthropicAuthToken ||
     provider.claudeCodeOauthToken ||
     provider.claudeOAuthCredentials
   );
@@ -3090,6 +3091,13 @@ export function mergeClaudeEnvConfig(
     anthropicAuthToken: hasExplicitAuth
       ? override.anthropicAuthToken || ''
       : override.anthropicAuthToken || global.anthropicAuthToken,
+    // The header style belongs to the provider's own token; a workspace token
+    // brings no mode and keeps the legacy inference.
+    ...(!hasExplicitAuth &&
+    !override.anthropicAuthToken &&
+    global.anthropicAuthMode
+      ? { anthropicAuthMode: global.anthropicAuthMode }
+      : {}),
     anthropicApiKey: hasExplicitAuth
       ? override.anthropicApiKey || ''
       : override.anthropicApiKey || global.anthropicApiKey,

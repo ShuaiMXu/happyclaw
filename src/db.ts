@@ -8706,6 +8706,17 @@ export function setSessionModelSelection(
   );
 }
 
+/** How many conversations currently pin this model configuration. */
+export function countSessionModelSelectionsForModelConfig(
+  modelConfigId: string,
+): number {
+  if (!isDatabaseInitialized()) return 0;
+  const row = prepareCached(`SELECT COUNT(*) AS count
+       FROM session_model_selections
+       WHERE model_config_id = ?`).get(modelConfigId) as { count: number };
+  return Number(row.count ?? 0);
+}
+
 /** Drop every Session selection pointing at a deleted model configuration. */
 export function clearSessionModelSelectionsForModelConfig(
   modelConfigId: string,

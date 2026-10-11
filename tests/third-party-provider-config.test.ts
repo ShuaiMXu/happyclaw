@@ -94,6 +94,46 @@ describe('third-party auth header', () => {
   });
 });
 
+describe('auth mode on the runner launch path', () => {
+  // Runners build their env through buildContainerEnvLines, which merges the
+  // workspace override first; the mode must survive that merge.
+  test('the provider mode reaches the runner env', () => {
+    const bearer = envOf(
+      runtimeConfig.buildContainerEnvLines(
+        config({ anthropicAuthMode: 'bearer' }),
+        {},
+        {},
+      ),
+    );
+    expect(bearer.ANTHROPIC_AUTH_TOKEN).toBe('tok-123456');
+    expect(bearer.ANTHROPIC_API_KEY).toBeUndefined();
+
+    const apiKey = envOf(
+      runtimeConfig.buildContainerEnvLines(
+        config({
+          anthropicAuthMode: 'x-api-key',
+          anthropicAuthToken: 'Bearer tok-123456',
+        }),
+        {},
+        {},
+      ),
+    );
+    expect(apiKey.ANTHROPIC_API_KEY).toBe('tok-123456');
+  });
+
+  test('a workspace token keeps the legacy inference', () => {
+    const env = envOf(
+      runtimeConfig.buildContainerEnvLines(
+        config({ anthropicAuthMode: 'bearer' }),
+        { anthropicAuthToken: 'workspace-token' },
+        {},
+      ),
+    );
+    expect(env.ANTHROPIC_API_KEY).toBe('workspace-token');
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  });
+});
+
 describe('third-party model tiers', () => {
   test('the subagent model follows the provider model like the aliases', () => {
     const env = envOf(runtimeConfig.buildClaudeEnvLines(config({}), {}));

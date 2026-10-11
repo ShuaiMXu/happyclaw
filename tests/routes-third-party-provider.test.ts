@@ -208,6 +208,26 @@ describe('third-party provider routes', () => {
     });
   });
 
+  test('an enabled provider cannot be created or left without a key', async () => {
+    const created = await request('POST', '/providers', {
+      name: 'Keyless',
+      type: 'third_party',
+      anthropicBaseUrl: 'https://relay.test',
+      enabled: true,
+    });
+    expect(created.status).toBe(400);
+
+    const provider = createThirdParty({ enabled: true });
+    const cleared = await request('PATCH', `/providers/${provider.id}`, {
+      clearAnthropicAuthToken: true,
+    });
+    expect(cleared.status).toBe(400);
+    expect(cleared.body.error).toContain('先停用');
+    expect(runtimeConfig.getProviderById(provider.id)!.anthropicAuthToken).toBe(
+      'glm-old-secret',
+    );
+  });
+
   test('test connection needs an endpoint and a key', async () => {
     const { status, body } = await request('POST', '/providers/test', {
       anthropicBaseUrl: 'https://relay.test',

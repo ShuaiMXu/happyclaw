@@ -2361,6 +2361,8 @@ function prepareVolumeMounts(
     rawGlobalConfig.anthropicBaseUrl,
   );
   const providerNeedsHostGateway = containerBaseUrl.addHostGateway;
+  const providerRoutedToHost =
+    containerBaseUrl.baseUrl !== codexLaunchConfig.anthropicBaseUrl;
   const containerOverride = getContainerEnvConfig(group.folder);
   const effectiveContainerOverride = resolvedProvider
     ? { customEnv: containerOverride.customEnv }
@@ -2403,14 +2405,28 @@ function prepareVolumeMounts(
   );
   applyFallbackModelToEnvLines(envLines, containerTierEnv.runnerFallbackModel);
   if (containerTierEnv.model) {
+    const walledSubagentLine = `CLAUDE_CODE_SUBAGENT_MODEL=${rawGlobalConfig.anthropicModel}`;
+    let subagentFollowedPrimary = false;
     for (let i = envLines.length - 1; i >= 0; i--) {
       if (envLines[i].startsWith('ANTHROPIC_MODEL=')) envLines.splice(i, 1);
+      else if (envLines[i] === walledSubagentLine) {
+        envLines.splice(i, 1);
+        subagentFollowedPrimary = true;
+      }
     }
     envLines.push(`ANTHROPIC_MODEL=${containerTierEnv.model}`);
+    // Subagents that followed the walled primary model escalate with it.
+    if (subagentFollowedPrimary) {
+      envLines.push(`CLAUDE_CODE_SUBAGENT_MODEL=${containerTierEnv.model}`);
+    }
   }
   applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
   applyContainerProxyEnvLines(envLines, containerProxy.envLines);
-  if (usesCodexGateway) applyCodexGatewayNoProxyToEnvLines(envLines);
+  // Both the gateway and a rewritten loopback relay live on
+  // host.docker.internal, which a forwarded host proxy cannot resolve.
+  if (usesCodexGateway || providerRoutedToHost) {
+    applyCodexGatewayNoProxyToEnvLines(envLines);
+  }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -4235,7 +4251,16 @@ export async function runHostAgent(
     } else {
       delete hostEnv['HAPPYCLAW_FALLBACK_MODEL'];
     }
-    if (tierEnv.model) hostEnv['ANTHROPIC_MODEL'] = tierEnv.model;
+    if (tierEnv.model) {
+      // Subagents that followed the walled primary model escalate with it.
+      if (
+        hostEnv['CLAUDE_CODE_SUBAGENT_MODEL'] &&
+        hostEnv['CLAUDE_CODE_SUBAGENT_MODEL'] === rawGlobalConfig.anthropicModel
+      ) {
+        hostEnv['CLAUDE_CODE_SUBAGENT_MODEL'] = tierEnv.model;
+      }
+      hostEnv['ANTHROPIC_MODEL'] = tierEnv.model;
+    }
     if (isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl)) {
       applyCodexGatewayNoProxy(hostEnv, 'host');
     }

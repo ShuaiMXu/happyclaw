@@ -122,6 +122,7 @@ describe('session model selection storage', () => {
   test('deleting a model configuration clears every selection of it', () => {
     db.setSessionModelSelection('grp', null, 'B');
     db.setSessionModelSelection('grp', 'agent-1', 'B');
+    expect(db.countSessionModelSelectionsForModelConfig('B')).toBe(2);
     expect(db.clearSessionModelSelectionsForModelConfig('B')).toBe(2);
     expect(db.getSessionModelSelection('grp', null)).toBeNull();
     expect(db.getSessionModelSelection('grp', 'agent-1')).toBeNull();

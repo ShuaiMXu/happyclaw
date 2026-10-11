@@ -45,6 +45,7 @@ import {
   updateAgentLastImJid,
   clearSessionModelSelectionsForModelConfig,
   countAgentProfilesByModelConfigId,
+  countSessionModelSelectionsForModelConfig,
 } from '../db.js';
 import {
   channelConversationJid,
@@ -593,6 +594,19 @@ function syncProviderSessionCaches(affectedFolders: string[]): void {
       delete deps.sessions[folder];
     }
   }
+}
+
+/**
+ * Whether runners may be using this provider. The automatic pool only picks
+ * enabled ones, but an Agent binding or a conversation's model pick can run
+ * any saved configuration — those need the same runtime cleanup on a change.
+ */
+function providerMayHaveRunners(provider: UnifiedProvider): boolean {
+  return (
+    provider.enabled ||
+    countAgentProfilesByModelConfigId(provider.id) > 0 ||
+    countSessionModelSelectionsForModelConfig(provider.id) > 0
+  );
 }
 
 function commitProviderConfigWithSessionInvalidation<T>(
@@ -1267,7 +1281,7 @@ async function commitProviderCredentialUpdate(
       }
     });
   };
-  if (previous.enabled && !sameAccount) {
+  if (providerMayHaveRunners(previous) && !sameAccount) {
     return mutateClaudeConfigForAllGroups(
       actor,
       { trigger: audit.trigger, providerId: id },
@@ -1419,6 +1433,20 @@ configRoutes.post(
 
     const envError = validateProviderCustomEnv(validation.data.customEnv ?? {});
     if (envError) return c.json({ error: envError }, 400);
+    if (validation.data.enabled) {
+      const draft = validation.data;
+      const hasCredential = !!(
+        draft.anthropicAuthToken?.trim() ||
+        draft.anthropicApiKey?.trim() ||
+        (draft.type === 'official' &&
+          (draft.claudeCodeOauthToken?.trim() ||
+            draft.claudeOAuthCredentials ||
+            draft.claudeCredentialInput?.trim()))
+      );
+      if (!hasCredential) {
+        return c.json({ error: '启用的模型配置必须带有可用的凭据' }, 400);
+      }
+    }
 
     const actor = (c.get('user') as AuthUser).username;
     const { claudeCredentialInput, ...createInput } = validation.data;
@@ -1493,6 +1521,13 @@ configRoutes.patch(
         if (tokenChange && previous.codexOAuthCredentials) {
           throw new Error('ChatGPT 订阅配置的网关凭据由系统管理');
         }
+        if (
+          clearAnthropicAuthToken &&
+          previous.enabled &&
+          !previous.anthropicApiKey
+        ) {
+          throw new Error('该配置正在启用，请先停用再清空密钥');
+        }
         const changedFields = Object.keys(validation.data).map(
           (k) => `${k}:updated`,
         );
@@ -1564,7 +1599,7 @@ configRoutes.patch(
         };
 
         let mutation: ClaudeMutationResult<ReturnType<typeof updateProvider>>;
-        if (previous.enabled) {
+        if (providerMayHaveRunners(previous)) {
           mutation = await mutateClaudeConfigForAllGroups(
             actor,
             metadata,
