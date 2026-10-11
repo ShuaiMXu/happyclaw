@@ -156,6 +156,34 @@ describe('ChatGPT subscription editor', () => {
     );
   });
 
+  test('the offline catalog marks the same default effort as the server', async () => {
+    await render({
+      ...codexProvider,
+      anthropicModel: 'gpt-6-astra',
+      codexOAuthNeedsReauth: false,
+      codexOAuthLastRefreshError: null,
+      codexDefaultEffort: undefined,
+    });
+    const effort = document.querySelector(
+      '#codex-effort-select',
+    ) as HTMLSelectElement;
+    // No stored or resolved effort: the catalog default (gpt-6.1-sol's) applies.
+    expect(effort.value).toBe('low');
+    expect(
+      [...effort.options].find((option) => option.text.endsWith('（默认）'))
+        ?.value,
+    ).toBe('low');
+    const models = [
+      ...(document.querySelector('#codex-model-select') as HTMLSelectElement)
+        .options,
+    ].map((option) => option.value);
+    expect(models.slice(0, 3)).toEqual([
+      'gpt-6.1-sol',
+      'gpt-6-astra',
+      'gpt-6-sol',
+    ]);
+  });
+
   test('a spent code sends the user back to log in again', async () => {
     mocks.post
       .mockResolvedValueOnce({ authorizeUrl: 'https://x.test', state: 's' })
