@@ -14,6 +14,11 @@ import {
   decodeReasoningSignature,
   encodeReasoningSignature,
 } from '../src/codex-gateway/reasoning-signature.js';
+import {
+  estimateCodexInputTokens,
+  estimateEncryptedReasoningTokens,
+  estimateTextTokens,
+} from '../src/codex-gateway/token-estimate.js';
 
 describe('reasoning-signature', () => {
   test('round-trips id and encrypted content through the signature field', () => {
@@ -730,4 +735,57 @@ describe('multimodal tool result round trip', () => {
       expect(request.input).toHaveLength(2);
     },
   );
+});
+
+describe('local token estimate', () => {
+  test('JSON and code count about 3.2 characters per token, prose about 4', () => {
+    const prose = 'The quick brown fox jumps over the lazy dog again. '.repeat(
+      20,
+    );
+    expect(estimateTextTokens(prose)).toBe(Math.ceil(prose.length / 4));
+    const code = JSON.stringify({ items: [{ id: 1, path: 'a/b.ts' }] }).repeat(
+      20,
+    );
+    expect(estimateTextTokens(code)).toBe(Math.ceil(code.length / 3.2));
+    // Serialized structure uses the code ratio even when it reads as prose.
+    expect(estimateTextTokens(prose, true)).toBe(Math.ceil(prose.length / 3.2));
+    expect(estimateTextTokens('你好世界')).toBe(4);
+  });
+
+  test('replayed encrypted reasoning counts by ciphertext length like the official client', () => {
+    expect(estimateEncryptedReasoningTokens('x'.repeat(800))).toBe(0);
+    // (4000 * 3/4 - 650) bytes at 4 bytes per token.
+    expect(estimateEncryptedReasoningTokens('x'.repeat(4000))).toBe(588);
+    const request = anthropicToResponses(
+      {
+        messages: [
+          { role: 'user', content: 'hi' },
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'thinking',
+                thinking: 'summary',
+                signature: encodeReasoningSignature({
+                  id: 'rs_1',
+                  encryptedContent: 'c'.repeat(4000),
+                })!,
+              },
+              { type: 'text', text: 'ok' },
+            ],
+          },
+          { role: 'user', content: 'next' },
+        ],
+      },
+      { targetModel: 'gpt-6-sol' },
+    );
+    const withoutReasoning = {
+      ...request,
+      input: request.input.filter((item) => item.type !== 'reasoning'),
+    };
+    expect(
+      estimateCodexInputTokens(request) -
+        estimateCodexInputTokens(withoutReasoning),
+    ).toBe(3 + 588);
+  });
 });

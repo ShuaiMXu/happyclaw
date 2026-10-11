@@ -165,7 +165,8 @@ describe('Codex upstream failure semantics', () => {
 
     test.each([
       [{ code: 'server_is_overloaded' }, 'overloaded_error', 529],
-      [{ code: 'slow_down' }, 'overloaded_error', 529],
+      // Official RateLimitExceeded, not ServerOverloaded.
+      [{ code: 'slow_down' }, 'rate_limit_error', 429],
       [{ type: 'service_unavailable_error' }, 'overloaded_error', 529],
       [{ code: 'usage_not_included' }, 'permission_error', 403],
       [{ type: 'usage_not_included' }, 'permission_error', 403],
@@ -183,6 +184,110 @@ describe('Codex upstream failure semantics', () => {
       const failure = describeUpstreamFailure({ type: 'error', error });
       expect(failure.type).toBe(type);
       expect(upstreamFailureStatus(failure)).toBe(status);
+    });
+
+    test.each([
+      'insufficient_quota',
+      'credit_balance_exhausted',
+      'organization_spend_limit_exceeded',
+      'project_spend_limit_exceeded',
+      'organization_usage_limit_exceeded',
+    ])('quota code %s is a terminal rate limit', (code) => {
+      for (const error of [{ code }, { type: code }]) {
+        const failure = describeUpstreamFailure({ type: 'error', error });
+        expect(failure).toMatchObject({
+          type: 'rate_limit_error',
+          status: 429,
+          noRetry: true,
+        });
+        expect(failure.message).toContain(code);
+      }
+    });
+
+    test.each([
+      ['cyber_policy', 'cybersecurity risk'],
+      ['bio_policy', 'biological risk'],
+      ['misalignment_policy_violation', 'misalignment policy'],
+      ['invalid_prompt', 'Invalid request.'],
+    ])(
+      'policy code %s is a terminal invalid request with its fallback text',
+      (code, fallback) => {
+        const failure = describeUpstreamFailure({
+          type: 'response.failed',
+          response: { error: { code, message: '  ' } },
+        });
+        expect(failure).toMatchObject({
+          type: 'invalid_request_error',
+          status: 400,
+          noRetry: true,
+        });
+        expect(failure.message).toContain(fallback);
+        // HTTP 403 rejections classify the same way (api_bridge.rs).
+        expect(
+          describeUpstreamHttpFailure(
+            403,
+            JSON.stringify({ error: { code, message: 'blocked' } }),
+          ),
+        ).toMatchObject({ type: 'invalid_request_error', status: 400 });
+      },
+    );
+
+    test('a policy code that collides with an Object property is not a policy', () => {
+      expect(
+        describeUpstreamFailure({ error: { code: 'constructor' } }).noRetry,
+      ).toBeUndefined();
+    });
+
+    test.each([
+      ['Rate limit reached. Please try again in 1.5s.', 1.5],
+      ['Please try again in 500ms', 0.5],
+      ['Try again in 20 seconds', 20],
+    ])('rate limits read the retry delay from %j', (message, seconds) => {
+      for (const code of ['rate_limit_exceeded', 'slow_down'])
+        expect(
+          describeUpstreamFailure({ error: { code, message } }),
+        ).toMatchObject({
+          type: 'rate_limit_error',
+          status: 429,
+          retryAfterSeconds: seconds,
+        });
+    });
+
+    test('only rate limits parse delays out of message text', () => {
+      expect(
+        describeUpstreamFailure({
+          error: { code: 'server_error', message: 'try again in 5s' },
+        }).retryAfterSeconds,
+      ).toBeUndefined();
+    });
+
+    test('a streamed error carries Retry-After in error.headers', () => {
+      const failed = (code: string, retryAfter: unknown) => ({
+        type: 'response.failed',
+        response: {
+          error: {
+            code,
+            message: 'try again in 9s',
+            headers: { 'Retry-After': retryAfter },
+          },
+        },
+      });
+      // The header wins over the message text.
+      expect(
+        describeUpstreamFailure(failed('rate_limit_exceeded', '4')),
+      ).toMatchObject({ retryAfterSeconds: 4 });
+      expect(
+        describeUpstreamFailure(failed('server_is_overloaded', ['7'])),
+      ).toMatchObject({ type: 'overloaded_error', retryAfterSeconds: 7 });
+      expect(
+        describeUpstreamFailure(
+          failed('server_error', new Date(now + 30_000).toUTCString()),
+          { now },
+        ),
+      ).toMatchObject({ type: 'api_error', retryAfterSeconds: 30 });
+      expect(
+        describeUpstreamFailure(failed('server_error', 'soon')),
+      ).not.toHaveProperty('retryAfterSeconds');
     });
 
     test('context-length failures start with the wording Claude Code compacts on', () => {

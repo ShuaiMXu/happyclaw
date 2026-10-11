@@ -849,3 +849,75 @@ describe('Claude provider usage route', () => {
     expect(globalThis.fetch).toHaveBeenCalledOnce();
   });
 });
+
+describe('Codex provider usage route', () => {
+  test('returns the gateway rate-limit snapshot without calling any upstream', async () => {
+    const { CODEX_GATEWAY_BASE_URL_PLACEHOLDER } =
+      await import('../src/codex-gateway/types.js');
+    const rateLimits =
+      await import('../src/codex-gateway/rate-limit-snapshot.js');
+    const provider = runtimeConfig.createProvider({
+      name: 'ChatGPT fixture provider',
+      type: 'third_party',
+      enabled: true,
+      anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+      anthropicAuthToken: 'codex-internal-identifier',
+      anthropicModel: 'gpt-6-sol',
+    });
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error('no upstream call expected');
+    });
+    const usageUrl = `/api/config/claude/providers/${provider.id}/usage`;
+    expect(await (await app.request(usageUrl)).json()).toEqual({
+      kind: 'codex_rate_limits',
+      observedAt: null,
+      activeLimit: null,
+      rateLimitReachedType: null,
+      limits: [],
+    });
+
+    rateLimits.recordCodexRateLimitHeaders(
+      provider.id,
+      new Headers({
+        'x-codex-primary-used-percent': '42.5',
+        'x-codex-primary-window-minutes': '300',
+        'x-codex-primary-reset-at': '1788303600',
+        'x-codex-secondary-used-percent': '12',
+        'x-codex-secondary-window-minutes': '10080',
+        'x-codex-secondary-reset-at': '1788800000',
+        'x-codex-credits-has-credits': 'true',
+        'x-codex-credits-unlimited': 'false',
+        'x-codex-credits-balance': '7.50',
+        'x-codex-active-limit': 'codex',
+      }),
+      { ok: true, now: 1_788_300_000_000 },
+    );
+    const response = await app.request(usageUrl);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      kind: 'codex_rate_limits',
+      observedAt: 1_788_300_000_000,
+      activeLimit: 'codex',
+      rateLimitReachedType: null,
+      limits: [
+        {
+          limitId: 'codex',
+          limitName: null,
+          primary: {
+            usedPercent: 42.5,
+            windowMinutes: 300,
+            resetsAt: 1_788_303_600,
+          },
+          secondary: {
+            usedPercent: 12,
+            windowMinutes: 10080,
+            resetsAt: 1_788_800_000,
+          },
+          credits: { hasCredits: true, unlimited: false, balance: '7.50' },
+        },
+      ],
+    });
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    rateLimits.clearCodexProviderRateLimits(provider.id);
+  });
+});

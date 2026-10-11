@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import {
   aggregateResponsesStream,
+  assembleAnthropicMessage,
   ResponsesToAnthropicConverter,
   type AnthropicStreamEvent,
 } from '../src/codex-gateway/convert-response.js';
@@ -1227,5 +1228,312 @@ describe('Responses to Anthropic compatibility and ownership', () => {
         arguments: '{"different":1}',
       }),
     ).toThrow(expect.objectContaining({ code: 'invalid_stream' }));
+  });
+});
+
+describe('official turn semantics on the Anthropic side', () => {
+  const text = (delta: string, item_id = 'msg_1') => ({
+    type: 'response.output_text.delta',
+    item_id,
+    output_index: 0,
+    content_index: 0,
+    delta,
+  });
+  const message = (id: string, value: string) => ({
+    type: 'message',
+    id,
+    role: 'assistant',
+    status: 'completed',
+    content: [{ type: 'output_text', text: value, annotations: [] }],
+  });
+  const reasoning = {
+    type: 'reasoning',
+    id: 'rs_1',
+    summary: [{ type: 'summary_text', text: 'plan' }],
+    encrypted_content: 'cipher-1',
+  };
+  const usage = (input: number, cached: number, output: number) => ({
+    input_tokens: input,
+    input_tokens_details: { cached_tokens: cached },
+    output_tokens: output,
+  });
+
+  test('end_turn: false keeps one message open and replays the items a follow-up needs', () => {
+    const converter = new ResponsesToAnthropicConverter('gpt-6-sol', {
+      maxFollowUps: 4,
+      inputTokenEstimate: 900,
+    });
+    const wire = [
+      created,
+      added(reasoning),
+      done(reasoning),
+      added({ ...message('msg_1', ''), content: [] }, 1),
+      text('Hello '),
+      done(message('msg_1', 'Hello '), 1),
+      {
+        type: 'response.completed',
+        response: { end_turn: false, usage: usage(1000, 600, 20) },
+      },
+    ].flatMap((event) => converter.handleEvent(event));
+    expect(wire.map(({ event }) => event)).not.toContain('message_delta');
+    expect(converter.pendingFollowUp()).toEqual([
+      {
+        type: 'reasoning',
+        id: 'rs_1',
+        summary: [{ type: 'summary_text', text: 'plan' }],
+        encrypted_content: 'cipher-1',
+      },
+      {
+        type: 'message',
+        id: 'msg_1',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'Hello ', annotations: [] }],
+        status: 'completed',
+      },
+    ]);
+    converter.beginFollowUp();
+    expect(converter.pendingFollowUp()).toBeNull();
+    wire.push(
+      ...[
+        { ...created, response: { id: 'r2', model: 'gpt-6-sol' } },
+        text('world', 'msg_2'),
+        done(message('msg_2', 'world')),
+        {
+          type: 'response.completed',
+          response: { usage: usage(1100, 1000, 5) },
+        },
+      ].flatMap((event) => converter.handleEvent(event)),
+    );
+    wire.push(...converter.finish());
+    const result = consume(wire);
+    expect(result.content.map((block) => block.text ?? block.thinking)).toEqual(
+      ['plan', 'Hello ', 'world'],
+    );
+    expect(result.stopReason).toBe('end_turn');
+    // Usage of both upstream responses, cache-exclusive.
+    expect(result.usage).toEqual({
+      input_tokens: 500,
+      output_tokens: 25,
+      cache_read_input_tokens: 1600,
+    });
+    expect(wire[0].data.message).toMatchObject({
+      usage: { input_tokens: 900, output_tokens: 0 },
+    });
+  });
+
+  test('an interrupted incomplete follows up; other incompletes and exhausted budgets end the message', () => {
+    const interrupted = {
+      type: 'response.incomplete',
+      response: {
+        incomplete_details: { reason: 'interrupted' },
+        usage: { output_tokens: 0 },
+      },
+    };
+    const converter = new ResponsesToAnthropicConverter('gpt-6-sol', {
+      maxFollowUps: 1,
+    });
+    // An empty interrupted response is a continuation, not an empty abort.
+    const wire = converter.handleEvent(interrupted);
+    expect(wire[0].event).toBe('message_start');
+    expect(converter.getFailure()).toBeNull();
+    expect(converter.pendingFollowUp()).toEqual([]);
+    converter.beginFollowUp();
+    wire.push(
+      ...[text('late'), interrupted].flatMap((event) =>
+        converter.handleEvent(event),
+      ),
+    );
+    // The budget is spent: the second interruption ends the message.
+    expect(converter.pendingFollowUp()).toBeNull();
+    expect(consume(wire).stopReason).toBe('end_turn');
+    // Without a follow-up budget, end_turn: false completes as before.
+    expect(
+      translate([
+        created,
+        text('only'),
+        { type: 'response.completed', response: { end_turn: false } },
+      ]).message.stopReason,
+    ).toBe('end_turn');
+  });
+
+  test('a response with a tool call ends the message for the client to run it', () => {
+    const converter = new ResponsesToAnthropicConverter('gpt-6-sol', {
+      maxFollowUps: 4,
+    });
+    const call = tool('a', 'Read', '{"path":"x"}');
+    const wire = [
+      created,
+      added(call),
+      done(call),
+      { type: 'response.completed', response: { end_turn: false } },
+    ].flatMap((event) => converter.handleEvent(event));
+    expect(converter.pendingFollowUp()).toBeNull();
+    expect(consume(wire).stopReason).toBe('tool_use');
+  });
+
+  test('aggregation assembles a followed-up message like the stream', () => {
+    const converter = new ResponsesToAnthropicConverter('gpt-6-sol', {
+      maxFollowUps: 2,
+    });
+    const events = [
+      created,
+      text('A'),
+      done(message('msg_1', 'A')),
+      { type: 'response.completed', response: { end_turn: false } },
+    ].flatMap((event) => converter.handleEvent(event));
+    converter.beginFollowUp();
+    events.push(
+      ...[text('B', 'msg_2'), done(message('msg_2', 'B')), completed].flatMap(
+        (event) => converter.handleEvent(event),
+      ),
+    );
+    events.push(...converter.finish());
+    expect(
+      assembleAnthropicMessage(events, converter, 'gpt-6-sol').content,
+    ).toEqual([
+      { type: 'text', text: 'A' },
+      { type: 'text', text: 'B' },
+    ]);
+  });
+
+  test('a call cut by max_output_tokens ends with max_tokens and is never runnable', () => {
+    const truncated = {
+      type: 'response.incomplete',
+      response: {
+        incomplete_details: { reason: 'max_output_tokens' },
+        usage: { output_tokens: 64 },
+      },
+    };
+    // Already streaming downstream: the block closes as is.
+    const started = [
+      created,
+      added(tool('a')),
+      {
+        type: 'response.function_call_arguments.delta',
+        item_id: 'fc_a',
+        delta: '{"path":"/very/lo',
+      },
+      truncated,
+    ];
+    const converter = new ResponsesToAnthropicConverter('gpt-6-sol');
+    const wire = started.flatMap((event) => converter.handleEvent(event));
+    expect(converter.getFailure()).toBeNull();
+    const events = wire.map(({ event }) => event);
+    expect(events).toContain('content_block_stop');
+    expect(
+      wire.find(({ event }) => event === 'message_delta')?.data.delta,
+    ).toMatchObject({ stop_reason: 'max_tokens' });
+    const aggregated = aggregateResponsesStream(started, 'gpt-6-sol');
+    expect(aggregated.stopReason).toBe('max_tokens');
+    expect(aggregated.content).toEqual([]);
+
+    // Queued behind text, never started: dropped entirely.
+    const queued = [
+      created,
+      text('Writing the file now'),
+      added(tool('b'), 1),
+      {
+        type: 'response.function_call_arguments.delta',
+        item_id: 'fc_b',
+        output_index: 1,
+        delta: '{"content":"',
+      },
+      truncated,
+    ];
+    const result = translate(queued).message;
+    expect(result.stopReason).toBe('max_tokens');
+    expect(result.content).toEqual([
+      { type: 'text', text: 'Writing the file now' },
+    ]);
+    expect(aggregateResponsesStream(queued, 'gpt-6-sol').content).toEqual(
+      result.content,
+    );
+  });
+
+  test('a truncated turn reports max_tokens even after a complete call', () => {
+    const call = tool('a', 'Read', '{}');
+    expect(
+      translate([
+        created,
+        added(call),
+        done(call),
+        {
+          type: 'response.incomplete',
+          response: { incomplete_details: { reason: 'max_output_tokens' } },
+        },
+      ]).message.stopReason,
+    ).toBe('max_tokens');
+  });
+
+  test('refusal content without a tool call stops with refusal', () => {
+    const refusal = {
+      type: 'message',
+      id: 'msg_r',
+      content: [{ type: 'refusal', refusal: 'I cannot help with that.' }],
+    };
+    const streamed = translate([
+      created,
+      {
+        type: 'response.content_part.added',
+        item_id: 'msg_r',
+        output_index: 0,
+        content_index: 0,
+        part: { type: 'refusal', refusal: '' },
+      },
+      {
+        type: 'response.refusal.delta',
+        item_id: 'msg_r',
+        output_index: 0,
+        content_index: 0,
+        delta: 'I cannot help with that.',
+      },
+      done(refusal),
+      completed,
+    ]).message;
+    expect(streamed.stopReason).toBe('refusal');
+    expect(streamed.content).toEqual([
+      { type: 'text', text: 'I cannot help with that.' },
+    ]);
+    const terminalOnly = [
+      { type: 'response.completed', response: { output: [refusal] } },
+    ];
+    expect(aggregateResponsesStream(terminalOnly, 'gpt-6-sol').stopReason).toBe(
+      'refusal',
+    );
+  });
+
+  test('a fully cached prompt still leaves Claude Code an exact total', () => {
+    const converter = new ResponsesToAnthropicConverter('gpt-6-sol', {
+      inputTokenEstimate: 4000,
+    });
+    const wire = [
+      created,
+      text('ok'),
+      {
+        type: 'response.completed',
+        response: { usage: usage(5000, 5000, 3) },
+      },
+    ].flatMap((event) => converter.handleEvent(event));
+    const start = wire[0].data.message as Json;
+    const delta = wire.find(({ event }) => event === 'message_delta')!.data
+      .usage as Json;
+    // Claude Code keeps message_start's input_tokens when the delta reports 0.
+    const kept = (field: string) =>
+      delta[field] > 0 ? delta[field] : (start.usage[field] ?? 0);
+    expect(delta).toMatchObject({
+      input_tokens: 1,
+      cache_read_input_tokens: 4999,
+    });
+    expect(
+      kept('input_tokens') +
+        kept('cache_read_input_tokens') +
+        kept('cache_creation_input_tokens'),
+    ).toBe(5000);
+    // Without an estimate the split is reported unchanged.
+    expect(
+      translate([
+        { type: 'response.completed', response: { usage: usage(50, 50, 1) } },
+      ]).message.usage,
+    ).toMatchObject({ input_tokens: 0, cache_read_input_tokens: 50 });
   });
 });

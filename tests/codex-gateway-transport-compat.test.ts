@@ -643,45 +643,47 @@ describe('Codex executor transport compatibility', () => {
   });
 
   test.each(['{PRIVATE_INVALID_JSON', 'null', '[]', '"string"', '{"type":42}'])(
-    'malformed data %j fails rather than losing a frame and reporting success',
+    'malformed data %j is counted and skipped like the official client',
     async (data) => {
       mocks.fetch.mockResolvedValue(
-        upstream(frame(created) + `data: ${data}\n\n` + frame(completed)),
+        upstream(
+          frame(created) +
+            `data: ${data}\n\n` +
+            frame(delta) +
+            `data: ${data}\n\n` +
+            frame(completed),
+        ),
       );
       const response = await request();
-      expect(response.status).toBe(502);
+      expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({
-        error: { type: 'api_error' },
+        content: [{ type: 'text', text: '你好 🌍' }],
+        stop_reason: 'end_turn',
       });
-      expect(JSON.stringify(mocks.logger.warn.mock.calls)).not.toContain(
-        'PRIVATE_INVALID_JSON',
+      const logged = JSON.stringify(mocks.logger.warn.mock.calls);
+      expect(logged).not.toContain('PRIVATE_INVALID_JSON');
+      expect(logged).toContain('"invalidFrames":2');
+      expect(JSON.stringify(mocks.logger.info.mock.calls)).toContain(
+        '"invalidFrames":2',
       );
     },
   );
 
-  test('a malformed streaming frame produces error with no successful terminal', async () => {
-    mocks.fetch.mockResolvedValue(
-      upstream(
-        frame(created) + frame(delta) + 'data: {broken\n\n' + frame(completed),
-      ),
-    );
-    const response = await request(true);
-    expect(response.status).toBe(200);
-    const body = await response.text();
-    expect(body).toContain('event: error');
-    expect(body).not.toContain('event: message_stop');
-  });
-
-  test('a malformed frame before any content fails the stream with a real status', async () => {
-    mocks.fetch.mockResolvedValue(
-      upstream(frame(created) + 'data: {broken\n\n' + frame(completed)),
-    );
-    const response = await request(true);
-    expect(response.status).toBe(502);
-    expect(await response.json()).toMatchObject({
-      error: { type: 'api_error' },
-    });
-  });
+  test.each([
+    ['after content', frame(created) + frame(delta) + 'data: {broken\n\n'],
+    ['before content', frame(created) + 'data: {broken\n\n' + frame(delta)],
+  ])(
+    'a malformed streaming frame %s is skipped and the stream completes',
+    async (_label, prefix) => {
+      mocks.fetch.mockResolvedValue(upstream(prefix + frame(completed)));
+      const response = await request(true);
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain('你好 🌍');
+      expect(body).not.toContain('event: error');
+      expect(body.match(/event: message_stop/g)).toHaveLength(1);
+    },
+  );
 
   test('[DONE] without a Responses terminal cannot fabricate a successful completion', async () => {
     const cancel = vi.fn();
@@ -724,6 +726,7 @@ describe('Codex executor transport compatibility', () => {
   ])(
     'HTTP %s maps to %s Anthropic %s with a bounded body and safe headers',
     async (status, mapped, type) => {
+      vi.useFakeTimers();
       const cancel = vi.fn();
       mocks.fetch.mockResolvedValue(
         new Response(
@@ -743,7 +746,11 @@ describe('Codex executor transport compatibility', () => {
           },
         ),
       );
-      const response = await request();
+      const pending = request();
+      // 5xx answers retry four times, honoring Retry-After: 3.
+      await vi.advanceTimersByTimeAsync(15_000);
+      const response = await pending;
+      expect(mocks.fetch).toHaveBeenCalledTimes(Number(status) >= 500 ? 5 : 1);
       expect(response.status).toBe(mapped);
       expect(await response.json()).toMatchObject({ error: { type } });
       expect(response.headers.get('retry-after')).toBe('3');
@@ -755,12 +762,16 @@ describe('Codex executor transport compatibility', () => {
   );
 
   test('an HTML error page is not echoed into the error message', async () => {
-    mocks.fetch.mockResolvedValue(
-      new Response('<html><body>PRIVATE edge page</body></html>', {
-        status: 502,
-      }),
+    vi.useFakeTimers();
+    mocks.fetch.mockImplementation(
+      async () =>
+        new Response('<html><body>PRIVATE edge page</body></html>', {
+          status: 502,
+        }),
     );
-    const response = await request();
+    const pending = request();
+    await vi.advanceTimersByTimeAsync(10_000);
+    const response = await pending;
     expect(response.status).toBe(502);
     const { error } = await response.json();
     expect(error.message).not.toContain('PRIVATE');

@@ -41,6 +41,11 @@ const { issueCodexGatewayToken, revokeCodexGatewayToken } =
   await import('../src/codex-gateway/runner-tokens.js');
 const { resetCodexTokenManagerForTests } =
   await import('../src/codex-gateway/token-manager.js');
+const { encodeReasoningSignature } =
+  await import('../src/codex-gateway/reasoning-signature.js');
+const { clearCodexProviderRateLimits, getCodexProviderRateLimits } =
+  await import('../src/codex-gateway/rate-limit-snapshot.js');
+const { providerPool } = await import('../src/provider-pool.js');
 let fixtureNumber = 0;
 let runnerToken: string;
 let runnerGrant: ReturnType<typeof issueCodexGatewayToken>['grant'];
@@ -133,6 +138,8 @@ beforeEach(() => {
     provider.codexOAuthLastRefreshError = state;
     return true;
   });
+  // Drop once-implementations a failed test may have left queued.
+  mocks.fetch.mockReset();
   mocks.fetch.mockImplementation(async () => upstreamEvents());
   vi.stubGlobal('fetch', mocks.fetch);
   ({ token: runnerToken, grant: runnerGrant } = issueCodexGatewayToken(
@@ -624,19 +631,26 @@ describe('Codex gateway HTTP boundary', () => {
     const response = await pendingResponse;
     expect(response.status).toBe(200);
     const reader = response.body!.getReader();
-    await reader.read(); // message_start
-    await reader.read(); // ping
-    const pending = reader.read();
+    const decoder = new TextDecoder();
+    const chunks: string[] = [];
+    const drained = (async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        chunks.push(decoder.decode(value));
+      }
+    })();
     // A quiet reasoning phase is not a stall before the 300s idle deadline.
     await vi.advanceTimersByTimeAsync(200_000);
     expect(cancel).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(100_000);
-    const chunk = await pending;
-    const text = new TextDecoder().decode(chunk.value);
+    await drained;
+    const text = chunks.join('');
     expect(text).toContain('event: error');
+    expect(text).toContain('Upstream Codex stream timed out');
     expect(text).not.toContain('event: message_stop');
-    expect((await reader.read()).done).toBe(true);
     expect(cancel).toHaveBeenCalled();
+    expect(runnerGrant.lastVerdict).toBe('upstream_failure');
   });
 
   test('an upstream error body is read only up to its bound, redacted, and never logged', async () => {
@@ -761,15 +775,25 @@ describe('upstream 401 handling', () => {
     expect(runnerGrant.lastVerdict).toBe('local_transient');
   });
 
-  test('a second 401 after a successful refresh is surfaced, not retried again', async () => {
+  test('a second 401 after a successful refresh needs a new login and stops client retries', async () => {
     mocks.fetch
       .mockResolvedValueOnce(jsonResponse(401, {}))
       .mockResolvedValueOnce(refreshed())
-      .mockResolvedValueOnce(jsonResponse(401, {}));
+      .mockResolvedValueOnce(
+        new Response('{}', {
+          status: 401,
+          headers: { 'x-request-id': 'req-401', 'cf-ray': 'ray-401' },
+        }),
+      );
     const response = await request();
     expect(response.status).toBe(401);
     expect(mocks.fetch).toHaveBeenCalledTimes(3);
+    // Retrying would only refresh again: Claude Code must surface it.
+    expect(response.headers.get('x-should-retry')).toBe('false');
     expect((await response.json()).error.message).toContain('重新登录');
+    expect(runnerGrant.lastVerdict).toBe('reauth_required');
+    expect(JSON.stringify(mocks.logger.warn.mock.calls)).toContain('req-401');
+    expect(JSON.stringify(mocks.logger.warn.mock.calls)).toContain('ray-401');
   });
 });
 
@@ -803,8 +827,8 @@ describe('upstream error mapping', () => {
     [
       { error: { code: 'slow_down', message: 'slow' } },
       429,
-      529,
-      'overloaded_error',
+      429,
+      'rate_limit_error',
     ],
     [{ detail: { code: 'usage_not_included' } }, 403, 403, 'permission_error'],
     [
@@ -821,10 +845,17 @@ describe('upstream error mapping', () => {
   ])(
     'maps upstream %j (HTTP %i) to %i %s',
     async (body, upstreamStatus, status, type) => {
-      mocks.fetch.mockResolvedValueOnce(jsonResponse(upstreamStatus, body));
-      const response = await request();
+      vi.useFakeTimers();
+      // 5xx answers are retried first; each attempt gets a fresh body.
+      mocks.fetch.mockImplementation(async () =>
+        jsonResponse(upstreamStatus, body),
+      );
+      const pending = request();
+      await vi.advanceTimersByTimeAsync(10_000);
+      const response = await pending;
       expect(response.status).toBe(status);
       expect((await response.json()).error.type).toBe(type);
+      expect(mocks.fetch).toHaveBeenCalledTimes(upstreamStatus >= 500 ? 5 : 1);
     },
   );
 
@@ -999,5 +1030,572 @@ describe('reasoning effort policy', () => {
     await request(adaptive({ model: 'claude-haiku-4-5' }));
     expect(sentBody(1).reasoning.effort).toBe('low');
     expect(sentBody(1).model).toBe('gpt-6-sol');
+  });
+});
+
+/** An upstream SSE body the test feeds frame by frame. */
+function controlledUpstream(headers: Record<string, string> = {}) {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const cancel = vi.fn();
+  const response = new Response(
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+      cancel,
+    }),
+    { headers: { 'content-type': 'text/event-stream', ...headers } },
+  );
+  return {
+    response,
+    cancel,
+    send: (event: Record<string, unknown>) => controller.enqueue(frame(event)),
+    close: () => controller.close(),
+  };
+}
+
+/** Read every chunk with the fake clock time it arrived at. */
+function collect(response: Response) {
+  const chunks: Array<{ at: number; text: string }> = [];
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  const done = (async () => {
+    for (;;) {
+      const { value, done: finished } = await reader.read();
+      if (finished) return;
+      chunks.push({ at: Date.now(), text: decoder.decode(value) });
+    }
+  })();
+  return { chunks, done };
+}
+
+const streamed = (extra: Record<string, unknown> = {}) => ({
+  messages: [{ role: 'user', content: 'hi' }],
+  stream: true,
+  ...extra,
+});
+const delta = (text: string) => ({
+  type: 'response.output_text.delta',
+  delta: text,
+});
+
+describe('downstream keepalive', () => {
+  test('pings after 15s of downstream silence, never before message_start, and stops at the end', async () => {
+    vi.useFakeTimers({ now: 0 });
+    const upstream = controlledUpstream();
+    mocks.fetch.mockResolvedValueOnce(upstream.response);
+    const pending = request(streamed());
+    // Nothing upstream: the bootstrap budget releases an empty stream.
+    await vi.advanceTimersByTimeAsync(20_000);
+    const { chunks, done } = collect(await pending);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(chunks).toEqual([]);
+
+    upstream.send(created);
+    await vi.advanceTimersByTimeAsync(15_000);
+    upstream.send(delta('thinking done'));
+    await vi.advanceTimersByTimeAsync(16_000);
+    upstream.send(completed);
+    upstream.close();
+    await vi.advanceTimersByTimeAsync(1);
+    await done;
+    const timeline = chunks.map(({ at, text }) => [
+      at,
+      /event: (\w+)/.exec(text)![1],
+    ]);
+    expect(timeline).toEqual([
+      [40_000, 'message_start'],
+      [40_000, 'ping'],
+      [55_000, 'ping'],
+      [55_000, 'content_block_start'],
+      [55_000, 'content_block_delta'],
+      [70_000, 'ping'],
+      [71_000, 'content_block_stop'],
+      [71_000, 'message_delta'],
+      [71_000, 'message_stop'],
+    ]);
+    // No keepalive survives the end of the stream.
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('official error and retry semantics', () => {
+  test('an empty reasoning block start still holds the handshake for a real status', async () => {
+    providerPool.refreshFromConfig(
+      [{ id: provider.id as string, enabled: true, weight: 1 }],
+      {
+        strategy: 'failover',
+        unhealthyThreshold: 3,
+        recoveryIntervalMs: 300_000,
+      },
+    );
+    const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+    mocks.fetch.mockImplementationOnce(async () => upstreamEvents());
+    expect((await request()).status).toBe(200);
+    expect(runnerGrant.lastVerdict).toBe('ok');
+    mocks.fetch.mockImplementationOnce(async () =>
+      upstreamEvents([
+        created,
+        {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: { type: 'reasoning', id: 'rs_1', summary: [] },
+        },
+        {
+          type: 'response.failed',
+          response: {
+            error: {
+              type: 'usage_limit_reached',
+              message: 'limit',
+              resets_at: resetsAt,
+            },
+          },
+        },
+      ]),
+    );
+    const response = await request(streamed());
+    expect(response.status).toBe(429);
+    expect(response.headers.get('x-should-retry')).toBe('false');
+    expect(Number(response.headers.get('retry-after'))).toBeGreaterThan(3500);
+    expect(runnerGrant.lastVerdict).toBe('upstream_failure');
+    // The pool waits until the reported reset instead of its flat interval.
+    const health = providerPool
+      .getHealthStatuses()
+      .find((status) => status.profileId === provider.id);
+    expect(health).toMatchObject({
+      healthy: false,
+      quarantinedUntil: resetsAt * 1000,
+    });
+    providerPool.refreshFromConfig([], {
+      strategy: 'failover',
+      unhealthyThreshold: 3,
+      recoveryIntervalMs: 300_000,
+    });
+  });
+
+  test('in-stream rate limits before content keep their retry advice', async () => {
+    mocks.fetch.mockImplementationOnce(async () =>
+      upstreamEvents([
+        created,
+        {
+          type: 'response.failed',
+          response: {
+            error: {
+              code: 'rate_limit_exceeded',
+              message: 'Rate limit reached. Please try again in 6.2s.',
+            },
+          },
+        },
+      ]),
+    );
+    const response = await request(streamed());
+    expect(response.status).toBe(429);
+    expect(response.headers.get('retry-after')).toBe('7');
+    expect(response.headers.get('x-should-retry')).toBeNull();
+  });
+
+  test.each([
+    ['bio_policy', 400, 'invalid_request_error'],
+    ['insufficient_quota', 429, 'rate_limit_error'],
+  ])('%s is answered once and never retried', async (code, status, type) => {
+    mocks.fetch.mockImplementationOnce(async () =>
+      upstreamEvents([
+        created,
+        { type: 'response.failed', response: { error: { code, message: '' } } },
+      ]),
+    );
+    const response = await request(streamed());
+    expect(response.status).toBe(status);
+    expect(response.headers.get('x-should-retry')).toBe('false');
+    expect((await response.json()).error.type).toBe(type);
+    expect(mocks.fetch).toHaveBeenCalledOnce();
+  });
+
+  test('5xx answers retry with 200 ms exponential backoff before any byte is sent', async () => {
+    vi.useFakeTimers({ now: 0 });
+    const sentAt: number[] = [];
+    let calls = 0;
+    mocks.fetch.mockImplementation(async () => {
+      sentAt.push(Date.now());
+      return ++calls < 3
+        ? new Response('{"error":{"message":"boom"}}', {
+            status: 500,
+            headers: { 'x-request-id': `req-${calls}` },
+          })
+        : upstreamEvents();
+    });
+    const pending = request();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect((await pending).status).toBe(200);
+    expect(sentAt).toHaveLength(3);
+    // backoff(1) = 200 ms, backoff(2) = 400 ms, each ±10%.
+    expect(sentAt[1] - sentAt[0]).toBeGreaterThanOrEqual(180);
+    expect(sentAt[1] - sentAt[0]).toBeLessThanOrEqual(220);
+    expect(sentAt[2] - sentAt[1]).toBeGreaterThanOrEqual(360);
+    expect(sentAt[2] - sentAt[1]).toBeLessThanOrEqual(440);
+    expect(JSON.stringify(mocks.logger.warn.mock.calls)).toContain('req-1');
+    expect(runnerGrant.lastVerdict).toBe('ok');
+  });
+
+  test('Retry-After paces a 5xx retry; advice beyond the retry window is returned instead', async () => {
+    vi.useFakeTimers({ now: 0 });
+    const sentAt: number[] = [];
+    mocks.fetch.mockImplementation(async () => {
+      sentAt.push(Date.now());
+      return sentAt.length === 1
+        ? new Response('busy', { status: 503, headers: { 'retry-after': '2' } })
+        : upstreamEvents();
+    });
+    let pending = request();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect((await pending).status).toBe(200);
+    expect(sentAt).toEqual([0, 2_000]);
+
+    mocks.fetch.mockClear();
+    mocks.fetch.mockImplementation(
+      async () =>
+        new Response('busy', {
+          status: 503,
+          headers: { 'retry-after': '120' },
+        }),
+    );
+    pending = request();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const response = await pending;
+    expect(response.status).toBe(503);
+    expect(response.headers.get('retry-after')).toBe('120');
+    expect(mocks.fetch).toHaveBeenCalledOnce();
+  });
+
+  test('429 is never retried by the gateway', async () => {
+    mocks.fetch.mockImplementation(async () =>
+      jsonResponse(429, { error: { code: 'rate_limit_exceeded' } }),
+    );
+    expect((await request()).status).toBe(429);
+    expect(mocks.fetch).toHaveBeenCalledOnce();
+  });
+
+  test('transport failures and a dropped stream before content are retried', async () => {
+    vi.useFakeTimers({ now: 0 });
+    mocks.fetch
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      // Ends after the handshake: a dropped connection, not a reply.
+      .mockImplementationOnce(async () => upstreamEvents([created]))
+      .mockImplementationOnce(async () =>
+        upstreamEvents([created, delta('recovered'), completed]),
+      );
+    const pending = request(streamed());
+    await vi.advanceTimersByTimeAsync(2_000);
+    const response = await pending;
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    expect(text).toContain('recovered');
+    expect(text.match(/event: message_start/g)).toHaveLength(1);
+    expect(mocks.fetch).toHaveBeenCalledTimes(3);
+  });
+
+  test('retries stop after four attempts', async () => {
+    vi.useFakeTimers({ now: 0 });
+    mocks.fetch.mockRejectedValue(new TypeError('fetch failed'));
+    const pending = request();
+    await vi.advanceTimersByTimeAsync(5_000);
+    const response = await pending;
+    expect(response.status).toBe(502);
+    expect(mocks.fetch).toHaveBeenCalledTimes(5);
+    expect(runnerGrant.lastVerdict).toBe('upstream_failure');
+  });
+
+  test('a nonstream stall answers 504 like the stream does', async () => {
+    vi.useFakeTimers();
+    const upstream = controlledUpstream();
+    mocks.fetch.mockResolvedValueOnce(upstream.response);
+    upstream.send(created);
+    const pending = request();
+    await vi.advanceTimersByTimeAsync(300_000);
+    const response = await pending;
+    expect(response.status).toBe(504);
+    expect((await response.json()).error.message).toContain('timed out');
+    expect(upstream.cancel).toHaveBeenCalled();
+  });
+
+  test('a client cancel is not recorded as an upstream failure', async () => {
+    mocks.fetch.mockImplementationOnce(async () => upstreamEvents());
+    await request();
+    expect(runnerGrant.lastVerdict).toBe('ok');
+    const upstream = controlledUpstream();
+    mocks.fetch.mockResolvedValueOnce(upstream.response);
+    upstream.send(created);
+    upstream.send(delta('partial'));
+    const response = await request(streamed());
+    const reader = response.body!.getReader();
+    await reader.read();
+    await reader.cancel();
+    expect(upstream.cancel).toHaveBeenCalled();
+    expect(runnerGrant.lastVerdict).toBe('ok');
+  });
+});
+
+describe('invalid_encrypted_content recovery', () => {
+  const signature = encodeReasoningSignature({
+    id: 'rs_foreign',
+    encryptedContent: 'sealed-by-another-account',
+  });
+  const withReasoning = (stream: boolean) => ({
+    stream,
+    messages: [
+      { role: 'user', content: 'first' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'earlier', signature },
+          { type: 'text', text: 'answer' },
+        ],
+      },
+      { role: 'user', content: 'second' },
+    ],
+  });
+  const reasoningItems = (call: number) =>
+    sentBody(call).input.filter(
+      (item: Record<string, unknown>) => item.type === 'reasoning',
+    );
+
+  test('an HTTP 400 strips replayed reasoning and retries once', async () => {
+    mocks.fetch
+      .mockResolvedValueOnce(
+        jsonResponse(400, {
+          error: {
+            code: 'invalid_encrypted_content',
+            message: 'The encrypted content could not be verified.',
+          },
+        }),
+      )
+      .mockImplementationOnce(async () => upstreamEvents());
+    expect((await request(withReasoning(false))).status).toBe(200);
+    expect(reasoningItems(0)).toHaveLength(1);
+    expect(reasoningItems(1)).toHaveLength(0);
+    expect(
+      sentBody(1).input.map((item: { type: string }) => item.type),
+    ).toEqual(['message', 'message', 'message']);
+  });
+
+  test('a response.failed before content strips and retries once', async () => {
+    const failed = {
+      type: 'response.failed',
+      response: {
+        error: {
+          code: 'invalid_encrypted_content',
+          message: 'Could not decrypt the provided encrypted_content.',
+        },
+      },
+    };
+    mocks.fetch
+      .mockImplementationOnce(async () => upstreamEvents([created, failed]))
+      .mockImplementationOnce(async () => upstreamEvents([created, failed]));
+    const response = await request(withReasoning(true));
+    // The second rejection stands: there is nothing left to strip.
+    expect(response.status).toBe(400);
+    expect(mocks.fetch).toHaveBeenCalledTimes(2);
+    expect(reasoningItems(1)).toHaveLength(0);
+  });
+
+  test('without replayed reasoning the rejection is returned unchanged', async () => {
+    mocks.fetch.mockResolvedValueOnce(
+      jsonResponse(400, { error: { code: 'invalid_encrypted_content' } }),
+    );
+    expect((await request()).status).toBe(400);
+    expect(mocks.fetch).toHaveBeenCalledOnce();
+  });
+});
+
+describe('end_turn: false follow-ups', () => {
+  const reasoningDone = {
+    type: 'response.output_item.done',
+    output_index: 0,
+    item: {
+      type: 'reasoning',
+      id: 'rs_1',
+      summary: [],
+      encrypted_content: 'cipher-1',
+    },
+  };
+  const firstPart = [
+    created,
+    reasoningDone,
+    { ...delta('Hello '), item_id: 'msg_1', output_index: 1 },
+    {
+      type: 'response.output_item.done',
+      output_index: 1,
+      item: {
+        type: 'message',
+        id: 'msg_1',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'Hello ' }],
+      },
+    },
+    {
+      type: 'response.completed',
+      response: {
+        end_turn: false,
+        usage: { input_tokens: 100, output_tokens: 4 },
+      },
+    },
+  ];
+  const secondPart = [
+    { ...created, response: { id: 'resp-2', model: 'gpt-6-sol' } },
+    { ...delta('world'), item_id: 'msg_2' },
+    {
+      type: 'response.completed',
+      response: { usage: { input_tokens: 110, output_tokens: 2 } },
+    },
+  ];
+
+  test.each([true, false])(
+    'continues into the same message with the earlier output replayed (stream=%s)',
+    async (stream) => {
+      mocks.fetch
+        .mockImplementationOnce(async () => upstreamEvents(firstPart))
+        .mockImplementationOnce(async () => upstreamEvents(secondPart));
+      const response = await request(streamed({ stream }));
+      expect(response.status).toBe(200);
+      // A released stream follows up while the client reads it.
+      const body = stream ? await response.text() : await response.json();
+      expect(mocks.fetch).toHaveBeenCalledTimes(2);
+      const original = sentBody(0).input;
+      expect(sentBody(1).input).toEqual([
+        ...original,
+        {
+          type: 'reasoning',
+          id: 'rs_1',
+          summary: [],
+          encrypted_content: 'cipher-1',
+        },
+        {
+          type: 'message',
+          id: 'msg_1',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Hello ' }],
+        },
+      ]);
+      if (stream) {
+        expect(body.match(/event: message_start/g)).toHaveLength(1);
+        expect(body.match(/event: message_stop/g)).toHaveLength(1);
+        expect(body.match(/"stop_reason":"end_turn"/g)).toHaveLength(1);
+        expect(body).toContain('"output_tokens":6');
+      } else {
+        expect(
+          body.content.filter((b: { type: string }) => b.type === 'text'),
+        ).toEqual([
+          { type: 'text', text: 'Hello ' },
+          { type: 'text', text: 'world' },
+        ]);
+        expect(body.usage).toMatchObject({
+          input_tokens: 210,
+          output_tokens: 6,
+        });
+      }
+      expect(runnerGrant.lastVerdict).toBe('ok');
+    },
+  );
+
+  test('follow-ups are bounded', async () => {
+    mocks.fetch.mockImplementation(async () =>
+      upstreamEvents([
+        created,
+        delta('more'),
+        { type: 'response.completed', response: { end_turn: false } },
+      ]),
+    );
+    const response = await request();
+    expect(response.status).toBe(200);
+    expect(mocks.fetch).toHaveBeenCalledTimes(5);
+    expect((await response.json()).stop_reason).toBe('end_turn');
+  });
+
+  test('a follow-up that fails after content becomes an in-stream error', async () => {
+    mocks.fetch
+      .mockImplementationOnce(async () => upstreamEvents(firstPart))
+      .mockImplementationOnce(async () =>
+        jsonResponse(400, { error: { message: 'bad follow-up' } }),
+      );
+    const response = await request(streamed());
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    expect(text).toContain('Hello ');
+    expect(text).toContain('event: error');
+    expect(text).not.toContain('event: message_stop');
+    expect(runnerGrant.lastVerdict).toBe('upstream_failure');
+  });
+});
+
+describe('message usage and rate-limit headers', () => {
+  test('message_start carries an input estimate and the stream reports a truncated call as max_tokens', async () => {
+    mocks.fetch.mockImplementationOnce(async () =>
+      upstreamEvents([
+        created,
+        {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: {
+            type: 'function_call',
+            id: 'fc_1',
+            call_id: 'c1',
+            name: 'Write',
+          },
+        },
+        {
+          type: 'response.function_call_arguments.delta',
+          item_id: 'fc_1',
+          delta: '{"content":"long',
+        },
+        {
+          type: 'response.incomplete',
+          response: {
+            incomplete_details: { reason: 'max_output_tokens' },
+            usage: { input_tokens: 30, output_tokens: 8 },
+          },
+        },
+      ]),
+    );
+    const response = await request(
+      streamed({ messages: [{ role: 'user', content: 'x'.repeat(4000) }] }),
+    );
+    const text = await response.text();
+    const start = JSON.parse(/event: message_start\ndata: (.*)/.exec(text)![1]);
+    expect(start.message.usage.input_tokens).toBeGreaterThan(900);
+    expect(text).toContain('"stop_reason":"max_tokens"');
+    expect(text).not.toContain('event: error');
+  });
+
+  test('x-codex-* headers update the provider snapshot', async () => {
+    clearCodexProviderRateLimits();
+    mocks.fetch.mockImplementationOnce(async () => {
+      const response = upstreamEvents();
+      response.headers.set('x-codex-primary-used-percent', '80');
+      response.headers.set('x-codex-primary-window-minutes', '300');
+      response.headers.set('x-codex-primary-reset-at', '1788303600');
+      response.headers.set('x-codex-other-primary-used-percent', '5');
+      response.headers.set('x-codex-other-limit-name', 'Other models');
+      return response;
+    });
+    await request();
+    expect(getCodexProviderRateLimits(provider.id as string)).toMatchObject({
+      kind: 'codex_rate_limits',
+      limits: [
+        {
+          limitId: 'codex',
+          primary: {
+            usedPercent: 80,
+            windowMinutes: 300,
+            resetsAt: 1788303600,
+          },
+          secondary: null,
+        },
+        {
+          limitId: 'codex_other',
+          limitName: 'Other models',
+          primary: { usedPercent: 5, windowMinutes: null, resetsAt: null },
+        },
+      ],
+    });
   });
 });
