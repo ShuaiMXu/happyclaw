@@ -167,7 +167,14 @@ try {
     process.env.HTTPS_PROXY = proxy;
     process.env.NO_PROXY = '127.0.0.1,localhost';
   }
-  await import(pathToFileURL(path.join(repository, 'dist/load-env.js')).href);
+  // load-env announces the proxy on stdout; keep stdout for the JSON report.
+  const announce = console.log;
+  console.log = () => {};
+  try {
+    await import(pathToFileURL(path.join(repository, 'dist/load-env.js')).href);
+  } finally {
+    console.log = announce;
+  }
   const { Hono } = await import(
     pathToFileURL(path.join(repository, 'node_modules/hono/dist/index.js')).href
   );
@@ -380,7 +387,7 @@ try {
     'Read the file sample.pdf with the Read tool and reply with the single all-caps word printed in it.',
     ['Read'],
   );
-  check('pdfAnswered', !pdf.error && pdf.result.includes(pdfMarker));
+  notes.pdfAgentAnswered = !pdf.error && pdf.result.includes(pdfMarker);
   check(
     'pdfUpstreamOk',
     pdf.calls.length > 0 && pdf.calls.every((entry) => entry.status === 200),
@@ -427,6 +434,38 @@ try {
     effort: background.calls[0]?.body?.reasoning?.effort ?? null,
     subagent: background.calls[0]?.subagent ?? null,
   };
+  // A document block exactly as Claude Code sends a PDF the model reads.
+  const pdfDirect = await direct('/v1/messages', {
+    model: liteModel,
+    max_tokens: 256,
+    stream: false,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'document',
+            source: {
+              type: 'base64',
+              media_type: 'application/pdf',
+              data: tinyPdf(pdfMarker).toString('base64'),
+            },
+          },
+          {
+            type: 'text',
+            text: 'Reply with the single all-caps word printed in the attached PDF.',
+          },
+        ],
+      },
+    ],
+  });
+  notes.pdfDirect = {
+    status: pdfDirect.status,
+    sentAsInputFile: pdfDirect.calls.some((entry) => entry.body?.inputFile),
+    upstreamStatuses: pdfDirect.calls.map((entry) => entry.status),
+    answered: pdfDirect.text.includes(pdfMarker),
+  };
+  check('pdfDocumentAccepted', pdfDirect.status === 200);
   const counted = await direct('/v1/messages/count_tokens', {
     model: liteModel,
     messages: [{ role: 'user', content: 'Count these tokens please.' }],
