@@ -336,7 +336,13 @@ Provider：
 - `GET /api/config/claude/providers/health`
 - `GET /api/config/claude/providers/:id/usage`，读不到用量时以 `status`
   区分 `unsupported`（setup-token、仅推理权限或非 OAuth 凭据，见
-  `unsupportedReason`）与 `needs_relogin`（刷新授权被拒）
+  `unsupportedReason`）与 `needs_relogin`（刷新授权被拒）；ChatGPT 订阅型
+  Provider 不调用上游，返回网关记下的最近一次 `x-codex-*` 用量快照：
+  `kind: 'codex_rate_limits'`、`observedAt`（毫秒，未见过为 `null`）、
+  `activeLimit`、`rateLimitReachedType` 与 `limits[]`；每个限额族含
+  `limitId`、`limitName`、`primary`/`secondary` 窗口（`usedPercent` 0–100、
+  `windowMinutes`、`resetsAt` epoch 秒）和 `credits`（`hasCredits`、
+  `unlimited`、`balance`），服务重启后为空
 - `PUT /api/config/claude/balancing`
 - `POST /api/config/claude/apply`
 - `POST /api/config/claude/oauth/start`，可选 `targetProviderId`（必须是已有的

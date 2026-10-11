@@ -19,13 +19,15 @@ import {
   resolveCodexModel,
   resolveGatewayReasoningEffort,
   type AnthropicRequestSubset,
+  type ResponsesRequest,
 } from './convert-request.js';
 import { getResolvedCodexCatalog } from './model-catalog-sync.js';
 import {
   ResponsesToAnthropicConverter,
-  aggregateResponsesStream,
+  assembleAnthropicMessage,
   CodexUpstreamError,
   describeUpstreamHttpFailure,
+  isInvalidEncryptedContentFailure,
   upstreamFailureStatus,
   type AnthropicErrorType,
   type AnthropicStreamEvent,
@@ -40,6 +42,12 @@ import {
 } from './token-manager.js';
 import { CodexProviderRateLimiter } from './provider-rate-limit.js';
 import {
+  exhaustedWindowResetAt,
+  quarantineCodexProviderUntil,
+  recordCodexRateLimitEvent,
+  recordCodexRateLimitHeaders,
+} from './rate-limit-snapshot.js';
+import {
   CodexMessagesRequestSchema,
   describeCodexRequestIssue,
 } from './request-validation.js';
@@ -48,6 +56,7 @@ import { buildCodexUpstreamRequest } from './request-context.js';
 import {
   resolveCodexGatewayToken,
   type CodexGatewayGrant,
+  type CodexGatewayVerdict,
 } from './runner-tokens.js';
 import { rejectNonLocalGatewaySource } from './source-guard.js';
 import { estimateCodexInputTokens } from './token-estimate.js';
@@ -77,21 +86,61 @@ const UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
 const UPSTREAM_STREAM_IDLE_TIMEOUT_MS = 300_000;
 /** Whole-response cap for nonstream aggregation, the Anthropic SDK default. */
 const AGGREGATE_DEADLINE_MS = 600_000;
+const AGGREGATE_EVENT_BYTES_LIMIT = 32 * 1024 * 1024;
 /** Bounded, time-limited read of an upstream error body. */
 const ERROR_BODY_LIMIT_BYTES = 64 * 1024;
 const ERROR_BODY_TIMEOUT_MS = 5_000;
 /**
- * Streams hold back the handshake (message_start/ping) until content starts,
- * so a failure reported before any content becomes a real HTTP status rather
- * than 200 + event: error. Bounded like CLIProxyAPI's bootstrap buffering
- * (48 frames, 1 MiB), plus a time ceiling so slow reasoning still streams.
+ * Streams hold back the handshake (message_start/ping and content blocks that
+ * have no content yet) until content starts, so a failure reported before
+ * any content becomes a real HTTP status rather than 200 + event: error.
+ * Bounded like CLIProxyAPI's bootstrap buffering (48 frames, 1 MiB), plus a
+ * time ceiling so slow reasoning still streams.
  */
 const STREAM_BOOTSTRAP_MAX_EVENTS = 48;
 const STREAM_BOOTSTRAP_MAX_BYTES = 1024 * 1024;
 const STREAM_BOOTSTRAP_TIMEOUT_MS = 20_000;
+/**
+ * A released stream sends `event: ping` after this much downstream silence.
+ * Claude Code's idle watchdog for custom base URLs counts pings as chunks, so
+ * a long upstream reasoning phase does not trip it (magpie keepaliveEvery).
+ */
+const STREAM_KEEPALIVE_INTERVAL_MS = 15_000;
+/**
+ * Official HTTP retry policy (model-provider-info request_max_retries and
+ * codex-client retry.rs): 5xx and transport failures retry up to four times
+ * with 200 ms exponential backoff, honoring Retry-After; 429 is not retried.
+ * Retries end once they would push the exchange past the window.
+ */
+const UPSTREAM_MAX_RETRIES = 4;
+const UPSTREAM_RETRY_BASE_DELAY_MS = 200;
+const UPSTREAM_RETRY_WINDOW_MS = 60_000;
+/** Follow-up requests folded into one message for end_turn: false. */
+const MAX_FOLLOW_UPS = 4;
+
+const PING_EVENT: AnthropicStreamEvent = {
+  event: 'ping',
+  data: { type: 'ping' },
+};
 
 function sseEncode(event: AnthropicStreamEvent): string {
   return `event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`;
+}
+
+/** The upstream stream stayed silent past its idle deadline. */
+class UpstreamStallError extends Error {
+  constructor() {
+    super('Upstream Codex stream stalled');
+    this.name = 'UpstreamStallError';
+  }
+}
+
+/** The upstream broke a local framing bound; a retry would break it again. */
+class UpstreamFramingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UpstreamFramingError';
+  }
 }
 
 // Authenticate before allocating counters or reading a request body. Windows
@@ -143,6 +192,7 @@ function logGatewaySuccess(
     output_tokens: number;
     cache_read_input_tokens: number;
   },
+  extra: Record<string, unknown> = {},
 ): void {
   logger.info(
     {
@@ -151,9 +201,21 @@ function logGatewaySuccess(
       inputTokens: usage.input_tokens,
       outputTokens: usage.output_tokens,
       cacheReadInputTokens: usage.cache_read_input_tokens,
+      ...extra,
     },
     'Codex gateway: request proxied',
   );
+}
+
+/** Upstream request identifiers worth a log line on failures (api_bridge.rs). */
+function upstreamTrace(headers: Headers | undefined): Record<string, string> {
+  const trace: Record<string, string> = {};
+  const requestId =
+    headers?.get('x-request-id') ?? headers?.get('x-oai-request-id');
+  const cfRay = headers?.get('cf-ray');
+  if (requestId) trace.upstreamRequestId = requestId.slice(0, 128);
+  if (cfRay) trace.cfRay = cfRay.slice(0, 128);
+  return trace;
 }
 
 function extractGatewayToken(headers: Headers): string | null {
@@ -180,6 +242,37 @@ function upstreamRetryHeaders(headers: Headers): Record<string, string> {
   return {};
 }
 
+/** Retry-After as a delay: delay-seconds or an HTTP date (RetryAfter::from_header). */
+function upstreamRetryAfterMs(headers: Headers): number | undefined {
+  const value = headers.get('retry-after')?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return Number(value) * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
+}
+
+/** codex-client retry.rs backoff(): base · 2^(attempt-1), ±10% jitter. */
+function retryBackoffMs(attempt: number): number {
+  return Math.round(
+    UPSTREAM_RETRY_BASE_DELAY_MS *
+      2 ** (attempt - 1) *
+      (0.9 + Math.random() * 0.2),
+  );
+}
+
+function delayUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
+
 /**
  * Retry hints for a classified failure. Limits that only clear after more
  * than a minute (usage windows, plans without Codex) are surfaced at once:
@@ -202,17 +295,43 @@ function failureHeaders(
   return headers;
 }
 
-function failureResponse(
-  c: Context<CodexGatewayEnv>,
+/**
+ * A failure the gateway answers: a real HTTP status while nothing reached the
+ * client, an `event: error` once the stream is released.
+ */
+interface GatewayFailure {
+  failure: CodexUpstreamFailure;
+  headers: Record<string, string>;
+  verdict: CodexGatewayVerdict;
+  trace?: Record<string, string>;
+}
+
+function isGatewayFailure(value: object): value is GatewayFailure {
+  return 'failure' in value;
+}
+
+function upstreamGatewayFailure(
   failure: CodexUpstreamFailure,
   upstreamHeaders?: Headers,
+): GatewayFailure {
+  return {
+    failure,
+    headers: failureHeaders(failure, upstreamHeaders),
+    verdict: 'upstream_failure',
+    trace: upstreamTrace(upstreamHeaders),
+  };
+}
+
+function failureResponse(
+  c: Context<CodexGatewayEnv>,
+  { failure, headers }: GatewayFailure,
 ): Response {
   return errorResponse(
     c,
     upstreamFailureStatus(failure),
     failure.type,
     failure.message,
-    failureHeaders(failure, upstreamHeaders),
+    headers,
   );
 }
 
@@ -221,11 +340,10 @@ function failureResponse(
  * Anthropic errors: a dead refresh grant is an authentication error telling
  * the user to log in again; a refresh in backoff is a retryable 503.
  */
-async function resolveAccessOrResponse(
-  c: Context<CodexGatewayEnv>,
+async function resolveAccessOrFailure(
   grant: CodexGatewayGrant,
   rejectedAccessToken?: string,
-): Promise<CodexAccessContext | Response> {
+): Promise<CodexAccessContext | GatewayFailure> {
   try {
     return await resolveCodexAccess(
       grant.providerId,
@@ -233,34 +351,55 @@ async function resolveAccessOrResponse(
     );
   } catch (err) {
     if (err instanceof CodexRefreshUnavailableError) {
-      grant.lastVerdict = 'local_transient';
-      return errorResponse(c, 503, 'api_error', err.message, {
-        'Retry-After': String(Math.max(1, Math.ceil(err.retryAfterMs / 1000))),
-      });
+      return {
+        failure: {
+          type: 'api_error',
+          code: null,
+          message: err.message,
+          status: 503,
+        },
+        headers: {
+          'Retry-After': String(
+            Math.max(1, Math.ceil(err.retryAfterMs / 1000)),
+          ),
+        },
+        verdict: 'local_transient',
+      };
     }
     if (err instanceof CodexReauthRequiredError) {
-      grant.lastVerdict = 'reauth_required';
       logger.warn(
         grantLogContext(grant),
         'Codex gateway: ChatGPT login must be renewed',
       );
-      return errorResponse(c, 401, 'authentication_error', err.message, {
-        'x-should-retry': 'false',
-      });
+      return {
+        failure: {
+          type: 'authentication_error',
+          code: null,
+          message: err.message,
+          status: 401,
+          noRetry: true,
+        },
+        headers: { 'x-should-retry': 'false' },
+        verdict: 'reauth_required',
+      };
     }
-    grant.lastVerdict = 'upstream_failure';
     logger.warn(
       { ...grantLogContext(grant), err },
       'Codex gateway: auth failed',
     );
-    return errorResponse(
-      c,
-      401,
-      'authentication_error',
-      err instanceof CodexGatewayAuthError
-        ? err.message
-        : 'Codex authentication failed',
-    );
+    return {
+      failure: {
+        type: 'authentication_error',
+        code: null,
+        message:
+          err instanceof CodexGatewayAuthError
+            ? err.message
+            : 'Codex authentication failed',
+        status: 401,
+      },
+      headers: {},
+      verdict: 'upstream_failure',
+    };
   }
 }
 
@@ -301,10 +440,15 @@ const TERMINAL_EVENT_TYPES = new Set([
   'error',
 ]);
 
-/** Parse bounded SSE frames across arbitrary UTF-8 chunks and line endings. */
+/**
+ * Parse bounded SSE frames across arbitrary UTF-8 chunks and line endings.
+ * A frame whose data is not a JSON event object is skipped and reported to
+ * `onInvalidFrame`, as the official client logs and skips it.
+ */
 async function* iterateUpstreamEvents(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
+  onInvalidFrame: () => void,
 ): AsyncGenerator<Record<string, unknown>> {
   const reader = body.getReader();
   const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -341,17 +485,20 @@ async function* iterateUpstreamEvents(
     try {
       parsed = JSON.parse(data);
     } catch {
-      // SyntaxError messages can quote private upstream data. Keep the error
-      // generic and fail the request instead of silently dropping output.
-      throw new Error('Upstream Codex SSE contains invalid JSON');
+      // SyntaxError messages can quote private upstream data; the frame is
+      // only counted, never logged.
+      onInvalidFrame();
+      return;
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('Upstream Codex SSE event is not an object');
+      onInvalidFrame();
+      return;
     }
     const event = parsed as Record<string, unknown>;
     if (event.type === undefined && name) event.type = name;
     if (event.type !== undefined && typeof event.type !== 'string') {
-      throw new Error('Upstream Codex SSE event has an invalid type');
+      onInvalidFrame();
+      return;
     }
     terminalSeen = TERMINAL_EVENT_TYPES.has(String(event.type));
     yield event;
@@ -373,7 +520,9 @@ async function* iterateUpstreamEvents(
     } else if (field === 'data') {
       eventBytes += Buffer.byteLength(value) + (dataParts.length ? 1 : 0);
       if (eventBytes > UPSTREAM_EVENT_LIMIT) {
-        throw new Error('Upstream Codex SSE event exceeds size limit');
+        throw new UpstreamFramingError(
+          'Upstream Codex SSE event exceeds size limit',
+        );
       }
       dataParts.push(value);
     }
@@ -394,7 +543,9 @@ async function* iterateUpstreamEvents(
       const part = text.slice(start, match.index);
       lineBytes += Buffer.byteLength(part);
       if (lineBytes > UPSTREAM_EVENT_LIMIT) {
-        throw new Error('Upstream Codex SSE line exceeds size limit');
+        throw new UpstreamFramingError(
+          'Upstream Codex SSE line exceeds size limit',
+        );
       }
       lineParts.push(part);
       const line = lineParts.join('');
@@ -410,7 +561,9 @@ async function* iterateUpstreamEvents(
       const part = text.slice(start);
       lineBytes += Buffer.byteLength(part);
       if (lineBytes > UPSTREAM_EVENT_LIMIT) {
-        throw new Error('Upstream Codex SSE line exceeds size limit');
+        throw new UpstreamFramingError(
+          'Upstream Codex SSE line exceeds size limit',
+        );
       }
       lineParts.push(part);
     }
@@ -422,8 +575,10 @@ async function* iterateUpstreamEvents(
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
+          // Reject before cancelling: the cancel also settles the pending
+          // read, and the race must report a stall rather than an EOF.
+          reject(new UpstreamStallError());
           void reader.cancel().catch(() => {});
-          reject(new Error('Upstream Codex stream stalled'));
         }, UPSTREAM_STREAM_IDLE_TIMEOUT_MS);
       });
       let result: ReadableStreamReadResult<Uint8Array>;
@@ -453,6 +608,30 @@ async function* iterateUpstreamEvents(
     if (!reachedEof) await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
+}
+
+/**
+ * Anthropic events that carry no content yet. Holding them back keeps a real
+ * HTTP status available, so an announced but still empty reasoning, text or
+ * tool block does not end the handshake (CLIProxyAPI bootstrap buffering).
+ */
+function isHandshakeEvent({ event, data }: AnthropicStreamEvent): boolean {
+  if (event === 'message_start' || event === 'ping') return true;
+  if (event === 'content_block_start') {
+    const block = (data.content_block ?? {}) as Record<string, unknown>;
+    if (block.type === 'thinking') return !block.thinking;
+    if (block.type === 'text') return !block.text;
+    return block.type === 'tool_use';
+  }
+  if (event === 'content_block_delta') {
+    const delta = (data.delta ?? {}) as Record<string, unknown>;
+    return (
+      (delta.type === 'input_json_delta' && !delta.partial_json) ||
+      (delta.type === 'text_delta' && !delta.text) ||
+      (delta.type === 'thinking_delta' && !delta.thinking)
+    );
+  }
+  return false;
 }
 
 /** Source checks, then a live runner token. Runs before any body is read. */
@@ -569,8 +748,11 @@ codexGatewayApp.post(
     const grant = c.get('codexGatewayGrant');
     const logContext = grantLogContext(grant);
 
-    const resolvedAccess = await resolveAccessOrResponse(c, grant);
-    if (resolvedAccess instanceof Response) return resolvedAccess;
+    const resolvedAccess = await resolveAccessOrFailure(grant);
+    if (isGatewayFailure(resolvedAccess)) {
+      grant.lastVerdict = resolvedAccess.verdict;
+      return failureResponse(c, resolvedAccess);
+    }
     let access = resolvedAccess;
 
     const provider = getProviderById(access.providerId);
@@ -593,7 +775,8 @@ codexGatewayApp.post(
       requestTools: !!anthropicRequest.tools?.length,
     });
 
-    const controller = new AbortController();
+    // `let`: a headers-timeout abort ends one attempt; a retry renews it.
+    let controller = new AbortController();
     let clientCancelled = false;
     const onClientAbort = () => {
       clientCancelled = true;
@@ -604,13 +787,17 @@ codexGatewayApp.post(
     const cleanup = () =>
       c.req.raw.signal.removeEventListener('abort', onClientAbort);
 
+    // `payload` defaults to the translated request. The response side passes
+    // a variant whose `input` differs for reasoning-strip retries and
+    // end_turn: false follow-ups; everything else stays request-side.
     const sendUpstream = async (
       current: CodexAccessContext,
+      payload: ResponsesRequest = responsesRequest,
     ): Promise<Response> => {
       const upstreamRequest = buildCodexUpstreamRequest({
         incomingHeaders: c.req.raw.headers,
         anthropicRequest: parsed,
-        responsesRequest,
+        responsesRequest: payload,
         access: current,
         fallbackScope: grant.id,
       });
@@ -635,110 +822,418 @@ codexGatewayApp.post(
         clearTimeout(headersTimeout);
       }
     };
-    const upstreamUnreachable = (err: unknown): Response => {
-      cleanup();
-      grant.lastVerdict = 'upstream_failure';
+
+    // ── Upstream attempts ──────────────────────────────────────────────
+    /** Retry budget of the current upstream request (official per request). */
+    const retryBudget = { retries: 0, startedAt: Date.now() };
+    /** Nonstream aggregation passed its whole-response deadline. */
+    let deadlineReached = false;
+    let refreshedAfter401 = false;
+    let reasoningStripped = false;
+    let baseInput = responsesRequest.input;
+    /** Output items of earlier responses, replayed by follow-ups. */
+    const replayItems: Array<Record<string, unknown>> = [];
+    const clientGone = () => new Error('Client cancelled the Codex request');
+
+    /** Delay before the next transport/5xx retry, or null when spent. */
+    const nextRetryDelay = (advisedMs?: number): number | null => {
+      if (retryBudget.retries >= UPSTREAM_MAX_RETRIES) return null;
+      const delay = advisedMs ?? retryBackoffMs(retryBudget.retries + 1);
+      if (Date.now() - retryBudget.startedAt + delay > UPSTREAM_RETRY_WINDOW_MS)
+        return null;
+      retryBudget.retries += 1;
+      return delay;
+    };
+    const waitForRetry = async (delay: number): Promise<void> => {
+      await delayUnlessAborted(delay, c.req.raw.signal);
+      if (clientCancelled) throw clientGone();
+      if (deadlineReached) throw new UpstreamStallError();
+      if (controller.signal.aborted) controller = new AbortController();
+    };
+    const currentPayload = (): ResponsesRequest =>
+      baseInput === responsesRequest.input && !replayItems.length
+        ? responsesRequest
+        : { ...responsesRequest, input: [...baseInput, ...replayItems] };
+    /** invalid_encrypted_content: drop replayed reasoning once and retry. */
+    const stripReplayedReasoning = (): boolean => {
+      if (
+        reasoningStripped ||
+        !baseInput.some((item) => item.type === 'reasoning')
+      )
+        return false;
+      reasoningStripped = true;
+      baseInput = baseInput.filter((item) => item.type !== 'reasoning');
       logger.warn(
-        { ...logContext, err },
-        'Codex gateway: upstream request failed',
+        logContext,
+        'Codex gateway: upstream could not verify replayed reasoning; retrying without it',
       );
+      return true;
+    };
+
+    /**
+     * Open one upstream response, applying the official HTTP retry policy,
+     * a single forced refresh on 401 and the reasoning strip. Throws only
+     * when the client went away.
+     */
+    const openUpstream = async (): Promise<
+      { response: Response } | GatewayFailure
+    > => {
+      for (;;) {
+        let upstream: Response;
+        try {
+          upstream = await sendUpstream(access, currentPayload());
+        } catch (err) {
+          if (clientCancelled) throw err;
+          // A headers deadline aborts the shared controller or only the
+          // attempt's own signal; either way the attempt timed out.
+          const timedOut =
+            controller.signal.aborted ||
+            (err instanceof Error &&
+              (err.name === 'AbortError' || err.name === 'TimeoutError'));
+          const delay = nextRetryDelay();
+          logger.warn(
+            { ...logContext, err, timedOut, retrying: delay !== null },
+            'Codex gateway: upstream request failed',
+          );
+          if (delay !== null) {
+            await waitForRetry(delay);
+            continue;
+          }
+          return {
+            failure: {
+              type: 'api_error',
+              code: null,
+              message: timedOut
+                ? 'Upstream Codex request timed out'
+                : 'Upstream Codex request failed',
+              status: timedOut ? 504 : 502,
+            },
+            headers: {},
+            verdict: 'upstream_failure',
+          };
+        }
+        recordCodexRateLimitHeaders(access.providerId, upstream.headers, {
+          ok: upstream.ok,
+        });
+        // An access token can be revoked before its recorded expiry. Refresh
+        // once (single-flight, shared with concurrent requests) and retry.
+        if (upstream.status === 401) {
+          await upstream.body?.cancel().catch(() => {});
+          if (!refreshedAfter401) {
+            refreshedAfter401 = true;
+            const refreshed = await resolveAccessOrFailure(
+              grant,
+              access.accessToken,
+            );
+            if (isGatewayFailure(refreshed)) return refreshed;
+            access = refreshed;
+            continue;
+          }
+          // The account rejected a token it just issued: retrying refreshes
+          // again and again, only a new login can help.
+          return {
+            failure: {
+              type: 'authentication_error',
+              code: null,
+              message:
+                'ChatGPT 拒绝了刚刷新的访问令牌，账号可能已被停用或登出。请在「模型配置」中重新登录 ChatGPT。',
+              status: 401,
+              noRetry: true,
+            },
+            headers: { 'x-should-retry': 'false' },
+            verdict: 'reauth_required',
+            trace: upstreamTrace(upstream.headers),
+          };
+        }
+        if (upstream.ok && upstream.body) return { response: upstream };
+        const bodyText = await readBoundedErrorBody(upstream);
+        const failure = describeUpstreamHttpFailure(upstream.status, bodyText);
+        if (upstream.status >= 500) {
+          const delay = nextRetryDelay(upstreamRetryAfterMs(upstream.headers));
+          if (delay !== null) {
+            logger.warn(
+              {
+                ...logContext,
+                status: upstream.status,
+                code: failure.code,
+                retryInMs: delay,
+                ...upstreamTrace(upstream.headers),
+              },
+              'Codex gateway: upstream server error; retrying',
+            );
+            await waitForRetry(delay);
+            continue;
+          }
+        }
+        if (
+          isInvalidEncryptedContentFailure(failure) &&
+          stripReplayedReasoning()
+        )
+          continue;
+        return upstreamGatewayFailure(failure, upstream.headers);
+      }
+    };
+
+    /** Record the verdict of a failed exchange, once. */
+    const noteFailure = (outcome: GatewayFailure, message: string): void => {
+      grant.lastVerdict = outcome.verdict;
+      const { failure } = outcome;
+      if (failure.usageLimitReached) {
+        const resetsAt =
+          failure.resetsAt ?? exhaustedWindowResetAt(access.providerId);
+        if (resetsAt) quarantineCodexProviderUntil(access.providerId, resetsAt);
+      }
+      logger.warn(
+        {
+          ...logContext,
+          status: upstreamFailureStatus(failure),
+          code: failure.code,
+          errorType: failure.type,
+          ...outcome.trace,
+        },
+        message,
+      );
+    };
+
+    let initial: { response: Response } | GatewayFailure;
+    try {
+      initial = await openUpstream();
+    } catch {
+      // The client went away while the request was being sent.
+      cleanup();
       return errorResponse(
         c,
         502,
         'api_error',
         'Upstream Codex request failed',
       );
+    }
+    if (isGatewayFailure(initial)) {
+      cleanup();
+      noteFailure(initial, 'Codex gateway: upstream rejected request');
+      return failureResponse(c, initial);
+    }
+
+    // ── Exchange: upstream responses → one Anthropic message ───────────
+    const conversionOptions = {
+      tools: anthropicRequest.tools,
+      inputTokenEstimate: estimateCodexInputTokens(responsesRequest),
+      maxFollowUps: MAX_FOLLOW_UPS,
+    };
+    let upstream = initial.response;
+    // The served model (openai-model) names the message until the stream
+    // reports its own.
+    const newConverter = () =>
+      new ResponsesToAnthropicConverter(
+        upstream.headers.get('openai-model')?.trim().slice(0, 128) ||
+          responsesRequest.model,
+        conversionOptions,
+      );
+    let converter = newConverter();
+    let invalidFrames = 0;
+    const onInvalidFrame = () => {
+      invalidFrames += 1;
+      // Bounded logging: the first skipped frame and every power of two.
+      if ((invalidFrames & (invalidFrames - 1)) === 0)
+        logger.warn(
+          { ...logContext, invalidFrames, ...upstreamTrace(upstream.headers) },
+          'Codex gateway: skipped an upstream SSE frame that is not a JSON event',
+        );
+    };
+    const attach = (response: Response) =>
+      iterateUpstreamEvents(response.body!, controller.signal, onInvalidFrame);
+    let upstreamEvents = attach(upstream);
+    let pendingRead: Promise<IteratorResult<Record<string, unknown>>> | null =
+      null;
+    const pendingEvents: AnthropicStreamEvent[] = [];
+    let exchangeDone = false;
+    let prematureEof = false;
+    /** A follow-up that could not be opened ended the message. */
+    let followUpFailure: GatewayFailure | null = null;
+    let followUps = 0;
+    let measureEvents = true;
+    let consumedEvents = 0;
+    let consumedBytes = 0;
+
+    /** Advance by one upstream event, a follow-up request, or EOF. */
+    const pump = async (): Promise<void> => {
+      const followUp = converter.pendingFollowUp();
+      if (followUp) {
+        await upstreamEvents.return(undefined).catch(() => {});
+        replayItems.push(...followUp);
+        followUps += 1;
+        retryBudget.retries = 0;
+        retryBudget.startedAt = Date.now();
+        logger.info(
+          { ...logContext, followUp: followUps },
+          'Codex gateway: upstream ended the response but not the turn; following up',
+        );
+        const opened = await openUpstream();
+        if (isGatewayFailure(opened)) {
+          followUpFailure = opened;
+          pendingEvents.push(...converter.fail(opened.failure));
+          exchangeDone = true;
+          return;
+        }
+        upstream = opened.response;
+        upstreamEvents = attach(upstream);
+        converter.beginFollowUp();
+        return;
+      }
+      const next = await (pendingRead ??= upstreamEvents.next());
+      pendingRead = null;
+      if (next.done) {
+        const tail = converter.finish();
+        prematureEof = tail.length > 0;
+        pendingEvents.push(...tail);
+        exchangeDone = true;
+        return;
+      }
+      if (measureEvents) {
+        consumedEvents += 1;
+        consumedBytes += Buffer.byteLength(JSON.stringify(next.value));
+      }
+      if (next.value.type === 'codex.rate_limits')
+        recordCodexRateLimitEvent(access.providerId, next.value);
+      pendingEvents.push(...converter.handleEvent(next.value));
     };
 
-    let upstream: Response;
-    try {
-      upstream = await sendUpstream(access);
-    } catch (err) {
-      return upstreamUnreachable(err);
-    }
-
-    // An access token can be revoked before its recorded expiry. Refresh once
-    // (single-flight, shared with concurrent requests) and retry once.
-    if (upstream.status === 401) {
-      await upstream.body?.cancel().catch(() => {});
-      const refreshed = await resolveAccessOrResponse(
-        c,
-        grant,
-        access.accessToken,
-      );
-      if (refreshed instanceof Response) {
-        cleanup();
-        return refreshed;
-      }
-      access = refreshed;
+    // Bootstrap and the stream body share one in-flight step: a step the
+    // bootstrap budget stopped waiting for is resumed, never restarted.
+    let inflight: Promise<void> | null = null;
+    const step = (): Promise<void> => (inflight ??= pump());
+    const consumeStep = async (): Promise<void> => {
       try {
-        upstream = await sendUpstream(access);
-      } catch (err) {
-        return upstreamUnreachable(err);
+        await step();
+      } finally {
+        inflight = null;
       }
-    }
+    };
 
-    if (!upstream.ok || !upstream.body) {
-      const bodyText = await readBoundedErrorBody(upstream);
-      cleanup();
-      const failure: CodexUpstreamFailure =
-        upstream.status === 401
-          ? {
-              type: 'authentication_error',
-              code: null,
-              message:
-                'ChatGPT 拒绝了刚刷新的访问令牌，账号可能已被停用或登出。请在「模型配置」中重新登录 ChatGPT。',
-              status: 401,
-            }
-          : describeUpstreamHttpFailure(upstream.status, bodyText);
-      grant.lastVerdict = 'upstream_failure';
+    const exchangeFailure = (): GatewayFailure | null => {
+      if (followUpFailure) return followUpFailure;
+      const failure = converter.getFailure();
+      return failure ? upstreamGatewayFailure(failure, upstream.headers) : null;
+    };
+    let settled = false;
+    /** Log and record the verdict once the exchange has ended. */
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      const failure = exchangeFailure();
+      if (failure) {
+        noteFailure(failure, 'Codex gateway: upstream reported failure');
+        return;
+      }
+      grant.lastVerdict = 'ok';
+      logGatewaySuccess(grant, responsesRequest.model, converter.getUsage(), {
+        ...(followUps ? { followUps } : {}),
+        ...(invalidFrames ? { invalidFrames } : {}),
+      });
+    };
+
+    /**
+     * Nothing reached the client yet, so a failure a fresh attempt can fix
+     * restarts the exchange: unverifiable replayed reasoning is stripped once
+     * and a dropped stream spends the transport retry budget. Resolves to
+     * true after a restart, or to the failure that now stands.
+     */
+    const restartBeforeContent = async (
+      thrown?: unknown,
+    ): Promise<true | GatewayFailure | null> => {
+      let delay: number | null = null;
+      if (thrown === undefined) {
+        const failure = converter.getFailure();
+        if (
+          !followUpFailure &&
+          failure &&
+          isInvalidEncryptedContentFailure(failure) &&
+          stripReplayedReasoning()
+        )
+          delay = 0;
+        else if (prematureEof) delay = nextRetryDelay();
+      } else if (
+        !clientCancelled &&
+        !controller.signal.aborted &&
+        !(thrown instanceof CodexUpstreamError) &&
+        !(thrown instanceof UpstreamStallError) &&
+        !(thrown instanceof UpstreamFramingError)
+      ) {
+        delay = nextRetryDelay();
+      }
+      if (delay === null) return null;
       logger.warn(
         {
           ...logContext,
-          status: upstream.status,
-          code: failure.code,
-          errorType: failure.type,
+          retryInMs: delay,
+          ...(thrown !== undefined ? { err: thrown } : {}),
+          ...upstreamTrace(upstream.headers),
         },
-        'Codex gateway: upstream rejected request',
+        'Codex gateway: upstream stream failed before content; retrying',
       );
-      return failureResponse(c, failure, upstream.headers);
-    }
-
-    const conversionOptions = { tools: anthropicRequest.tools };
-    const converter = new ResponsesToAnthropicConverter(
-      responsesRequest.model,
-      conversionOptions,
-    );
+      await upstreamEvents.return(undefined).catch(() => {});
+      if (delay > 0) await waitForRetry(delay);
+      replayItems.length = 0;
+      followUps = 0;
+      const reopened = await openUpstream();
+      if (isGatewayFailure(reopened)) return reopened;
+      upstream = reopened.response;
+      upstreamEvents = attach(upstream);
+      pendingRead = null;
+      converter = newConverter();
+      pendingEvents.length = 0;
+      exchangeDone = false;
+      prematureEof = false;
+      consumedEvents = 0;
+      consumedBytes = 0;
+      return true;
+    };
 
     if (!wantsStream) {
-      const events: Record<string, unknown>[] = [];
-      let eventBytes = 0;
       // 非流式聚合需要一个整体上限：空闲超时只限制块间间隔，慢滴上游可以
       // 无限拖住请求和 events 数组。上限对齐 Anthropic SDK 客户端默认 10 分钟。
-      const deadline = setTimeout(
-        () => controller.abort(),
-        AGGREGATE_DEADLINE_MS,
-      );
+      const deadline = setTimeout(() => {
+        deadlineReached = true;
+        controller.abort();
+      }, AGGREGATE_DEADLINE_MS);
       try {
-        for await (const event of iterateUpstreamEvents(
-          upstream.body,
-          controller.signal,
-        )) {
-          eventBytes += Buffer.byteLength(JSON.stringify(event));
-          if (eventBytes > 32 * 1024 * 1024) {
-            throw new Error(
-              'Upstream Codex response exceeds aggregation limit',
-            );
+        for (;;) {
+          try {
+            while (!exchangeDone) {
+              await consumeStep();
+              if (consumedBytes > AGGREGATE_EVENT_BYTES_LIMIT) {
+                throw new UpstreamFramingError(
+                  'Upstream Codex response exceeds aggregation limit',
+                );
+              }
+            }
+          } catch (err) {
+            if (deadlineReached) throw err;
+            const restarted = await restartBeforeContent(err);
+            if (restarted === true) continue;
+            if (restarted) {
+              noteFailure(
+                restarted,
+                'Codex gateway: upstream rejected request',
+              );
+              return failureResponse(c, restarted);
+            }
+            throw err;
           }
-          events.push(event);
+          const failure = exchangeFailure();
+          if (!failure) break;
+          const restarted = await restartBeforeContent();
+          if (restarted === true) continue;
+          const standing = restarted ?? failure;
+          noteFailure(standing, 'Codex gateway: upstream reported failure');
+          return failureResponse(c, standing);
         }
-        const aggregated = aggregateResponsesStream(
-          events,
+        const aggregated = assembleAnthropicMessage(
+          pendingEvents,
+          converter,
           responsesRequest.model,
-          conversionOptions,
         );
-        grant.lastVerdict = 'ok';
-        logGatewaySuccess(grant, responsesRequest.model, aggregated.usage);
+        settle();
         return c.json({
           id: aggregated.id,
           type: 'message',
@@ -751,10 +1246,20 @@ codexGatewayApp.post(
         });
       } catch (err) {
         controller.abort();
-        grant.lastVerdict = 'upstream_failure';
+        await upstreamEvents.return(undefined).catch(() => {});
         if (err instanceof CodexUpstreamError) {
-          logger.warn(
-            { ...logContext, code: err.code, errorType: err.errorType },
+          noteFailure(
+            upstreamGatewayFailure(
+              {
+                type: err.errorType,
+                code: err.code,
+                message: err.message,
+                status: err.status,
+                retryAfterSeconds: err.retryAfterSeconds,
+                noRetry: err.noRetry,
+              },
+              upstream.headers,
+            ),
             'Codex gateway: upstream reported failure',
           );
           return errorResponse(
@@ -765,11 +1270,20 @@ codexGatewayApp.post(
             failureHeaders(err, upstream.headers),
           );
         }
-        const timedOut = err instanceof Error && err.name === 'AbortError';
-        logger.warn(
-          { ...logContext, err },
-          'Codex gateway: upstream stream failed',
-        );
+        // The stall deadline, the aggregation deadline and a client that
+        // left all end the wait: a timeout, never an upstream verdict.
+        const timedOut =
+          err instanceof UpstreamStallError ||
+          deadlineReached ||
+          clientCancelled ||
+          (err instanceof Error && err.name === 'AbortError');
+        if (!clientCancelled) {
+          grant.lastVerdict = 'upstream_failure';
+          logger.warn(
+            { ...logContext, err, ...upstreamTrace(upstream.headers) },
+            'Codex gateway: upstream stream failed',
+          );
+        }
         return errorResponse(
           c,
           timedOut ? 504 : 502,
@@ -784,86 +1298,61 @@ codexGatewayApp.post(
       }
     }
 
-    let streamCancelled = false;
-    let upstreamFinished = false;
-    const upstreamEvents = iterateUpstreamEvents(
-      upstream.body,
-      controller.signal,
-    );
-    // A read started during bootstrap may still be pending when its time
-    // budget ends; the stream must continue from that same read.
-    let pendingRead: Promise<IteratorResult<Record<string, unknown>>> | null =
-      null;
-    const nextUpstreamEvent = () => (pendingRead ??= upstreamEvents.next());
-    const pendingEvents: AnthropicStreamEvent[] = [];
-    const consumeUpstream = (
-      next: IteratorResult<Record<string, unknown>>,
-    ): void => {
-      pendingRead = null;
-      if (next.done) {
-        upstreamFinished = true;
-        pendingEvents.push(...converter.finish());
-        const failure = converter.getFailure();
-        if (failure) {
-          grant.lastVerdict = 'upstream_failure';
-          logger.warn(
-            { ...logContext, code: failure.code, errorType: failure.type },
-            'Codex gateway: upstream reported failure',
-          );
-        } else {
-          grant.lastVerdict = 'ok';
-          logGatewaySuccess(
-            grant,
-            responsesRequest.model,
-            converter.getUsage(),
-          );
-        }
-      } else {
-        pendingEvents.push(...converter.handleEvent(next.value));
-      }
-    };
-
     const bootstrapDeadline = Date.now() + STREAM_BOOTSTRAP_TIMEOUT_MS;
-    let bootstrapEvents = 0;
-    let bootstrapBytes = 0;
+    /** Wait for the in-flight step up to `ms`; false when the wait ran out. */
+    const stepWithin = async (ms: number): Promise<boolean> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const completed = await Promise.race([
+        step().then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), ms);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      if (completed) inflight = null;
+      return completed;
+    };
     try {
       while (
-        !upstreamFinished &&
-        !pendingEvents.some(
-          ({ event }) => event !== 'message_start' && event !== 'ping',
-        ) &&
-        bootstrapEvents < STREAM_BOOTSTRAP_MAX_EVENTS &&
-        bootstrapBytes < STREAM_BOOTSTRAP_MAX_BYTES
+        !exchangeDone &&
+        pendingEvents.every(isHandshakeEvent) &&
+        consumedEvents < STREAM_BOOTSTRAP_MAX_EVENTS &&
+        consumedBytes < STREAM_BOOTSTRAP_MAX_BYTES
       ) {
         const remaining = bootstrapDeadline - Date.now();
         if (remaining <= 0) break;
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const next = await Promise.race([
-          nextUpstreamEvent(),
-          new Promise<null>((resolve) => {
-            timer = setTimeout(() => resolve(null), remaining);
-          }),
-        ]).finally(() => clearTimeout(timer));
-        if (!next) break;
-        consumeUpstream(next);
-        bootstrapEvents += 1;
-        if (!next.done)
-          bootstrapBytes += Buffer.byteLength(JSON.stringify(next.value));
-        // Nothing has reached the client yet: report the real status.
-        const failure = converter.getFailure();
-        if (failure) {
-          controller.abort();
-          await upstreamEvents.return(undefined).catch(() => {});
-          cleanup();
-          return failureResponse(c, failure, upstream.headers);
+        let completed: boolean;
+        try {
+          completed = await stepWithin(remaining);
+        } catch (err) {
+          inflight = null;
+          const restarted = await restartBeforeContent(err);
+          if (restarted === true) continue;
+          if (restarted) {
+            cleanup();
+            noteFailure(restarted, 'Codex gateway: upstream rejected request');
+            return failureResponse(c, restarted);
+          }
+          throw err;
         }
+        if (!completed) break;
+        // Nothing has reached the client yet: report the real status.
+        const failure = exchangeFailure();
+        if (!failure) continue;
+        const restarted = await restartBeforeContent();
+        if (restarted === true) continue;
+        const standing = restarted ?? failure;
+        controller.abort();
+        await upstreamEvents.return(undefined).catch(() => {});
+        cleanup();
+        noteFailure(standing, 'Codex gateway: upstream reported failure');
+        return failureResponse(c, standing);
       }
     } catch (err) {
       controller.abort();
       await upstreamEvents.return(undefined).catch(() => {});
       cleanup();
-      grant.lastVerdict = 'upstream_failure';
       if (err instanceof CodexUpstreamError) {
+        grant.lastVerdict = 'upstream_failure';
         return errorResponse(
           c,
           err.status,
@@ -872,13 +1361,14 @@ codexGatewayApp.post(
           failureHeaders(err, upstream.headers),
         );
       }
-      const timedOut =
-        err instanceof Error && err.message === 'Upstream Codex stream stalled';
-      if (!clientCancelled)
+      if (!clientCancelled) {
+        grant.lastVerdict = 'upstream_failure';
         logger.warn(
-          { ...logContext, err },
+          { ...logContext, err, ...upstreamTrace(upstream.headers) },
           'Codex gateway: upstream stream failed before content',
         );
+      }
+      const timedOut = err instanceof UpstreamStallError;
       return errorResponse(
         c,
         timedOut ? 504 : 502,
@@ -888,27 +1378,63 @@ codexGatewayApp.post(
           : 'Upstream Codex stream failed',
       );
     }
+    measureEvents = false;
 
     const encoder = new TextEncoder();
+    let downstream!: ReadableStreamDefaultController<Uint8Array>;
+    let streamCancelled = false;
+    let streamClosed = false;
+    let lastWriteAt = 0;
+    let keepalive: ReturnType<typeof setTimeout> | undefined;
+    const write = (event: AnthropicStreamEvent): void => {
+      downstream.enqueue(encoder.encode(sseEncode(event)));
+      lastWriteAt = Date.now();
+      // Keepalive starts with the handshake: never a ping before message_start.
+      if (event.event === 'message_start')
+        armKeepalive(STREAM_KEEPALIVE_INTERVAL_MS);
+    };
+    const armKeepalive = (delay: number): void => {
+      clearTimeout(keepalive);
+      keepalive = setTimeout(() => {
+        keepalive = undefined;
+        if (streamClosed) return;
+        const idle = Date.now() - lastWriteAt;
+        if (idle < STREAM_KEEPALIVE_INTERVAL_MS) {
+          armKeepalive(STREAM_KEEPALIVE_INTERVAL_MS - idle);
+          return;
+        }
+        // A full queue means the client is not reading; it is not idle.
+        if ((downstream.desiredSize ?? 0) > 0) write(PING_EVENT);
+        armKeepalive(STREAM_KEEPALIVE_INTERVAL_MS);
+      }, delay);
+    };
+    const endStream = (): void => {
+      streamClosed = true;
+      clearTimeout(keepalive);
+      cleanup();
+    };
+
     const stream = new ReadableStream<Uint8Array>({
+      start(controllerStream) {
+        downstream = controllerStream;
+      },
       async pull(controllerStream) {
         try {
           // Consume upstream only when downstream has room; a slow/disconnected
           // client cannot leave an unbounded queue of translated SSE chunks.
-          while (!pendingEvents.length && !upstreamFinished) {
-            consumeUpstream(await nextUpstreamEvent());
-          }
+          while (!pendingEvents.length && !exchangeDone) await consumeStep();
+          if (exchangeDone) settle();
           if (streamCancelled) return;
           if (clientCancelled) {
-            cleanup();
+            endStream();
             controllerStream.close();
             return;
           }
           const event = pendingEvents.shift();
           if (event) {
-            controllerStream.enqueue(encoder.encode(sseEncode(event)));
+            write(event);
           } else {
-            cleanup();
+            endStream();
             controllerStream.close();
           }
         } catch (err) {
@@ -918,7 +1444,7 @@ codexGatewayApp.post(
             if (!clientCancelled) {
               grant.lastVerdict = 'upstream_failure';
               logger.warn(
-                { ...logContext, err },
+                { ...logContext, err, ...upstreamTrace(upstream.headers) },
                 'Codex gateway: stream translation failed',
               );
               controllerStream.enqueue(
@@ -927,10 +1453,16 @@ codexGatewayApp.post(
                     event: 'error',
                     data: {
                       type: 'error',
-                      error: {
-                        type: 'api_error',
-                        message: 'Codex gateway stream failed',
-                      },
+                      error:
+                        err instanceof CodexUpstreamError
+                          ? { type: err.errorType, message: err.message }
+                          : {
+                              type: 'api_error',
+                              message:
+                                err instanceof UpstreamStallError
+                                  ? 'Upstream Codex stream timed out'
+                                  : 'Codex gateway stream failed',
+                            },
                     },
                   }),
                 ),
@@ -938,14 +1470,14 @@ codexGatewayApp.post(
             }
             controllerStream.close();
           }
-          cleanup();
+          endStream();
         }
       },
       async cancel() {
         streamCancelled = true;
         clientCancelled = true;
         controller.abort();
-        cleanup();
+        endStream();
         await upstreamEvents.return(undefined).catch(() => {});
       },
     });

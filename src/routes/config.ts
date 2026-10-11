@@ -185,6 +185,7 @@ import {
   CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
   CODEX_OAUTH_FLOW_TTL_MS,
 } from '../codex-gateway/types.js';
+import { getCodexProviderRateLimits } from '../codex-gateway/rate-limit-snapshot.js';
 import {
   CODEX_DEFAULT_MODEL,
   CODEX_DEFAULT_EFFORT,
@@ -2034,12 +2035,23 @@ configRoutes.get(
 );
 
 // ─── GET /claude/providers/:id/usage — OAuth 用量数据 ─────
+// ChatGPT 订阅 provider 没有用量接口：返回网关从上游 x-codex-* 响应头记下的
+// 最近一次用量窗口快照（kind: 'codex_rate_limits'，见 rate-limit-snapshot.ts）。
 configRoutes.get(
   '/claude/providers/:id/usage',
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
     const { id } = c.req.param();
+    if (
+      getProviders().some(
+        (provider) =>
+          provider.id === id &&
+          provider.anthropicBaseUrl === CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+      )
+    ) {
+      return c.json(getCodexProviderRateLimits(id));
+    }
     try {
       const usage = await fetchOAuthUsage(id);
       return c.json(usage);

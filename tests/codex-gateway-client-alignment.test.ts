@@ -498,8 +498,9 @@ describe('x-codex-turn-state', () => {
     mocks.fetch
       .mockImplementationOnce(
         async () =>
-          new Response('{}', {
-            status: 500,
+          // A non-retryable failure: 5xx would be retried by the gateway.
+          new Response('{"error":{"message":"rejected"}}', {
+            status: 400,
             headers: { 'x-codex-turn-state': 'from-error' },
           }),
       )
@@ -507,7 +508,7 @@ describe('x-codex-turn-state', () => {
         sse({ 'x-codex-turn-state': 'main-state' }),
       );
     const opening = { role: 'user', content: 'go' };
-    expect((await request({ messages: [opening] })).status).toBe(500);
+    expect((await request({ messages: [opening] })).status).toBe(400);
     // The retry of the opening request keeps the same turn.
     await request({ messages: [opening] });
     await request({ messages: [opening, toolUse, toolResult()], tools });
@@ -721,6 +722,8 @@ describe('upstream headers deadline', () => {
     await vi.advanceTimersByTimeAsync(299_000);
     expect(settled).toBe(false);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect((await pending).status).toBe(502);
+    // A headers stall reports 504 like a stream stall; the 300-second
+    // deadline exceeds the retry window, so it is not retried.
+    expect((await pending).status).toBe(504);
   });
 });
