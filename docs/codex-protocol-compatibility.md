@@ -28,20 +28,36 @@ The port and derived compatibility fixtures retain the original
 
 ## Response and transport mapping
 
-| Output or condition                      | Previous behavior                                        | Aligned behavior                                                             | Reference                                                                       |
-| ---------------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Tool argument deltas                     | Ignored until item done; initial arguments could be lost | Buffer by item/call/output identity; emit each argument byte once            | `codexFunctionCallStream`, `appendCodexFunctionCallQueue`                       |
-| Parallel calls                           | Multiple blocks could remain open                        | Serial Anthropic blocks with deferred content                                | `codex_claude_parallel_function_calls_test.go`                                  |
-| Multiple text parts                      | Shared one text block                                    | Track item/content identity with correct block boundaries                    | `ConvertCodexResponseToClaude`                                                  |
-| Multipart thinking                       | Parts ran together; early signatures could be used       | One block per reasoning item, blank-line separators and the final signature  | `finalizeCodexThinkingBlock`                                                    |
-| Final-only response output               | Missing content or tool call                             | Hydrate missing final content without duplicating streamed bytes             | `appendCodexFunctionCallsFromTerminal`, `ConvertCodexResponseToClaudeNonStream` |
-| Stop and usage fields                    | Basic end/limit/tool reasons; cache reads only           | Preserve refusal/sequence/context reasons, cache writes and reasoning detail | `codexStopReason`, `extractResponsesUsage`, `setClaudeReasoningUsage`           |
-| Successful terminal with open connection | Waited for HTTP EOF and could time out                   | Finish at the Responses terminal and cancel the reader                       | `codex_executor_execute.go`, `codex_executor_stream.go`                         |
-| SSE fragments and malformed data         | Incomplete framing; malformed JSON was skipped           | Handle UTF-8 fragments, CR/LF and multiline data; fail malformed frames      | Codex executors and compatibility tests                                         |
-| HTTP failures                            | Generic `api_error`                                      | Status-specific Anthropic errors and valid retry hints                       | Executor/Anthropic compatibility boundary                                       |
-| Late reasoning signature                 | Could close thinking before the final cipher arrived     | Final cipher takes priority; added cipher is a fallback only at terminal     | `finalizeCodexThinkingBlock`                                                    |
-| Empty aborted or cancelled response      | Could return empty successful output                     | Reject reference-defined empty aborts and explicit unsuccessful terminals    | `helps/IsCodexTerminalEmptyIncomplete`, Codex executor terminal handling        |
-| SDK session identity                     | No stable cache hint                                     | Model/session/agent cache identity with provider/account isolation           | `helps/claude_code_session.go`, `cacheHelper`                                   |
+| Output or condition                      | Previous behavior                                        | Aligned behavior                                                                  | Reference                                                                       |
+| ---------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Tool argument deltas                     | Ignored until item done; initial arguments could be lost | Buffer by item/call/output identity; emit each argument byte once                 | `codexFunctionCallStream`, `appendCodexFunctionCallQueue`                       |
+| Parallel calls                           | Multiple blocks could remain open                        | Serial Anthropic blocks with deferred content                                     | `codex_claude_parallel_function_calls_test.go`                                  |
+| Multiple text parts                      | Shared one text block                                    | Track item/content identity with correct block boundaries                         | `ConvertCodexResponseToClaude`                                                  |
+| Multipart thinking                       | Parts ran together; early signatures could be used       | One block per reasoning item, blank-line separators and the final signature       | `finalizeCodexThinkingBlock`                                                    |
+| Final-only response output               | Missing content or tool call                             | Hydrate missing final content without duplicating streamed bytes                  | `appendCodexFunctionCallsFromTerminal`, `ConvertCodexResponseToClaudeNonStream` |
+| Stop and usage fields                    | Basic end/limit/tool reasons; cache reads only           | Preserve refusal/sequence/context reasons, cache writes and reasoning detail      | `codexStopReason`, `extractResponsesUsage`, `setClaudeReasoningUsage`           |
+| Successful terminal with open connection | Waited for HTTP EOF and could time out                   | Finish at the Responses terminal and cancel the reader                            | `codex_executor_execute.go`, `codex_executor_stream.go`                         |
+| SSE fragments and malformed data         | Incomplete framing; malformed JSON was skipped           | Handle UTF-8 fragments, CR/LF and multiline data; count and skip malformed frames | Codex executors; official `responses.rs` `process_sse`                          |
+| HTTP failures                            | Generic `api_error`                                      | Status-specific Anthropic errors and valid retry hints                            | Executor/Anthropic compatibility boundary                                       |
+| Late reasoning signature                 | Could close thinking before the final cipher arrived     | Final cipher takes priority; added cipher is a fallback only at terminal          | `finalizeCodexThinkingBlock`                                                    |
+| Empty aborted or cancelled response      | Could return empty successful output                     | Reject reference-defined empty aborts and explicit unsuccessful terminals         | `helps/IsCodexTerminalEmptyIncomplete`, Codex executor terminal handling        |
+| SDK session identity                     | No stable cache hint                                     | Model/session/agent cache identity with provider/account isolation                | `helps/claude_code_session.go`, `cacheHelper`                                   |
+
+## Official Codex CLI alignment
+
+The backend semantics below follow openai/codex `main` (2026-10-11); the
+Anthropic side follows what the Claude Code CLI expects.
+
+| Condition                                   | Behavior                                                                                            | Official reference                                          |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Quota and policy error codes                | Quota codes → non-retryable 429; `cyber`/`bio`/`misalignment`/`invalid_prompt` → non-retryable 400  | `sse/responses_error.rs`, `api_bridge.rs`, `error.rs`       |
+| `slow_down`, `rate_limit_exceeded`          | 429 with `Retry-After` from `error.headers` or a "try again in Xs" message                          | `parse_failed_response`, `try_parse_retry_delay`            |
+| 5xx and transport failures                  | Up to four retries, 200 ms exponential backoff with jitter, `Retry-After` honored, no 429 retry     | `model-provider-info` retry config, `codex-client/retry.rs` |
+| `end_turn: false`, `interrupted` incomplete | Follow-up request replaying the previous output items, continued in the same Anthropic message (≤4) | `core/src/session/turn.rs` `needs_follow_up`                |
+| Rate-limit headers                          | `x-codex-*` windows, credits, active limit and rejection type kept per provider for the usage route | `codex-api/src/rate_limits.rs`                              |
+| Invalid SSE JSON                            | Logged with a counter and skipped                                                                   | `process_sse_with_treatment`                                |
+| Replayed reasoning size                     | `count_tokens` uses `(len·3/4 − 650) / 4` tokens per encrypted reasoning item                       | `context_manager/history.rs`                                |
+| Stream idle                                 | 300-second upstream idle deadline                                                                   | `DEFAULT_STREAM_IDLE_TIMEOUT_MS`                            |
 
 ## Intentional runtime differences
 
@@ -58,6 +74,14 @@ The port and derived compatibility fixtures retain the original
 - Streams buffer their first frames until content starts, so a failure before
   any content returns a real HTTP status (as CLIProxyAPI's optional bootstrap
   buffering does), and `count_tokens` is answered with a local estimate.
+- Released streams send `event: ping` after 15 seconds of downstream silence
+  (as magpie does), because Claude Code's idle watchdog for custom base URLs
+  counts pings; the official client has no Anthropic-side equivalent.
+- `invalid_encrypted_content` strips replayed reasoning and retries once
+  (as magpie does); the official client has no such recovery.
+- A truncated (`max_output_tokens`) or refused turn keeps Anthropic stop
+  reasons (`max_tokens`, `refusal`) instead of the official stream error, and
+  an incomplete tool call is never reported as runnable.
 - Gateway authentication, bounded rate/body/event/aggregation budgets,
   backpressure, cancellation and idle deadlines remain in force. CLIProxyAPI's
   account pools, WebSocket continuation, distributed replay cache and management
@@ -67,8 +91,9 @@ The port and derived compatibility fixtures retain the original
   content. No shared server history cache is created.
 - Streaming and nonstream thinking use the same blank-line summary separators;
   the reference's separate nonstream converter concatenates those parts.
-- Malformed final tool JSON and conflicting already streamed snapshots fail
-  explicitly, instead of becoming an empty tool invocation or partial success.
+- Malformed final tool JSON of a completed response and conflicting already
+  streamed snapshots fail explicitly, instead of becoming an empty tool
+  invocation or partial success.
 
 ## Verification
 

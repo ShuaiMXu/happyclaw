@@ -74,7 +74,9 @@ pool. Requests refresh short-lived tokens when needed, share a single refresh
 per provider, and re-read persisted credentials after concurrent changes.
 A failed compare-and-swap never returns an old credential snapshot or
 silently overwrites a reauthorization. An upstream 401 forces one shared
-refresh and a single retry. A rejected refresh grant (`invalid_grant`,
+refresh and a single retry; a second 401 for the freshly refreshed token is
+answered with `x-should-retry: false` and recorded as needing a new login,
+so it never turns into a refresh loop. A rejected refresh grant (`invalid_grant`,
 `refresh_token_reused`, other 400/401 answers) is saved on the provider as
 "needs re-login"; the gateway stops refreshing and answers an authentication
 error that names the re-login until the credentials change. Transient refresh
@@ -111,28 +113,78 @@ access token keeps serving.
   placeholder or its plain text, so one such block in the history does not
   fail every later turn.
 - `POST /gateway/chatgpt/v1/messages/count_tokens` answers a local estimate
-  (characters per token, fixed cost for images and files) without calling the
-  backend.
+  without calling the backend: about 4 characters per token for prose, 3.2
+  for JSON and code (tool arguments, schemas, symbol-dense text), one token
+  per CJK character, a fixed cost for images and files, and replayed
+  encrypted reasoning by ciphertext length using the official client's
+  formula. The same estimate fills `message_start` usage; the final
+  `message_delta` reports the exact cache-exclusive counts. Because Claude
+  Code keeps the `message_start` input whenever the delta reports 0, a fully
+  cached prompt reports one cached token as input so the total stays exact.
 - Reasoning effort: disabled thinking uses the model's lowest supported level;
   haiku-tier background requests use low; an Agent with an explicit effort
   keeps it; otherwise `CODEX_REASONING_EFFORT` applies, falling back to the
   model's catalog default. The settings page shows that same default.
 - Upstream headers have a 30-second deadline and streams a 300-second idle
-  deadline, matching the official Codex CLI. Nonstream aggregation also has a
-  ten-minute deadline and a 32 MiB budget. Individual SSE events are bounded.
-  Downstream backpressure pauses upstream reading, and cancellation
-  disconnects the upstream stream.
+  deadline, matching the official Codex CLI. A stall answers 504 for both
+  response modes. Nonstream aggregation also has a ten-minute deadline and a
+  32 MiB budget. Individual SSE events are bounded. Downstream backpressure
+  pauses upstream reading, and cancellation disconnects the upstream stream.
+- Once a stream is released, 15 seconds without a downstream write send an
+  `event: ping`. Claude Code's 300-second idle watchdog counts pings, so a
+  long silent reasoning phase does not end the reply. No ping precedes
+  `message_start`, and keepalive stops with the stream.
 - Streams hold their first frames until content starts (at most 48 events,
   1 MiB or 20 seconds), so a failure reported before any content becomes a
-  real HTTP status instead of 200 followed by an error event.
+  real HTTP status instead of 200 followed by an error event. A content
+  block announced without content yet (an empty reasoning, text or tool
+  start) still counts as handshake.
+- Like the official client, 5xx answers and transport failures are retried up
+  to four times with 200 ms exponential backoff (±10%), honoring
+  `Retry-After`, and only while nothing has reached the client. Retries of
+  one upstream request stay within 60 seconds; advice beyond that is
+  returned to the client instead. 429 is never retried by the gateway. A
+  stream that drops before any content counts as a transport failure.
+- When the backend reports that it could not verify replayed reasoning
+  (`invalid_encrypted_content`, for example ciphertext sealed by another
+  account), the gateway drops the reasoning items from the request input and
+  retries once.
+- A response that ends with `end_turn: false`, or an `interrupted`
+  incomplete response, is continued like the official client's follow-up:
+  the gateway sends the previous output items again (requests are
+  `store: false`) and streams the continuation into the same Anthropic
+  message, with continuing block indexes and summed usage. At most four
+  follow-ups are made; a response with a tool call always ends the message so
+  the client can run it.
+- A tool call cut by `max_output_tokens` ends the message with
+  `max_tokens`: a call that had not started downstream is dropped, one that
+  was already streaming is closed and never reported as `tool_use`.
+  Refusal content without a tool call stops with `refusal`.
+- An SSE frame whose data is not a JSON event object is skipped and counted
+  in the logs, as the official client does; the stream continues.
 - Success logs record model and usage counts. Upstream HTTP error bodies are
   read up to 64 KiB within five seconds; the client gets a redacted, bounded
-  excerpt, and logs keep only status, code and type. Usage limits become 429
-  with `Retry-After` and the reset time; overload and `slow_down` become 529;
-  a plan without Codex (`usage_not_included`) becomes 403; context-length
-  rejections become 400 "Prompt is too long", which Claude Code answers by
-  compacting. Semantic terminal events close the upstream reader without
-  waiting for the HTTP connection to close. Malformed SSE fails the request.
+  excerpt, and logs keep only status, code, type and the upstream
+  `x-request-id`/`cf-ray`. Error classification follows the official client:
+  usage limits become 429 with `Retry-After`, the reset time and
+  `x-should-retry: false`; quota exhaustion (`insufficient_quota`,
+  `credit_balance_exhausted`, spend/usage-limit codes) becomes a 429 that is
+  not retried; policy rejections (`cyber_policy`, `bio_policy`,
+  `misalignment_policy_violation`, `invalid_prompt`) become 400
+  `invalid_request_error` that is not retried; `slow_down` and
+  `rate_limit_exceeded` become 429, taking the delay from the streamed
+  error's `Retry-After` header or a "try again in Xs" message; overload
+  becomes 529; a plan without Codex (`usage_not_included`) becomes 403;
+  context-length rejections become 400 "Prompt is too long", which Claude
+  Code answers by compacting. Semantic terminal events close the upstream
+  reader without waiting for the HTTP connection to close.
+- The gateway reads the official `x-codex-*` rate-limit headers (primary and
+  secondary used percent, window minutes and reset time per limit family,
+  credits, active limit and rejection type) and in-band `codex.rate_limits`
+  frames, and keeps the latest snapshot per provider in memory.
+  `GET /api/config/claude/providers/:id/usage` returns it for a ChatGPT
+  provider. When the usage window is exhausted and its reset time is known,
+  the provider is quarantined in the provider pool until that reset.
 
 The protocol implementation is ported from
 [CLIProxyAPI a2976eb8](https://github.com/router-for-me/CLIProxyAPI/tree/a2976eb8a303f11b4ea5177bce9f9ff752634dfc).
@@ -155,7 +207,7 @@ that an account can access the live backend.
 | 401 or authentication error     | The provider page shows "needs re-login" when the refresh grant was rejected; use its HappyClaw re-login action.      |
 | 403 from HappyClaw gateway      | The request came through a reverse proxy or from a non-local address; runners reach the gateway directly.             |
 | 429 from HappyClaw gateway      | One runner exceeded its 120 requests per minute; it retries after `Retry-After`. Other runners keep their own budget. |
-| 429 usage limit                 | The ChatGPT plan's Codex usage window is exhausted; the message names the reset time.                                 |
+| 429 usage limit                 | The ChatGPT plan's Codex usage window is exhausted; the message names the reset time and the pool waits for it.       |
 | 413                             | Reduce the request below the 32 MiB envelope, including image base64 overhead.                                        |
 | 400 invalid messages request    | The message names the field path that does not match a supported message/tool shape.                                  |
 | Upstream model/plan rejection   | Select a model available to the linked account and check its current Codex access.                                    |
