@@ -41,7 +41,35 @@ The port and derived compatibility fixtures retain the original
 | HTTP failures                            | Generic `api_error`                                      | Status-specific Anthropic errors and valid retry hints                       | Executor/Anthropic compatibility boundary                                       |
 | Late reasoning signature                 | Could close thinking before the final cipher arrived     | Final cipher takes priority; added cipher is a fallback only at terminal     | `finalizeCodexThinkingBlock`                                                    |
 | Empty aborted or cancelled response      | Could return empty successful output                     | Reject reference-defined empty aborts and explicit unsuccessful terminals    | `helps/IsCodexTerminalEmptyIncomplete`, Codex executor terminal handling        |
-| SDK session identity                     | No stable cache hint                                     | Model/session/agent cache identity with provider/account isolation           | `helps/claude_code_session.go`, `cacheHelper`                                   |
+| SDK session identity                     | No stable cache hint                                     | Session/agent cache identity with provider/account isolation                 | `helps/claude_code_session.go`, `cacheHelper`                                   |
+
+## Official client alignment
+
+Beyond the CLIProxyAPI port, the HTTP identity and transport follow the
+official openai/codex client (0.162.1) directly; where the two differ, the
+official client wins.
+
+| Concern             | Aligned behavior                                                                                                  | Official source                                                                |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Client identity     | `originator: codex-tui`, `version` on every request, official User-Agent format                                   | `login/src/auth/default_client.rs`, `model-provider-info/src/lib.rs`           |
+| Account headers     | `ChatGPT-Account-ID`; `X-OpenAI-Fedramp: true` from the `chatgpt_account_is_fedramp` claim                        | `model-provider/src/bearer_auth_provider.rs`, `login/src/token_data.rs`        |
+| Session headers     | `session-id`, `thread-id`, `x-client-request-id`, `x-codex-window-id`, `x-codex-turn-metadata`                    | `codex-api/src/requests/headers.rs`, `core/src/responses_metadata.rs`          |
+| Body metadata       | `client_metadata` (installation, session, thread, window, turn, turn metadata); `prompt_cache_key` always present | `core/src/client.rs` build_responses_request                                   |
+| Background requests | Own thread, `x-codex-parent-thread-id`, cache key `{source}:{parent}`                                             | `core/src/client.rs` prompt_cache_key                                          |
+| Turn state          | First `x-codex-turn-state` of a turn replayed within the turn, per provider/account/thread                        | `codex-api/src/sse/responses.rs`, `core/src/client.rs` build_responses_headers |
+| Cookies             | Allowlisted Cloudflare/`__oailb` cookies only, one jar per provider/account                                       | `http-client/src/chatgpt_cloudflare_cookies.rs`                                |
+| Request compression | zstd level 3 when the runtime supports it                                                                         | `http-client/src/request.rs`, `features` EnableRequestCompression              |
+| Responses Lite      | `x-openai-internal-codex-responses-lite: true` for Responses Lite models                                          | `core/src/client.rs` add_responses_lite_header                                 |
+| Token refresh       | Permanent only for 401, 400 + `invalid_grant`, `refresh_token_expired/reused/invalidated`; auth-client headers    | `login/src/auth/manager.rs`                                                    |
+| Authorization code  | Never resent after a request may have reached the token endpoint                                                  | `login/src/server.rs` exchange_code_for_tokens                                 |
+| Revocation          | Best-effort refresh-token revocation when a login is replaced by another account or the provider is deleted       | `login/src/auth/revoke.rs`                                                     |
+
+Not adopted: `x-codex-beta-features` (`remote_compaction_v2` would advertise
+remote compaction, which Claude Code's local compaction cannot honor),
+`x-openai-subagent` for background requests (the official client sends none
+for its own title thread), WebSocket transport (HTTP SSE remains the official
+fallback) and HTTP/2 through the proxy dispatcher (experimental in the pinned
+undici). Compaction windows are not tracked, so the window number stays 0.
 
 ## Intentional runtime differences
 

@@ -48,8 +48,11 @@ const web = await import('../src/web.js');
 const db = await import('../src/db.js');
 const runtimeConfig = await import('../src/runtime-config.js');
 const { providerPool } = await import('../src/provider-pool.js');
-const { CODEX_GATEWAY_BASE_URL_PLACEHOLDER, CODEX_OAUTH_TOKEN_URL } =
-  await import('../src/codex-gateway/types.js');
+const {
+  CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+  CODEX_OAUTH_REVOKE_URL,
+  CODEX_OAUTH_TOKEN_URL,
+} = await import('../src/codex-gateway/types.js');
 
 const queue = {
   listDescendantJids: () => [],
@@ -66,6 +69,7 @@ const app = web.createAppForTest({
 } as any);
 
 const tokenEndpoint = vi.fn();
+const revokeEndpoint = vi.fn();
 
 function jwt(payload: unknown): string {
   return `e30.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.sig`;
@@ -118,13 +122,17 @@ beforeAll(() => {
 beforeEach(() => {
   fs.rmSync(path.join(tmpDir, 'config'), { recursive: true, force: true });
   vi.clearAllMocks();
+  tokenEndpoint.mockReset();
   tokenEndpoint.mockImplementation(async () =>
     json(200, tokenBody('account-a')),
   );
+  revokeEndpoint.mockReset();
+  revokeEndpoint.mockImplementation(async () => json(200, {}));
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input.toString();
+      if (url === CODEX_OAUTH_REVOKE_URL) return revokeEndpoint(url, init);
       if (url !== CODEX_OAUTH_TOKEN_URL) throw new Error(`blocked ${url}`);
       return tokenEndpoint(url, init);
     }),
@@ -171,16 +179,47 @@ describe('POST /api/config/codex/oauth/callback', () => {
     expect((await callback(state, callbackUrl(state))).status).toBe(200);
   });
 
-  test('a transient exchange failure keeps the flow so the same code can be retried', async () => {
+  test('a connection that never opened keeps the flow so the same code can be retried', async () => {
     tokenEndpoint
-      .mockResolvedValueOnce(json(503, { error: 'temporarily_unavailable' }))
+      .mockRejectedValueOnce(
+        new TypeError('fetch failed', {
+          cause: Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }),
+        }),
+      )
       .mockResolvedValueOnce(json(200, tokenBody('account-a')));
     const state = await startFlow();
     const failed = await callback(state, callbackUrl(state));
     expect(failed.status).toBe(502);
     expect(await failed.json()).toMatchObject({ retryable: true });
     expect((await callback(state, callbackUrl(state))).status).toBe(200);
+    expect(tokenEndpoint).toHaveBeenCalledTimes(2);
   });
+
+  test.each([
+    ['an upstream 5xx', () => json(503, { error: 'temporarily_unavailable' })],
+    [
+      'a dropped connection',
+      () => {
+        throw new TypeError('fetch failed', {
+          cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }),
+        });
+      },
+    ],
+  ])(
+    'after %s the code may be consumed, so it is never sent again',
+    async (_label, answer) => {
+      tokenEndpoint.mockImplementationOnce(async () => answer());
+      const state = await startFlow();
+      const failed = await callback(state, callbackUrl(state));
+      expect(failed.status).toBe(502);
+      const body = await failed.json();
+      expect(body.retryable).toBe(false);
+      expect(body.error).toContain('请重新登录 ChatGPT');
+      const again = await callback(state, callbackUrl(state));
+      expect(again.status).toBe(400);
+      expect(tokenEndpoint).toHaveBeenCalledTimes(1);
+    },
+  );
 
   test('a rejected code consumes the flow', async () => {
     tokenEndpoint.mockResolvedValueOnce(json(400, { error: 'invalid_grant' }));
@@ -257,6 +296,101 @@ describe('POST /api/config/codex/oauth/callback', () => {
     expect(queue.drainProviderRunnersForCredentialRefresh).toHaveBeenCalledWith(
       created.id,
     );
+  });
+
+  test('re-login with a different account revokes the replaced refresh token in the background', async () => {
+    const state = await startFlow();
+    const created = await (await callback(state, callbackUrl(state))).json();
+    expect(revokeEndpoint).not.toHaveBeenCalled();
+
+    // Same account: the new login keeps serving, nothing is revoked.
+    const same = await startFlow(created.id);
+    expect((await callback(same, callbackUrl(same))).status).toBe(200);
+    expect(revokeEndpoint).not.toHaveBeenCalled();
+
+    // A revoke that fails must not fail the login.
+    revokeEndpoint.mockImplementationOnce(async () => {
+      throw new TypeError('fetch failed');
+    });
+    tokenEndpoint.mockResolvedValueOnce(json(200, tokenBody('account-b')));
+    const relogin = await startFlow(created.id);
+    expect((await callback(relogin, callbackUrl(relogin))).status).toBe(200);
+    await vi.waitFor(() => expect(revokeEndpoint).toHaveBeenCalledTimes(1));
+    const init = revokeEndpoint.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      token: 'refresh-account-a',
+      token_type_hint: 'refresh_token',
+    });
+    expect(
+      runtimeConfig.getProviderById(created.id)!.codexOAuthCredentials,
+    ).toMatchObject({ refreshToken: 'refresh-account-b' });
+  });
+
+  test('deleting a ChatGPT provider revokes its grant without waiting for it', async () => {
+    const state = await startFlow();
+    const created = await (await callback(state, callbackUrl(state))).json();
+    let releaseRevoke!: () => void;
+    revokeEndpoint.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          releaseRevoke = () => resolve(json(503, {}));
+        }),
+    );
+    const response = await app.request(
+      `/api/config/claude/providers/${created.id}`,
+      { method: 'DELETE' },
+    );
+    expect(response.status).toBe(200);
+    expect(runtimeConfig.getProviderById(created.id)).toBeNull();
+    await vi.waitFor(() => expect(revokeEndpoint).toHaveBeenCalledTimes(1));
+    expect(
+      JSON.parse(
+        (revokeEndpoint.mock.calls[0][1] as RequestInit).body as string,
+      ),
+    ).toMatchObject({ token: 'refresh-account-a' });
+    releaseRevoke();
+  });
+
+  test('legacy reauth verdicts for non-grant 4xx answers read back as transient', async () => {
+    const state = await startFlow();
+    const created = await (await callback(state, callbackUrl(state))).json();
+    const stored = runtimeConfig.getProviderById(created.id)!;
+    const record = (message: string) =>
+      runtimeConfig.setProviderCodexOAuthRefreshErrorIfCurrent(
+        created.id,
+        stored.codexOAuthCredentials!,
+        { kind: 'reauth_required', message, at: new Date().toISOString() },
+      );
+    record('refresh_token 被拒绝（HTTP 403）');
+    expect(
+      runtimeConfig.getProviderById(created.id)!.codexOAuthLastRefreshError,
+    ).toMatchObject({
+      kind: 'transient',
+      message: '令牌刷新暂时失败（HTTP 403）',
+    });
+    record('refresh_token 被拒绝（invalid_grant）');
+    expect(
+      runtimeConfig.getProviderById(created.id)!.codexOAuthLastRefreshError,
+    ).toMatchObject({ kind: 'reauth_required' });
+  });
+
+  test('stores the FedRAMP claim with the credentials', async () => {
+    tokenEndpoint.mockResolvedValueOnce(
+      json(200, {
+        ...tokenBody('gov'),
+        id_token: jwt({
+          'https://api.openai.com/auth': {
+            chatgpt_account_id: 'gov',
+            chatgpt_account_is_fedramp: true,
+          },
+        }),
+      }),
+    );
+    const state = await startFlow();
+    const created = await (await callback(state, callbackUrl(state))).json();
+    expect(
+      runtimeConfig.getProviderById(created.id)!.codexOAuthCredentials,
+    ).toMatchObject({ accountId: 'gov', isFedramp: true });
   });
 
   test('converting a third-party provider resets its model, writes the effort and replaces its secret', async () => {

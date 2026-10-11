@@ -14,6 +14,7 @@ import {
 import { resolveCodexDefaultEffort } from './codex-gateway/model-catalog.js';
 import { getResolvedCodexCatalog } from './codex-gateway/model-catalog-sync.js';
 import { normalizeLegacyCodexModel } from './codex-gateway/convert-request.js';
+import { retiredCodexReauthReason } from './codex-gateway/oauth.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
@@ -1036,6 +1037,7 @@ function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
         accountId: typeof creds.accountId === 'string' ? creds.accountId : null,
         planType: typeof creds.planType === 'string' ? creds.planType : null,
         email: typeof creds.email === 'string' ? creds.email : null,
+        ...(creds.isFedramp === true ? { isFedramp: true } : {}),
         updatedAt:
           typeof creds.updatedAt === 'string'
             ? creds.updatedAt
@@ -1468,6 +1470,13 @@ function normalizeCodexRefreshErrorState(
   if (typeof record.message !== 'string' || typeof record.at !== 'string') {
     return null;
   }
+  // Earlier releases also saved other 4xx answers (e.g. a Cloudflare 403) as
+  // needing re-login; the official classification retries those.
+  const retired =
+    record.kind === 'reauth_required'
+      ? retiredCodexReauthReason(record.message)
+      : null;
+  if (retired) return { kind: 'transient', message: retired, at: record.at };
   return {
     kind: record.kind,
     message: record.message.slice(0, MAX_REFRESH_ERROR_MESSAGE_LENGTH),

@@ -15,14 +15,23 @@ export interface CodexOAuthCredentials {
   /** id_token JWT `https://api.openai.com/auth.chatgpt_plan_type` claim（plus/pro/...）。 */
   planType: string | null;
   email: string | null;
+  /**
+   * id_token `auth.chatgpt_account_is_fedramp`; requests then carry
+   * `X-OpenAI-Fedramp: true` (model-provider bearer_auth_provider.rs).
+   * Absent on credentials saved before this field existed.
+   */
+  isFedramp?: boolean;
   updatedAt: string;
 }
 
 /**
  * 最近一次上游 token 刷新失败的状态，落在 provider 的非机密配置里（不进 secrets）。
- * - reauth_required：refresh_token 被拒（invalid_grant / refresh_token_reused /
- *   400 / 401），只有重新登录 ChatGPT 才能恢复；凭据更换前不再发起刷新。
- * - transient：网络、超时或上游 5xx/429，按退避自动重试。
+ * 分类与官方 login/src/auth/manager.rs 一致：
+ * - reauth_required：401、400 + invalid_grant，或 refresh_token_expired /
+ *   refresh_token_reused / refresh_token_invalidated，只有重新登录 ChatGPT 才能
+ *   恢复；凭据更换前不再发起刷新。
+ * - transient：其余一切失败——网络、超时、5xx/429，以及其他 4xx（例如
+ *   Cloudflare 的 403），按退避自动重试。
  * 凭据写入（重新登录、刷新成功、清除）时一并清掉。
  */
 export interface CodexOAuthRefreshErrorState {
@@ -50,6 +59,8 @@ export const CODEX_GATEWAY_ROUTE = '/gateway/chatgpt';
 export const CODEX_OAUTH_AUTHORIZE_URL =
   'https://auth.openai.com/oauth/authorize';
 export const CODEX_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
+/** login/src/auth/manager.rs REVOKE_TOKEN_URL. */
+export const CODEX_OAUTH_REVOKE_URL = 'https://auth.openai.com/oauth/revoke';
 export const CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 export const CODEX_OAUTH_REDIRECT_URI = 'http://localhost:1455/auth/callback';
 /** 用户粘贴回调 URL 时接受的来源：浏览器可能把 localhost 解析/改写成 127.0.0.1。 */

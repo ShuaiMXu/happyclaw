@@ -173,7 +173,9 @@ import {
   exchangeCodexCode,
   buildCodexCredentials,
   CodexOAuthTokenError,
+  revokeCodexTokenInBackground,
 } from '../codex-gateway/oauth.js';
+import { forgetCodexTransportState } from '../codex-gateway/transport-state.js';
 import {
   codexProviderCreationDefaults,
   extractCodexCallbackParams,
@@ -1813,6 +1815,18 @@ configRoutes.delete(
             sessionInvalidation,
           },
         );
+        if (
+          previous?.codexOAuthCredentials &&
+          !getProviders().some((provider) => provider.id === id)
+        ) {
+          // Like the official logout, end the ChatGPT grant HappyClaw no
+          // longer holds; deletion never waits for or fails on this.
+          forgetCodexTransportState(id);
+          revokeCodexTokenInBackground(previous.codexOAuthCredentials, {
+            providerId: id,
+            reason: 'provider_deleted',
+          });
+        }
         if (!mutation.applied.success) {
           return c.json(
             {
@@ -2441,8 +2455,10 @@ configRoutes.post(
       );
     }
 
-    // Claim the flow so one code is exchanged at a time; restore it when the
-    // exchange failed transiently and the same code can still be retried.
+    // Claim the flow so one code is exchanged at a time. Like the official
+    // login server, a code is never sent twice once a request may have reached
+    // the token endpoint (a response timeout may hide a consumed code); only a
+    // connection that never opened restores the flow for the same code.
     codexOauthFlows.delete(state);
     let codexCredentials;
     try {
@@ -2450,21 +2466,28 @@ configRoutes.post(
         await exchangeCodexCode(parsed.code, flow.codeVerifier),
       );
     } catch (err) {
-      const transient = !(err instanceof CodexOAuthTokenError) || err.transient;
-      if (transient && flow.expiresAt > Date.now()) {
+      const tokenError = err instanceof CodexOAuthTokenError ? err : null;
+      const reusable = !!tokenError && !tokenError.requestDelivered;
+      const transient = !tokenError || tokenError.transient;
+      if (reusable && flow.expiresAt > Date.now()) {
         codexOauthFlows.set(state, flow);
       }
-      logger.warn({ err, transient }, 'Codex OAuth token exchange error');
+      logger.warn(
+        { err, transient, reusable },
+        'Codex OAuth token exchange error',
+      );
       const message =
         err instanceof Error
           ? err.message
           : 'Codex OAuth token exchange failed';
       return c.json(
         {
-          error: transient
+          error: reusable
             ? `${message}；可以直接重试，无需重新授权`
-            : `${message}；授权码已失效，请重新登录 ChatGPT`,
-          retryable: transient,
+            : transient
+              ? `${message}；授权码可能已被使用，请重新登录 ChatGPT`
+              : `${message}；授权码已失效，请重新登录 ChatGPT`,
+          retryable: reusable,
         },
         transient ? 502 : 400,
       );
@@ -2561,6 +2584,15 @@ configRoutes.post(
                 },
               };
         if (mutation.value) {
+          if (plan.accountChanged && previous.codexOAuthCredentials) {
+            // The replaced account's grant is no longer reachable from
+            // HappyClaw; revoke it best-effort without delaying the login.
+            forgetCodexTransportState(id);
+            revokeCodexTokenInBackground(previous.codexOAuthCredentials, {
+              providerId: id,
+              reason: 'account_replaced',
+            });
+          }
           // A new login settles any account verdict held against the old one.
           providerPool.resetHealth(id);
           try {

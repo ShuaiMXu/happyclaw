@@ -44,7 +44,7 @@ import {
   describeCodexRequestIssue,
 } from './request-validation.js';
 import { CODEX_BACKEND_RESPONSES_URL } from './types.js';
-import { codexRequestContext } from './request-context.js';
+import { buildCodexUpstreamRequest } from './request-context.js';
 import {
   resolveCodexGatewayToken,
   type CodexGatewayGrant,
@@ -62,8 +62,13 @@ interface CodexGatewayEnv {
 
 export const codexGatewayApp = new Hono<CodexGatewayEnv>();
 
-/** Upstream response headers deadline. */
-const UPSTREAM_HEADERS_TIMEOUT_MS = 30_000;
+/**
+ * Deadline for upstream response headers. The official client sets no
+ * response deadline on /responses; the backend may hold a request queued
+ * before answering, so a short deadline would kill requests the official
+ * client keeps. Bounded by the same 300s budget as stream idleness.
+ */
+const UPSTREAM_HEADERS_TIMEOUT_MS = 300_000;
 /**
  * Silence allowed between upstream stream chunks. Matches the official Codex
  * CLI's stream_idle_timeout_ms (and CLIProxyAPI's Codex executor): a long
@@ -602,36 +607,30 @@ codexGatewayApp.post(
     const sendUpstream = async (
       current: CodexAccessContext,
     ): Promise<Response> => {
-      const requestContext = codexRequestContext(c.req.raw.headers, parsed, {
-        providerId: current.providerId,
-        accountId: current.accountId,
-        model: responsesRequest.model,
-        serviceTier: responsesRequest.service_tier,
+      const upstreamRequest = buildCodexUpstreamRequest({
+        incomingHeaders: c.req.raw.headers,
+        anthropicRequest: parsed,
+        responsesRequest,
+        access: current,
+        fallbackScope: grant.id,
       });
+      // The deadline belongs to this attempt only: a timed-out attempt does
+      // not abort the request's shared controller, so a retry can still run.
+      // The shared controller still cancels the attempt and its body.
+      const attempt = new AbortController();
       const headersTimeout = setTimeout(
-        () => controller.abort(),
+        () => attempt.abort(),
         UPSTREAM_HEADERS_TIMEOUT_MS,
       );
       try {
-        return await fetch(CODEX_BACKEND_RESPONSES_URL, {
+        const response = await fetch(CODEX_BACKEND_RESPONSES_URL, {
           method: 'POST',
-          headers: {
-            Authorization: `Bearer ${current.accessToken}`,
-            'Content-Type': 'application/json',
-            Accept: 'text/event-stream',
-            ...(current.accountId
-              ? { 'chatgpt-account-id': current.accountId }
-              : {}),
-            ...requestContext.headers,
-          },
-          body: JSON.stringify({
-            ...responsesRequest,
-            ...(requestContext.promptCacheKey
-              ? { prompt_cache_key: requestContext.promptCacheKey }
-              : {}),
-          }),
-          signal: controller.signal,
+          headers: upstreamRequest.headers,
+          body: upstreamRequest.body,
+          signal: AbortSignal.any([controller.signal, attempt.signal]),
         });
+        upstreamRequest.observe(response);
+        return response;
       } finally {
         clearTimeout(headersTimeout);
       }

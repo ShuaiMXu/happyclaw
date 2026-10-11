@@ -8,6 +8,7 @@ import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import zlib from 'node:zlib';
 
 const repository = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -82,7 +83,13 @@ async function jsonBody(request) {
     assert.ok(bytes < 2 * 1024 * 1024, 'fixture body limit');
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  const raw = Buffer.concat(chunks);
+  // The gateway compresses bodies with zstd like the official client.
+  const decoded =
+    request.headers['content-encoding'] === 'zstd'
+      ? zlib.zstdDecompressSync(raw)
+      : raw;
+  return JSON.parse(decoded.toString('utf8'));
 }
 
 function fixtureEvents(turn, shortenedMcp) {

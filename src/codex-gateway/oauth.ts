@@ -5,13 +5,18 @@
 // - token 交换: form 编码；refresh: JSON 编码（codex-rs/login/src/oauth/client.rs
 //   明确注释 "ChatGPT refresh uses JSON; authorization-code ... use form encoding"）
 // - id_token claims: codex-rs/login/src/token_data.rs（auth.chatgpt_account_id 等）
+// - 刷新失败分类: codex-rs/login/src/auth/manager.rs request_chatgpt_token_refresh
+// - 吊销: codex-rs/login/src/auth/revoke.rs
 
 import { createHash, randomBytes } from 'node:crypto';
 
+import { logger } from '../logger.js';
+import { CODEX_ORIGINATOR, codexClientHeaders } from './client-identity.js';
 import {
   CODEX_OAUTH_AUTHORIZE_URL,
   CODEX_OAUTH_CLIENT_ID,
   CODEX_OAUTH_REDIRECT_URI,
+  CODEX_OAUTH_REVOKE_URL,
   CODEX_OAUTH_SCOPES,
   CODEX_OAUTH_TOKEN_URL,
   type CodexOAuthCredentials,
@@ -53,7 +58,9 @@ export function buildCodexAuthorizeUrl(
     id_token_add_organizations: 'true',
     codex_cli_simplified_flow: 'true',
     state,
-    originator: 'codex_cli_rs',
+    // server.rs build_authorize_url sends the process originator; the TUI's
+    // is codex-tui, the same value every backend request carries.
+    originator: CODEX_ORIGINATOR,
   });
   return `${CODEX_OAUTH_AUTHORIZE_URL}?${params.toString()}`;
 }
@@ -69,9 +76,13 @@ interface RawTokenResponse {
 const DEFAULT_ACCESS_TOKEN_TTL_MS = 3600 * 1000;
 
 /**
- * token 端点失败。transient 区分"稍后重试可能成功"（网络、超时、5xx、429、
- * 响应体异常）与"凭据/授权码已被拒"（400/401/403，如 invalid_grant、
- * refresh_token_reused）；后者只能重新登录。message 不含上游原文。
+ * token 端点失败。transient 与官方 manager.rs 的刷新分类一致：只有 401、
+ * 400 + invalid_grant 与 refresh_token_expired / refresh_token_reused /
+ * refresh_token_invalidated 是"凭据已被拒"（只能重新登录），其余一切——网络、
+ * 超时、5xx/429、响应体异常以及其他 4xx（例如 Cloudflare 403）——都按瞬时失败
+ * 退避重试。requestDelivered=false 只表示请求可证明从未到达服务器（DNS、拒绝
+ * 连接、连接超时、TLS 握手失败）；授权码只有这种情况下才能重用。message 不含
+ * 上游原文。
  */
 export class CodexOAuthTokenError extends Error {
   constructor(
@@ -79,21 +90,24 @@ export class CodexOAuthTokenError extends Error {
     readonly status: number | null,
     readonly code: string | null,
     readonly transient: boolean,
+    readonly requestDelivered = true,
   ) {
     super(message);
     this.name = 'CodexOAuthTokenError';
   }
 }
 
-/** 上游错误码只用于分类和提示，限制成短 token，避免把任意响应内容带进日志/界面。 */
+/**
+ * 上游错误码只用于分类和提示，限制成短 token，避免把任意响应内容带进日志/界面。
+ * 取值顺序同官方 TokenErrorDetail：字符串 error、error.code、顶层 code。
+ */
 function oauthErrorCode(body: Record<string, unknown>): string | null {
   const error = body.error;
   const candidate =
-    typeof error === 'string'
+    typeof error === 'string' && error.trim()
       ? error
       : error && typeof error === 'object' && !Array.isArray(error)
-        ? ((error as Record<string, unknown>).code ??
-          (error as Record<string, unknown>).type)
+        ? ((error as Record<string, unknown>).code ?? body.code)
         : body.code;
   return typeof candidate === 'string' &&
     /^[A-Za-z0-9_.-]{1,64}$/.test(candidate)
@@ -101,8 +115,87 @@ function oauthErrorCode(body: Record<string, unknown>): string | null {
     : null;
 }
 
-function isTransientTokenStatus(status: number): boolean {
-  return status === 408 || status === 429 || status >= 500;
+const PERMANENT_REFRESH_CODES = new Set([
+  'refresh_token_expired',
+  'refresh_token_reused',
+  'refresh_token_invalidated',
+]);
+
+/** manager.rs: only these rejections end the refresh grant. */
+export function isPermanentCodexTokenRejection(
+  status: number,
+  code: string | null,
+): boolean {
+  const normalized = code?.toLowerCase() ?? null;
+  return (
+    status === 401 ||
+    (status === 400 && normalized === 'invalid_grant') ||
+    (normalized !== null && PERMANENT_REFRESH_CODES.has(normalized))
+  );
+}
+
+/** token-manager 落盘的被拒原因格式：`refresh_token 被拒绝（<code | HTTP status>）`。 */
+export function describeCodexRefreshRejection(
+  code: string | null,
+  status: number | null,
+): string {
+  return `refresh_token 被拒绝（${code ?? `HTTP ${status}`}）`;
+}
+
+/**
+ * 旧版本把 401/400 以外的 4xx（如 Cloudflare 403）也记成 reauth_required。
+ * 返回 null 表示该原因按现行分类仍需重新登录；否则返回改记为瞬时失败时的描述。
+ */
+export function retiredCodexReauthReason(message: string): string | null {
+  const match = /^refresh_token 被拒绝（(.+)）$/.exec(message);
+  if (!match) return null;
+  const detail = match[1];
+  const status = /^HTTP (\d{3})$/.exec(detail)?.[1];
+  const permanent = status
+    ? status === '401'
+    : detail.toLowerCase() === 'invalid_grant' ||
+      PERMANENT_REFRESH_CODES.has(detail.toLowerCase());
+  return permanent ? null : `令牌刷新暂时失败（${detail}）`;
+}
+
+/** Transport failures that provably happened before any request byte left. */
+const UNDELIVERED_ERROR_CODES = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EAI_NONAME',
+  'ECONNREFUSED',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EADDRNOTAVAIL',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'CERT_HAS_EXPIRED',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+]);
+
+/**
+ * fetch reports transport failures as TypeError('fetch failed', { cause });
+ * Happy Eyeballs connects add an AggregateError of per-address failures.
+ */
+function failedBeforeDelivery(err: unknown, depth = 0): boolean {
+  if (!err || typeof err !== 'object' || depth > 4) return false;
+  const { code, errors, cause } = err as {
+    code?: unknown;
+    errors?: unknown;
+    cause?: unknown;
+  };
+  if (typeof code === 'string' && UNDELIVERED_ERROR_CODES.has(code))
+    return true;
+  if (
+    Array.isArray(errors) &&
+    errors.length > 0 &&
+    errors.every((entry) => failedBeforeDelivery(entry, depth + 1))
+  )
+    return true;
+  return failedBeforeDelivery(cause, depth + 1);
 }
 
 /** access_token 没有 expires_in 时用其 JWT exp 推算到期时间，再不行才兜底一小时。 */
@@ -156,7 +249,10 @@ async function postTokenEndpoint(
         ...init,
         signal: controller.signal,
       });
-    } catch {
+    } catch (err) {
+      // A response timeout may follow a request the server already consumed;
+      // only a connection that never opened proves the request went nowhere.
+      const delivered = controller.signal.aborted || !failedBeforeDelivery(err);
       throw new CodexOAuthTokenError(
         controller.signal.aborted
           ? 'Codex OAuth token endpoint timed out'
@@ -164,6 +260,7 @@ async function postTokenEndpoint(
         null,
         null,
         true,
+        delivered,
       );
     }
     const body = (await response.json().catch(() => ({}))) as Record<
@@ -176,7 +273,7 @@ async function postTokenEndpoint(
         `Codex OAuth token endpoint rejected: ${code ?? `HTTP ${response.status}`}`,
         response.status,
         code,
-        isTransientTokenStatus(response.status),
+        !isPermanentCodexTokenRejection(response.status, code),
       );
     }
     return toTokenResponse(body as RawTokenResponse);
@@ -207,22 +304,79 @@ export async function exchangeCodexCode(
   });
 }
 
-/** 刷新 token（JSON 编码 — 官方 CLI 明确使用 JSON 而非 form）。 */
+/**
+ * 刷新 token（JSON 编码 — 官方 CLI 明确使用 JSON 而非 form）。官方用默认 auth
+ * 客户端发送，带 originator 与 User-Agent；字段按 BTreeMap 排序。
+ */
 export async function refreshCodexToken(
   refreshToken: string,
 ): Promise<CodexTokenResponse> {
   return postTokenEndpoint({
     method: 'POST',
     headers: {
+      ...codexClientHeaders(),
       'Content-Type': 'application/json',
-      Accept: 'application/json',
     },
     body: JSON.stringify({
-      grant_type: 'refresh_token',
       client_id: CODEX_OAUTH_CLIENT_ID,
+      grant_type: 'refresh_token',
       refresh_token: refreshToken,
     }),
   });
+}
+
+const REVOKE_TIMEOUT_MS = 10_000;
+
+/**
+ * revoke.rs: revoke the refresh token (the access token only when no refresh
+ * token is stored) with the default auth client headers and a 10 s timeout.
+ */
+export async function revokeCodexToken(
+  credentials: Pick<CodexOAuthCredentials, 'accessToken' | 'refreshToken'>,
+): Promise<void> {
+  const refresh = !!credentials.refreshToken;
+  const token = refresh ? credentials.refreshToken : credentials.accessToken;
+  if (!token) return;
+  const response = await fetch(CODEX_OAUTH_REVOKE_URL, {
+    method: 'POST',
+    headers: { ...codexClientHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      token,
+      token_type_hint: refresh ? 'refresh_token' : 'access_token',
+      ...(refresh ? { client_id: CODEX_OAUTH_CLIENT_ID } : {}),
+    }),
+    signal: AbortSignal.timeout(REVOKE_TIMEOUT_MS),
+  });
+  await response.body?.cancel().catch(() => {});
+  if (!response.ok) {
+    throw new CodexOAuthTokenError(
+      `Codex OAuth revoke rejected: HTTP ${response.status}`,
+      response.status,
+      null,
+      false,
+    );
+  }
+}
+
+/**
+ * Logout-style best-effort revocation: the caller's action has already
+ * succeeded and never waits for, or fails because of, this request.
+ */
+export function revokeCodexTokenInBackground(
+  credentials: Pick<CodexOAuthCredentials, 'accessToken' | 'refreshToken'>,
+  context: { providerId: string; reason: string },
+): void {
+  void revokeCodexToken(credentials).then(
+    () => logger.info(context, 'Codex OAuth token revoked'),
+    (err: unknown) =>
+      logger.warn(
+        {
+          ...context,
+          status: err instanceof CodexOAuthTokenError ? err.status : null,
+        },
+        'Codex OAuth token revocation failed',
+      ),
+  );
 }
 
 function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
@@ -244,17 +398,21 @@ export interface CodexIdTokenClaims {
   accountId: string | null;
   planType: string | null;
   email: string | null;
+  /** `auth.chatgpt_account_is_fedramp`; serde default false. */
+  isFedramp: boolean;
 }
 
 /** 解析 id_token JWT 中的 ChatGPT 账号 claim。 */
 export function parseCodexIdToken(idToken: string | null): CodexIdTokenClaims {
-  if (!idToken) {
-    return { accountId: null, planType: null, email: null };
-  }
+  const empty = {
+    accountId: null,
+    planType: null,
+    email: null,
+    isFedramp: false,
+  };
+  if (!idToken) return empty;
   const payload = decodeJwtPayload(idToken);
-  if (!payload) {
-    return { accountId: null, planType: null, email: null };
-  }
+  if (!payload) return empty;
   // Rust's IdClaims uses serde rename for these namespaced JWT keys. Keep
   // the old unnamespaced shape for credentials from compatible gateways.
   const claimRecord = (value: unknown): Record<string, unknown> | null =>
@@ -281,6 +439,7 @@ export function parseCodexIdToken(idToken: string | null): CodexIdTokenClaims {
         ? auth.chatgpt_plan_type
         : null,
     email: typeof email === 'string' ? email : null,
+    isFedramp: auth?.chatgpt_account_is_fedramp === true,
   };
 }
 
@@ -297,6 +456,8 @@ export function buildCodexCredentials(
     accountId: claims.accountId ?? previous?.accountId ?? null,
     planType: claims.planType ?? previous?.planType ?? null,
     email: claims.email ?? previous?.email ?? null,
+    // A refresh without a new id_token keeps the account's FedRAMP status.
+    isFedramp: token.idToken ? claims.isFedramp : previous?.isFedramp === true,
     updatedAt: new Date().toISOString(),
   };
 }
