@@ -173,7 +173,9 @@ import {
   exchangeCodexCode,
   buildCodexCredentials,
   CodexOAuthTokenError,
+  revokeCodexTokenInBackground,
 } from '../codex-gateway/oauth.js';
+import { forgetCodexTransportState } from '../codex-gateway/transport-state.js';
 import {
   codexProviderCreationDefaults,
   extractCodexCallbackParams,
@@ -184,12 +186,19 @@ import {
   CODEX_OAUTH_FLOW_TTL_MS,
 } from '../codex-gateway/types.js';
 import {
+  clearCodexProviderRateLimits,
+  getCodexProviderRateLimits,
+} from '../codex-gateway/rate-limit-snapshot.js';
+import {
   CODEX_DEFAULT_MODEL,
-  CODEX_DEFAULT_EFFORT,
+  filterCodexCatalogByPlan,
+  resolveCodexDefaultEffort,
 } from '../codex-gateway/model-catalog.js';
 import {
+  ensureCodexProviderCatalog,
   getResolvedCodexCatalog,
   maybeRefreshCodexCatalog,
+  type ProviderCodexCatalog,
 } from '../codex-gateway/model-catalog-sync.js';
 import {
   hasOAuthUsageSignals,
@@ -1813,6 +1822,19 @@ configRoutes.delete(
             sessionInvalidation,
           },
         );
+        if (
+          previous?.codexOAuthCredentials &&
+          !getProviders().some((provider) => provider.id === id)
+        ) {
+          // Like the official logout, end the ChatGPT grant HappyClaw no
+          // longer holds; deletion never waits for or fails on this.
+          forgetCodexTransportState(id);
+          clearCodexProviderRateLimits(id);
+          revokeCodexTokenInBackground(previous.codexOAuthCredentials, {
+            providerId: id,
+            reason: 'provider_deleted',
+          });
+        }
         if (!mutation.applied.success) {
           return c.json(
             {
@@ -2020,12 +2042,23 @@ configRoutes.get(
 );
 
 // ─── GET /claude/providers/:id/usage — OAuth 用量数据 ─────
+// ChatGPT 订阅 provider 没有用量接口：返回网关从上游 x-codex-* 响应头记下的
+// 最近一次用量窗口快照（kind: 'codex_rate_limits'，见 rate-limit-snapshot.ts）。
 configRoutes.get(
   '/claude/providers/:id/usage',
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
     const { id } = c.req.param();
+    if (
+      getProviders().some(
+        (provider) =>
+          provider.id === id &&
+          provider.anthropicBaseUrl === CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+      )
+    ) {
+      return c.json(getCodexProviderRateLimits(id));
+    }
     try {
       const usage = await fetchOAuthUsage(id);
       return c.json(usage);
@@ -2344,7 +2377,9 @@ configRoutes.post(
 
 // ─── GET /codex/model-catalog — Codex 模型目录（UI 下拉数据源）──────────
 // 目录真相源是上游 openai/codex 的 models.json，由 model-catalog-sync
-// 定期同步（baked-in 目录兜底）；前端不再硬编码。
+// 定期同步（baked-in 目录兜底）；前端不再硬编码。带 ?providerId= 时改用该
+// 账号的实时目录（/backend-api/codex/models，首次等待一次拉取），并按其
+// ChatGPT 套餐过滤 available_in_plans。
 configRoutes.get(
   '/codex/model-catalog',
   authMiddleware,
@@ -2352,13 +2387,32 @@ configRoutes.get(
   async (c) => {
     // TTL 过期时触发后台刷新：响应不等待网络，目录在流量中自愈。
     maybeRefreshCodexCatalog();
-    const resolved = getResolvedCodexCatalog();
+    const providerId = c.req.query('providerId')?.trim();
+    let resolved: ProviderCodexCatalog = getResolvedCodexCatalog();
+    let planType: string | null = null;
+    if (providerId) {
+      const provider = getProviders().find(
+        (candidate) =>
+          candidate.id === providerId && !!candidate.codexOAuthCredentials,
+      );
+      if (!provider) return c.json({ error: 'Codex provider not found' }, 404);
+      planType = provider.codexOAuthCredentials?.planType ?? null;
+      resolved = await ensureCodexProviderCatalog(provider.id);
+    }
+    const models = filterCodexCatalogByPlan(resolved.models, planType);
+    const defaultModel = models.some(
+      (entry) => entry.value === CODEX_DEFAULT_MODEL,
+    )
+      ? CODEX_DEFAULT_MODEL
+      : (models[0]?.value ?? CODEX_DEFAULT_MODEL);
     return c.json({
-      models: resolved.models,
-      defaultModel: CODEX_DEFAULT_MODEL,
-      defaultEffort: CODEX_DEFAULT_EFFORT,
+      models,
+      defaultModel,
+      // The default model's own default level, as new providers are created.
+      defaultEffort: resolveCodexDefaultEffort(models, defaultModel),
       source: resolved.source,
       fetchedAt: resolved.fetchedAt,
+      ...(providerId ? { providerId, planType } : {}),
     });
   },
 );
@@ -2441,8 +2495,10 @@ configRoutes.post(
       );
     }
 
-    // Claim the flow so one code is exchanged at a time; restore it when the
-    // exchange failed transiently and the same code can still be retried.
+    // Claim the flow so one code is exchanged at a time. Like the official
+    // login server, a code is never sent twice once a request may have reached
+    // the token endpoint (a response timeout may hide a consumed code); only a
+    // connection that never opened restores the flow for the same code.
     codexOauthFlows.delete(state);
     let codexCredentials;
     try {
@@ -2450,21 +2506,28 @@ configRoutes.post(
         await exchangeCodexCode(parsed.code, flow.codeVerifier),
       );
     } catch (err) {
-      const transient = !(err instanceof CodexOAuthTokenError) || err.transient;
-      if (transient && flow.expiresAt > Date.now()) {
+      const tokenError = err instanceof CodexOAuthTokenError ? err : null;
+      const reusable = !!tokenError && !tokenError.requestDelivered;
+      const transient = !tokenError || tokenError.transient;
+      if (reusable && flow.expiresAt > Date.now()) {
         codexOauthFlows.set(state, flow);
       }
-      logger.warn({ err, transient }, 'Codex OAuth token exchange error');
+      logger.warn(
+        { err, transient, reusable },
+        'Codex OAuth token exchange error',
+      );
       const message =
         err instanceof Error
           ? err.message
           : 'Codex OAuth token exchange failed';
       return c.json(
         {
-          error: transient
+          error: reusable
             ? `${message}；可以直接重试，无需重新授权`
-            : `${message}；授权码已失效，请重新登录 ChatGPT`,
-          retryable: transient,
+            : transient
+              ? `${message}；授权码可能已被使用，请重新登录 ChatGPT`
+              : `${message}；授权码已失效，请重新登录 ChatGPT`,
+          retryable: reusable,
         },
         transient ? 502 : 400,
       );
@@ -2561,6 +2624,17 @@ configRoutes.post(
                 },
               };
         if (mutation.value) {
+          if (plan.accountChanged && previous.codexOAuthCredentials) {
+            // The replaced account's grant is no longer reachable from
+            // HappyClaw; revoke it best-effort without delaying the login.
+            forgetCodexTransportState(id);
+            // The old account's windows and credits say nothing about the new one.
+            clearCodexProviderRateLimits(id);
+            revokeCodexTokenInBackground(previous.codexOAuthCredentials, {
+              providerId: id,
+              reason: 'account_replaced',
+            });
+          }
           // A new login settles any account verdict held against the old one.
           providerPool.resetHealth(id);
           try {

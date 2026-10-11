@@ -3,6 +3,8 @@ import { api } from '@/api/client';
 import { cn } from '@/lib/utils';
 import type {
   CachedOAuthUsage,
+  CodexRateLimitsUsage,
+  CodexRateLimitWindow,
   OAuthExtraUsage,
   OAuthUsageBucket,
   ProviderQuotaObservation,
@@ -188,6 +190,96 @@ function ExtraUsageColumn({ extra }: { extra: OAuthExtraUsage }) {
   );
 }
 
+/** 300 → "5h", 10080 → "7d": the window lengths ChatGPT reports. */
+export function codexWindowLabel(minutes: number | null): string {
+  if (minutes === null || !Number.isFinite(minutes) || minutes <= 0)
+    return '额度';
+  if (minutes % 1440 === 0) return `${minutes / 1440}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+function codexWindowBucket(window: CodexRateLimitWindow): OAuthUsageBucket {
+  return {
+    utilization: window.usedPercent,
+    resets_at:
+      window.resetsAt && Number.isFinite(window.resetsAt)
+        ? new Date(window.resetsAt * 1000).toISOString()
+        : null,
+  };
+}
+
+/** ChatGPT subscription windows as seen on the latest gateway response. */
+function CodexUsage({
+  usage,
+  className,
+}: {
+  usage: CodexRateLimitsUsage;
+  className?: string;
+}) {
+  if (usage.limits.length === 0) {
+    return (
+      <div className={cn('text-micro text-muted-foreground', className)}>
+        发出一次请求后显示 ChatGPT 订阅额度
+      </div>
+    );
+  }
+  const columns: Array<{
+    key: string;
+    label: string;
+    bucket: OAuthUsageBucket;
+    detail?: string;
+  }> = [];
+  for (const limit of usage.limits) {
+    // The account-wide limit is "codex"; others are model-specific.
+    const prefix =
+      limit.limitId === 'codex' ? '' : `${limit.limitName ?? limit.limitId} `;
+    for (const window of [limit.primary, limit.secondary]) {
+      if (!window) continue;
+      columns.push({
+        key: `${limit.limitId}-${window.windowMinutes}`,
+        label: `${prefix}${codexWindowLabel(window.windowMinutes)}`,
+        bucket: codexWindowBucket(window),
+      });
+    }
+    if (limit.credits?.hasCredits) {
+      columns.push({
+        key: `${limit.limitId}-credits`,
+        label: `${prefix}Credits`,
+        bucket: { utilization: null, resets_at: null },
+        detail: limit.credits.unlimited
+          ? '不限量'
+          : `余额 ${limit.credits.balance ?? '—'}`,
+      });
+    }
+  }
+  return (
+    <div className={cn('min-w-0 space-y-2', className)}>
+      {usage.rateLimitReachedType && (
+        <div className="text-micro text-error">
+          已触达 ChatGPT 订阅限额（{usage.rateLimitReachedType}
+          ），重置前请求会被拒绝
+        </div>
+      )}
+      <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        {columns.map((column) => (
+          <UsageColumn
+            key={column.key}
+            label={column.label}
+            bucket={column.bucket}
+            detail={column.detail}
+          />
+        ))}
+      </div>
+      {usage.observedAt && (
+        <div className="text-micro text-faint-foreground">
+          更新于 {new Date(usage.observedAt).toLocaleTimeString()}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function displayRateLimitType(type: string | undefined): string {
   switch (type) {
     case 'five_hour':
@@ -270,7 +362,9 @@ export function UsageBars({
   providerVersion?: string;
   className?: string;
 }) {
-  const [usage, setUsage] = useState<CachedOAuthUsage | null>(null);
+  const [usage, setUsage] = useState<
+    CachedOAuthUsage | CodexRateLimitsUsage | null
+  >(null);
   const [loading, setLoading] = useState(true);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -282,7 +376,7 @@ export function UsageBars({
     const fetchUsage = async () => {
       if (document.visibilityState !== 'visible') return;
       try {
-        const data = await api.get<CachedOAuthUsage>(
+        const data = await api.get<CachedOAuthUsage | CodexRateLimitsUsage>(
           `/api/config/claude/providers/${providerId}/usage`,
         );
         if (!cancelled) setUsage(data);
@@ -309,7 +403,11 @@ export function UsageBars({
     };
   }, [providerId, providerVersion]);
 
-  if (loading || !usage?.data) return null;
+  if (loading || !usage) return null;
+  if ('kind' in usage && usage.kind === 'codex_rate_limits') {
+    return <CodexUsage usage={usage} className={className} />;
+  }
+  if (!('data' in usage) || !usage.data) return null;
 
   // An unsupported grant can still carry live SDK rate-limit observations;
   // only the usage buckets are unavailable.

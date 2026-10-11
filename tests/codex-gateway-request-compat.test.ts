@@ -5,8 +5,12 @@ import { describe, expect, test } from 'vitest';
 import {
   anthropicToResponses,
   buildCodexToolNameMap,
+  codexRequestUsesResponsesLite,
+  codexUuidV5,
   resolveCodexRequestEffort,
   resolveGatewayReasoningEffort,
+  sanitizeCodexToolSchema,
+  serializeCodexResponsesRequest,
   shortenCodexCallId,
   type AnthropicRequestSubset,
 } from '../src/codex-gateway/convert-request.js';
@@ -16,8 +20,10 @@ import {
   describeCodexRequestIssue,
 } from '../src/codex-gateway/request-validation.js';
 
-type Json = Record<string, unknown>;
-const options = { targetModel: 'gpt-6-sol' };
+type Json = Record<string, any>;
+// Classic Responses shape (catalog use_responses_lite=false); the Responses
+// Lite cases further down run on gpt-6-sol.
+const options = { targetModel: 'gpt-5.5' };
 const user = (content: unknown): Json => ({ role: 'user', content });
 const image = {
   type: 'image',
@@ -40,6 +46,11 @@ const result = (id: string, content: unknown): Json => ({
 });
 const convert = (request: AnthropicRequestSubset) =>
   anthropicToResponses(request, options);
+const inputImage = {
+  type: 'input_image',
+  image_url: 'data:image/png;base64,c2NyZWVu',
+  detail: 'high',
+};
 
 function rawReasoningSignature(): string {
   const bytes = Buffer.alloc(73);
@@ -151,7 +162,7 @@ describe('request-local tool identity compatibility', () => {
     },
   );
 
-  test('defaults declared tools to auto, removes all tool controls for missing/empty tools', () => {
+  test('always sends official tool controls and drops missing/empty tools', () => {
     expect(
       convert({ messages: [user('hi')], tools: [tool('Bash')] }).tool_choice,
     ).toBe('auto');
@@ -162,80 +173,226 @@ describe('request-local tool identity compatibility', () => {
         tool_choice: { type: 'any', disable_parallel_tool_use: true },
       });
       expect(converted).not.toHaveProperty('tools');
-      expect(converted).not.toHaveProperty('tool_choice');
-      expect(converted).not.toHaveProperty('parallel_tool_calls');
+      expect(converted.tool_choice).toBe('auto');
+      expect(converted.parallel_tool_calls).toBe(false);
     }
+    expect(convert({ messages: [user('hi')] }).parallel_tool_calls).toBe(true);
   });
 });
 
-describe('schema normalization at schema positions', () => {
-  test('removes dialect metadata and unsupported regex without changing property names or literals', () => {
+describe('official tool schema subset (codex-rs/tools json_schema)', () => {
+  const parametersOf = (schema: unknown): Json =>
+    convert({
+      messages: [user('hi')],
+      tools: [tool('schema', schema as Json)],
+    }).tools![0].parameters as Json;
+
+  test('keeps only official keywords in struct order with sorted maps, leaving literals and names intact', () => {
     const schema = {
       $schema: 'draft',
       $id: 'schema-id',
-      type: ['object', 'null'],
+      title: 'Ignored',
+      additionalProperties: false,
+      required: ['zeta'],
       properties: {
-        $schema: { type: 'string', $schema: 'nested-draft' },
-        $id: { type: 'string' },
-        value: {
+        zeta: {
           type: 'string',
-          $id: 'annotation',
           pattern: String.raw`\p{L}+`,
-          default: { $id: 'literal', pattern: String.raw`\p{L}` },
+          format: 'uri',
+          default: { $id: 'literal' },
+          description: 'Z',
         },
-        config: {
-          type: 'object',
-          properties: {
-            path: { type: 'string', pattern: String.raw`^[^\0]*$` },
-          },
+        $schema: { type: 'string', $schema: 'nested-draft' },
+        alpha: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 3,
+          items: { type: 'integer', minimum: 0 },
         },
       },
-      patternProperties: {
-        [String.raw`\P{L}`]: { type: 'string' },
-        '^ok': { type: 'string', $schema: 'draft' },
-      },
-      $defs: { id: { type: 'string', $id: 'definition' } },
-      anyOf: [{ type: 'string', pattern: String.raw`\\p{L}` }],
+      patternProperties: { '^ok': { type: 'string' } },
+      type: 'object',
     };
     const original = structuredClone(schema);
-    const converted = convert({
-      messages: [user('hi')],
-      tools: [tool('schema', schema)],
-    });
-    const parameters = converted.tools![0].parameters as typeof schema;
-    expect(parameters).not.toHaveProperty('$schema');
-    expect(parameters).not.toHaveProperty('$id');
-    expect(parameters.properties.$schema).toEqual({ type: 'string' });
-    expect(parameters.properties.$id).toEqual({ type: 'string' });
-    expect(parameters.properties.value).toEqual({
-      type: 'string',
-      default: { $id: 'literal', pattern: String.raw`\p{L}` },
-    });
-    expect(parameters.properties.config.properties.path).toEqual({
-      type: 'string',
-    });
-    expect(parameters.patternProperties).toEqual({ '^ok': { type: 'string' } });
-    expect(parameters.$defs).toEqual({ id: { type: 'string' } });
-    expect(parameters.anyOf).toEqual([
-      { type: 'string', pattern: String.raw`\\p{L}` },
-    ]);
+    const parameters = parametersOf(schema);
+    expect(JSON.stringify(parameters)).toBe(
+      JSON.stringify({
+        type: 'object',
+        properties: {
+          $schema: { type: 'string' },
+          alpha: { type: 'array', items: { type: 'integer' }, minItems: 1 },
+          zeta: { type: 'string', description: 'Z' },
+        },
+        required: ['zeta'],
+        additionalProperties: false,
+      }),
+    );
     expect(schema).toEqual(original);
   });
 
-  test('normalizes deeply nested valid JSON without structuredClone stack overflow', () => {
-    let schema: Json = { type: 'string', $schema: 'draft' };
-    for (let depth = 0; depth < 2000; depth++) schema = { items: schema };
-    const converted = convert({
-      messages: [user('hi')],
-      tools: [tool('deep', schema)],
+  test('lowers const, boolean schemas and missing types like sanitize_json_schema', () => {
+    expect(
+      sanitizeCodexToolSchema({
+        properties: {
+          mode: { const: 'fast', description: 'Mode' },
+          anything: true,
+          list: { items: { enum: ['a', 'b'] } },
+          count: { maximum: 3 },
+          map: { additionalProperties: { type: 'number' } },
+          unknown: { title: 'only annotations' },
+          union: { oneOf: [{ const: 'a' }, { const: 'b' }] },
+          nullable: { type: ['object', 'null'] },
+          array: { type: 'array' },
+        },
+      }),
+    ).toEqual({
+      type: 'object',
+      properties: {
+        anything: { type: 'string' },
+        array: { type: 'array', items: { type: 'string' } },
+        count: { type: 'number' },
+        list: { type: 'array', items: { type: 'string', enum: ['a', 'b'] } },
+        map: {
+          type: 'object',
+          properties: {},
+          additionalProperties: { type: 'number' },
+        },
+        mode: { type: 'string', description: 'Mode', enum: ['fast'] },
+        nullable: { type: ['object', 'null'], properties: {} },
+        union: {
+          oneOf: [
+            { type: 'string', enum: ['a'] },
+            { type: 'string', enum: ['b'] },
+          ],
+        },
+        unknown: {},
+      },
     });
-    let leaf = converted.tools![0].parameters as Json;
-    for (let depth = 0; depth < 2000; depth++) leaf = leaf.items as Json;
-    expect(leaf).toEqual({ type: 'string' });
-    expect(JSON.stringify(converted)).toContain('"name":"deep"');
   });
 
-  test('supplies missing object properties and preserves optional tool arguments', () => {
+  test('prunes unreachable root definitions and keeps referenced ones', () => {
+    expect(
+      sanitizeCodexToolSchema({
+        type: 'object',
+        properties: { user: { $ref: '#/$defs/User' } },
+        $defs: {
+          User: {
+            type: 'object',
+            properties: { address: { $ref: '#/definitions/Address' } },
+          },
+          Unused: { type: 'string' },
+        },
+        definitions: {
+          Address: { type: 'string' },
+          Orphan: { type: 'number' },
+        },
+      }),
+    ).toEqual({
+      type: 'object',
+      properties: { user: { $ref: '#/$defs/User' } },
+      $defs: {
+        User: {
+          type: 'object',
+          properties: { address: { $ref: '#/definitions/Address' } },
+        },
+      },
+      definitions: { Address: { type: 'string' } },
+    });
+  });
+
+  test('compacts schemas over 5,000 bytes with the official passes, in order', () => {
+    const long = 'x'.repeat(200);
+    const fields = Object.fromEntries(
+      Array.from({ length: 30 }, (_, index) => [
+        `field${index}`,
+        { type: 'string', description: long },
+      ]),
+    );
+    // Pass 1 alone fits: descriptions go, structure stays.
+    expect(
+      sanitizeCodexToolSchema({
+        type: 'object',
+        description: long,
+        properties: fields,
+      }),
+    ).toEqual({
+      type: 'object',
+      properties: Object.fromEntries(
+        Object.keys(fields)
+          .sort()
+          .map((key) => [key, { type: 'string' }]),
+      ),
+    });
+    // Small schemas keep their descriptions.
+    expect(
+      sanitizeCodexToolSchema({
+        type: 'object',
+        properties: { a: { type: 'string', description: 'kept' } },
+      }),
+    ).toEqual({
+      type: 'object',
+      properties: { a: { type: 'string', description: 'kept' } },
+    });
+
+    // Without descriptions to strip: definitions go (refs become {}), then
+    // objects at depth 3 collapse, then compositions are pruned.
+    const wide = Object.fromEntries(
+      Array.from({ length: 200 }, (_, index) => [
+        `p${index}`,
+        { type: 'string' },
+      ]),
+    );
+    const compacted = sanitizeCodexToolSchema({
+      type: 'object',
+      properties: {
+        ref: { $ref: '#/$defs/Wide' },
+        nested: {
+          type: 'object',
+          properties: {
+            deeper: {
+              type: 'object',
+              properties: { deepest: { type: 'object', properties: wide } },
+            },
+          },
+        },
+        choice: { anyOf: [{ type: 'object', properties: wide }] },
+      },
+      $defs: { Wide: { type: 'object', properties: wide } },
+    });
+    expect(compacted).toEqual({
+      type: 'object',
+      properties: {
+        choice: {},
+        nested: {
+          type: 'object',
+          properties: {
+            deeper: { type: 'object', properties: { deepest: {} } },
+          },
+        },
+        ref: {},
+      },
+    });
+  });
+
+  test('bounds recursion on deeply nested schemas exactly like compaction would', () => {
+    let schema: Json = { type: 'string', $schema: 'draft' };
+    for (let depth = 0; depth < 2000; depth++) schema = { items: schema };
+    const parameters = parametersOf({
+      type: 'object',
+      properties: { deep: schema },
+    });
+    expect(parameters).toEqual({
+      type: 'object',
+      properties: {
+        deep: {
+          type: 'array',
+          items: { type: 'array', items: {} },
+        },
+      },
+    });
+  });
+
+  test('supplies missing object properties and degrades invalid keyword values', () => {
     const converted = convert({
       messages: [user('hi')],
       tools: [
@@ -245,133 +402,35 @@ describe('schema normalization at schema positions', () => {
           type: 'object',
           properties: { value: { type: 'string' } },
         }),
-      ],
-    });
-    expect(converted.tools![0].parameters).toEqual({
-      type: 'object',
-      properties: {},
-    });
-    expect(converted.tools![1].parameters).toEqual({
-      type: ['object', 'null'],
-      properties: {},
-    });
-    expect(converted.tools![2]).toMatchObject({
-      strict: false,
-      parameters: { properties: { value: { type: 'string' } } },
-    });
-    expect(converted.tools![2].parameters).not.toHaveProperty('required');
-  });
-});
-
-describe('CPA executor pure const-union compaction', () => {
-  const branches = (values: unknown[]): Json[] =>
-    values.map((value, index) => ({
-      const: value,
-      title: `Case ${index}`,
-      description: `Description ${index}`,
-    }));
-  const values = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
-  const parametersFor = (property: Json): Json =>
-    convert({
-      messages: [user('hi')],
-      tools: [
-        tool('union', {
+        tool('invalid', {
           type: 'object',
-          properties: { 'mode.:selector': property },
+          description: 42,
+          properties: { items: { type: 'array', items: [{ type: 'string' }] } },
+          required: ['items', 7],
+          minItems: -1,
         }),
+        tool('null-root', { type: 'null' }),
       ],
-    }).tools![0].parameters as Json;
-  const propertyFor = (property: Json): Json =>
-    (parametersFor(property).properties as Json)['mode.:selector'] as Json;
-
-  test.each(['oneOf', 'anyOf'])(
-    'compacts >=8 unique scalar %s constants and preserves sibling constraints',
-    (keyword) => {
-      const original = {
-        type: 'string',
-        description: 'Mode',
-        default: 'a',
-        [keyword]: branches(values),
-      };
-      expect(propertyFor(original)).toEqual({
-        type: 'string',
-        description: 'Mode',
-        default: 'a',
-        enum: values,
-      });
-      expect(original).toHaveProperty(keyword);
-    },
-  );
-
-  test('keeps existing equivalent enum order while removing the redundant union', () => {
-    const existing = [...values].reverse();
-    expect(
-      propertyFor({ type: 'string', enum: existing, oneOf: branches(values) }),
-    ).toEqual({ type: 'string', enum: existing });
-  });
-
-  test('handles null, booleans, numbers, and numeric strings as distinct scalar values', () => {
-    const scalars = [null, true, false, 0, 1, 0.5, '0', '1'];
-    expect(propertyFor({ anyOf: branches(scalars) })).toEqual({
-      enum: scalars,
     });
-  });
-
-  test.each([
-    { oneOf: branches(values.slice(0, 7)) },
-    { oneOf: branches(values), anyOf: [{ type: 'string' }] },
-    { oneOf: branches([...values.slice(0, 7), 'a']) },
-    { anyOf: branches([...values.slice(0, 7), 'a']) },
-    { oneOf: branches([1, 1.0, 2, 3, 4, 5, 6, 7]) },
-    { oneOf: branches([-0, 0, 2, 3, 4, 5, 6, 7]) },
-    { oneOf: [...branches(values.slice(0, 7)), { const: 'h', minLength: 1 }] },
-    {
-      oneOf: [...branches(values.slice(0, 7)), { const: 'h', type: 'string' }],
-    },
-    { oneOf: branches([...values.slice(0, 7), {}]) },
-    { oneOf: branches([...values.slice(0, 7), []]) },
-    { oneOf: branches(values), enum: [...values, 'extra'] },
-    { oneOf: branches(values), enum: [...values.slice(0, 7), 'a'] },
-    {
-      oneOf: branches([1, 2, 3, 4, 5, 6, 7, 8]),
-      enum: ['1', '2', '3', '4', '5', '6', '7', '8'],
-    },
-    { oneOf: branches(values), enum: null },
-    { oneOf: branches([Number.MAX_SAFE_INTEGER + 1, 1, 2, 3, 4, 5, 6, 7]) },
-    { anyOf: branches([-Number.MAX_SAFE_INTEGER - 1, 1, 2, 3, 4, 5, 6, 7]) },
-  ])(
-    'retains unions when semantic equivalence is not proven: %#',
-    (property) => {
-      expect(propertyFor(property)).toEqual(
-        JSON.parse(JSON.stringify(property)),
-      );
-    },
-  );
-
-  test('preserves nested property unions and structured-output schemas outside the reference scope', () => {
-    const nested = {
-      type: 'object',
-      properties: { mode: { oneOf: branches(values) } },
-    };
-    const converted = convert({
-      messages: [user('hi')],
-      tools: [tool('nested', { type: 'object', properties: { nested } })],
-      output_config: {
-        format: {
-          type: 'json_schema',
-          schema: {
-            type: 'object',
-            properties: { mode: { oneOf: branches(values) } },
-          },
+    expect(converted.tools!.map((definition) => definition.parameters)).toEqual(
+      [
+        { type: 'object', properties: {} },
+        { type: ['object', 'null'], properties: {} },
+        { type: 'object', properties: { value: { type: 'string' } } },
+        {
+          type: 'object',
+          properties: { items: { type: 'array', items: {} } },
+          required: ['items'],
         },
-      },
+        { type: 'object', properties: {} },
+      ],
+    );
+    expect(converted.tools![2]).toMatchObject({
+      type: 'function',
+      name: 'optional',
+      description: '',
+      strict: false,
     });
-    expect(
-      ((converted.tools![0].parameters as Json).properties as Json).nested,
-    ).toEqual(nested);
-    expect(
-      ((converted.text!.format.schema as Json).properties as Json).mode,
-    ).toHaveProperty('oneOf');
   });
 });
 
@@ -397,7 +456,7 @@ describe('ordered messages and multimodal tool results', () => {
     });
     expect(converted.input[0].content).toEqual([
       { type: 'input_text', text: 'before' },
-      { type: 'input_image', image_url: 'data:image/png;base64,c2NyZWVu' },
+      inputImage,
       { type: 'input_text', text: 'between' },
       {
         type: 'input_file',
@@ -443,7 +502,7 @@ describe('ordered messages and multimodal tool results', () => {
       call_id: 'screen',
       output: [
         { type: 'input_text', text: 'before' },
-        { type: 'input_image', image_url: 'data:image/png;base64,c2NyZWVu' },
+        inputImage,
         { type: 'input_text', text: 'after' },
       ],
     });
@@ -494,25 +553,39 @@ describe('ordered messages and multimodal tool results', () => {
     }
   });
 
-  test('places top-level system instructions before conversation and omits billing attribution', () => {
-    const converted = convert({
+  test('sends the system prompt as the official base-instructions item and omits billing attribution', () => {
+    const request = {
       system: [
         { type: 'text', text: ' \nx-anthropic-billing-header: fingerprint' },
         { type: 'text', text: 'Rules' },
         { type: 'text', text: 'More rules' },
       ],
       messages: [user('hello')],
+    };
+    const converted = anthropicToResponses(request, {
+      ...options,
+      threadId: 'thread-1',
     });
-    expect(converted.instructions).toBe('');
+    expect(converted).not.toHaveProperty('instructions');
+    const namespace = codexUuidV5(
+      '6ba7b812-9dad-11d1-80b4-00c04fd430c8',
+      'thread-1',
+    );
     expect(converted.input[0]).toEqual({
       type: 'message',
+      id: `msg_${codexUuidV5(namespace, 'Rules\n\nMore rules')}`,
       role: 'developer',
-      content: [
-        { type: 'input_text', text: 'Rules' },
-        { type: 'input_text', text: 'More rules' },
-      ],
+      content: [{ type: 'input_text', text: 'Rules\n\nMore rules' }],
     });
+    expect(Object.keys(converted.input[0])).toEqual([
+      'type',
+      'id',
+      'role',
+      'content',
+    ]);
     expect(converted.input[1].role).toBe('user');
+    // Without a session identity the id stays stable for the same prompt.
+    expect(convert(request).input[0].id).toBe(convert(request).input[0].id);
   });
 
   test('defers between-call system reminders until matching parallel results are emitted', () => {
@@ -822,11 +895,12 @@ describe('structured output and native web search', () => {
         output_config: { format: { type: 'json_schema', schema: valid } },
       }).text,
     ).toEqual({
+      verbosity: 'low',
       format: {
         type: 'json_schema',
-        name: 'cli_proxy_structured_output',
         strict: true,
         schema: valid,
+        name: 'codex_output_schema',
       },
     });
     const optional = {
@@ -870,21 +944,29 @@ describe('structured output and native web search', () => {
         ],
         tool_choice: { type: 'tool', name: 'browser_search' },
       });
-      expect(converted.tools![0]).toEqual({
-        type: 'web_search',
-        filters: { allowed_domains: ['example.com'] },
-        user_location: { type: 'approximate', city: 'Paris' },
-      });
+      expect(JSON.stringify(converted.tools![0])).toBe(
+        JSON.stringify({
+          type: 'web_search',
+          external_web_access: true,
+          filters: { allowed_domains: ['example.com'] },
+          user_location: { type: 'approximate', city: 'Paris' },
+          search_content_types: ['text', 'image'],
+        }),
+      );
       expect(converted.tools![1]).toMatchObject({
         type: 'function',
         name: 'web_search',
       });
       expect(converted.tool_choice).toEqual({ type: 'web_search' });
-      expect(converted.include).toContain('web_search_call.action.sources');
+      // Sources feed Claude Code's WebSearch result links.
+      expect(converted.include).toEqual([
+        'reasoning.encrypted_content',
+        'web_search_call.action.sources',
+      ]);
       expect(
         convert({ messages: [user('hi')], tools: [tool('web_search')] })
           .include,
-      ).not.toContain('web_search_call.action.sources');
+      ).toEqual(['reasoning.encrypted_content']);
     },
   );
 
@@ -1088,4 +1170,480 @@ describe('consumed-shape validation', () => {
     ])
       expect(converted).not.toHaveProperty(field);
   });
+});
+
+describe('official Responses Lite request shape', () => {
+  const lite = { targetModel: 'gpt-6-sol', threadId: 'thread-1' };
+  const tools = [
+    {
+      name: 'Bash',
+      description: 'Run a command',
+      input_schema: {
+        type: 'object',
+        properties: {
+          timeout: { type: 'number', minimum: 0 },
+          command: { type: 'string', description: 'Cmd', pattern: '.*' },
+        },
+        required: ['command'],
+      },
+    },
+    {
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+      },
+    },
+  ];
+
+  test('puts tools in an additional_tools prefix with the official functions namespace and id', () => {
+    const converted = anthropicToResponses(
+      {
+        system: 'Rules',
+        messages: [user([{ type: 'text', text: 'hi' }, image])],
+        tools,
+        thinking: { type: 'adaptive' },
+      },
+      lite,
+    );
+    expect(converted).not.toHaveProperty('tools');
+    // Expected id computed independently with Python's uuid.uuid5 over the
+    // compact JSON below; the same derivation reproduces ids captured from a
+    // real codex-cli 0.162.1 request.
+    expect(JSON.stringify(converted.input[0])).toBe(
+      JSON.stringify({
+        type: 'additional_tools',
+        id: 'at_81767038-dbc1-5397-802c-57a7852cfd0f',
+        role: 'developer',
+        tools: [
+          {
+            type: 'namespace',
+            name: 'functions',
+            description: '',
+            tools: [
+              {
+                type: 'function',
+                name: 'Bash',
+                description: 'Run a command',
+                strict: false,
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    command: { type: 'string', description: 'Cmd' },
+                    timeout: { type: 'number' },
+                  },
+                  required: ['command'],
+                },
+              },
+              {
+                type: 'function',
+                name: 'Read',
+                description: '',
+                strict: false,
+                parameters: {
+                  type: 'object',
+                  properties: { path: { type: 'string' } },
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(converted.input[1]).toMatchObject({
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text: 'Rules' }],
+    });
+    // Lite strips image detail.
+    expect(converted.input[2].content[1]).toEqual({
+      type: 'input_image',
+      image_url: 'data:image/png;base64,c2NyZWVu',
+    });
+    expect(converted.tool_choice).toBe('auto');
+    expect(converted.parallel_tool_calls).toBe(false);
+    expect(converted.reasoning).toEqual({
+      effort: 'xhigh',
+      summary: 'auto',
+      context: 'all_turns',
+    });
+    expect(converted.text).toEqual({ verbosity: 'low' });
+    expect(codexRequestUsesResponsesLite({ tools }, 'gpt-6-sol')).toBe(true);
+  });
+
+  test('keeps the prefix id stable per thread and changes it across threads', () => {
+    const id = (threadId?: string) =>
+      anthropicToResponses(
+        { system: 'Rules', messages: [user('hi')], tools },
+        { targetModel: 'gpt-6-sol', threadId },
+      ).input[0].id;
+    expect(id('thread-1')).toBe(id('thread-1'));
+    expect(id('thread-2')).not.toBe(id('thread-1'));
+    // No session identity: deterministic fallback from the system prompt.
+    expect(id()).toBe(id());
+    expect(id()).not.toBe(id('thread-1'));
+  });
+
+  test('replays calls in the functions namespace and strips tool-output image detail', () => {
+    const converted = anthropicToResponses(
+      {
+        messages: [
+          { role: 'assistant', content: [call('c1', 'Bash')] },
+          user([result('c1', [image])]),
+        ],
+        tools,
+      },
+      lite,
+    );
+    expect(JSON.stringify(converted.input[1])).toBe(
+      JSON.stringify({
+        type: 'function_call',
+        name: 'Bash',
+        namespace: 'functions',
+        arguments: '{"q":"c1"}',
+        call_id: 'c1',
+      }),
+    );
+    expect(converted.input[2].output).toEqual([
+      { type: 'input_image', image_url: 'data:image/png;base64,c2NyZWVu' },
+    ]);
+  });
+
+  test('maps forced choices to string modes and omits the prefix without tools', () => {
+    const choice = (tool_choice: Json) =>
+      anthropicToResponses({ messages: [user('hi')], tools, tool_choice }, lite)
+        .tool_choice;
+    expect(choice({ type: 'tool', name: 'Read' })).toBe('required');
+    expect(choice({ type: 'any' })).toBe('required');
+    expect(choice({ type: 'none' })).toBe('none');
+    const bare = anthropicToResponses(
+      { messages: [user('hi')], tool_choice: { type: 'any' } },
+      lite,
+    );
+    expect(bare.input.map((item) => item.type)).toEqual(['message']);
+    expect(bare.tool_choice).toBe('auto');
+    expect(bare.parallel_tool_calls).toBe(false);
+  });
+
+  test('keeps requests with server web search in the classic shape', () => {
+    const request = {
+      messages: [user('search')],
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }, ...tools],
+    };
+    expect(codexRequestUsesResponsesLite(request, 'gpt-6-sol')).toBe(false);
+    const converted = anthropicToResponses(request, lite);
+    expect(converted.input[0].type).toBe('message');
+    expect(converted.tools!.map((definition) => definition.type)).toEqual([
+      'web_search',
+      'function',
+      'function',
+    ]);
+    expect(converted.parallel_tool_calls).toBe(true);
+    expect(converted.reasoning).not.toHaveProperty('context');
+  });
+});
+
+describe('catalog-driven request traits and body order', () => {
+  test('uses the catalog for lite, verbosity and Fast tier; unknown models get the classic shape', () => {
+    const fast = { messages: [user('hi')], speed: 'fast' };
+    const known = anthropicToResponses(fast, { targetModel: 'gpt-6-luna' });
+    expect(known.service_tier).toBe('priority');
+    expect(known.text).toEqual({ verbosity: 'low' });
+    expect(known.reasoning.context).toBe('all_turns');
+    const unknown = anthropicToResponses(fast, { targetModel: 'gpt-9-future' });
+    expect(unknown).not.toHaveProperty('service_tier');
+    expect(unknown).not.toHaveProperty('text');
+    expect(unknown.reasoning).not.toHaveProperty('context');
+    // A provider catalog decides first; entries without shape data fall back.
+    const catalog = [
+      {
+        value: 'gpt-9-future',
+        label: 'future',
+        efforts: ['low'],
+        useResponsesLite: true,
+        supportsVerbosity: true,
+        defaultVerbosity: 'high' as const,
+        serviceTiers: [],
+      },
+      { value: 'gpt-6-luna', label: 'luna', efforts: ['low'] },
+    ];
+    const live = anthropicToResponses(fast, {
+      targetModel: 'gpt-9-future',
+      catalog,
+    });
+    expect(live.text).toEqual({ verbosity: 'high' });
+    expect(live.reasoning.context).toBe('all_turns');
+    expect(live).not.toHaveProperty('service_tier');
+    expect(
+      anthropicToResponses(fast, { targetModel: 'gpt-6-luna', catalog })
+        .service_tier,
+    ).toBe('priority');
+  });
+
+  test('serializes keys in the official ResponsesApiRequest order', () => {
+    const converted = anthropicToResponses(
+      {
+        system: 'Rules',
+        messages: [user('hi')],
+        tools: [tool('Bash')],
+        speed: 'fast',
+        output_config: {
+          format: { type: 'json_schema', schema: { type: 'object' } },
+        },
+      },
+      options,
+    );
+    const body = JSON.parse(
+      serializeCodexResponsesRequest(
+        { client_metadata: { stale: 'x' }, ...converted } as never,
+        { promptCacheKey: 'cache', clientMetadata: { turn_id: 't' } },
+      ),
+    );
+    expect(Object.keys(body)).toEqual([
+      'model',
+      'stream',
+      'service_tier',
+      'input',
+      'tools',
+      'tool_choice',
+      'parallel_tool_calls',
+      'reasoning',
+      'store',
+      'include',
+      'prompt_cache_key',
+      'text',
+      'client_metadata',
+    ]);
+    expect(body.client_metadata).toEqual({ turn_id: 't' });
+    expect(Object.keys(body.text)).toEqual(['verbosity', 'format']);
+    expect(Object.keys(body.text.format)).toEqual([
+      'type',
+      'strict',
+      'schema',
+      'name',
+    ]);
+    expect(Object.keys(body.tools[0])).toEqual([
+      'type',
+      'name',
+      'description',
+      'strict',
+      'parameters',
+    ]);
+    expect(
+      Object.keys(JSON.parse(serializeCodexResponsesRequest(converted))),
+    ).not.toContain('prompt_cache_key');
+  });
+
+  test('requests a reasoning summary unless thinking is explicitly disabled', () => {
+    const summary = (thinking?: Json) =>
+      convert({ messages: [user('hi')], thinking }).reasoning.summary;
+    expect(summary()).toBe('auto');
+    expect(summary({ type: 'adaptive' })).toBe('auto');
+    expect(summary({ type: 'enabled', budget_tokens: 2048 })).toBe('auto');
+    expect(summary({ type: 'disabled' })).toBeUndefined();
+    expect(summary({ type: 'enabled', budget_tokens: 0 })).toBeUndefined();
+  });
+});
+
+describe('assistant-side media and PDF delivery', () => {
+  test('turns assistant images and documents into output_text placeholders', () => {
+    const converted = convert({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'see' },
+            image,
+            {
+              type: 'document',
+              source: {
+                type: 'base64',
+                media_type: 'application/pdf',
+                data: 'cGRm',
+              },
+            },
+            {
+              type: 'document',
+              source: { type: 'text', media_type: 'text/plain', data: 'note' },
+            },
+          ],
+        },
+      ],
+    });
+    const content = converted.input[0].content as Json[];
+    expect(content.map((part) => part.type)).toEqual([
+      'output_text',
+      'output_text',
+      'output_text',
+      'output_text',
+    ]);
+    expect(content[1].text).toContain('[Image omitted');
+    expect(content[2].text).toContain(
+      '[Document omitted from assistant message',
+    );
+    expect(content[3].text).toBe('note');
+  });
+
+  test('falls back to a visible placeholder when PDFs are not sent as files', () => {
+    const pdf = {
+      type: 'document',
+      title: 'Spec',
+      source: { type: 'base64', media_type: 'application/pdf', data: 'cGRm' },
+    };
+    const sent = convert({ messages: [user([pdf])] });
+    expect(sent.input[0].content[0].type).toBe('input_file');
+    const placeholder = anthropicToResponses(
+      { messages: [user([pdf])] },
+      { ...options, sendPdfAsInputFile: false },
+    );
+    expect(placeholder.input[0].content).toEqual([
+      {
+        type: 'input_text',
+        text: '[Document omitted: application/pdf documents are not supported by the ChatGPT backend]',
+      },
+    ]);
+  });
+});
+
+describe('Claude Code tool search', () => {
+  const request = {
+    messages: [
+      user('find a tool'),
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'server_tool_use',
+            id: 'srvtoolu_1',
+            name: 'tool_search_tool_regex',
+            input: { pattern: 'read' },
+          },
+          {
+            type: 'tool_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: {
+              type: 'tool_search_tool_search_result',
+              tool_references: [{ type: 'tool_reference', tool_name: 'Read' }],
+            },
+          },
+          call('c1', 'ToolSearch'),
+        ],
+      },
+      user([
+        result('c1', [
+          {
+            type: 'tool_reference',
+            tool_name: `mcp__${'long_server_'.repeat(6)}__read`,
+          },
+        ]),
+        { type: 'tool_reference', tool_name: 'Read' },
+      ]),
+    ],
+    tools: [
+      {
+        type: 'tool_search_tool_regex_20251119',
+        name: 'tool_search_tool_regex',
+      },
+      tool('ToolSearch'),
+      { ...tool('Read'), defer_loading: true },
+      {
+        ...tool(`mcp__${'long_server_'.repeat(6)}__read`),
+        defer_loading: true,
+      },
+    ],
+  };
+
+  test('accepts the search tool, declares deferred tools upfront and drops the server tool', () => {
+    const parsed = CodexMessagesRequestSchema.parse(request);
+    const converted = convert(parsed);
+    expect(converted.tools!.map((definition) => definition.name)).toEqual([
+      'ToolSearch',
+      'Read',
+      'mcp__read',
+    ]);
+    expect(JSON.stringify(converted.tools)).not.toContain('defer_loading');
+    // Server-side search history is skipped; client ToolSearch replays.
+    expect(converted.input.map((item) => item.type)).toEqual([
+      'message',
+      'function_call',
+      'function_call_output',
+      'message',
+    ]);
+    expect(converted.input[2].output).toEqual([
+      { type: 'input_text', text: '[Tool available: mcp__read]' },
+    ]);
+    expect(converted.input[3].content).toEqual([
+      { type: 'input_text', text: '[Tool available: Read]' },
+    ]);
+    const lite = anthropicToResponses(parsed, { targetModel: 'gpt-6-sol' });
+    expect(
+      (lite.input[0].tools[0].tools as Json[]).map((entry) => entry.name),
+    ).toEqual(['ToolSearch', 'Read', 'mcp__read']);
+  });
+});
+
+describe('background requests behind the Codex gateway', () => {
+  test('the gateway haiku default is a background request at low effort', () => {
+    const request = {
+      model: 'claude-haiku-5-5',
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'max' },
+    };
+    expect(
+      resolveGatewayReasoningEffort(request, {
+        catalog: [],
+        model: 'gpt-6-sol',
+        providerEffort: 'xhigh',
+        agentEffort: 'max',
+      }),
+    ).toBe('low');
+    expect(
+      resolveGatewayReasoningEffort(
+        { ...request, model: 'gpt-6-sol' },
+        { catalog: [], model: 'gpt-6-sol', providerEffort: 'xhigh' },
+      ),
+    ).toBe('xhigh');
+  });
+});
+
+describe('Responses Lite body marker', () => {
+  // The HTTP layer sends x-openai-internal-codex-responses-lite exactly when
+  // the converted body carries reasoning.context "all_turns".
+  test.each([
+    undefined,
+    { type: 'disabled' },
+    { type: 'enabled', budget_tokens: 0 },
+    { type: 'adaptive' },
+  ])(
+    'marks every Lite request and no classic one (thinking %j)',
+    (thinking) => {
+      const request = {
+        messages: [user('hi')],
+        tools: [tool('Bash')],
+        thinking,
+      };
+      for (const [model, lite] of [
+        ['gpt-6-sol', true],
+        ['gpt-5.6-luna', true],
+        ['gpt-5.5', false],
+        ['gpt-9-future', false],
+      ] as const) {
+        const converted = anthropicToResponses(request, {
+          targetModel: model,
+          reasoningEffort: 'low',
+        });
+        expect(converted.reasoning.context === 'all_turns').toBe(lite);
+        expect(codexRequestUsesResponsesLite(request, model)).toBe(lite);
+      }
+      const search = anthropicToResponses(
+        {
+          ...request,
+          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        },
+        { targetModel: 'gpt-6-sol' },
+      );
+      expect(search.reasoning).not.toHaveProperty('context');
+      expect(search.include).toContain('web_search_call.action.sources');
+    },
+  );
 });

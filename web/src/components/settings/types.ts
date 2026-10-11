@@ -179,6 +179,34 @@ export interface OAuthUsageResponse {
   extra_usage: OAuthExtraUsage | null;
 }
 
+/** One ChatGPT usage window, from the backend's x-codex-* headers. */
+export interface CodexRateLimitWindow {
+  /** 0..100 */
+  usedPercent: number;
+  windowMinutes: number | null;
+  /** Unix epoch seconds. */
+  resetsAt: number | null;
+}
+
+/** GET /claude/providers/:id/usage for a ChatGPT-subscription provider. */
+export interface CodexRateLimitsUsage {
+  kind: 'codex_rate_limits';
+  observedAt: number | null;
+  activeLimit: string | null;
+  rateLimitReachedType: string | null;
+  limits: Array<{
+    limitId: string;
+    limitName: string | null;
+    primary: CodexRateLimitWindow | null;
+    secondary: CodexRateLimitWindow | null;
+    credits: {
+      hasCredits: boolean;
+      unlimited: boolean;
+      balance: string | null;
+    } | null;
+  }>;
+}
+
 export interface CachedOAuthUsage {
   data: OAuthUsageResponse;
   fetchedAt: number;

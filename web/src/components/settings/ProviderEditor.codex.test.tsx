@@ -132,6 +132,10 @@ async function type(selector: string, value: string) {
 describe('ChatGPT subscription editor', () => {
   test('flags a refused refresh and keeps the effective default effort', async () => {
     await render(codexProvider);
+    // The account's own plan-filtered catalog, not the global one.
+    expect(mocks.get).toHaveBeenCalledWith(
+      '/api/config/codex/model-catalog?providerId=chatgpt',
+    );
     expect(document.body.textContent).toContain(
       'ChatGPT 授权已失效，请重新登录',
     );

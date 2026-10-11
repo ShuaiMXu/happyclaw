@@ -8,12 +8,15 @@ import { logger } from './logger.js';
 import { clearProviderQuotaObservation } from './provider-quota-observation.js';
 import {
   CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+  CODEX_GATEWAY_ROUTE,
   type CodexOAuthCredentials,
   type CodexOAuthRefreshErrorState,
 } from './codex-gateway/types.js';
+import { isCodexGatewayBaseUrl } from './codex-gateway/resolve-gateway-url.js';
 import { resolveCodexDefaultEffort } from './codex-gateway/model-catalog.js';
 import { getResolvedCodexCatalog } from './codex-gateway/model-catalog-sync.js';
 import { normalizeLegacyCodexModel } from './codex-gateway/convert-request.js';
+import { retiredCodexReauthReason } from './codex-gateway/oauth.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
@@ -153,6 +156,29 @@ const THIRD_PARTY_MODEL_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'CLAUDE_CODE_SUBAGENT_MODEL',
 ] as const;
+
+/**
+ * Haiku tier behind the ChatGPT subscription gateway: Claude Code's own
+ * small-fast model id (2.1.x first-party default). The gateway maps every
+ * claude-* model to the provider's Codex model and recognizes haiku-tier
+ * calls as background requests that run at low effort.
+ */
+const CODEX_GATEWAY_HAIKU_MODEL = 'claude-haiku-5-5';
+
+/** The gateway placeholder, or the local gateway URL it resolves to at launch. */
+function isCodexGatewayEndpoint(baseUrl: string): boolean {
+  if (isCodexGatewayBaseUrl(baseUrl)) return true;
+  try {
+    const url = new URL(baseUrl);
+    return (
+      ['127.0.0.1', 'localhost', 'host.docker.internal'].includes(
+        url.hostname,
+      ) && url.pathname.replace(/\/+$/, '') === CODEX_GATEWAY_ROUTE
+    );
+  } catch {
+    return false;
+  }
+}
 
 /** Provider env values that Claude Code parses as positive integers. */
 const POSITIVE_INTEGER_PROVIDER_ENV_KEYS = new Set([
@@ -1036,6 +1062,7 @@ function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
         accountId: typeof creds.accountId === 'string' ? creds.accountId : null,
         planType: typeof creds.planType === 'string' ? creds.planType : null,
         email: typeof creds.email === 'string' ? creds.email : null,
+        ...(creds.isFedramp === true ? { isFedramp: true } : {}),
         updatedAt:
           typeof creds.updatedAt === 'string'
             ? creds.updatedAt
@@ -1468,6 +1495,13 @@ function normalizeCodexRefreshErrorState(
   if (typeof record.message !== 'string' || typeof record.at !== 'string') {
     return null;
   }
+  // Earlier releases also saved other 4xx answers (e.g. a Cloudflare 403) as
+  // needing re-login; the official classification retries those.
+  const retired =
+    record.kind === 'reauth_required'
+      ? retiredCodexReauthReason(record.message)
+      : null;
+  if (retired) return { kind: 'transient', message: retired, at: record.at };
   return {
     kind: record.kind,
     message: record.message.slice(0, MAX_REFRESH_ERROR_MESSAGE_LENGTH),
@@ -2841,9 +2875,17 @@ export function buildClaudeEnvLines(
 
     // Every model tier follows the provider model by default. A pass-through
     // relay leaves the model empty, so only explicit per-tier mappings apply.
+    // The Codex gateway keeps a Claude haiku id so it can tell Claude Code's
+    // background calls apart from agent turns.
     const model = sanitizeEnvValue(config.anthropicModel);
+    const codexGateway = isCodexGatewayEndpoint(config.anthropicBaseUrl);
     for (const key of THIRD_PARTY_MODEL_ENV_KEYS) {
-      const value = configuredValue(key, model);
+      const value = configuredValue(
+        key,
+        codexGateway && key === 'ANTHROPIC_DEFAULT_HAIKU_MODEL'
+          ? CODEX_GATEWAY_HAIKU_MODEL
+          : model,
+      );
       if (value) lines.push(`${key}=${value}`);
     }
 

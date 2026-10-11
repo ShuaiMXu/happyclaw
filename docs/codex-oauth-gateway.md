@@ -25,11 +25,15 @@ not read or update the host's Codex CLI login file.
    than a model name copied from an old example.
 
 HappyClaw exchanges the code with PKCE, reads the official namespaced JWT
-identity claims, and saves OAuth secrets encrypted in its provider secret
-store. A callback URL from `localhost:1455` or `127.0.0.1:1455` is accepted;
-an `error=` returned by the authorization page is shown as such. A transient
-token-exchange failure keeps the pending login, so pasting the same URL again
-retries it; a rejected code requires a new login. A new provider stores the
+identity claims (including `chatgpt_account_is_fedramp`), and saves OAuth
+secrets encrypted in its provider secret store. A callback URL from
+`localhost:1455` or `127.0.0.1:1455` is accepted; an `error=` returned by the
+authorization page is shown as such. Like the official login server, a code
+is sent to the token endpoint at most once unless the connection provably
+never opened (DNS, refused connection, connect timeout, TLS handshake): then
+the pending login is kept and pasting the same URL again retries it. After a
+response timeout, an HTTP error or a dropped connection the code may already
+be consumed, so the login has to start over. A new provider stores the
 catalog default model and its default reasoning effort.
 
 **重新登录 ChatGPT** replaces that provider's login, clears any refresh
@@ -37,7 +41,11 @@ failure and provider-health verdict, and lets the provider's warm runners
 finish their current query and restart. Logging in with a different ChatGPT
 account, or converting a non-ChatGPT provider, also stops runners and drops
 the provider's saved sessions, because encrypted reasoning from one account
-cannot be replayed to another. A converted provider gets the catalog default
+cannot be replayed to another. When a different account replaces a login, or
+a ChatGPT provider is deleted, HappyClaw revokes the old refresh token in the
+background (`POST https://auth.openai.com/oauth/revoke`, the official logout
+request). The revocation is best effort: the login or deletion never waits
+for it or fails because of it. A converted provider gets the catalog default
 model unless it already uses a Codex catalog model. No additional Docker
 gateway service or device-code-login switch is needed for this flow.
 
@@ -74,12 +82,20 @@ pool. Requests refresh short-lived tokens when needed, share a single refresh
 per provider, and re-read persisted credentials after concurrent changes.
 A failed compare-and-swap never returns an old credential snapshot or
 silently overwrites a reauthorization. An upstream 401 forces one shared
-refresh and a single retry. A rejected refresh grant (`invalid_grant`,
-`refresh_token_reused`, other 400/401 answers) is saved on the provider as
-"needs re-login"; the gateway stops refreshing and answers an authentication
-error that names the re-login until the credentials change. Transient refresh
-failures back off (30 seconds doubling to 5 minutes) while a still-valid
-access token keeps serving.
+refresh and a single retry; a second 401 for the freshly refreshed token is
+answered with `x-should-retry: false` and recorded as needing a new login,
+so it never turns into a refresh loop. Refresh failures are classified like
+the official client: only a 401, a 400 with `invalid_grant`, or the codes
+`refresh_token_expired`, `refresh_token_reused` and
+`refresh_token_invalidated` reject the grant. That is saved on the provider
+as "needs re-login"; the gateway stops refreshing and answers an
+authentication error that names the re-login until the credentials change.
+Every other failure — network, timeout, 5xx/429 and any other 4xx such as a
+Cloudflare 403 — is transient and backs off (30 seconds doubling to 5
+minutes) while a still-valid access token keeps serving. A "needs re-login"
+verdict saved by an earlier release for such a 4xx reads back as transient.
+Refresh and revocation requests carry the official auth-client `originator`
+and `User-Agent`.
 
 ### Protocol and operating limits
 
@@ -111,28 +127,143 @@ access token keeps serving.
   placeholder or its plain text, so one such block in the history does not
   fail every later turn.
 - `POST /gateway/chatgpt/v1/messages/count_tokens` answers a local estimate
-  (characters per token, fixed cost for images and files) without calling the
-  backend.
+  without calling the backend: about 4 characters per token for prose, 3.2
+  for JSON and code (tool arguments, schemas, symbol-dense text), one token
+  per CJK character, a fixed cost for images and files, tool definitions
+  whether top-level or inside a Responses Lite `additional_tools` item, and
+  replayed encrypted reasoning by ciphertext length using the official
+  client's formula. The same estimate fills `message_start` usage; the final
+  `message_delta` reports the exact cache-exclusive counts. Because Claude
+  Code keeps the `message_start` input whenever the delta reports 0, a fully
+  cached prompt reports one cached token as input so the total stays exact.
 - Reasoning effort: disabled thinking uses the model's lowest supported level;
   haiku-tier background requests use low; an Agent with an explicit effort
   keeps it; otherwise `CODEX_REASONING_EFFORT` applies, falling back to the
   model's catalog default. The settings page shows that same default.
-- Upstream headers have a 30-second deadline and streams a 300-second idle
-  deadline, matching the official Codex CLI. Nonstream aggregation also has a
+- The official Codex CLI sets no response-header deadline on `/responses`
+  and a 300-second stream idle deadline. The gateway waits up to 300 seconds
+  for upstream headers (a queued request is not cut off early; the deadline
+  covers only that attempt) and 300 seconds between stream chunks. A stall
+  answers 504 for both response modes. Nonstream aggregation also has a
   ten-minute deadline and a 32 MiB budget. Individual SSE events are bounded.
   Downstream backpressure pauses upstream reading, and cancellation
   disconnects the upstream stream.
+- Once a stream is released, 15 seconds without a downstream write send an
+  `event: ping`. Claude Code's 300-second idle watchdog counts pings, so a
+  long silent reasoning phase does not end the reply. No ping precedes
+  `message_start`, and keepalive stops with the stream.
 - Streams hold their first frames until content starts (at most 48 events,
   1 MiB or 20 seconds), so a failure reported before any content becomes a
-  real HTTP status instead of 200 followed by an error event.
+  real HTTP status instead of 200 followed by an error event. A content
+  block announced without content yet (an empty reasoning, text or tool
+  start) still counts as handshake.
+- Like the official client, 5xx answers and transport failures are retried up
+  to four times with 200 ms exponential backoff (±10%), honoring
+  `Retry-After`, and only while nothing has reached the client. Retries of
+  one upstream request stay within 60 seconds; advice beyond that is
+  returned to the client instead. 429 is never retried by the gateway. A
+  stream that drops before any content counts as a transport failure.
+- When the backend reports that it could not verify replayed reasoning
+  (`invalid_encrypted_content`, for example ciphertext sealed by another
+  account), the gateway drops the reasoning items from the request input and
+  retries once.
+- A response that ends with `end_turn: false`, or an `interrupted`
+  incomplete response, is continued like the official client's follow-up:
+  the gateway sends the previous output items again (requests are
+  `store: false`) and streams the continuation into the same Anthropic
+  message, with continuing block indexes and summed usage. At most four
+  follow-ups are made; a response with a tool call always ends the message so
+  the client can run it.
+- A tool call cut by `max_output_tokens` ends the message with
+  `max_tokens`: a call that had not started downstream is dropped, one that
+  was already streaming is closed and never reported as `tool_use`.
+  Refusal content without a tool call stops with `refusal`.
+- An SSE frame whose data is not a JSON event object is skipped and counted
+  in the logs, as the official client does; the stream continues.
 - Success logs record model and usage counts. Upstream HTTP error bodies are
   read up to 64 KiB within five seconds; the client gets a redacted, bounded
-  excerpt, and logs keep only status, code and type. Usage limits become 429
-  with `Retry-After` and the reset time; overload and `slow_down` become 529;
-  a plan without Codex (`usage_not_included`) becomes 403; context-length
-  rejections become 400 "Prompt is too long", which Claude Code answers by
-  compacting. Semantic terminal events close the upstream reader without
-  waiting for the HTTP connection to close. Malformed SSE fails the request.
+  excerpt, and logs keep only status, code, type and the upstream
+  `x-request-id`/`cf-ray`. Error classification follows the official client:
+  usage limits become 429 with `Retry-After`, the reset time and
+  `x-should-retry: false`; quota exhaustion (`insufficient_quota`,
+  `credit_balance_exhausted`, spend/usage-limit codes) becomes a 429 that is
+  not retried; policy rejections (`cyber_policy`, `bio_policy`,
+  `misalignment_policy_violation`, `invalid_prompt`) become 400
+  `invalid_request_error` that is not retried; `slow_down` and
+  `rate_limit_exceeded` become 429, taking the delay from the streamed
+  error's `Retry-After` header or a "try again in Xs" message; overload
+  becomes 529; a plan without Codex (`usage_not_included`) becomes 403;
+  context-length rejections become 400 "Prompt is too long", which Claude
+  Code answers by compacting. Semantic terminal events close the upstream
+  reader without waiting for the HTTP connection to close.
+- The gateway reads the official `x-codex-*` rate-limit headers (primary and
+  secondary used percent, window minutes and reset time per limit family,
+  credits, active limit and rejection type) and in-band `codex.rate_limits`
+  frames, and keeps the latest snapshot per provider in memory.
+  `GET /api/config/claude/providers/:id/usage` returns it for a ChatGPT
+  provider. When the usage window is exhausted and its reset time is known,
+  the provider is quarantined in the provider pool until that reset.
+
+### Official client identity and transport
+
+Requests to the Codex backend mirror the official Codex CLI 0.162.1
+(`codex-tui`; see `src/codex-gateway/client-identity.ts`):
+
+- Identity: `originator: codex-tui`, `version: 0.162.1` on every request, and
+  the official User-Agent format
+  `codex-tui/0.162.1 (<OS> <version>; <arch>) <terminal> (codex-tui; 0.162.1)`
+  describing the host that runs HappyClaw (a service without a terminal
+  reports `unknown`). The authorization URL uses the same originator.
+- Auth: `ChatGPT-Account-ID`, and `X-OpenAI-Fedramp: true` for FedRAMP
+  accounts.
+- Session and turn: the Claude Code session is the official session and the
+  session plus Claude Code agent is the thread. Requests send `session-id`,
+  `thread-id`, `x-client-request-id` (the thread), `x-codex-window-id`
+  (`{thread}:0`; HappyClaw does not track Claude Code's local compaction
+  windows) and `x-codex-turn-metadata`, plus the body's `client_metadata`
+  with a per-install `installation_id` (`data/config/codex-installation-id`),
+  session, thread, window and turn ids. `prompt_cache_key` is always sent:
+  the thread id, or a deterministic key scoped to the runner and the
+  conversation's opening when the SDK sends no session id. All derived ids
+  are scoped to the provider and ChatGPT account.
+- A request whose last user message carries new user content starts a turn;
+  tool-result continuations (including reminders Claude Code attaches to the
+  results) and retries of the same request stay in it. The first
+  `x-codex-turn-state` the backend returns in a turn is replayed on the
+  turn's later requests and dropped when the next turn starts. Turn state is
+  kept in memory per provider, account and thread, with a one-hour idle TTL
+  and at most 4,096 threads.
+- Cookies: only the infrastructure cookies the official client keeps
+  (`__cf_bm`, `__cflb`, `__cfruid`, `__cfseq`, `__cfwaitingroom`, `__oailb`,
+  `_cfuvid`, `cf_clearance`, `cf_ob_info`, `cf_use_ob`, `cf_chl_*`) are stored,
+  in a separate in-memory jar for each provider and account, and sent back on
+  that account's requests. Account and session cookies are never stored.
+- Background requests (haiku tier) take the shape of the official TUI's
+  hidden title thread: a separate root thread (stable per conversation
+  thread) with `thread_source: thread_title` in the turn metadata and no
+  `x-openai-subagent`, whose official values describe reviewers, compaction,
+  memory jobs and spawned agents. Their prompt cache key, also their
+  `session-id`, is `thread_title:{conversation thread}`, so they share a
+  cache without joining the conversation's.
+- `x-openai-internal-codex-responses-lite: true` is sent exactly when the
+  converted request is a Responses Lite request (it carries
+  `reasoning.context: "all_turns"`); a request kept in the classic shape,
+  such as one with hosted web search, omits it even on a Lite model.
+- `x-codex-beta-features` is omitted. The official default list is only
+  `remote_compaction_v2`, which advertises remote compaction and `compaction`
+  output items; Claude Code compacts locally, so HappyClaw cannot honor it.
+- Request bodies are compressed with zstd (`Content-Encoding: zstd`, level 3)
+  like the official ChatGPT-auth default when the Node runtime provides
+  `zlib.zstdCompressSync`; otherwise they are sent uncompressed.
+- HTTP/2: Node 26's built-in fetch already negotiates HTTP/2 for direct
+  connections. With `HTTPS_PROXY`/`HTTP_PROXY` set, the global
+  `EnvHttpProxyAgent` from the pinned undici 6 uses HTTP/1.1; enabling its
+  `allowH2` is experimental in that release and would change every
+  server-side fetch, so it is left off.
+- WebSocket transport is not implemented. The official client keeps HTTP SSE
+  as its supported fallback, and the gateway translates each Anthropic
+  request into one independent Responses request; the WebSocket session's
+  incremental input and connection reuse have no counterpart here.
 
 The protocol implementation is ported from
 [CLIProxyAPI a2976eb8](https://github.com/router-for-me/CLIProxyAPI/tree/a2976eb8a303f11b4ea5177bce9f9ff752634dfc).
@@ -152,10 +283,11 @@ that an account can access the live backend.
 | Symptom                         | Check                                                                                                                 |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | Login callback rejected         | Finish the same user's flow within ten minutes and paste its complete callback URL; do not reuse a consumed code.     |
+| Login says to start over        | The token request may have reached OpenAI (timeout, HTTP error, dropped connection); start a new ChatGPT login.       |
 | 401 or authentication error     | The provider page shows "needs re-login" when the refresh grant was rejected; use its HappyClaw re-login action.      |
 | 403 from HappyClaw gateway      | The request came through a reverse proxy or from a non-local address; runners reach the gateway directly.             |
 | 429 from HappyClaw gateway      | One runner exceeded its 120 requests per minute; it retries after `Retry-After`. Other runners keep their own budget. |
-| 429 usage limit                 | The ChatGPT plan's Codex usage window is exhausted; the message names the reset time.                                 |
+| 429 usage limit                 | The ChatGPT plan's Codex usage window is exhausted; the message names the reset time and the pool waits for it.       |
 | 413                             | Reduce the request below the 32 MiB envelope, including image base64 overhead.                                        |
 | 400 invalid messages request    | The message names the field path that does not match a supported message/tool shape.                                  |
 | Upstream model/plan rejection   | Select a model available to the linked account and check its current Codex access.                                    |

@@ -321,7 +321,8 @@ Provider：
   OAuth、setup-token、API Key 中的一种
 - `PATCH|DELETE /api/config/claude/providers/:id`，第三方 Provider 的 PATCH
   可同时携带 `anthropicAuthToken` / `clearAnthropicAuthToken`，与其他字段在同一
-  请求内提交
+  请求内提交；删除 ChatGPT 订阅型 Provider 后在后台尽力吊销其 refresh token，
+  吊销结果不影响响应
 - `PUT /api/config/claude/providers/:id/secrets`，同样接受
   `claudeCredentialInput`；凭据变更只排空该 Provider 的 Runner
 - `POST /api/config/claude/providers/:id/toggle`，没有可用凭据的 Provider
@@ -335,7 +336,13 @@ Provider：
 - `GET /api/config/claude/providers/health`
 - `GET /api/config/claude/providers/:id/usage`，读不到用量时以 `status`
   区分 `unsupported`（setup-token、仅推理权限或非 OAuth 凭据，见
-  `unsupportedReason`）与 `needs_relogin`（刷新授权被拒）
+  `unsupportedReason`）与 `needs_relogin`（刷新授权被拒）；ChatGPT 订阅型
+  Provider 不调用上游，返回网关记下的最近一次 `x-codex-*` 用量快照：
+  `kind: 'codex_rate_limits'`、`observedAt`（毫秒，未见过为 `null`）、
+  `activeLimit`、`rateLimitReachedType` 与 `limits[]`；每个限额族含
+  `limitId`、`limitName`、`primary`/`secondary` 窗口（`usedPercent` 0–100、
+  `windowMinutes`、`resetsAt` epoch 秒）和 `credits`（`hasCredits`、
+  `unlimited`、`balance`），服务重启后为空
 - `PUT /api/config/claude/balancing`
 - `POST /api/config/claude/apply`
 - `POST /api/config/claude/oauth/start`，可选 `targetProviderId`（必须是已有的
@@ -349,23 +356,36 @@ Provider：
   接受 `localhost:1455` / `127.0.0.1:1455` 回调页完整 URL、其 query 或裸授权码）
   换取 token，创建或更新 ChatGPT 订阅型 Provider，成功返回公开 Provider；其
   `anthropicBaseUrl` 落盘为内嵌网关占位值。新建时写入目录默认模型与
-  `CODEX_REASONING_EFFORT`；回调带 `error=` 或 token 交换瞬时失败时返回
-  `{ error, retryable: true }`（400 / 502）并保留挂起流程，授权码被拒返回
-  `{ error, retryable: false }`（400）；目标 Provider 不存在返回 404。换账号或由
-  其他类型转换时会停稳运行器并清除该 Provider 的会话，停稳失败返回 503
-  `{ error, applied, provider? }`
+  `CODEX_REASONING_EFFORT`；回调带 `error=`（400），或 token 请求可证明未到达
+  服务器（DNS、拒绝连接、连接超时、TLS 握手失败，502）时返回
+  `{ error, retryable: true }` 并保留挂起流程；请求可能已到达 token 端点时
+  （响应超时、连接中断、5xx 等，502）或授权码被拒（400）返回
+  `{ error, retryable: false }`，授权码不会再次发送，需重新发起登录；目标
+  Provider 不存在返回 404。换账号或由其他类型转换时会停稳运行器并清除该
+  Provider 的会话，停稳失败返回 503 `{ error, applied, provider? }`；换成另一个
+  ChatGPT 账号时后台尽力吊销旧 refresh token，不影响响应
 - 内嵌网关（不在 `/api` 下）：`POST /gateway/chatgpt/v1/messages` 与
   `POST /gateway/chatgpt/v1/messages/count_tokens`（本地估算），只接受存活 Runner
   的临时 token，并拒绝带反代转发头或非回环/私网来源的请求
-- `GET /api/config/codex/model-catalog`，返回 Codex 模型目录
-  `{ models: [{ value, label, efforts, defaultEffort? }], defaultModel,
-defaultEffort, source, fetchedAt }`（条目内 `defaultEffort` 是上游
-  per-model 默认推理档，可能缺省）；目录由
-  `src/codex-gateway/model-catalog-sync.ts`
-  从上游 openai/codex 仓库 `codex-rs/models-manager/models.json` 同步
-  （`source` 为 `upstream`/`disk-cache`/`builtin`），baked-in 目录
-  （`src/codex-gateway/model-catalog.ts`）作离线兜底，供设置页模型/
-  推理力度下拉使用
+- `GET /api/config/codex/model-catalog[?providerId=]`，返回 Codex 模型目录
+  `{ models, defaultModel, defaultEffort, source, fetchedAt, providerId?,
+planType? }`。`models` 条目为 `{ value, label, efforts, defaultEffort?,
+useResponsesLite, supportsVerbosity, defaultVerbosity, contextWindow?,
+minimalClientVersion?, availableInPlans?, serviceTiers }`（字段取自官方
+  `models.json`；条目内 `defaultEffort` 是 per-model 默认推理档，可能缺省；
+  顶层 `defaultModel` 同官方默认（目前 `gpt-6.1-sol`），`defaultEffort` 是该
+  模型的目录默认档，与新建 Provider 写入的值一致；
+  `serviceTiers` 含 `priority` 才可用 Fast）。全局目录由
+  `src/codex-gateway/model-catalog-sync.ts` 从上游 openai/codex 仓库
+  `codex-rs/models-manager/models.json` 同步（`source` 为
+  `upstream`/`disk-cache`/`builtin`），baked-in 目录
+  （`src/codex-gateway/model-catalog.ts`）作离线兜底，并剔除
+  `minimal_client_version` 高于网关客户端版本的模型。带 `providerId`
+  （必须是已登录 ChatGPT 的 Provider，否则 404）时改用该账号的实时目录
+  `GET chatgpt.com/backend-api/codex/models?client_version=`（`source` 为
+  `live`，内存缓存 1 小时，首次请求等待一次拉取，失败回落全局目录），
+  并按该账号 `planType` 过滤 `availableInPlans`；`defaultModel` 不在结果中时
+  取第一项。供设置页模型/推理力度下拉使用
 - `PUT /api/config/claude/custom-env`
 
 第三方 Provider 的 `anthropicAuthMode` 为 `bearer`（`Authorization: Bearer`，

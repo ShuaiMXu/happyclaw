@@ -5,6 +5,7 @@ import {
   normalizeCodexEffort,
   normalizeLegacyCodexModel,
   resolveCodexModel,
+  type ResponsesRequest,
 } from '../src/codex-gateway/convert-request.js';
 import {
   ResponsesToAnthropicConverter,
@@ -14,6 +15,11 @@ import {
   decodeReasoningSignature,
   encodeReasoningSignature,
 } from '../src/codex-gateway/reasoning-signature.js';
+import {
+  estimateCodexInputTokens,
+  estimateEncryptedReasoningTokens,
+  estimateTextTokens,
+} from '../src/codex-gateway/token-estimate.js';
 
 describe('reasoning-signature', () => {
   test('round-trips id and encrypted content through the signature field', () => {
@@ -55,7 +61,7 @@ describe('resolveCodexModel', () => {
   });
 
   test('falls back to a default when no request model or configured model exists', () => {
-    expect(resolveCodexModel(undefined, '')).toBe('gpt-6-sol');
+    expect(resolveCodexModel(undefined, '')).toBe('gpt-6.1-sol');
   });
 
   test('normalizes legacy gpt-5.1 configured models to the current catalog', () => {
@@ -116,13 +122,14 @@ describe('anthropicToResponses', () => {
       { targetModel: 'gpt-5.1-codex' },
     );
 
-    expect(result.instructions).toBe('');
+    expect(result).not.toHaveProperty('instructions');
     expect(result.model).toBe('gpt-5.1-codex');
     expect(result.stream).toBe(true);
     expect(result.store).toBe(false);
     expect(result.input).toEqual([
       {
         type: 'message',
+        id: expect.stringMatching(/^msg_[0-9a-f-]{36}$/),
         role: 'developer',
         content: [{ type: 'input_text', text: 'You are helpful.' }],
       },
@@ -221,14 +228,17 @@ describe('anthropicToResponses', () => {
       },
       { targetModel: 'gpt-6-sol' },
     );
-    expect(result.instructions).toBe('');
+    expect(result).not.toHaveProperty('instructions');
     expect(result.input).toEqual([
       {
         type: 'message',
+        id: expect.stringMatching(/^msg_/),
         role: 'developer',
         content: [
-          { type: 'input_text', text: 'Base instructions.' },
-          { type: 'input_text', text: 'Workspace instructions.' },
+          {
+            type: 'input_text',
+            text: 'Base instructions.\n\nWorkspace instructions.',
+          },
         ],
       },
       {
@@ -248,9 +258,11 @@ describe('anthropicToResponses', () => {
       },
       {
         type: 'function_call',
-        call_id: 'call_bash',
         name: 'Bash',
+        // gpt-6-sol is a Responses Lite model.
+        namespace: 'functions',
         arguments: '{"command":"printf hello"}',
+        call_id: 'call_bash',
       },
       {
         type: 'function_call_output',
@@ -270,13 +282,13 @@ describe('anthropicToResponses', () => {
     ]);
   });
 
-  test('drops tools/tool_choice when no tools are provided', () => {
+  test('drops tools and keeps the official auto tool_choice when no tools are provided', () => {
     const result = anthropicToResponses(
       { messages: [{ role: 'user', content: 'hi' }] },
       { targetModel: 'gpt-5.1-codex' },
     );
     expect(result.tools).toBeUndefined();
-    expect(result.tool_choice).toBeUndefined();
+    expect(result.tool_choice).toBe('auto');
   });
 
   test('converts Anthropic tool definitions to Responses function tools', () => {
@@ -730,4 +742,117 @@ describe('multimodal tool result round trip', () => {
       expect(request.input).toHaveLength(2);
     },
   );
+});
+
+describe('local token estimate', () => {
+  test('JSON and code count about 3.2 characters per token, prose about 4', () => {
+    const prose = 'The quick brown fox jumps over the lazy dog again. '.repeat(
+      20,
+    );
+    expect(estimateTextTokens(prose)).toBe(Math.ceil(prose.length / 4));
+    const code = JSON.stringify({ items: [{ id: 1, path: 'a/b.ts' }] }).repeat(
+      20,
+    );
+    expect(estimateTextTokens(code)).toBe(Math.ceil(code.length / 3.2));
+    // Serialized structure uses the code ratio even when it reads as prose.
+    expect(estimateTextTokens(prose, true)).toBe(Math.ceil(prose.length / 3.2));
+    expect(estimateTextTokens('你好世界')).toBe(4);
+  });
+
+  test('Responses Lite tools inside additional_tools count like top-level tools', () => {
+    const bash = {
+      type: 'function',
+      name: 'Bash',
+      description: 'Run a shell command',
+      strict: false,
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+    };
+    const developer = {
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text: 'You are a careful agent.' }],
+    };
+    const user = {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'list files' }],
+    };
+    // Lite requests set neither top-level tools nor instructions.
+    const request = (fields: Record<string, unknown>) =>
+      ({
+        model: 'gpt-6-sol',
+        store: false,
+        stream: true,
+        ...fields,
+      }) as unknown as ResponsesRequest;
+    const classic = estimateCodexInputTokens(
+      request({ input: [developer, user], tools: [bash] }),
+    );
+    const lite = estimateCodexInputTokens(
+      request({
+        input: [
+          {
+            type: 'additional_tools',
+            role: 'developer',
+            tools: [
+              {
+                type: 'namespace',
+                name: 'functions',
+                description: '',
+                tools: [bash],
+              },
+            ],
+          },
+          developer,
+          user,
+        ],
+      }),
+    );
+    // One more input item and the namespace header; no tool is lost.
+    expect(lite).toBe(classic + 3 + estimateTextTokens('functions\n'));
+    expect(estimateCodexInputTokens(request({ input: [developer] }))).toBe(
+      3 + estimateTextTokens('You are a careful agent.'),
+    );
+  });
+
+  test('replayed encrypted reasoning counts by ciphertext length like the official client', () => {
+    expect(estimateEncryptedReasoningTokens('x'.repeat(800))).toBe(0);
+    // (4000 * 3/4 - 650) bytes at 4 bytes per token.
+    expect(estimateEncryptedReasoningTokens('x'.repeat(4000))).toBe(588);
+    const request = anthropicToResponses(
+      {
+        messages: [
+          { role: 'user', content: 'hi' },
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'thinking',
+                thinking: 'summary',
+                signature: encodeReasoningSignature({
+                  id: 'rs_1',
+                  encryptedContent: 'c'.repeat(4000),
+                })!,
+              },
+              { type: 'text', text: 'ok' },
+            ],
+          },
+          { role: 'user', content: 'next' },
+        ],
+      },
+      { targetModel: 'gpt-6-sol' },
+    );
+    const withoutReasoning = {
+      ...request,
+      input: request.input.filter((item) => item.type !== 'reasoning'),
+    };
+    expect(
+      estimateCodexInputTokens(request) -
+        estimateCodexInputTokens(withoutReasoning),
+    ).toBe(3 + 588);
+  });
 });

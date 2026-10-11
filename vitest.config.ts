@@ -21,6 +21,8 @@ export default defineConfig({
     },
   },
   test: {
+    // Runtime state that would otherwise default into the real data/ dir.
+    env: { HAPPYCLAW_CODEX_INSTALLATION_ID_FILE: '' },
     exclude: [
       '**/node_modules/**',
       '**/dist/**',

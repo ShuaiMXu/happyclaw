@@ -4,7 +4,10 @@
 // Claude SDK. Tool arguments hydrate from deltas and authoritative snapshots;
 // reasoning retains summary boundaries and a replayable final signature.
 // Completion normalizes usage and stop metadata exactly once. Failures and
-// premature EOF remain errors rather than successful partial answers.
+// premature EOF remain errors rather than successful partial answers. A
+// response the backend ends with end_turn: false (or interrupts) can be
+// continued by a follow-up request into the same Anthropic message, as the
+// official Codex turn loop does with needs_follow_up.
 
 import { encodeReasoningSignature } from './reasoning-signature.js';
 import {
@@ -17,6 +20,16 @@ type Json = Record<string, unknown>;
 export interface ResponseConversionOptions {
   /** Original Anthropic tools, used to restore names shortened upstream. */
   tools?: Array<Json>;
+  /**
+   * Local input estimate for message_start. Claude Code keeps it until a
+   * message_delta reports a positive count, so partial replies carry a size.
+   */
+  inputTokenEstimate?: number;
+  /**
+   * Upstream responses that may continue this message when the backend asks
+   * for a follow-up (`end_turn: false`, or an `interrupted` incomplete).
+   */
+  maxFollowUps?: number;
 }
 
 type StopReason =
@@ -52,6 +65,10 @@ interface OutputBlock {
   name?: string;
   callId?: string;
   initialEmptyDelta?: boolean;
+  /** Upstream marked the call's arguments final (arguments.done/item done). */
+  argumentsFinal?: boolean;
+  /** Started downstream, then cut by a truncated response: close as is. */
+  truncated?: boolean;
   parts?: Map<number, string>;
   currentPart?: number;
   data?: Json;
@@ -115,12 +132,48 @@ function responseUsage(response: Json): ResponseUsage {
   };
 }
 
+function addUsage(a: ResponseUsage, b: ResponseUsage): ResponseUsage {
+  const created =
+    (a.cache_creation_input_tokens ?? 0) + (b.cache_creation_input_tokens ?? 0);
+  const thinking =
+    a.output_tokens_details || b.output_tokens_details
+      ? (a.output_tokens_details?.thinking_tokens ?? 0) +
+        (b.output_tokens_details?.thinking_tokens ?? 0)
+      : undefined;
+  return {
+    input_tokens: a.input_tokens + b.input_tokens,
+    output_tokens: a.output_tokens + b.output_tokens,
+    cache_read_input_tokens:
+      a.cache_read_input_tokens + b.cache_read_input_tokens,
+    ...(created ? { cache_creation_input_tokens: created } : {}),
+    ...(thinking !== undefined
+      ? { output_tokens_details: { thinking_tokens: thinking } }
+      : {}),
+  };
+}
+
+function incompleteReason(response: Json): string {
+  return (asString(object(response.incomplete_details).reason) ?? '')
+    .trim()
+    .toLowerCase();
+}
+
+function isTruncation(reason: string): boolean {
+  return reason === 'max_output_tokens' || reason === 'max_tokens';
+}
+
 function stopReason(
   response: Json,
   incomplete: boolean,
   hasToolUse: boolean,
+  refused: boolean,
 ): StopReason {
+  // A truncated turn is not a tool_use success even when calls were
+  // delivered: the truncation reason wins, as on Anthropic.
+  if (incomplete && isTruncation(incompleteReason(response)))
+    return 'max_tokens';
   if (hasToolUse) return 'tool_use';
+  if (refused) return 'refusal';
   const sequence = asString(response.stop_sequence);
   const reason =
     asString(response.stop_reason) ||
@@ -173,15 +226,42 @@ export interface CodexUpstreamFailure {
    * away or a plan that does not include Codex will not clear on a retry.
    */
   noRetry?: boolean;
+  /** usage_limit_reached: the account's usage window is exhausted. */
+  usageLimitReached?: boolean;
+  /** When the exhausted window resets, Unix epoch seconds, if known. */
+  resetsAt?: number;
 }
 
-const RATE_LIMIT_CODES = new Set(['rate_limit_exceeded', 'insufficient_quota']);
+// Classification follows the official client (codex-api responses_error.rs
+// and api_bridge.rs): quota and policy verdicts are terminal, slow_down is a
+// rate limit rather than an overload, and only rate limits read a retry delay
+// out of the message text.
+const RATE_LIMIT_CODES = new Set(['rate_limit_exceeded', 'slow_down']);
 const USAGE_LIMIT_CODES = new Set(['usage_limit_reached']);
+const QUOTA_CODES = new Set([
+  'insufficient_quota',
+  'credit_balance_exhausted',
+  'organization_spend_limit_exceeded',
+  'project_spend_limit_exceeded',
+  'organization_usage_limit_exceeded',
+]);
+/** Official fallback text for policy rejections that arrive without a message. */
+const POLICY_FALLBACK_MESSAGES: ReadonlyMap<string, string> = new Map([
+  [
+    'cyber_policy',
+    'This request has been flagged for possible cybersecurity risk.',
+  ],
+  ['bio_policy', 'This content was flagged for possible biological risk.'],
+  [
+    'misalignment_policy_violation',
+    'This request was blocked due to a misalignment policy violation.',
+  ],
+  ['invalid_prompt', 'Invalid request.'],
+]);
 const OVERLOADED_CODES = new Set([
   'server_is_overloaded',
   'server_overloaded',
   'overloaded',
-  'slow_down',
 ]);
 const CONTEXT_LENGTH_CODES = new Set([
   'context_length_exceeded',
@@ -265,6 +345,34 @@ function usageLimitRetry(
   return {};
 }
 
+/** `Retry-After` inside a streamed error (`error.headers`), as seconds. */
+function errorHeadersRetryAfter(nested: Json, now: number): number | undefined {
+  const headers = object(nested.headers);
+  const name = Object.keys(headers).find(
+    (key) => key.toLowerCase() === 'retry-after',
+  );
+  const raw = name === undefined ? undefined : headers[name];
+  const value = asString(Array.isArray(raw) ? raw[0] : raw)?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return positiveSeconds(value);
+  const date = Date.parse(value);
+  return Number.isFinite(date)
+    ? positiveSeconds((date - now) / 1000)
+    : undefined;
+}
+
+/** responses_error.rs try_parse_retry_delay: "try again in 1.5s" / "500ms". */
+function messageRetryAfter(message: string): number | undefined {
+  const match = /try again in\s*(\d+(?:\.\d+)?)\s*(s|ms|seconds?)/i.exec(
+    message,
+  );
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  return positiveSeconds(
+    match[2].toLowerCase() === 'ms' ? value / 1000 : value,
+  );
+}
+
 function isContextLengthMessage(message: string): boolean {
   const lower = message.toLowerCase();
   return (
@@ -278,9 +386,9 @@ function isContextLengthMessage(message: string): boolean {
 
 /**
  * 把上游失败翻译成 Anthropic 错误类型与 HTTP 状态。类型决定客户端是否重试：
- * SDK 对 api_error 会反复重试，而 invalid_prompt（上游安全策略拒绝）重试同一
- * 请求并不会改变判定，必须以 invalid_request_error 暴露真实原因。SSE 终止事件
- * 与非 2xx HTTP 响应体共用这一套映射。
+ * SDK 对 api_error 会反复重试，而安全策略拒绝（invalid_prompt、cyber_policy
+ * 等）或额度耗尽重试同一请求并不会改变判定，必须以不可重试的错误暴露真实原因。
+ * SSE 终止事件与非 2xx HTTP 响应体共用这一套映射，分类对齐官方 Codex CLI。
  */
 export function describeUpstreamFailure(
   raw: Json,
@@ -310,15 +418,15 @@ export function describeUpstreamFailure(
       ? options.httpStatus
       : undefined;
   const status = declaredStatus ?? httpStatus;
+  const upstreamMessage =
+    asString(nested.message) ?? asString(error) ?? asString(raw.message);
   const detail = sanitizeUpstreamText(
-    asString(nested.message) ??
-      asString(error) ??
-      asString(raw.message) ??
-      'Upstream Codex request failed',
+    upstreamMessage ?? 'Upstream Codex request failed',
   );
   const now = options.now ?? Date.now();
   const isCode = (codes: Set<string>) =>
     codes.has(normalizedCode) || codes.has(upstreamType);
+  const headerRetry = errorHeadersRetryAfter(nested, now);
 
   // Plan/quota verdicts first: Codex sends them with error.type, not code.
   if (isCode(USAGE_LIMIT_CODES)) {
@@ -333,8 +441,12 @@ export function describeUpstreamFailure(
       message: `ChatGPT 订阅的 Codex 用量已达上限（usage_limit_reached）${reset}。${detail}`,
       status: 429,
       noRetry: true,
+      usageLimitReached: true,
       ...(retry.retryAfterSeconds !== undefined
         ? { retryAfterSeconds: retry.retryAfterSeconds }
+        : {}),
+      ...(retry.resetsAt !== undefined
+        ? { resetsAt: Math.ceil(retry.resetsAt / 1000) }
         : {}),
     };
   }
@@ -347,6 +459,29 @@ export function describeUpstreamFailure(
       code: code ?? 'usage_not_included',
       message: `当前 ChatGPT 套餐不包含 Codex 用量（usage_not_included），请升级套餐或改用其他模型配置。${detail}`,
       status: 403,
+      noRetry: true,
+    };
+  }
+  if (isCode(QUOTA_CODES)) {
+    const quotaCode = code ?? upstreamType;
+    return {
+      type: 'rate_limit_error',
+      code: quotaCode,
+      message: `ChatGPT 账号的额度已用尽（${quotaCode}），重试不会恢复，请检查套餐与账单。${detail}`,
+      status: 429,
+      noRetry: true,
+    };
+  }
+  const policyFallback = POLICY_FALLBACK_MESSAGES.get(normalizedCode);
+  if (policyFallback !== undefined) {
+    const reason = upstreamMessage?.trim()
+      ? detail
+      : sanitizeUpstreamText(policyFallback);
+    return {
+      type: 'invalid_request_error',
+      code,
+      message: `Codex 上游安全策略拒绝了本次请求（${normalizedCode}）：${reason}`,
+      status: 400,
       noRetry: true,
     };
   }
@@ -363,6 +498,17 @@ export function describeUpstreamFailure(
         ? `Codex upstream overloaded (${code}): ${detail}`
         : `Codex upstream overloaded: ${detail}`,
       status: 529,
+      ...(headerRetry !== undefined ? { retryAfterSeconds: headerRetry } : {}),
+    };
+  }
+  if (RATE_LIMIT_CODES.has(normalizedCode)) {
+    const retryAfterSeconds = headerRetry ?? messageRetryAfter(detail);
+    return {
+      type: 'rate_limit_error',
+      code,
+      message: `Codex upstream rate limited (${code}): ${detail}`,
+      status: 429,
+      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
     };
   }
   if (
@@ -382,18 +528,14 @@ export function describeUpstreamFailure(
   }
 
   let type: AnthropicErrorType = 'api_error';
-  if (
-    RATE_LIMIT_CODES.has(normalizedCode) ||
-    upstreamType.includes('rate_limit') ||
-    status === 429
-  ) {
+  if (upstreamType.includes('rate_limit') || status === 429) {
     type = 'rate_limit_error';
   } else if (
     upstreamType === 'invalid_request_error' ||
     upstreamType === 'invalid_request' ||
     upstreamType === 'bad_request_error' ||
-    normalizedCode === 'cyber_policy' ||
-    normalizedCode === 'invalid_prompt' ||
+    // Resending the same ciphertext fails identically; the gateway strips it.
+    normalizedCode === 'invalid_encrypted_content' ||
     status === 400 ||
     status === 422
   ) {
@@ -421,18 +563,30 @@ export function describeUpstreamFailure(
     type = 'not_found_error';
   }
 
-  const message =
-    normalizedCode === 'invalid_prompt'
-      ? `Codex 上游安全策略拒绝了本次请求（invalid_prompt）：${detail}`
-      : code
-        ? `Codex upstream error (${code}): ${detail}`
-        : detail;
   return {
     type,
     code,
-    message,
+    message: code ? `Codex upstream error (${code}): ${detail}` : detail,
     ...(status ? { status } : {}),
+    // Anything else is retryable upstream advice (ApiError::Retryable).
+    ...(headerRetry !== undefined ? { retryAfterSeconds: headerRetry } : {}),
   };
+}
+
+/**
+ * The upstream could not verify replayed reasoning ciphertext, typically
+ * sealed by another account. Stripping the reasoning items lets the same
+ * conversation continue (magpie affinity.go foreignReasoning).
+ */
+export function isInvalidEncryptedContentFailure(
+  failure: Pick<CodexUpstreamFailure, 'code' | 'message'>,
+): boolean {
+  return (
+    failure.code?.trim().toLowerCase() === 'invalid_encrypted_content' ||
+    /invalid_encrypted_content|encrypted[ _]content.{0,80}could not be (verified|decrypted)|could not (decrypt|verify).{0,40}encrypted[ _]content/i.test(
+      failure.message,
+    )
+  );
 }
 
 /**
@@ -492,6 +646,56 @@ export function upstreamFailureStatus(failure: CodexUpstreamFailure): number {
   return failure.status ?? HTTP_STATUS_BY_ERROR_TYPE[failure.type];
 }
 
+/** Namespace Responses Lite puts every client function in. */
+const DEFAULT_FUNCTION_NAMESPACE = 'functions';
+
+/** Prefixed item IDs survive replay, like the official client's history. */
+function replayItemId(value: unknown): string | undefined {
+  const id = asString(value);
+  const separator = id?.indexOf('_') ?? -1;
+  return id && separator > 0 && separator < id.length - 1 ? id : undefined;
+}
+
+/**
+ * One completed output item as the official client replays it from its
+ * history (codex-protocol ResponseItem): with store: false the follow-up
+ * request must carry every earlier item again, including encrypted reasoning.
+ */
+function replayOutputItem(item: Json): Json | null {
+  const type = asString(item.type);
+  if (!type) return null;
+  const id = replayItemId(item.id);
+  switch (type) {
+    case 'message':
+      return {
+        type,
+        ...(id ? { id } : {}),
+        role: asString(item.role) ?? 'assistant',
+        content: Array.isArray(item.content) ? item.content : [],
+        ...(asString(item.status) ? { status: item.status } : {}),
+        ...(asString(item.phase) ? { phase: item.phase } : {}),
+      };
+    case 'reasoning':
+      return {
+        type,
+        ...(id ? { id } : {}),
+        summary: Array.isArray(item.summary) ? item.summary : [],
+        // Raw reasoning text is replayed only when present (official serde).
+        ...(Array.isArray(item.content) &&
+        item.content.some((part) => object(part).type === 'reasoning_text')
+          ? { content: item.content }
+          : {}),
+        encrypted_content: asString(item.encrypted_content),
+      };
+    default: {
+      const replay: Json = { ...item };
+      if (id) replay.id = id;
+      else delete replay.id;
+      return replay;
+    }
+  }
+}
+
 export class ResponsesToAnthropicConverter {
   private blockIndex = 0;
   private readonly aliases = new Map<string, OutputItem>();
@@ -501,6 +705,10 @@ export class ResponsesToAnthropicConverter {
   private readonly contentQueue: OutputBlock[] = [];
   private active: OutputBlock | null = null;
   private hasToolUse = false;
+  /** Any function call in the current upstream response, started or not. */
+  private responseHasToolCall = false;
+  private truncatedToolUse = false;
+  private refused = false;
   private sawMeaningfulOutput = false;
   private completedOutputItems = 0;
   private usage: ResponseUsage = {
@@ -508,6 +716,13 @@ export class ResponsesToAnthropicConverter {
     output_tokens: 0,
     cache_read_input_tokens: 0,
   };
+  /** Usage of earlier upstream responses folded into this message. */
+  private priorUsage: ResponseUsage | null = null;
+  /** Completed output items of the current response, for follow-up replay. */
+  private outputItems: Json[] = [];
+  private followUpItems: Json[] | null = null;
+  private followUpsLeft: number;
+  private readonly inputTokenEstimate: number;
   private messageStarted = false;
   private finished = false;
   private failure: CodexUpstreamFailure | null = null;
@@ -523,6 +738,48 @@ export class ResponsesToAnthropicConverter {
         original,
       ]),
     );
+    this.inputTokenEstimate = tokens(options.inputTokenEstimate);
+    this.followUpsLeft = tokens(options.maxFollowUps);
+  }
+
+  /**
+   * Output items to replay when the backend asked for a follow-up: the
+   * message stays open and the next upstream response continues it.
+   */
+  pendingFollowUp(): Json[] | null {
+    return this.followUpItems ? [...this.followUpItems] : null;
+  }
+
+  /** Continue the open message with the next upstream response. */
+  beginFollowUp(): void {
+    if (!this.followUpItems) return;
+    this.followUpItems = null;
+    this.finished = false;
+    this.aliases.clear();
+    this.lastItems.clear();
+    this.items.clear();
+    this.toolQueue.length = 0;
+    this.contentQueue.length = 0;
+    this.active = null;
+    this.outputItems = [];
+    this.responseHasToolCall = false;
+  }
+
+  /** End the message with a failure the caller observed itself. */
+  fail(failure: CodexUpstreamFailure): AnthropicStreamEvent[] {
+    if (this.finished && !this.followUpItems) return [];
+    this.followUpItems = null;
+    this.finished = true;
+    this.failure = { ...failure };
+    return [
+      {
+        event: 'error',
+        data: {
+          type: 'error',
+          error: { type: failure.type, message: failure.message },
+        },
+      },
+    ];
   }
 
   handleEvent(raw: Json): AnthropicStreamEvent[] {
@@ -578,8 +835,15 @@ export class ResponsesToAnthropicConverter {
       raw.item &&
       typeof raw.item === 'object' &&
       !Array.isArray(raw.item)
-    )
+    ) {
       this.completedOutputItems++;
+      if (this.followUpsLeft > 0) this.outputItems.push(raw.item as Json);
+    }
+    if (
+      type.startsWith('response.refusal.') ||
+      object(raw.part).type === 'refusal'
+    )
+      this.refused = true;
     if (
       [
         'response.output_text.delta',
@@ -604,6 +868,7 @@ export class ResponsesToAnthropicConverter {
         else {
           this.setSnapshot(block, asString(raw.arguments) ?? '');
           this.validateToolArguments(block);
+          block.argumentsFinal = true;
         }
       }
     } else if (type.startsWith('response.reasoning_')) {
@@ -661,7 +926,7 @@ export class ResponsesToAnthropicConverter {
             content: [],
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
+            usage: { input_tokens: this.inputTokenEstimate, output_tokens: 0 },
           },
         },
       },
@@ -737,7 +1002,29 @@ export class ResponsesToAnthropicConverter {
     };
   }
 
+  /**
+   * The original Anthropic name of a function call. Responses Lite calls
+   * carry the default `functions` namespace beside an unqualified name
+   * (official ToolName::with_default_namespace); the namespace is dropped,
+   * as is a `functions.`/`functions__` qualification of the name itself.
+   */
+  private restoreToolName(item: Json): string | null {
+    let name = asString(item.name);
+    if (!name) return null;
+    const namespace = asString(item.namespace) || DEFAULT_FUNCTION_NAMESPACE;
+    if (!this.originalToolNames.has(name))
+      for (const separator of ['.', '__']) {
+        const prefix = `${namespace}${separator}`;
+        if (name.startsWith(prefix) && name.length > prefix.length) {
+          name = name.slice(prefix.length);
+          break;
+        }
+      }
+    return this.originalToolNames.get(name) ?? name;
+  }
+
   private toolFor(item: OutputItem): OutputBlock {
+    this.responseHasToolCall = true;
     if (!item.tool) {
       item.tool = this.blockFor(item, 'tool_use');
       this.toolQueue.push(item.tool);
@@ -838,14 +1125,15 @@ export class ResponsesToAnthropicConverter {
     if (type === 'function_call') {
       const block = this.toolFor(item);
       if (block.closed) return;
-      const name = asString(data.name);
+      const name = this.restoreToolName(data);
       if (name) {
-        block.name = this.originalToolNames.get(name) ?? name;
+        block.name = name;
         block.initialEmptyDelta = !done;
       }
       block.callId = asString(data.call_id) || block.callId || item.id || '';
       this.setSnapshot(block, asString(data.arguments) ?? '');
       block.done = done;
+      if (done) block.argumentsFinal = true;
       // A pending tool must not close reasoning before its final signature.
       // Its buffered arguments are released after the preceding block's done.
     } else if (type === 'reasoning') {
@@ -876,6 +1164,7 @@ export class ResponsesToAnthropicConverter {
       parts.forEach((part, index) => {
         const value = object(part);
         if (value.type !== 'output_text' && value.type !== 'refusal') return;
+        if (value.type === 'refusal') this.refused = true;
         const block = this.textFor(item, index);
         this.setSnapshot(
           block,
@@ -1008,7 +1297,7 @@ export class ResponsesToAnthropicConverter {
     for (;;) {
       if (this.active) {
         const block = this.active;
-        if (block.type === 'tool_use' && block.done)
+        if (block.type === 'tool_use' && block.done && !block.truncated)
           this.validateToolArguments(block);
         if (block.text.length > block.emitted.length) {
           const value = block.text.slice(block.emitted.length);
@@ -1094,7 +1383,15 @@ export class ResponsesToAnthropicConverter {
   ): AnthropicStreamEvent[] {
     const response = object(raw.response);
     const output = Array.isArray(response.output) ? response.output : [];
+    // Official needs_follow_up: the backend ended this response but not the
+    // turn. Tool calls end the message instead; the client runs them.
+    const canFollowUp =
+      this.followUpsLeft > 0 &&
+      (incomplete
+        ? incompleteReason(response) === 'interrupted'
+        : response.end_turn === false);
     if (
+      !canFollowUp &&
       incomplete &&
       raw.type === 'response.incomplete' &&
       !output.length &&
@@ -1128,8 +1425,8 @@ export class ResponsesToAnthropicConverter {
         );
         const block = this.toolFor(target);
         if (block.closed) return;
-        const name = asString(item.name);
-        if (name) block.name = this.originalToolNames.get(name) ?? name;
+        const name = this.restoreToolName(item);
+        if (name) block.name = name;
         block.callId =
           asString(item.call_id) || block.callId || target.id || '';
         this.setSnapshot(block, asString(item.arguments) ?? '');
@@ -1156,15 +1453,49 @@ export class ResponsesToAnthropicConverter {
     }
     if (this.active) this.active.done = true;
     for (const block of this.toolQueue) if (!block.name) block.closed = true;
+    // A truncated response can cut a call mid-arguments. A call not yet
+    // started downstream is dropped; one already streaming is closed as is
+    // and the message ends with max_tokens, never as a runnable tool_use.
+    if (incomplete)
+      for (const block of this.toolQueue) {
+        if (block.closed || this.toolArgumentsComplete(block)) continue;
+        if (block.index === null) block.closed = true;
+        else {
+          block.truncated = true;
+          this.truncatedToolUse = true;
+        }
+      }
     events.push(...this.flush());
     this.finished = true;
-    this.usage = responseUsage(response);
+    const usage = responseUsage(response);
+    if (canFollowUp && !this.responseHasToolCall) {
+      this.followUpsLeft -= 1;
+      this.priorUsage = this.priorUsage
+        ? addUsage(this.priorUsage, usage)
+        : usage;
+      const items = this.outputItems.length
+        ? this.outputItems
+        : output.map(object);
+      this.followUpItems = items.flatMap((item) => {
+        const replay = replayOutputItem(item);
+        return replay ? [replay] : [];
+      });
+      return events;
+    }
+    this.usage = this.finalUsage(usage);
+    let reason = stopReason(
+      response,
+      incomplete,
+      this.hasToolUse && !this.truncatedToolUse,
+      this.refused,
+    );
+    if (this.truncatedToolUse && reason === 'end_turn') reason = 'max_tokens';
     events.push({
       event: 'message_delta',
       data: {
         type: 'message_delta',
         delta: {
-          stop_reason: stopReason(response, incomplete, this.hasToolUse),
+          stop_reason: reason,
           stop_sequence: asString(response.stop_sequence) || null,
         },
         usage: { ...this.usage },
@@ -1172,6 +1503,37 @@ export class ResponsesToAnthropicConverter {
     });
     events.push({ event: 'message_stop', data: { type: 'message_stop' } });
     return events;
+  }
+
+  private toolArgumentsComplete(block: OutputBlock): boolean {
+    if (!block.text.trim()) return block.argumentsFinal === true;
+    try {
+      const input: unknown = JSON.parse(block.text);
+      return !!input && typeof input === 'object' && !Array.isArray(input);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Usage of every upstream response in this message. Claude Code keeps the
+   * message_start input estimate whenever message_delta reports 0 uncached
+   * input (a fully cached prompt); one cached token moves into input_tokens
+   * so the total it keeps stays exact.
+   */
+  private finalUsage(last: ResponseUsage): ResponseUsage {
+    const usage = this.priorUsage ? addUsage(this.priorUsage, last) : last;
+    if (usage.input_tokens > 0 || this.inputTokenEstimate === 0) return usage;
+    if (usage.cache_read_input_tokens > 0) {
+      usage.cache_read_input_tokens -= 1;
+      usage.input_tokens = 1;
+    } else if (usage.cache_creation_input_tokens) {
+      usage.cache_creation_input_tokens -= 1;
+      usage.input_tokens = 1;
+      if (!usage.cache_creation_input_tokens)
+        delete usage.cache_creation_input_tokens;
+    }
+    return usage;
   }
 
   private handleFailure(raw: Json): AnthropicStreamEvent[] {
@@ -1226,6 +1588,18 @@ export function aggregateResponsesStream(
     anthropicEvents.push(...converter.handleEvent(event));
   }
   anthropicEvents.push(...converter.finish());
+  return assembleAnthropicMessage(anthropicEvents, converter, fallbackModel);
+}
+
+/**
+ * Assemble the Anthropic events one converter produced — possibly across
+ * several upstream follow-up responses — into a nonstream message.
+ */
+export function assembleAnthropicMessage(
+  anthropicEvents: AnthropicStreamEvent[],
+  converter: ResponsesToAnthropicConverter,
+  fallbackModel: string,
+): AggregatedAnthropicMessage {
   if (anthropicEvents.some(({ event }) => event === 'error')) {
     throw new CodexUpstreamError(
       converter.getFailure() ?? {
@@ -1320,7 +1694,7 @@ export function aggregateResponsesStream(
 
   const content = [...blocks.entries()]
     .sort(([a], [b]) => a - b)
-    .map(([, acc]) => {
+    .flatMap(([, acc]) => {
       if (
         (acc.block.type === 'tool_use' ||
           acc.block.type === 'server_tool_use') &&
@@ -1335,6 +1709,8 @@ export function aggregateResponsesStream(
             throw new Error();
           acc.block.input = input as Json;
         } catch {
+          // A call cut by max_output_tokens is dropped, never run partially.
+          if (stopReason === 'max_tokens') return [];
           throw new CodexUpstreamError({
             type: 'api_error',
             code: 'invalid_tool_arguments',
@@ -1342,7 +1718,7 @@ export function aggregateResponsesStream(
           });
         }
       }
-      return acc.block;
+      return [acc.block];
     })
     .filter((block) => {
       // 丢弃上游断流留下的空块；空 thinking 但有签名的保留（回放仍需签名）。

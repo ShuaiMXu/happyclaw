@@ -123,8 +123,15 @@ describe('resolveCodexAccess', () => {
       providerId: 'provider',
       accessToken: 'upstream-token',
       accountId: 'account-id',
+      isFedramp: false,
     });
     expect(mocks.refresh).not.toHaveBeenCalled();
+  });
+  test('carries the stored FedRAMP status to the request layer', async () => {
+    provider.codexOAuthCredentials = { ...credentials(), isFedramp: true };
+    await expect(resolveCodexAccess('provider')).resolves.toMatchObject({
+      isFedramp: true,
+    });
   });
   test('the stored identifier finds its provider but is not an access path', async () => {
     expect(findCodexProviderByGatewayIdentifier('gateway-identifier')?.id).toBe(
@@ -330,6 +337,24 @@ describe('refresh failures', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+  test('a non-grant 4xx such as a Cloudflare 403 backs off instead of requiring re-login', async () => {
+    provider.codexOAuthCredentials = credentials('old', true);
+    mocks.refresh.mockRejectedValue(
+      new CodexOAuthTokenError(
+        'Codex OAuth token endpoint rejected: HTTP 403',
+        403,
+        null,
+        true,
+      ),
+    );
+    await expect(resolveCodexAccess('provider')).rejects.toThrow(
+      CodexRefreshUnavailableError,
+    );
+    expect(provider.codexOAuthLastRefreshError).toMatchObject({
+      kind: 'transient',
+      message: '令牌刷新暂时失败（HTTP 403）',
+    });
   });
   test('transient failures escalate the backoff only once per failed exchange', async () => {
     provider.codexOAuthCredentials = credentials('near-expiry');
