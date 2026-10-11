@@ -116,13 +116,14 @@ describe('anthropicToResponses', () => {
       { targetModel: 'gpt-5.1-codex' },
     );
 
-    expect(result.instructions).toBe('');
+    expect(result).not.toHaveProperty('instructions');
     expect(result.model).toBe('gpt-5.1-codex');
     expect(result.stream).toBe(true);
     expect(result.store).toBe(false);
     expect(result.input).toEqual([
       {
         type: 'message',
+        id: expect.stringMatching(/^msg_[0-9a-f-]{36}$/),
         role: 'developer',
         content: [{ type: 'input_text', text: 'You are helpful.' }],
       },
@@ -221,14 +222,17 @@ describe('anthropicToResponses', () => {
       },
       { targetModel: 'gpt-6-sol' },
     );
-    expect(result.instructions).toBe('');
+    expect(result).not.toHaveProperty('instructions');
     expect(result.input).toEqual([
       {
         type: 'message',
+        id: expect.stringMatching(/^msg_/),
         role: 'developer',
         content: [
-          { type: 'input_text', text: 'Base instructions.' },
-          { type: 'input_text', text: 'Workspace instructions.' },
+          {
+            type: 'input_text',
+            text: 'Base instructions.\n\nWorkspace instructions.',
+          },
         ],
       },
       {
@@ -248,9 +252,11 @@ describe('anthropicToResponses', () => {
       },
       {
         type: 'function_call',
-        call_id: 'call_bash',
         name: 'Bash',
+        // gpt-6-sol is a Responses Lite model.
+        namespace: 'functions',
         arguments: '{"command":"printf hello"}',
+        call_id: 'call_bash',
       },
       {
         type: 'function_call_output',
@@ -270,13 +276,13 @@ describe('anthropicToResponses', () => {
     ]);
   });
 
-  test('drops tools/tool_choice when no tools are provided', () => {
+  test('drops tools and keeps the official auto tool_choice when no tools are provided', () => {
     const result = anthropicToResponses(
       { messages: [{ role: 'user', content: 'hi' }] },
       { targetModel: 'gpt-5.1-codex' },
     );
     expect(result.tools).toBeUndefined();
-    expect(result.tool_choice).toBeUndefined();
+    expect(result.tool_choice).toBe('auto');
   });
 
   test('converts Anthropic tool definitions to Responses function tools', () => {

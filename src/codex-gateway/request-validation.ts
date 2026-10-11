@@ -160,6 +160,15 @@ const webSearchTool = z
       .optional(),
   })
   .passthrough();
+// Claude Code's tool search (ENABLE_TOOL_SEARCH) declares an Anthropic server
+// tool and marks other tools `defer_loading`. The converter declares every
+// tool upfront and drops the search tool, so only its identity is checked.
+const toolSearchTool = z
+  .object({
+    type: z.string().regex(/^tool_search_tool_/),
+    name: z.string().min(1).optional(),
+  })
+  .passthrough();
 
 // Validate every consumed shape; unrelated SDK options remain passthrough and
 // are deliberately omitted from the Codex payload.
@@ -185,7 +194,9 @@ export const CodexMessagesRequestSchema = z
         ]),
       )
       .min(1),
-    tools: z.array(z.union([webSearchTool, functionTool])).optional(),
+    tools: z
+      .array(z.union([webSearchTool, toolSearchTool, functionTool]))
+      .optional(),
     tool_choice: toolChoice.optional(),
     thinking: z
       .discriminatedUnion('type', [

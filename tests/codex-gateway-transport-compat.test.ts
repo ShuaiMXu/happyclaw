@@ -514,9 +514,11 @@ describe('Codex executor transport compatibility', () => {
     });
     const stream = await (await request(true, { tools })).text();
     expect(stream).toContain(JSON.stringify(name));
-    expect(JSON.parse(mocks.fetch.mock.calls[0][1].body).tools[0].name).toBe(
-      'mcp__do_action',
-    );
+    // gpt-6-sol sends Responses Lite: tools sit in the additional_tools prefix.
+    expect(
+      JSON.parse(mocks.fetch.mock.calls[0][1].body).input[0].tools[0].tools[0]
+        .name,
+    ).toBe('mcp__do_action');
   });
 
   test.each(['\n', '\r\n', '\r'])(
