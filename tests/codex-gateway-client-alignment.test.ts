@@ -296,9 +296,14 @@ describe('official /responses request shape', () => {
       'window_id',
       'window_number',
       'request_kind',
+      'root_turn_id',
       'thread_source',
       'turn_started_at_unix_ms',
+      'model',
+      'reasoning_effort',
     ]);
+    // Official 0.162.1 capture: a root thread's root turn is its own turn.
+    expect(metadata.root_turn_id).toBe(metadata.turn_id);
     expect(metadata).toMatchObject({
       installation_id: installationId,
       session_id: thread,
@@ -319,6 +324,7 @@ describe('official /responses request shape', () => {
       'x-codex-window-id': `${thread}:0`,
       turn_id: metadata.turn_id,
       'x-codex-turn-metadata': headers['x-codex-turn-metadata'],
+      root_turn_id: metadata.turn_id,
     });
   });
 

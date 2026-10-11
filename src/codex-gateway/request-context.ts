@@ -259,8 +259,11 @@ function turnMetadataJson(fields: {
   turnId: string;
   windowId: string;
   turnStartedAtMs: number;
+  model: string;
+  reasoningEffort?: string;
 }): string {
   const { identity } = fields;
+  const root = identity.background || identity.agentId === 'main';
   return JSON.stringify({
     installation_id: fields.installationId,
     session_id: identity.sessionId,
@@ -273,12 +276,19 @@ function turnMetadataJson(fields: {
     window_id: fields.windowId,
     window_number: 0,
     request_kind: 'turn',
+    // A root thread's turn is its own root turn; a sub-agent's root turn
+    // belongs to the parent, which this request cannot see.
+    ...(root ? { root_turn_id: fields.turnId } : {}),
     thread_source: identity.background
       ? CODEX_BACKGROUND_SOURCE
       : identity.agentId === 'main'
         ? 'user'
         : 'subagent',
     turn_started_at_unix_ms: fields.turnStartedAtMs,
+    model: fields.model,
+    ...(fields.reasoningEffort
+      ? { reasoning_effort: fields.reasoningEffort }
+      : {}),
   });
 }
 
@@ -369,13 +379,20 @@ export function buildCodexUpstreamRequest(input: {
   );
   const installationId = codexInstallationId();
   const windowId = `${identity.threadId}:0`;
+  const reasoningEffort = (
+    responsesRequest as { reasoning?: { effort?: unknown } }
+  ).reasoning?.effort;
   const turnMetadata = turnMetadataJson({
     installationId,
     identity,
     turnId: turn.turnId,
     windowId,
     turnStartedAtMs: turn.startedAtMs,
+    model: responsesRequest.model,
+    reasoningEffort:
+      typeof reasoningEffort === 'string' ? reasoningEffort : undefined,
   });
+  const rootThread = identity.background || identity.agentId === 'main';
 
   const encoded = encodeCodexUpstreamBody(responsesRequest, {
     promptCacheKey: identity.promptCacheKey,
@@ -386,6 +403,7 @@ export function buildCodexUpstreamRequest(input: {
       'x-codex-window-id': windowId,
       turn_id: turn.turnId,
       'x-codex-turn-metadata': turnMetadata,
+      ...(rootThread ? { root_turn_id: turn.turnId } : {}),
     },
   });
 
