@@ -2,6 +2,7 @@
 // 自托管部署用 .env 配置 CORS_ALLOWED_ORIGINS（公网域名白名单）、自定义 env 等。
 // 必须作为 index.ts 的第一个 import，确保 config.ts / web.ts 在求值时已能读到这些值。
 // 缺少 .env 文件属正常情况（所有 env 均有默认值），静默忽略。
+import http from 'node:http';
 import { setGlobalDispatcher, EnvHttpProxyAgent } from 'undici';
 
 try {
@@ -29,6 +30,14 @@ const proxy =
 if (proxy) {
   try {
     setGlobalDispatcher(new EnvHttpProxyAgent());
+    // The pinned undici package registers its dispatcher where Node <= 25's
+    // built-in fetch looks for it. Node 26 bundles undici 8, which reads a new
+    // global slot that an undici 6 agent cannot serve, so its fetch would go
+    // direct. Node's own proxy support covers exactly those runtimes.
+    const setGlobalProxyFromEnv = (
+      http as { setGlobalProxyFromEnv?: () => unknown }
+    ).setGlobalProxyFromEnv;
+    if (typeof setGlobalProxyFromEnv === 'function') setGlobalProxyFromEnv();
     // logger 尚未初始化（本模块是最早的 import），用 console 输出一行启动提示。
     // 对代理串脱敏：去掉 userinfo（http://user:pass@host → http://***@host），避免凭据进日志。
     const safeProxy = proxy.replace(/\/\/[^/@]*@/, '//***@');
