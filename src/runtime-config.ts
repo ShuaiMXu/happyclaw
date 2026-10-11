@@ -1655,6 +1655,24 @@ interface StoredStateV5 {
   balancing: BalancingConfig;
 }
 
+/** Legacy subscriptions can predate the internal identifier used to mint grants. */
+function ensureCodexGatewayIdentifiers(providers: UnifiedProvider[]): boolean {
+  let changed = false;
+  for (const provider of providers) {
+    if (
+      provider.codexOAuthCredentials &&
+      isCodexGatewayBaseUrl(provider.anthropicBaseUrl) &&
+      !provider.anthropicAuthToken
+    ) {
+      // This stays encrypted with the provider. Only per-runner grants, never
+      // this identifier, authenticate requests to the embedded gateway.
+      provider.anthropicAuthToken = crypto.randomBytes(32).toString('hex');
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 /**
  * Decrypted V5 state, valid while the config and key files keep the
  * signatures observed before they were read. The Codex gateway, container
@@ -1731,8 +1749,15 @@ function readStoredStateV4FromDisk(): StoredStateV5 | null {
             DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
         },
       };
-      if (Object.hasOwn(v5, 'defaultProviderId')) {
+      const repairedGatewayIdentifiers =
+        ensureCodexGatewayIdentifiers(providers);
+      if (
+        repairedGatewayIdentifiers ||
+        Object.hasOwn(v5, 'defaultProviderId')
+      ) {
         writeStoredStateV4(state.providers, state.balancing);
+      }
+      if (Object.hasOwn(v5, 'defaultProviderId')) {
         logger.info(
           'Removed legacy default model pointer from Claude model configuration',
         );
@@ -1787,6 +1812,8 @@ function writeStoredStateV4(
   providers: UnifiedProvider[],
   balancing: BalancingConfig,
 ): void {
+  // Cover V3/V4 migration and newly imported subscriptions as well as V5 reads.
+  ensureCodexGatewayIdentifiers(providers);
   // Every save goes through here: drop the decrypted cache first, so the next
   // read decrypts what was actually persisted.
   storedStateCache = null;
