@@ -29,8 +29,7 @@ ssh macmini
 cd /Users/riba2534/airepo/happyclaw
 export HAPPYCLAW_DEPLOY_REF='codex/replace-with-remote-branch'
 export HAPPYCLAW_EXPECTED_SHA='replace-with-full-commit-sha'
-export HAPPYCLAW_PUBLIC_URL_PRIMARY='https://claw.riba2534.cn'
-export HAPPYCLAW_PUBLIC_URL_SECONDARY='https://claw.home.riba2534.cn:23333'
+export HAPPYCLAW_PUBLIC_URL='https://claw.home.riba2534.cn:23333'
 export HAPPYCLAW_AGENT_IMAGE='riba2534/happyclaw-agent:latest'
 # 分支不可变镜像会自动派生同 SHA 的 `-headroom` 能力标签；只有实际配置
 # headroom MCP 时 Docker 才按需拉取它。
@@ -117,8 +116,7 @@ launchctl print "gui/$(id -u)/com.riba2534.happyclaw" | head -40
 lsof -nP -iTCP:3000 -sTCP:LISTEN
 curl -fsS http://127.0.0.1:3000/api/config/appearance/public
 test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/auth/me)" = 401
-curl -fsS "$HAPPYCLAW_PUBLIC_URL_PRIMARY/api/health"
-curl -fsS "$HAPPYCLAW_PUBLIC_URL_SECONDARY/api/health"
+curl -fsS "$HAPPYCLAW_PUBLIC_URL/api/health"
 tail -100 "$HOME/Library/Logs/happyclaw/happyclaw.log"
 ```
 
@@ -132,7 +130,7 @@ tail -100 "$HOME/Library/Logs/happyclaw/happyclaw.log"
    不得回滚为旧值。
 5. 发起一个真实 Web Agent 回合；若本次涉及渠道或容器，再完成对应 IM 收发和 Container
    Agent 回合，确认流式输出、文件访问及最终回执正常。
-6. 检查两个生产公网入口的 `/api/health`、TLS 和静态资源加载均成功。
+6. 检查生产公网入口的 `/api/health`、TLS 和静态资源加载均成功。
 
 本地通过不等于部署完成；以上生产检查未通过时不得报告完成。
 
