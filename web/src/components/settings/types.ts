@@ -8,6 +8,8 @@ export interface UnifiedProviderPublic {
   weight: number;
   anthropicBaseUrl: string;
   anthropicModel: string;
+  /** null for third-party providers saved before the explicit choice. */
+  anthropicAuthMode: 'bearer' | 'x-api-key' | null;
   hasAnthropicAuthToken: boolean;
   anthropicAuthTokenMasked: string | null;
   hasAnthropicApiKey: boolean;

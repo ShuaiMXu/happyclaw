@@ -1721,8 +1721,12 @@ configRoutes.post(
     const result = await testProviderConnectivity({
       baseUrl,
       token,
+      // A legacy provider has no mode; probe with the header its runtime
+      // infers (bare token → x-api-key, `Bearer …` → Authorization).
       authMode:
-        draft.anthropicAuthMode ?? stored?.anthropicAuthMode ?? 'bearer',
+        draft.anthropicAuthMode ??
+        stored?.anthropicAuthMode ??
+        (stored && !/^Bearer\s/i.test(token) ? 'x-api-key' : 'bearer'),
       model,
       haikuModel: customEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL,
       customHeaders: customEnv.ANTHROPIC_CUSTOM_HEADERS,

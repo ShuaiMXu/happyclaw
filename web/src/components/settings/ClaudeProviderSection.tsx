@@ -166,20 +166,18 @@ export function ClaudeProviderSection({
     }
   }, [pendingDeleteProvider, loadProviders, setNotice, setError]);
 
-  // ─── 复制第三方提供商 ────────────────────────────────────────────
+  // ─── 复制第三方提供商（服务端连同密钥一起复制，默认停用）─────────
   const handleDuplicate = useCallback(
     async (provider: ProviderWithHealth) => {
       try {
-        await api.post('/api/config/claude/providers', {
-          name: `${provider.name} (副本)`,
-          type: 'third_party',
-          anthropicBaseUrl: provider.anthropicBaseUrl,
-          anthropicModel: provider.anthropicModel,
-          customEnv: provider.customEnv,
-          enabled: false,
-        });
+        const copy = await api.post<ProviderWithHealth>(
+          `/api/config/claude/providers/${provider.id}/duplicate`,
+        );
         await loadProviders();
-        setNotice(`已复制模型配置「${provider.name}」，密钥需要重新填写`);
+        setNotice(`已复制模型配置「${provider.name}」，可直接修改模型后启用`);
+        // Same vendor, different model is the common case: open the copy.
+        setEditingProvider({ ...copy, health: null });
+        setEditorOpen(true);
       } catch (err) {
         setError(getErrorMessage(err, '复制模型配置失败'));
       }

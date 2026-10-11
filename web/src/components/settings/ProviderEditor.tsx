@@ -7,8 +7,10 @@ import {
   EyeOff,
   Key,
   Loader2,
+  PlugZap,
   Plus,
   RotateCcw,
+  TriangleAlert,
   X,
 } from 'lucide-react';
 
@@ -24,6 +26,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import {
   NativeSelect,
   NativeSelectOption,
@@ -32,12 +35,25 @@ import { Switch } from '@/components/ui/switch';
 import { IconButton } from '@/components/common/IconButton';
 import { SegmentedControl } from '@/components/common/SegmentedControl';
 import { SettingsField } from './SettingsLayout';
+import { ProviderEnvImportPanel } from './ProviderEnvImportPanel';
+import {
+  ProviderConnectivityResult,
+  type ProviderConnectivityResponse,
+} from './ProviderConnectivityResult';
 import { api } from '../../api/client';
 import {
   buildDefaultProviderEnv,
   buildProviderModel,
   parseProviderModel,
 } from '../../utils/provider-model';
+import type {
+  ProviderAuthMode,
+  ProviderEnvImport,
+} from '../../utils/provider-env-import';
+import {
+  PROVIDER_PRESETS,
+  describeBaseUrlProblem,
+} from '../../utils/provider-presets';
 import type { ProviderWithHealth, EnvRow } from './types';
 import { getErrorMessage } from './types';
 
@@ -134,6 +150,9 @@ const CODEX_FALLBACK_CATALOG: CodexCatalog = {
   defaultEffort: CODEX_FALLBACK_DEFAULT_EFFORT,
 };
 
+const PROXY_ENV_KEY_RE = /^(https?|all|no)_proxy$/i;
+const ONE_MILLION_SUFFIX_RE = /\[1m\]\s*$/i;
+
 const MANAGED_ENV_SOURCE_LABELS = {
   model: '跟随模型',
   context: '跟随上下文',
@@ -164,10 +183,13 @@ function buildCustomEnv(
         error: `环境变量 Key "${key}" 格式无效（需匹配 [A-Za-z_][A-Za-z0-9_]*）`,
       };
     }
-    if (
-      RESERVED_ENV_KEYS.has(key) ||
-      (manageThirdPartyDefaults && DEFAULTED_THIRD_PARTY_ENV_KEYS.has(key))
-    ) {
+    if (RESERVED_ENV_KEYS.has(key)) {
+      return {
+        customEnv: {},
+        error: `${key} 由端点、密钥或模型字段管理，请在对应字段中填写`,
+      };
+    }
+    if (manageThirdPartyDefaults && DEFAULTED_THIRD_PARTY_ENV_KEYS.has(key)) {
       return {
         customEnv: {},
         error: `${key} 已在系统预填列表中，请直接修改对应值`,
@@ -180,6 +202,21 @@ function buildCustomEnv(
   }
 
   return { customEnv, error: null };
+}
+
+/** Blank prefilled overrides mean "use the default"; never persist them. */
+function nonBlank(values: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value.trim()),
+  );
+}
+
+function hostnameOf(url: string): string {
+  try {
+    return new URL(url.trim()).hostname;
+  } catch {
+    return '';
+  }
 }
 
 interface ProviderEditorProps {
@@ -269,6 +306,15 @@ export function ProviderEditor({
   const [authToken, setAuthToken] = useState('');
   const [authTokenDirty, setAuthTokenDirty] = useState(false);
   const [clearTokenOnSave, setClearTokenOnSave] = useState(false);
+  // 'legacy' = 旧配置未选择过认证方式，后端沿用旧的推断规则
+  const [authMode, setAuthMode] = useState<ProviderAuthMode | 'legacy'>(
+    'bearer',
+  );
+
+  // 测试连接
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] =
+    useState<ProviderConnectivityResponse | null>(null);
 
   // 环境变量
   const [customEnvRows, setCustomEnvRows] = useState<EnvRow[]>([]);
@@ -283,6 +329,18 @@ export function ProviderEditor({
   const [saving, setSaving] = useState(false);
 
   const defaultProviderEnv = buildDefaultProviderEnv(model, oneMillionContext);
+  const effectiveCompactWindow =
+    providerEnvOverrides.CLAUDE_CODE_AUTO_COMPACT_WINDOW?.trim() ||
+    (oneMillionContext ? '1000000' : '200000');
+  const baseUrlProblem = describeBaseUrlProblem(baseUrl);
+  const customProxyKeys = customEnvRows
+    .map((row) => row.key.trim())
+    .filter((key) => PROXY_ENV_KEY_RE.test(key));
+
+  // A result describes the draft it was run against; drop it once that changes.
+  useEffect(() => {
+    setTestResult(null);
+  }, [baseUrl, authToken, authMode, model, oneMillionContext, open]);
 
   // 当前值不在预设里（如后端已配置其他模型，例如旧目录的 gpt-5.1-*）时，
   // 追加为额外选项，避免 select 显示空白。
@@ -324,6 +382,7 @@ export function ProviderEditor({
       setAuthToken('');
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
+      setAuthMode('bearer');
       setCustomEnvRows([]);
       setProviderEnvOverrides({});
     } else {
@@ -350,6 +409,7 @@ export function ProviderEditor({
       setAuthToken('');
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
+      setAuthMode(provider.anthropicAuthMode ?? 'legacy');
       const providerCustomEnv = provider.customEnv || {};
       const defaultEnv = Object.fromEntries(
         buildDefaultProviderEnv(
@@ -412,6 +472,87 @@ export function ProviderEditor({
       delete next[key];
       return next;
     });
+  };
+
+  /** A pasted `glm-5.3[1m]` turns the 1M switch on instead of being lost. */
+  const handleModelChange = (value: string) => {
+    if (ONE_MILLION_SUFFIX_RE.test(value)) {
+      setModel(value.replace(ONE_MILLION_SUFFIX_RE, ''));
+      setOneMillionContext(true);
+    } else {
+      setModel(value);
+    }
+  };
+
+  const applyPreset = (preset: (typeof PROVIDER_PRESETS)[number]) => {
+    setBaseUrl(preset.baseUrl);
+    if (!model.trim()) {
+      setModel(preset.model);
+      setOneMillionContext(preset.oneMillionContext);
+    }
+    if (!name.trim()) setName(preset.label);
+  };
+
+  const applyImport = (imported: ProviderEnvImport) => {
+    if (imported.name && !name.trim()) setName(imported.name);
+    if (imported.baseUrl) setBaseUrl(imported.baseUrl);
+    if (imported.token) {
+      setAuthToken(imported.token);
+      setAuthTokenDirty(true);
+      setClearTokenOnSave(false);
+    }
+    if (imported.authMode) setAuthMode(imported.authMode);
+    if (imported.model !== null) {
+      setModel(imported.model);
+      setOneMillionContext(imported.oneMillionContext);
+    }
+    setProviderEnvOverrides(imported.envOverrides);
+    const importedRows = Object.entries(imported.customEnv).map(
+      ([key, value]) => ({ key, value }),
+    );
+    if (importedRows.length > 0) {
+      setCustomEnvRows((current) => [
+        ...current.filter(
+          (row) => row.key.trim() && !(row.key.trim() in imported.customEnv),
+        ),
+        ...importedRows,
+      ]);
+    }
+    setNotice('已从粘贴内容填入表单，请检查后保存');
+  };
+
+  // ─── 测试连接 ───────────────────────────────────────────────
+  const handleTestConnection = async () => {
+    const envResult = buildCustomEnv(customEnvRows, true);
+    if (envResult.error) {
+      setError(envResult.error);
+      return;
+    }
+    setTesting(true);
+    setError(null);
+    try {
+      const draftToken = authTokenDirty ? authToken.trim() : '';
+      const result = await api.post<ProviderConnectivityResponse>(
+        '/api/config/claude/providers/test',
+        {
+          ...(provider ? { providerId: provider.id } : {}),
+          anthropicBaseUrl: baseUrl.trim(),
+          ...(draftToken ? { anthropicAuthToken: draftToken } : {}),
+          ...(authMode !== 'legacy' ? { anthropicAuthMode: authMode } : {}),
+          anthropicModel: buildProviderModel(model, oneMillionContext),
+          customEnv: {
+            ...envResult.customEnv,
+            ...nonBlank(providerEnvOverrides),
+          },
+        },
+        60_000,
+      );
+      setTestResult(result);
+    } catch (err) {
+      setError(getErrorMessage(err, '测试连接失败'));
+    } finally {
+      setTesting(false);
+    }
   };
 
   // ─── OAuth 流程 ─────────────────────────────────────────────
@@ -518,14 +659,12 @@ export function ProviderEditor({
       providerType === 'third_party'
         ? buildProviderModel(model, oneMillionContext)
         : model.trim();
-    if (providerType === 'third_party' && !normalizedModel) {
-      setError('请填写第三方 API 支持的模型名称');
-      return;
-    }
+    // An empty third-party model is a pass-through relay: Claude Code keeps
+    // requesting its own model names and the relay routes them.
     const trimmedName =
       name.trim() ||
       (providerType === 'third_party'
-        ? parseProviderModel(normalizedModel).model
+        ? parseProviderModel(normalizedModel).model || hostnameOf(baseUrl)
         : '');
     if (!trimmedName) {
       setError('请填写模型配置名称');
@@ -577,7 +716,7 @@ export function ProviderEditor({
     }
     const savedCustomEnv = {
       ...envResult.customEnv,
-      ...(providerType === 'third_party' ? providerEnvOverrides : {}),
+      ...(providerType === 'third_party' ? nonBlank(providerEnvOverrides) : {}),
     };
 
     setSaving(true);
@@ -601,6 +740,7 @@ export function ProviderEditor({
           }
           createBody.anthropicBaseUrl = trimmedBaseUrl;
           createBody.anthropicAuthToken = trimmedToken;
+          if (authMode !== 'legacy') createBody.anthropicAuthMode = authMode;
         } else {
           // 官方模式 — 根据认证方式设置凭据
           if (authTab === 'setup_token') {
@@ -662,6 +802,14 @@ export function ProviderEditor({
 
         if (providerType === 'third_party') {
           patchBody.anthropicBaseUrl = trimmedBaseUrl;
+          if (authMode !== 'legacy') patchBody.anthropicAuthMode = authMode;
+          // The key travels with the other fields: one request, one runner
+          // restart, and never an endpoint saved without its key.
+          if (clearTokenOnSave) {
+            patchBody.clearAnthropicAuthToken = true;
+          } else if (authTokenDirty && authToken.trim()) {
+            patchBody.anthropicAuthToken = authToken.trim();
+          }
         }
         patchBody.anthropicModel = normalizedModel;
 
@@ -670,19 +818,11 @@ export function ProviderEditor({
           patchBody,
         );
 
-        // 更新密钥（如果有变更）
+        // 官方配置的凭据仍走 /secrets
         const secretsBody: Record<string, unknown> = {};
         let hasSecretsChange = false;
 
-        if (providerType === 'third_party') {
-          if (clearTokenOnSave) {
-            secretsBody.clearAnthropicAuthToken = true;
-            hasSecretsChange = true;
-          } else if (authTokenDirty && authToken.trim()) {
-            secretsBody.anthropicAuthToken = authToken.trim();
-            hasSecretsChange = true;
-          }
-        } else {
+        if (providerType === 'official') {
           // 官方模式编辑时更新凭据
           if (authTab === 'setup_token' && setupToken.trim()) {
             const trimmed = setupToken.trim();
@@ -1195,11 +1335,43 @@ export function ProviderEditor({
           {/* ─── 第三方模式 ─── */}
           {providerType === 'third_party' && (
             <div className="space-y-4">
+              <ProviderEnvImportPanel disabled={saving} onApply={applyImport} />
+
               <SettingsField
                 label={<FieldLabel text="API 端点" hint="ANTHROPIC_BASE_URL" />}
                 htmlFor="provider-base-url"
-                description="填写 Anthropic 兼容接口的完整地址。"
+                description={
+                  baseUrlProblem ? (
+                    <span className="flex gap-1.5 text-warning">
+                      <TriangleAlert
+                        className="mt-0.5 size-3.5 shrink-0"
+                        aria-hidden="true"
+                      />
+                      {baseUrlProblem}
+                    </span>
+                  ) : (
+                    '填写 Anthropic 兼容接口的地址，或点选常用服务商。'
+                  )
+                }
               >
+                <div
+                  className="flex flex-wrap gap-1.5"
+                  role="group"
+                  aria-label="常用服务商"
+                >
+                  {PROVIDER_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => applyPreset(preset)}
+                      disabled={saving}
+                      aria-pressed={baseUrl.trim() === preset.baseUrl}
+                      className="inline-flex h-7 items-center rounded-md px-2 text-caption text-muted-foreground ring-1 ring-surface-border transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none aria-pressed:bg-surface-selected aria-pressed:text-foreground pointer-coarse:h-9"
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
                 <Input
                   id="provider-base-url"
                   type="url"
@@ -1209,6 +1381,7 @@ export function ProviderEditor({
                   disabled={saving}
                   placeholder="https://api.example.com/anthropic"
                   autoComplete="off"
+                  aria-invalid={baseUrlProblem ? true : undefined}
                 />
               </SettingsField>
 
@@ -1219,7 +1392,9 @@ export function ProviderEditor({
                     hint={
                       !isCreate && provider?.hasAnthropicAuthToken
                         ? `当前 ${provider.anthropicAuthTokenMasked}`
-                        : 'ANTHROPIC_AUTH_TOKEN'
+                        : authMode === 'x-api-key'
+                          ? 'ANTHROPIC_API_KEY'
+                          : 'ANTHROPIC_AUTH_TOKEN'
                     }
                   />
                 }
@@ -1268,16 +1443,41 @@ export function ProviderEditor({
               </SettingsField>
 
               <SettingsField
+                label="认证方式"
+                description={
+                  authMode === 'x-api-key'
+                    ? '以 x-api-key 请求头发送，等同 ANTHROPIC_API_KEY。'
+                    : authMode === 'bearer'
+                      ? '以 Authorization: Bearer 发送，等同 ANTHROPIC_AUTH_TOKEN，大多数服务商和 alias 用这种方式。'
+                      : '旧配置沿用原规则：密钥以 Bearer 开头时用 Authorization，否则用 x-api-key。选择一种即可固定下来。'
+                }
+              >
+                <SegmentedControl
+                  label="认证方式"
+                  value={authMode}
+                  onChange={setAuthMode}
+                  options={[
+                    { value: 'bearer', label: 'Bearer' },
+                    { value: 'x-api-key', label: 'x-api-key' },
+                    ...(authMode === 'legacy'
+                      ? [{ value: 'legacy' as const, label: '自动（旧规则）' }]
+                      : []),
+                  ]}
+                />
+              </SettingsField>
+
+              <SettingsField
                 label={<FieldLabel text="模型名称" hint="ANTHROPIC_MODEL" />}
                 htmlFor="provider-model"
+                description="留空表示透传：Claude Code 继续请求 Claude 模型名，由中转站自行路由。"
               >
                 <Input
                   id="provider-model"
                   type="text"
                   value={model}
-                  onChange={(e) => setModel(e.target.value)}
+                  onChange={(e) => handleModelChange(e.target.value)}
                   disabled={saving}
-                  placeholder="例如 glm-5.2、k3、qwen3.7-max"
+                  placeholder="例如 glm-5.3、kimi-for-coding、deepseek-v4-pro"
                   autoComplete="off"
                 />
               </SettingsField>
@@ -1292,14 +1492,14 @@ export function ProviderEditor({
                       1M 上下文
                     </span>
                     <span className="mt-0.5 block text-caption text-muted-foreground">
-                      自动添加 [1m]
+                      自动添加 [1m]；粘贴带 [1m] 的模型名会自动打开
                     </span>
                   </label>
                   <Switch
                     id="provider-one-million-context"
                     checked={oneMillionContext}
                     onCheckedChange={setOneMillionContext}
-                    disabled={saving}
+                    disabled={saving || !model.trim()}
                     aria-label="启用 1M 上下文"
                   />
                 </div>
@@ -1314,18 +1514,24 @@ export function ProviderEditor({
                       实际模型：
                       <code className="break-all font-mono font-medium text-foreground">
                         {buildProviderModel(model, oneMillionContext) ||
-                          '填写模型后生成'}
+                          '透传 Claude 模型名'}
                       </code>
                       {' · '}
-                      上下文窗口：
-                      {oneMillionContext ? '1,000,000' : '200,000'} tokens
+                      压缩窗口：
+                      {Number(effectiveCompactWindow).toLocaleString(
+                        'en-US',
+                      )}{' '}
+                      tokens
                     </p>
                     <p className="mt-0.5 text-caption leading-5 text-faint-foreground">
-                      默认同步模型映射、压缩窗口、请求超时与兼容参数；可在高级设置中调整。
+                      默认同步 Opus / Sonnet / Haiku / 子 Agent
+                      模型映射、压缩窗口、请求超时与兼容参数；可在高级设置中调整。
                     </p>
                   </div>
                 </div>
               </div>
+
+              {testResult && <ProviderConnectivityResult result={testResult} />}
             </div>
           )}
 
@@ -1443,7 +1649,11 @@ export function ProviderEditor({
                                   )
                                 }
                                 disabled={saving}
-                                placeholder="填写模型后生成"
+                                placeholder={
+                                  row.source === 'model'
+                                    ? '跟随 Claude Code 默认（透传）'
+                                    : '使用默认值'
+                                }
                                 autoComplete="off"
                                 className="min-w-0 font-mono text-caption md:text-caption"
                               />
@@ -1482,7 +1692,9 @@ export function ProviderEditor({
                         自定义环境变量
                       </h3>
                       <p className="mt-0.5 text-caption leading-5 text-muted-foreground">
-                        仅用于 API 自定义 Header 等特殊需求。
+                        用于
+                        ANTHROPIC_CUSTOM_HEADERS、CLAUDE_CODE_MAX_CONTEXT_TOKENS
+                        等特殊需求。
                       </p>
                     </div>
                     <Button
@@ -1497,6 +1709,18 @@ export function ProviderEditor({
                     </Button>
                   </div>
 
+                  {customProxyKeys.length > 0 && (
+                    <p className="mb-2 flex gap-1.5 text-caption leading-5 text-warning">
+                      <TriangleAlert
+                        className="mt-0.5 size-3.5 shrink-0"
+                        aria-hidden="true"
+                      />
+                      {customProxyKeys.join('、')}
+                      会作用于 Agent 的全部网络请求（包括 Bash 和
+                      MCP）；Container 模式下 127.0.0.1
+                      指向容器自身。建议改在系统或工作区层面配置代理。
+                    </p>
+                  )}
                   {customEnvRows.length === 0 ? (
                     <p className="text-caption text-muted-foreground">
                       没有自定义环境变量，大多数配置无需添加。
@@ -1519,18 +1743,33 @@ export function ProviderEditor({
                             className="w-full font-mono text-caption sm:w-[38%] md:text-caption"
                           />
                           <div className="flex min-w-0 flex-1 items-center gap-1">
-                            <Input
-                              type={
-                                showCustomEnvValues[idx] ? 'text' : 'password'
-                              }
-                              value={row.value}
-                              onChange={(e) =>
-                                updateRow(idx, 'value', e.target.value)
-                              }
-                              placeholder="value"
-                              aria-label={`第 ${idx + 1} 行环境变量值`}
-                              className="min-w-0 flex-1 font-mono text-caption md:text-caption"
-                            />
+                            {row.key.trim() === 'ANTHROPIC_CUSTOM_HEADERS' ? (
+                              // Claude Code reads one `Name: value` per line.
+                              <Textarea
+                                value={row.value}
+                                onChange={(e) =>
+                                  updateRow(idx, 'value', e.target.value)
+                                }
+                                rows={2}
+                                spellCheck={false}
+                                placeholder={'X-Header: value\nX-Other: value'}
+                                aria-label={`第 ${idx + 1} 行环境变量值`}
+                                className="min-h-9 min-w-0 flex-1 font-mono text-caption md:text-caption"
+                              />
+                            ) : (
+                              <Input
+                                type={
+                                  showCustomEnvValues[idx] ? 'text' : 'password'
+                                }
+                                value={row.value}
+                                onChange={(e) =>
+                                  updateRow(idx, 'value', e.target.value)
+                                }
+                                placeholder="value"
+                                aria-label={`第 ${idx + 1} 行环境变量值`}
+                                className="min-w-0 flex-1 font-mono text-caption md:text-caption"
+                              />
+                            )}
                             <IconButton
                               label={
                                 showCustomEnvValues[idx]
@@ -1566,6 +1805,17 @@ export function ProviderEditor({
 
         {/* ─── 操作按钮 ─── */}
         <DialogFooter>
+          {providerType === 'third_party' && (
+            <Button
+              variant="ghost"
+              onClick={() => void handleTestConnection()}
+              disabled={saving || testing || !baseUrl.trim()}
+              className="sm:mr-auto"
+            >
+              {testing ? <Loader2 className="animate-spin" /> : <PlugZap />}
+              测试连接
+            </Button>
+          )}
           <Button
             variant="outline"
             onClick={handleClose}

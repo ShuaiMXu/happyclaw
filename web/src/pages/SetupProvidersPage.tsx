@@ -283,6 +283,8 @@ export function SetupProvidersPage() {
           type: 'third_party',
           anthropicBaseUrl: baseUrl.trim(),
           anthropicAuthToken: authToken.trim(),
+          // The field is labelled ANTHROPIC_AUTH_TOKEN, so send it as Bearer.
+          anthropicAuthMode: 'bearer',
           anthropicModel: model.trim(),
           customEnv,
           enabled: true,

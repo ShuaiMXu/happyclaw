@@ -51,6 +51,7 @@ export function buildDefaultProviderEnv(
     { key: 'ANTHROPIC_DEFAULT_OPUS_MODEL', value: model, source: 'model' },
     { key: 'ANTHROPIC_DEFAULT_SONNET_MODEL', value: model, source: 'model' },
     { key: 'ANTHROPIC_DEFAULT_HAIKU_MODEL', value: model, source: 'model' },
+    { key: 'CLAUDE_CODE_SUBAGENT_MODEL', value: model, source: 'model' },
     {
       key: 'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
       // Same default the backend applies when the provider leaves it unset.
