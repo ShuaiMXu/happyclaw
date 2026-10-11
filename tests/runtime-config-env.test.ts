@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'vitest';
 
+import { CODEX_GATEWAY_BASE_URL_PLACEHOLDER } from '../src/codex-gateway/types.js';
+import {
+  isCodexBackgroundRequest,
+  resolveCodexModel,
+  resolveGatewayReasoningEffort,
+} from '../src/codex-gateway/convert-request.js';
+import { CODEX_MODEL_CATALOG } from '../src/codex-gateway/model-catalog.js';
 import {
   buildClaudeEnvLines,
   buildContainerEnvLines,
@@ -137,6 +144,70 @@ describe('buildClaudeEnvLines', () => {
     expect(lines).toContain('CLAUDE_CODE_EFFORT_LEVEL=max');
     expect(lines).toContain('CLAUDE_CODE_NO_FLICKER=1');
     expect(lines).toContain('API_TIMEOUT_MS=3000000');
+  });
+
+  test.each([
+    CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+    'http://127.0.0.1:3000/gateway/chatgpt',
+    'http://host.docker.internal:3000/gateway/chatgpt/',
+  ])(
+    'keeps a Claude haiku tier behind the Codex gateway (%s)',
+    (anthropicBaseUrl) => {
+      const lines = buildClaudeEnvLines(
+        config({ anthropicBaseUrl, anthropicModel: 'gpt-6-sol' }),
+        NO_CUSTOM_ENV,
+      );
+      expect(lines).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5-5');
+      expect(lines).toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-6-sol');
+      expect(lines).toContain('ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-6-sol');
+      expect(lines).toContain('CLAUDE_CODE_SUBAGENT_MODEL=gpt-6-sol');
+      // An explicit provider mapping still wins.
+      expect(
+        buildClaudeEnvLines(
+          config({ anthropicBaseUrl, anthropicModel: 'gpt-6-sol' }),
+          { ANTHROPIC_DEFAULT_HAIKU_MODEL: 'gpt-6-luna' },
+        ),
+      ).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-6-luna');
+    },
+  );
+
+  test('haiku-tier calls from a Codex gateway provider run at low effort', () => {
+    const haiku = buildClaudeEnvLines(
+      config({
+        anthropicBaseUrl: 'http://127.0.0.1:3000/gateway/chatgpt',
+        anthropicModel: 'gpt-6-sol',
+      }),
+      { CODEX_REASONING_EFFORT: 'xhigh' },
+    )
+      .find((line) => line.startsWith('ANTHROPIC_DEFAULT_HAIKU_MODEL='))!
+      .split('=')[1];
+    // What Claude Code sends for a title/summary call with that env.
+    const request = {
+      model: haiku,
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'max' },
+    };
+    const model = resolveCodexModel(request.model, 'gpt-6-sol');
+    expect(model).toBe('gpt-6-sol');
+    expect(isCodexBackgroundRequest(request)).toBe(true);
+    expect(
+      resolveGatewayReasoningEffort(request, {
+        catalog: CODEX_MODEL_CATALOG,
+        model,
+        providerEffort: 'xhigh',
+        agentEffort: 'max',
+      }),
+    ).toBe('low');
+    // Other third-party gateways keep every tier on the provider model.
+    expect(
+      buildClaudeEnvLines(
+        config({
+          anthropicBaseUrl: 'http://127.0.0.1:3000/other/path',
+          anthropicModel: 'gpt-6-sol',
+        }),
+        NO_CUSTOM_ENV,
+      ),
+    ).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-6-sol');
   });
 
   test('defaults the compact window to 1M only for an explicit [1m] model', () => {

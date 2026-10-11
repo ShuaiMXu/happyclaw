@@ -19,6 +19,9 @@ vi.mock('../src/runtime-config.js', () => ({
 vi.mock('../src/logger.js', () => ({ logger: mocks.logger }));
 vi.mock('../src/codex-gateway/model-catalog-sync.js', () => ({
   getResolvedCodexCatalog: () => ({ models: [] }),
+  getCodexCatalogForProvider: () => [],
+  maybeRefreshCodexProviderCatalog: () => {},
+  noteCodexModelsEtag: () => {},
 }));
 vi.mock(
   '../src/codex-gateway/provider-rate-limit.js',
@@ -421,10 +424,17 @@ describe('Codex gateway HTTP boundary', () => {
     expect(response.status).toBe(200);
     await response.text();
     const body = sentBody();
-    expect(body.instructions).toBe('');
-    expect(body.input).toEqual([
+    expect(body).not.toHaveProperty('instructions');
+    // gpt-6-sol is a Responses Lite model: tools travel in the input prefix.
+    expect(body).not.toHaveProperty('tools');
+    expect(body.input[0]).toMatchObject({
+      type: 'additional_tools',
+      role: 'developer',
+    });
+    expect(body.input.slice(1)).toEqual([
       {
         type: 'message',
+        id: expect.stringMatching(/^msg_/),
         role: 'developer',
         content: [
           { type: 'input_text', text: 'You are an assistant with Bash.' },
@@ -446,7 +456,7 @@ describe('Codex gateway HTTP boundary', () => {
         ],
       },
     ]);
-    expect(body.tools[0].name).toBe('Bash');
+    expect(body.input[0].tools[0].tools[0].name).toBe('Bash');
     expect(body.thinking).toBeUndefined();
     expect(body.metadata).toBeUndefined();
   });

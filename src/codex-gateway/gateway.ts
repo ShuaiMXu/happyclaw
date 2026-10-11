@@ -21,7 +21,11 @@ import {
   type AnthropicRequestSubset,
   type ResponsesRequest,
 } from './convert-request.js';
-import { getResolvedCodexCatalog } from './model-catalog-sync.js';
+import {
+  getCodexCatalogForProvider,
+  maybeRefreshCodexProviderCatalog,
+  noteCodexModelsEtag,
+} from './model-catalog-sync.js';
 import {
   ResponsesToAnthropicConverter,
   assembleAnthropicMessage,
@@ -52,7 +56,10 @@ import {
   describeCodexRequestIssue,
 } from './request-validation.js';
 import { CODEX_BACKEND_RESPONSES_URL } from './types.js';
-import { buildCodexUpstreamRequest } from './request-context.js';
+import {
+  buildCodexUpstreamRequest,
+  codexRequestIdentity,
+} from './request-context.js';
 import {
   resolveCodexGatewayToken,
   type CodexGatewayGrant,
@@ -761,13 +768,30 @@ codexGatewayApp.post(
       provider?.anthropicModel || '',
     );
     const requestModel = resolveCodexModel(anthropicRequest.model, targetModel);
+    // The account's live /models catalog when cached (refreshed in the
+    // background, never awaited), else the synced global one.
+    maybeRefreshCodexProviderCatalog(access.providerId, {
+      accountId: access.accountId,
+    });
+    const catalog = getCodexCatalogForProvider(
+      access.providerId,
+      access.accountId,
+    );
+    // Official ids of the Lite tools prefix are namespaced by the thread.
+    const { threadId } = codexRequestIdentity(c.req.raw.headers, parsed, {
+      providerId: access.providerId,
+      accountId: access.accountId,
+      fallbackScope: grant.id,
+    });
     const responsesRequest = anthropicToResponses(anthropicRequest, {
       targetModel: requestModel,
+      threadId,
+      catalog,
       // 目录钳制：存量配置里被上游移除的 effort 档（如 minimal）或模型不支持
       // 的档位在请求侧归位，避免上游 400；与前端切模型归位逻辑语义一致。
       // 目录用解析后的实时目录（上游同步结果优先，baked-in 兜底）。
       reasoningEffort: resolveGatewayReasoningEffort(anthropicRequest, {
-        catalog: getResolvedCodexCatalog().models,
+        catalog,
         model: requestModel,
         providerEffort: provider?.customEnv?.CODEX_REASONING_EFFORT,
         agentEffort: grant.owner.agentEffort,
@@ -817,6 +841,11 @@ codexGatewayApp.post(
           signal: AbortSignal.any([controller.signal, attempt.signal]),
         });
         upstreamRequest.observe(response);
+        // The backend announces /models changes like the official client sees.
+        noteCodexModelsEtag(
+          current.providerId,
+          response.headers.get('x-models-etag'),
+        );
         return response;
       } finally {
         clearTimeout(headersTimeout);

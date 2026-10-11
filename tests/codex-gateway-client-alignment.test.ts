@@ -19,6 +19,9 @@ vi.mock('../src/runtime-config.js', () => ({
 vi.mock('../src/logger.js', () => ({ logger: mocks.logger }));
 vi.mock('../src/codex-gateway/model-catalog-sync.js', () => ({
   getResolvedCodexCatalog: () => ({ models: [] }),
+  getCodexCatalogForProvider: () => [],
+  maybeRefreshCodexProviderCatalog: () => {},
+  noteCodexModelsEtag: () => {},
 }));
 
 const { codexGatewayApp } = await import('../src/codex-gateway/gateway.js');
@@ -44,6 +47,10 @@ const { codexInstallationId, resetCodexInstallationIdForTests } =
 const { buildCodexUserAgent, codexUserAgent, CODEX_CLIENT_VERSION } =
   await import('../src/codex-gateway/client-identity.js');
 
+const { serializeCodexResponsesRequest } =
+  await import('../src/codex-gateway/convert-request.js');
+type ResponsesRequest =
+  import('../src/codex-gateway/convert-request.js').ResponsesRequest;
 const zstdAvailable = typeof zlib.zstdCompressSync === 'function';
 const encoder = new TextEncoder();
 const completed = {
@@ -639,6 +646,35 @@ describe('ChatGPT infrastructure cookies', () => {
   });
 });
 
+describe('gateway wiring of the request shape', () => {
+  test('Lite prefix ids are namespaced by the conversation thread', async () => {
+    const opening = { role: 'user', content: 'go' };
+    await request({ messages: [opening], tools });
+    await request({ messages: [opening, toolUse, toolResult()], tools });
+    await request(
+      { messages: [opening], tools },
+      { 'x-claude-code-session-id': 'session-2' },
+    );
+    const prefix = (call: number) => sent(call).body.input[0];
+    expect(prefix(0).type).toBe('additional_tools');
+    expect(sent(0).headers['x-openai-internal-codex-responses-lite']).toBe(
+      'true',
+    );
+    // Same conversation: stable ids, so the prompt prefix stays cacheable.
+    expect(prefix(1).id).toBe(prefix(0).id);
+    // Another conversation derives its own ids.
+    expect(prefix(2).id).not.toBe(prefix(0).id);
+  });
+
+  test('the body keeps the official field order', async () => {
+    await request({ tools });
+    const keys = Object.keys(sent(0).body);
+    expect(keys.slice(0, 2)).toEqual(['model', 'stream']);
+    expect(keys.indexOf('prompt_cache_key')).toBeLessThan(keys.indexOf('text'));
+    expect(keys.at(-1)).toBe('client_metadata');
+  });
+});
+
 describe('request body compression', () => {
   test.skipIf(!zstdAvailable)('zstd round-trips the exact JSON body', () => {
     const request = { input: 'x'.repeat(10_000), emoji: '你好 🌍' };
@@ -646,11 +682,11 @@ describe('request body compression', () => {
       promptCacheKey: 'key',
       clientMetadata: { turn_id: 'turn' },
     };
-    const json = JSON.stringify({
-      ...request,
-      prompt_cache_key: 'key',
-      client_metadata: { turn_id: 'turn' },
-    });
+    // The body is the official-order serialization of request + extras.
+    const json = serializeCodexResponsesRequest(
+      request as unknown as ResponsesRequest,
+      extras,
+    );
     const encoded = encodeCodexUpstreamBody(request, extras);
     expect(encoded.contentEncoding).toBe('zstd');
     expect(
@@ -669,7 +705,10 @@ describe('request body compression', () => {
           { promptCacheKey: 'k', clientMetadata: {} },
         ),
       ).toEqual({
-        body: '{"a":1,"prompt_cache_key":"k","client_metadata":{}}',
+        body: serializeCodexResponsesRequest(
+          { a: 1 } as unknown as ResponsesRequest,
+          { promptCacheKey: 'k', clientMetadata: {} },
+        ),
       });
       await request();
       const init = mocks.fetch.mock.calls[0][1];

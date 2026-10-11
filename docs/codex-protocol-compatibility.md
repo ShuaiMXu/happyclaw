@@ -11,20 +11,90 @@ The port and derived compatibility fixtures retain the original
 
 ## Request mapping
 
-| Input                          | Previous behavior                                 | Aligned behavior                                                                                           | Reference                                                               |
-| ------------------------------ | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| System and reminders           | Combined all system text into global instructions | Developer input for top-level system; timed user reminders after matching tool feedback                    | `codex_claude_request.go`, `common/claude_system.go`                    |
-| Long MCP tool names            | Sent unchanged                                    | Unique names at most 64 bytes, restored using the original request's tool map                              | `buildShortNameMap`, `buildReverseMapFromClaudeOriginalShortToOriginal` |
-| Long call IDs                  | Sent unchanged                                    | Stable SHA-256 suffix shared by calls and results                                                          | `shortenCodexCallIDIfNeeded`                                            |
-| Schema metadata and patterns   | Sent unchanged                                    | Remove provider-incompatible schema annotations/patterns, preserving property names and literal values     | `normalizeToolParameters`, `util/claude_schema.go`                      |
-| Large scalar const unions      | Sent every oneOf/anyOf branch                     | Compact at least eight pure, unique const branches into an equivalent enum at supported property positions | `helps/NormalizeCodexToolSchemas`                                       |
-| Parallel tool opt-out          | Dropped                                           | `disable_parallel_tool_use` maps to `parallel_tool_calls`                                                  | `ConvertClaudeRequestToCodex`                                           |
-| Images interspersed with text  | Text combined before images                       | Preserve block ordering                                                                                    | `ConvertClaudeRequestToCodex`                                           |
-| Image in tool feedback         | Moved into an adjacent user message               | Structured output remains attached to the call ID                                                          | `ConvertClaudeRequestToCodex`                                           |
-| PDF document                   | Rejected                                          | Base64 PDF maps to Responses `input_file`                                                                  | `ConvertClaudeRequestToCodex`                                           |
-| Thinking and structured output | Dropped SDK settings                              | Budget/adaptive effort and JSON-schema output mapped to Responses; optional schemas downgrade strictness   | `ConvertClaudeRequestToCodex`, `thinking/convert.go`                    |
-| Native web search              | Unsupported                                       | Typed tools, named selection, domains/location and sources; server tool history accepted                   | `codex_claude_request.go`, `codex_claude_response_web_search.go`        |
-| Reasoning replay               | Only private HappyClaw envelopes recognized       | Native GPT transport signatures and legacy envelopes accepted; replay omits the upstream reasoning ID      | `signature/gpt_validation.go`, `CompatibleSignatureForProvider`         |
+| Input                          | Previous behavior                                 | Aligned behavior                                                                                         | Reference                                                               |
+| ------------------------------ | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| System and reminders           | Combined all system text into global instructions | Developer input for top-level system; timed user reminders after matching tool feedback                  | `codex_claude_request.go`, `common/claude_system.go`                    |
+| Long MCP tool names            | Sent unchanged                                    | Unique names at most 64 bytes, restored using the original request's tool map                            | `buildShortNameMap`, `buildReverseMapFromClaudeOriginalShortToOriginal` |
+| Long call IDs                  | Sent unchanged                                    | Stable SHA-256 suffix shared by calls and results                                                        | `shortenCodexCallIDIfNeeded`                                            |
+| Tool schemas                   | Sent unchanged                                    | Official keyword subset after sanitize/prune; schemas over 5,000 bytes compacted (see below)             | openai/codex `tools/src/json_schema*`                                   |
+| Parallel tool opt-out          | Dropped                                           | `disable_parallel_tool_use` maps to `parallel_tool_calls` (always `false` for Responses Lite)            | `ConvertClaudeRequestToCodex`, openai/codex `core/src/client.rs`        |
+| Images interspersed with text  | Text combined before images                       | Preserve block ordering                                                                                  | `ConvertClaudeRequestToCodex`                                           |
+| Image in tool feedback         | Moved into an adjacent user message               | Structured output remains attached to the call ID                                                        | `ConvertClaudeRequestToCodex`                                           |
+| PDF document                   | Rejected                                          | Base64 PDF maps to `input_file` while `CODEX_SEND_PDF_AS_INPUT_FILE`; otherwise a visible placeholder    | `ConvertClaudeRequestToCodex`                                           |
+| Thinking and structured output | Dropped SDK settings                              | Budget/adaptive effort and JSON-schema output mapped to Responses; optional schemas downgrade strictness | `ConvertClaudeRequestToCodex`, `thinking/convert.go`                    |
+| Native web search              | Unsupported                                       | Official hosted `web_search` (live access, allowed domains, location); server tool history accepted      | openai/codex `core/src/tools/hosted_spec.rs`                            |
+| Reasoning replay               | Only private HappyClaw envelopes recognized       | Native GPT transport signatures and legacy envelopes accepted; replay omits the upstream reasoning ID    | `signature/gpt_validation.go`, `CompatibleSignatureForProvider`         |
+
+## Official Codex client request shape
+
+The request body follows the official openai/codex client (CLI 0.162.1,
+`codex-rs/core/src/client.rs` `build_responses_request`); where it and the
+reference translator differ, the official client wins.
+
+- **Body**: keys in `ResponsesApiRequest` order (`model`, `stream`,
+  `service_tier`, `input`, `tools`, `tool_choice`, `parallel_tool_calls`,
+  `reasoning`, `store`, `include`, `prompt_cache_key`, `text`) via
+  `serializeCodexResponsesRequest`. No top-level `instructions`: the system
+  prompt is a developer input item. `tool_choice` is always sent (`auto`
+  unless the caller forces a choice). `include` is only
+  `reasoning.encrypted_content`, plus `web_search_call.action.sources` when
+  the request carries hosted web search (Claude Code builds WebSearch result
+  links from the sources).
+- **Responses Lite** (catalog `use_responses_lite`, every current gpt-6 and
+  gpt-5.6 model): no top-level `tools`; an input-prefix
+  `{ type: "additional_tools", id: "at_<uuid>", role: "developer", tools }`
+  item whose tools are one `functions` namespace
+  (`create_tools_json_for_responses_lite`). The id is the uuid-v5 of the
+  compact tool JSON inside a uuid-v5(OID, thread) namespace; the thread is the
+  caller-supplied session identity, else a hash of the system prompt.
+  `parallel_tool_calls: false`, `reasoning.context: "all_turns"`, image
+  `detail` stripped, replayed calls carry `namespace: "functions"`, and a
+  forced single tool becomes `required`. `codexRequestUsesResponsesLite`
+  decides the shape per request; the Lite HTTP header must follow it.
+- **Hosted tools and Lite**: official Lite sends no hosted tools and replaces
+  web search with a client-executed `web.run` tool backed by
+  `/backend-api/codex/alpha/search`. That executor does not exist here, so a
+  request carrying Claude's server web search stays in the classic shape
+  (`{ type: "web_search", external_web_access: true, filters?,
+user_location? }`). `blocked_domains` and `max_uses` have no official field
+  and are dropped.
+- **Classic shape** (`gpt-5.5` and unknown models): top-level function tools
+  `{ type, name, description, strict: false, parameters }`, image
+  `detail: "high"` (official `DEFAULT_IMAGE_DETAIL`).
+- **Model traits** come from the catalog: `text.verbosity` is the model's
+  `default_verbosity` when it supports verbosity (merged with
+  `output_config.format` as `text.format`); `service_tier: "priority"` is sent
+  only when the request asks for fast/priority and the model lists that tier.
+  `reasoning.summary: "auto"` is sent unless thinking is explicitly disabled
+  (product choice; official clients default to no summary).
+- **Tool schemas**: `parse_tool_input_schema` semantics — missing root
+  `properties` inserted, boolean schemas become strings, `const` becomes a
+  one-value `enum`, missing types inferred, object/array children defaulted,
+  unreachable root definitions pruned. Only `$ref`, `type`, `description`,
+  `encrypted`, `enum`, `items`, `minItems`, `properties`, `required`,
+  `additionalProperties`, `anyOf`, `oneOf`, `allOf`, `$defs` and
+  `definitions` are kept, in that order with sorted maps. Schemas whose
+  normalized JSON exceeds 5,000 bytes go through the official compaction
+  passes (descriptions, definitions, objects below depth 3, compositions)
+  until they fit. Invalid keyword values are dropped rather than failing the
+  request.
+- **Assistant content** only carries `output_text`: assistant-side images and
+  documents become text placeholders.
+- **Tool search** (`ENABLE_TOOL_SEARCH`): `tool_search_tool_*` server tools
+  are dropped, `defer_loading` tools are declared upfront, `tool_reference`
+  blocks become `[Tool available: <name>]` text and server tool-search history
+  is skipped.
+- **Model catalog**: entries carry `use_responses_lite`, verbosity,
+  `context_window`, `minimal_client_version`, `available_in_plans` and service
+  tiers. Models requiring a newer client than 0.162.1 are dropped. Each
+  provider also has a live catalog from
+  `GET /backend-api/codex/models?client_version=0.162.1` (official headers,
+  1 h cache, refreshed when `x-models-etag` changes; never awaited by
+  requests). Official clients send no `If-None-Match` there, so neither does
+  the gateway.
+- **Background requests**: Codex gateway providers default
+  `ANTHROPIC_DEFAULT_HAIKU_MODEL` to `claude-haiku-5-5`, so Claude Code's
+  haiku-tier calls stay recognizable and run at low effort.
 
 ## Response and transport mapping
 
@@ -89,9 +159,10 @@ Anthropic side follows what the Claude Code CLI expects.
 
 ## Intentional runtime differences
 
-- HappyClaw explicitly requests `reasoning.summary: auto` for its thinking UI.
-- Empty tools and unused tool-choice/parallel fields are removed, matching the
-  final Codex executor cleanup rather than the raw translator output.
+- HappyClaw requests `reasoning.summary: auto` for its thinking UI unless
+  thinking is disabled.
+- Empty tools are removed; `tool_choice` and `parallel_tool_calls` are always
+  sent, as the official client does.
 - HappyClaw resolves the final reasoning effort itself (disabled thinking →
   lowest supported level, haiku-tier → low, explicit Agent effort, then the
   provider's `CODEX_REASONING_EFFORT` or catalog default) and clamps it to the
@@ -127,7 +198,10 @@ Anthropic side follows what the Claude Code CLI expects.
 
 `tests/fixtures/codex-cliproxy-a2976.json` contains independently generated
 request payloads and original Go SSE output for 34 cases. The differential test
-compares all business fields after only the documented runtime normalizations.
+compares all business fields after only the documented runtime normalizations;
+request cases run on the classic shape and normalize the official-client
+differences listed above (schema subset, image detail, verbosity, always-sent
+tool controls, no `instructions`).
 Golden data is generated with `scripts/reference/codex-claude-reference.go`
 inside a disposable checkout of the pinned CLIProxyAPI commit. Feed the existing
 corpus to the harness's standard input to regenerate it; the Go implementation

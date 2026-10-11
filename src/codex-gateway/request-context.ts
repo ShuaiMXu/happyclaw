@@ -18,6 +18,8 @@ import { codexBackendClientHeaders } from './client-identity.js';
 import {
   isCodexBackgroundRequest,
   type AnthropicRequestSubset,
+  serializeCodexResponsesRequest,
+  type ResponsesRequest,
 } from './convert-request.js';
 import { codexInstallationId } from './installation-id.js';
 import {
@@ -291,10 +293,11 @@ export function encodeCodexUpstreamBody(
   request: object,
   extras: { promptCacheKey: string; clientMetadata: Record<string, string> },
 ): { body: string | Uint8Array; contentEncoding?: 'zstd' } {
-  const json = JSON.stringify({
-    ...request,
-    prompt_cache_key: extras.promptCacheKey,
-    client_metadata: extras.clientMetadata,
+  // Official field order (model, stream, service_tier first, then the body,
+  // prompt_cache_key before text, client_metadata last).
+  const json = serializeCodexResponsesRequest(request as ResponsesRequest, {
+    promptCacheKey: extras.promptCacheKey,
+    clientMetadata: extras.clientMetadata,
   });
   if (typeof zlib.zstdCompressSync !== 'function') return { body: json };
   return {

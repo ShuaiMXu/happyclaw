@@ -17,6 +17,9 @@ vi.mock('../src/runtime-config.js', () => ({
 vi.mock('../src/logger.js', () => ({ logger: mocks.logger }));
 vi.mock('../src/codex-gateway/model-catalog-sync.js', () => ({
   getResolvedCodexCatalog: mocks.getResolvedCodexCatalog,
+  getCodexCatalogForProvider: () => mocks.getResolvedCodexCatalog().models,
+  maybeRefreshCodexProviderCatalog: () => {},
+  noteCodexModelsEtag: () => {},
 }));
 const { codexGatewayApp } = await import('../src/codex-gateway/gateway.js');
 const { issueCodexGatewayToken, revokeCodexGatewayToken } =
@@ -565,9 +568,11 @@ describe('Codex executor transport compatibility', () => {
     });
     const stream = await (await request(true, { tools })).text();
     expect(stream).toContain(JSON.stringify(name));
-    expect(upstreamJson(mocks.fetch.mock.calls[0][1]).tools[0].name).toBe(
-      'mcp__do_action',
-    );
+    // gpt-6-sol sends Responses Lite: tools sit in the additional_tools prefix.
+    expect(
+      upstreamJson(mocks.fetch.mock.calls[0][1]).input[0].tools[0].tools[0]
+        .name,
+    ).toBe('mcp__do_action');
   });
 
   test.each(['\n', '\r\n', '\r'])(

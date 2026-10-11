@@ -75,8 +75,8 @@ describe('extractCodexCallbackParams', () => {
 describe('creation defaults', () => {
   test('write the catalog default effort so UI and runtime agree', () => {
     expect(codexProviderCreationDefaults(CODEX_MODEL_CATALOG)).toEqual({
-      anthropicModel: 'gpt-6-sol',
-      customEnv: { CODEX_REASONING_EFFORT: 'medium' },
+      anthropicModel: 'gpt-6.1-sol',
+      customEnv: { CODEX_REASONING_EFFORT: 'low' },
     });
   });
 });
@@ -164,8 +164,8 @@ describe('planCodexReauthorization', () => {
     ).toEqual({
       converted: true,
       accountChanged: true,
-      anthropicModel: 'gpt-6-sol',
-      customEnv: { KEEP: '1', CODEX_REASONING_EFFORT: 'medium' },
+      anthropicModel: 'gpt-6.1-sol',
+      customEnv: { KEEP: '1', CODEX_REASONING_EFFORT: 'low' },
       rotateGatewayIdentifier: true,
     });
   });
