@@ -43,6 +43,7 @@ import {
   getChannelAccount,
   getGroupsByTargetAgent,
   updateAgentLastImJid,
+  clearSessionModelSelectionsForModelConfig,
   countAgentProfilesByModelConfigId,
 } from '../db.js';
 import {
@@ -1498,6 +1499,7 @@ configRoutes.delete(
           () => {
             if (previous) {
               deleteProvider(id);
+              clearSessionModelSelectionsForModelConfig(id);
               invalidateProviderUsageCache(id);
               appendClaudeConfigAuditBestEffort(actor, 'delete_provider', [
                 `id:${id}`,

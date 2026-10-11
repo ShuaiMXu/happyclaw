@@ -79,6 +79,7 @@ import {
   getUserById,
   getTaskRunById,
   isDatabaseInitialized,
+  getSessionModelSelection,
   getSessionProviderId,
   setSessionProviderId,
 } from './db.js';
@@ -1290,18 +1291,44 @@ function stickyBindingCanServeTier(
 
 function resolvePinnedModelConfigId(
   modelConfigId?: string | null,
+  session?: { groupFolder: string; agentId?: string | null },
 ): string | null {
+  const sessionSelection = session
+    ? resolveSessionModelSelection(session.groupFolder, session.agentId)
+    : null;
+  if (sessionSelection) return sessionSelection;
   if (modelConfigId) return modelConfigId;
   const enabledProviders = getEnabledProviders();
   return enabledProviders.length === 1 ? enabledProviders[0].id : null;
+}
+
+/**
+ * The model configuration the user picked for this conversation in the chat
+ * composer. It outranks the Agent's binding because it is the more specific
+ * choice; like the Agent binding it may name a configuration that is not in
+ * the automatic pool. A selection whose configuration has since been deleted
+ * degrades to the default instead of failing the turn.
+ */
+export function resolveSessionModelSelection(
+  groupFolder: string,
+  agentId?: string | null,
+): string | null {
+  const selected = getSessionModelSelection(groupFolder, agentId);
+  if (!selected) return null;
+  return getProviders().some((provider) => provider.id === selected)
+    ? selected
+    : null;
 }
 
 /** Whether a completed user turn must release its runner for the next pick. */
 export function shouldRotatePoolProviderAfterTurn(
   groupFolder: string,
   modelConfigId?: string | null,
+  agentId?: string | null,
 ): boolean {
-  if (resolvePinnedModelConfigId(modelConfigId)) return false;
+  if (resolvePinnedModelConfigId(modelConfigId, { groupFolder, agentId })) {
+    return false;
+  }
   const override = getContainerEnvConfig(groupFolder);
   if (
     override.anthropicApiKey ||
@@ -1367,7 +1394,10 @@ export function willClearSessionOnProviderSwitch(
   agentId?: string | null,
   modelConfigId?: string | null,
 ): boolean {
-  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
+  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId, {
+    groupFolder,
+    agentId,
+  });
   const boundId = getSessionProviderId(groupFolder, agentId);
   if (selectedModelConfigId) {
     return !!boundId && boundId !== selectedModelConfigId;
@@ -1451,7 +1481,10 @@ export function trySelectPoolProvider(
    */
   modelOverride?: string;
 } | null {
-  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId);
+  const selectedModelConfigId = resolvePinnedModelConfigId(modelConfigId, {
+    groupFolder,
+    agentId,
+  });
   const existingBoundId = getSessionProviderId(groupFolder, agentId);
   if (selectedModelConfigId) {
     // Agent/single-enabled selection is authoritative. Workspace credentials must
@@ -2785,6 +2818,7 @@ export async function runContainerAgent(
   const resolvedProvider = poolResult?.resolved;
   const modelSelectionPinned = !!resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
+    { groupFolder: group.folder, agentId: sessionAgentId },
   );
   let providerFailureReported = false;
   let providerFailureTerminal: boolean | undefined;
@@ -3903,6 +3937,7 @@ export async function runHostAgent(
     : null;
   const hostModelSelectionPinned = !!resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
+    { groupFolder: group.folder, agentId: sessionAgentId },
   );
   const rawGlobalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
@@ -4577,6 +4612,10 @@ export async function runAgentWithModelFallback(
   // still retries across its members (see resolvePinnedModelConfigId).
   const selectedModelConfigId = resolvePinnedModelConfigId(
     input.agentProfile?.modelConfigId,
+    {
+      groupFolder: group.folder,
+      agentId: input.sessionAgentId ?? input.agentId,
+    },
   );
   const enabledProviders = getEnabledProviders();
   const fallbackTier = getSystemSettings().fallbackModel?.trim();

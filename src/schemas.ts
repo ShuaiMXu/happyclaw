@@ -305,6 +305,12 @@ export const GroupAgentProfilePatchSchema = z.object({
   agent_profile_id: z.string().trim().min(1),
 });
 
+/** Chat composer model picker: null returns the conversation to the default. */
+export const SessionModelSelectionSchema = z.object({
+  agentId: z.string().trim().min(1).max(128).nullable().optional(),
+  modelConfigId: z.string().trim().min(1).max(128).nullable(),
+});
+
 const AgentProfileRuntimePolicyModeSchema = z.enum([
   'inherit',
   'custom',

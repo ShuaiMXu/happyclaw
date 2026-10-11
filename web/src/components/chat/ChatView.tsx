@@ -20,6 +20,7 @@ import {
 import { useAuthStore } from '../../stores/auth';
 import { MessageList } from './MessageList';
 import { MessageInput, type MessageInputHandle } from './MessageInput';
+import { ModelSelector } from './ModelSelector';
 import {
   Sheet,
   SheetContent,
@@ -541,6 +542,20 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     ? agents.find((a) => a.id === activeAgentTab)
     : null;
   const isConversationTab = activeAgent?.kind === 'conversation';
+  const composerAgentId =
+    activeAgentTab && isConversationTab ? activeAgentTab : null;
+  // Memoized so the memoized composer does not re-render with a fresh element.
+  const modelSelector = useMemo(
+    () => (
+      <ModelSelector
+        key={composerAgentId ?? 'main'}
+        groupJid={groupJid}
+        agentId={composerAgentId}
+        canChange={canModifyWorkspaceConfig}
+      />
+    ),
+    [groupJid, composerAgentId, canModifyWorkspaceConfig],
+  );
   const isTopicWorkspace =
     group?.conversation_nav_mode === 'vertical_threads' ||
     group?.conversation_source === 'native_thread' ||
@@ -1333,6 +1348,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                       ? requestResetActiveAgent
                       : undefined
                   }
+                  modelSelector={modelSelector}
                 />
               </>
             ) : (
@@ -1370,6 +1386,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   onToggleTerminal={
                     canUseTerminal ? handleTerminalToggle : undefined
                   }
+                  modelSelector={modelSelector}
                 />
               </>
             )}

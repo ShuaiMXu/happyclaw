@@ -84,6 +84,7 @@
 
 - 列表中的工作区投影
 - 读取消息与文件
+- 查看会话当前使用的模型配置
 - 发送普通消息
 - 查看 Runtime Session、绑定和项目能力
 - 打开 Web 终端前的资源检查
@@ -100,6 +101,7 @@ Host Workspace 在 Access 之外还要求 admin。
 
 - 重命名、切换 Agent、修改执行方式
 - stop、interrupt、reset-session、clear-history
+- 切换会话模型（`PUT /api/groups/:jid/model-selection`）
 - 创建、修改、删除 Runtime Session
 - 写入工作区 Skills/MCP
 - 修改群聊绑定、激活方式、响应对象和 owner

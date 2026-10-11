@@ -2332,6 +2332,41 @@ export class GroupQueue {
   }
 
   /**
+   * Retire the runners of one conversation after its model selection changed.
+   * A warm runner keeps the provider environment it was spawned with, so the
+   * next message must reach a fresh one. The drain sentinel lets an in-flight
+   * query finish first. With a concrete target, runners already on it are
+   * left alone; a null target (back to the default) cannot be predicted
+   * before pool selection, so every active runner is drained.
+   */
+  drainRunnersForModelSelection(
+    groupJids: readonly string[],
+    targetProviderId: string | null,
+  ): number {
+    let drained = 0;
+    for (const jid of new Set(groupJids)) {
+      const state = this.groups.get(jid);
+      if (
+        !state?.active ||
+        !state.groupFolder ||
+        state.drainSentinelWritten ||
+        (targetProviderId !== null &&
+          state.selectedProviderId === targetProviderId)
+      ) {
+        continue;
+      }
+      if (!this.writeDrainSentinel(state as ActiveGroupState)) continue;
+      state.drainSentinelWritten = true;
+      drained++;
+      logger.info(
+        { groupJid: jid, groupFolder: state.groupFolder, targetProviderId },
+        'Sent drain signal after conversation model selection changed',
+      );
+    }
+    return drained;
+  }
+
+  /**
    * Interrupt the current query for the same chat only (do not cross-interrupt
    * sibling chats that share a serialized runner/folder).
    *

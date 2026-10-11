@@ -84,6 +84,7 @@ Public：
 - `POST /api/groups/:jid/stop`
 - `POST /api/groups/:jid/interrupt`
 - `POST /api/groups/:jid/reset-session`
+- `GET|PUT /api/groups/:jid/model-selection`，聊天输入框的会话级模型选择
 - `POST /api/groups/:jid/clear-history`，重建工作区内容：永久清除聊天、
   Runtime Session、子对话、工作目录及 Workspace Memory（含版本历史和
   Home Owner Profile），关联定时任务停止并移入回收站；保留工作区外壳、
@@ -97,6 +98,12 @@ Public：
 - `POST /api/messages`
 - `GET /api/follow-ups`
 - `POST /api/follow-ups/:messageId/action`
+
+`model-selection` 以 `agentId`（GET 查询参数、PUT 请求体）区分 Runtime Session，
+缺省表示主会话。GET 返回当前选择、默认值的解析来源和全部已保存模型配置（不含凭据）；
+PUT 的 `modelConfigId` 为 `null` 时恢复默认。会话选择优先于智能体绑定的模型配置，
+可以选择未启用的配置；切换后该会话的暖 Runner 在当前轮次结束后退出，下一条消息
+使用新配置。
 
 `POST /api/messages` 可以携带 Web 附件和 Runtime Session 标识。`/clear` 与
 `/fresh` 会进入与 `reset-session` 相同的 owner 级破坏性检查。`/fresh` 会开启

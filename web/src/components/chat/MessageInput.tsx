@@ -8,6 +8,7 @@ import {
   useImperativeHandle,
   useMemo,
   memo,
+  type ReactNode,
   type Ref,
 } from 'react';
 import { toast } from 'sonner';
@@ -125,6 +126,8 @@ interface MessageInputProps {
   placeholder?: string;
   onResetSession?: () => void;
   onToggleTerminal?: () => void;
+  /** Conversation-scoped model picker shown in the action bar. */
+  modelSelector?: ReactNode;
   /** Stop the active run when the composer has no follow-up to send. */
   onStop?: () => Promise<boolean> | boolean;
   isRunning?: boolean;
@@ -161,6 +164,7 @@ export const MessageInput = memo(function MessageInput({
   placeholder = '输入消息...',
   onResetSession,
   onToggleTerminal,
+  modelSelector,
   onStop,
   isRunning = false,
   queuedFollowUps = [],
@@ -1212,6 +1216,7 @@ export const MessageInput = memo(function MessageInput({
                   className="text-muted-foreground pointer-coarse:size-10"
                 />
               )}
+              {modelSelector}
             </div>
 
             {contextLabel && (

@@ -17600,6 +17600,7 @@ async function processAgentConversation(
   const rotateProviderAfterAgentTurn = shouldRotatePoolProviderAfterTurn(
     effectiveGroup.folder,
     agentProfile?.model_config_id,
+    agentId,
   );
   let rotatingAgentTurnCompleted = false;
   let selectedAgentProviderIdForRun: string | null = null;
