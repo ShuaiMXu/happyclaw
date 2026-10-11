@@ -1873,6 +1873,8 @@ interface PreparedVolumeMounts {
   dockerOauthLaunch: DockerOauthLaunchSnapshot | null;
   /** Selected provider routes through the ChatGPT/Codex 订阅网关; docker run needs host.docker.internal. */
   usesCodexGateway: boolean;
+  /** Selected provider endpoint was rewritten from host loopback to host.docker.internal. */
+  providerNeedsHostGateway: boolean;
 }
 
 function prepareVolumeMounts(
@@ -2198,16 +2200,17 @@ function prepareVolumeMounts(
   );
   fs.mkdirSync(envDir, { recursive: true });
   const rawGlobalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
+  const containerBaseUrl = resolveContainerProviderBaseUrl(
+    resolveCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl, 'container'),
+  );
   const globalConfig = {
     ...rawGlobalConfig,
-    anthropicBaseUrl: resolveCodexGatewayBaseUrl(
-      rawGlobalConfig.anthropicBaseUrl,
-      'container',
-    ),
+    anthropicBaseUrl: containerBaseUrl.baseUrl,
   };
   const usesCodexGateway = isCodexGatewayBaseUrl(
     rawGlobalConfig.anthropicBaseUrl,
   );
+  const providerNeedsHostGateway = containerBaseUrl.addHostGateway;
   const containerOverride = getContainerEnvConfig(group.folder);
   const effectiveContainerOverride = resolvedProvider
     ? { customEnv: containerOverride.customEnv }
@@ -2382,6 +2385,7 @@ function prepareVolumeMounts(
     hostPlugins: pluginSkills,
     dockerOauthLaunch,
     usesCodexGateway,
+    providerNeedsHostGateway,
   };
 }
 
@@ -2561,6 +2565,38 @@ export async function detectContainerHostIdentityAsync(
 }
 
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
+
+/**
+ * A provider endpoint on the host's loopback (a local relay such as
+ * CLIProxyAPI) is unreachable from inside a bridge container. Route it through
+ * host.docker.internal, as the proxy settings do; on Linux that name needs the
+ * host-gateway mapping and the relay must listen on an address the Docker
+ * bridge reaches.
+ */
+export function resolveContainerProviderBaseUrl(
+  baseUrl: string,
+  platform: NodeJS.Platform = process.platform,
+): { baseUrl: string; addHostGateway: boolean } {
+  if (!baseUrl) return { baseUrl, addHostGateway: false };
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return { baseUrl, addHostGateway: false };
+  }
+  if (!LOOPBACK_HOSTNAMES.has(normalizedProxyHostname(parsed))) {
+    return { baseUrl, addHostGateway: false };
+  }
+  parsed.hostname = 'host.docker.internal';
+  return {
+    // URL serialization adds a trailing slash to a bare origin; keep the
+    // admin's path shape so the SDK joins `/v1/messages` the same way.
+    baseUrl: baseUrl.endsWith('/')
+      ? parsed.toString()
+      : parsed.toString().replace(/\/$/, ''),
+    addHostGateway: platform === 'linux',
+  };
+}
 
 export interface ResolvedContainerProxyConfig {
   /** Shell env assignments written to the per-container 0600 runtime file. */
@@ -2903,7 +2939,9 @@ export async function runContainerAgent(
       hostIdentity,
       {
         addHostGateway:
-          containerProxy.addHostGateway || preparedLaunch.usesCodexGateway,
+          containerProxy.addHostGateway ||
+          preparedLaunch.usesCodexGateway ||
+          preparedLaunch.providerNeedsHostGateway,
       },
       containerImage,
     );

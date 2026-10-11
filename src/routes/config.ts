@@ -78,6 +78,7 @@ import {
   UnifiedProviderCreateSchema,
   UnifiedProviderPatchSchema,
   UnifiedProviderSecretsSchema,
+  ProviderConnectivityTestSchema,
   BalancingConfigSchema,
 } from '../schemas.js';
 import {
@@ -92,6 +93,9 @@ import {
   updateProvider,
   updateProviderSecrets,
   setProviderEnabled,
+  duplicateProvider,
+  providerHasCredentials,
+  validateProviderCustomEnv,
   deleteProvider,
   providerToConfig,
   toPublicProvider,
@@ -159,6 +163,7 @@ import type { AudienceMode, AuthUser, RegisteredGroup } from '../types.js';
 import { logger } from '../logger.js';
 import brandAssetRoutes from './brand-assets.js';
 import { testFeishuCredentials } from '../feishu-connectivity.js';
+import { testProviderConnectivity } from '../provider-connectivity.js';
 import {
   buildSessionMountUpdate,
   buildDetachedWorkspaceUpdate,
@@ -1202,6 +1207,9 @@ configRoutes.post(
       );
     }
 
+    const envError = validateProviderCustomEnv(validation.data.customEnv ?? {});
+    if (envError) return c.json({ error: envError }, 400);
+
     const actor = (c.get('user') as AuthUser).username;
 
     try {
@@ -1236,13 +1244,31 @@ configRoutes.patch(
         400,
       );
     }
+    if (validation.data.customEnv) {
+      const envError = validateProviderCustomEnv(validation.data.customEnv);
+      if (envError) return c.json({ error: envError }, 400);
+    }
 
     const actor = (c.get('user') as AuthUser).username;
+    const { anthropicAuthToken, clearAnthropicAuthToken, ...providerPatch } =
+      validation.data;
+    const tokenChange =
+      anthropicAuthToken !== undefined
+        ? { anthropicAuthToken }
+        : clearAnthropicAuthToken
+          ? { clearAnthropicAuthToken: true }
+          : null;
 
     try {
       return await withClaudeConfigMutationLock(async () => {
         const previous = getProviders().find((p) => p.id === id);
         if (!previous) throw new Error('未找到指定供应商');
+        if (tokenChange && previous.type !== 'third_party') {
+          throw new Error('只有第三方模型配置可以在这里修改 API 密钥');
+        }
+        if (tokenChange && previous.codexOAuthCredentials) {
+          throw new Error('ChatGPT 订阅配置的网关凭据由系统管理');
+        }
         const changedFields = Object.keys(validation.data).map(
           (k) => `${k}:updated`,
         );
@@ -1259,14 +1285,33 @@ configRoutes.patch(
           JSON.stringify(validation.data.customEnv) !==
             JSON.stringify(previous.customEnv)
         );
+        // A different key can mean a different upstream account, whose
+        // thinking signatures the old session would replay; the auth header
+        // style changes the protocol the endpoint sees.
+        const tokenChanged = !!(
+          tokenChange &&
+          (anthropicAuthToken !== undefined
+            ? anthropicAuthToken.trim() !== previous.anthropicAuthToken
+            : !!previous.anthropicAuthToken)
+        );
+        const authModeChanged = !!(
+          providerPatch.anthropicAuthMode !== undefined &&
+          providerPatch.anthropicAuthMode !== previous.anthropicAuthMode
+        );
         const protocolFieldChanged =
-          baseUrlChanged || modelChanged || customEnvChanged;
+          baseUrlChanged ||
+          modelChanged ||
+          customEnvChanged ||
+          tokenChanged ||
+          authModeChanged;
         const pendingInvalidation = getPendingProviderSessionInvalidation(id);
         const sessionInvalidation = {
           modelChanged:
             modelChanged || pendingInvalidation?.modelChanged === true,
           baseUrlChanged:
-            baseUrlChanged || pendingInvalidation?.baseUrlChanged === true,
+            baseUrlChanged ||
+            tokenChanged ||
+            pendingInvalidation?.baseUrlChanged === true,
         };
         const shouldClearSessions =
           !!pendingInvalidation || protocolFieldChanged;
@@ -1277,9 +1322,15 @@ configRoutes.patch(
           baseUrlChanged,
           modelChanged,
           customEnvChanged,
+          tokenChanged,
+          authModeChanged,
         };
         const commit = () => {
-          const updated = updateProvider(id, validation.data);
+          let updated = updateProvider(id, providerPatch);
+          if (tokenChange) {
+            updated = updateProviderSecrets(id, tokenChange);
+            invalidateProviderUsageCache(id);
+          }
           appendClaudeConfigAuditBestEffort(actor, 'update_provider', [
             `id:${id}`,
             ...changedFields,
@@ -1547,6 +1598,13 @@ configRoutes.post(
 
     try {
       return await withClaudeConfigMutationLock(async () => {
+        // Refuse before any runner is stopped: enabling a credential-less
+        // provider would only route turns into authentication failures.
+        const target = getProviders().find((provider) => provider.id === id);
+        if (!target) throw new Error('未找到指定供应商');
+        if (body.enabled && !providerHasCredentials(target)) {
+          throw new Error('该模型配置还没有可用的凭据，请先填写密钥或完成授权');
+        }
         const mutation = await mutateClaudeConfigForAllGroups(
           actor,
           { trigger: 'provider_toggle', providerId: id },
@@ -1582,6 +1640,102 @@ configRoutes.post(
       logger.warn({ err }, 'Failed to toggle provider');
       return c.json({ error: message }, 400);
     }
+  },
+);
+
+// ─── POST /claude/providers/:id/duplicate — 复制供应商（含密钥，默认停用）─────
+configRoutes.post(
+  '/claude/providers/:id/duplicate',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    const actor = (c.get('user') as AuthUser).username;
+    try {
+      return await withClaudeConfigMutationLock(async () => {
+        const provider = duplicateProvider(id);
+        appendClaudeConfigAuditBestEffort(actor, 'duplicate_provider', [
+          `source:${id}`,
+          `id:${provider.id}`,
+        ]);
+        return c.json(toPublicProvider(provider), 201);
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to duplicate provider';
+      logger.warn({ err }, 'Failed to duplicate provider');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+// ─── POST /claude/providers/test — 测试第三方端点连通性 ─────
+const CONNECTIVITY_TEST_WINDOW_MS = 60_000;
+const CONNECTIVITY_TEST_LIMIT = 10;
+const connectivityTestHits = new Map<string, number[]>();
+
+configRoutes.post(
+  '/claude/providers/test',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const user = c.get('user') as AuthUser;
+    const now = Date.now();
+    const recent = (connectivityTestHits.get(user.id) ?? []).filter(
+      (at) => now - at < CONNECTIVITY_TEST_WINDOW_MS,
+    );
+    if (recent.length >= CONNECTIVITY_TEST_LIMIT) {
+      return c.json({ error: '测试过于频繁，请稍后再试' }, 429);
+    }
+    recent.push(now);
+    connectivityTestHits.set(user.id, recent);
+
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ProviderConnectivityTestSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json({ error: 'Invalid request body' }, 400);
+    }
+    const draft = validation.data;
+    const stored = draft.providerId
+      ? getProviders().find((provider) => provider.id === draft.providerId)
+      : undefined;
+    if (draft.providerId && !stored) {
+      return c.json({ error: '未找到指定供应商' }, 404);
+    }
+    if (
+      stored &&
+      (stored.type !== 'third_party' || stored.codexOAuthCredentials)
+    ) {
+      return c.json({ error: '只有第三方兼容接口支持测试连接' }, 400);
+    }
+
+    const baseUrl =
+      draft.anthropicBaseUrl?.trim() || stored?.anthropicBaseUrl || '';
+    const token =
+      draft.anthropicAuthToken?.trim() || stored?.anthropicAuthToken || '';
+    if (!baseUrl) return c.json({ error: '请填写 API 端点' }, 400);
+    if (!token) return c.json({ error: '请填写 API 密钥' }, 400);
+    const customEnv = draft.customEnv ?? stored?.customEnv ?? {};
+    const model = draft.anthropicModel ?? stored?.anthropicModel ?? '';
+
+    const result = await testProviderConnectivity({
+      baseUrl,
+      token,
+      authMode:
+        draft.anthropicAuthMode ?? stored?.anthropicAuthMode ?? 'bearer',
+      model,
+      haikuModel: customEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL,
+      customHeaders: customEnv.ANTHROPIC_CUSTOM_HEADERS,
+    });
+    logger.info(
+      {
+        providerId: draft.providerId ?? null,
+        ok: result.ok,
+        statuses: result.probes.map((probe) => probe.status),
+      },
+      'Provider connectivity test finished',
+    );
+    return c.json(result);
   },
 );
 

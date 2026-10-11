@@ -103,6 +103,10 @@ const INHERITED_CLAUDE_PROVIDER_ENV_KEYS = [
   'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_NO_FLICKER',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
+  'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+  'ANTHROPIC_SMALL_FAST_MODEL',
+  'ANTHROPIC_BETAS',
   'API_TIMEOUT_MS',
 ] as const;
 
@@ -127,12 +131,81 @@ const THIRD_PARTY_CONFIGURABLE_ENV_KEYS = new Set([
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
   'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_NO_FLICKER',
   'API_TIMEOUT_MS',
 ]);
+
+/** Model-tier mappings that default to the provider model. */
+const THIRD_PARTY_MODEL_ENV_KEYS = [
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_SUBAGENT_MODEL',
+] as const;
+
+/** Provider env values that Claude Code parses as positive integers. */
+const POSITIVE_INTEGER_PROVIDER_ENV_KEYS = new Set([
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+  'API_TIMEOUT_MS',
+]);
+
+const PROVIDER_EFFORT_LEVELS = new Set([
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]);
+
+/**
+ * How a third-party token is sent. `bearer` matches the usual
+ * `ANTHROPIC_AUTH_TOKEN=...` shell setup (`Authorization: Bearer`);
+ * `x-api-key` matches `ANTHROPIC_API_KEY`. Providers saved before the choice
+ * existed have no mode and keep the legacy inference in buildClaudeEnvLines.
+ */
+export type ProviderAuthMode = 'bearer' | 'x-api-key';
+
+/**
+ * Reject provider env the runtime would otherwise drop or misread, so the
+ * admin sees why instead of a silent "saved". Returns a user-facing message,
+ * or null when the map is acceptable. Write paths only: stored maps are still
+ * read leniently so an old file never fails to load.
+ */
+export function validateProviderCustomEnv(
+  customEnv: Record<string, string>,
+): string | null {
+  const dangerous = Object.keys(customEnv).filter(isDangerousEnvKey);
+  if (dangerous.length > 0) {
+    return `以下环境变量出于安全原因不允许配置：${dangerous.join(', ')}`;
+  }
+  const reserved = Object.keys(customEnv).filter(
+    (key) => RESERVED_CLAUDE_ENV_KEYS.has(key) || key === 'ANTHROPIC_API_KEY',
+  );
+  if (reserved.length > 0) {
+    return `${reserved.join(', ')} 由端点、密钥或模型字段管理，请在对应字段中填写`;
+  }
+  for (const [key, value] of Object.entries(customEnv)) {
+    const trimmed = value.trim();
+    if (POSITIVE_INTEGER_PROVIDER_ENV_KEYS.has(key) && trimmed) {
+      if (!/^[1-9]\d*$/.test(trimmed)) {
+        return `${key} 必须是正整数`;
+      }
+    }
+    if (
+      key === 'CLAUDE_CODE_EFFORT_LEVEL' &&
+      trimmed &&
+      !PROVIDER_EFFORT_LEVELS.has(trimmed)
+    ) {
+      return `CLAUDE_CODE_EFFORT_LEVEL 只能是 ${[...PROVIDER_EFFORT_LEVELS].join(' / ')}`;
+    }
+  }
+  return null;
+}
 
 const THIRD_PARTY_RUNTIME_DEFAULTS = {
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
@@ -278,6 +351,8 @@ export interface CachedOAuthUsage {
 export interface ClaudeProviderConfig {
   anthropicBaseUrl: string;
   anthropicAuthToken: string;
+  /** Unset for legacy providers: buildClaudeEnvLines infers the header. */
+  anthropicAuthMode?: ProviderAuthMode;
   anthropicApiKey: string;
   claudeCodeOauthToken: string;
   claudeOAuthCredentials: ClaudeOAuthCredentials | null;
@@ -453,6 +528,7 @@ interface StoredProviderV4 {
   weight: number;
   anthropicBaseUrl: string;
   anthropicModel: string;
+  anthropicAuthMode?: ProviderAuthMode;
   secrets: EncryptedSecrets;
   customEnv?: Record<string, string>;
   updatedAt: string;
@@ -483,6 +559,7 @@ export interface UnifiedProvider {
   weight: number;
   anthropicBaseUrl: string;
   anthropicAuthToken: string;
+  anthropicAuthMode?: ProviderAuthMode;
   anthropicModel: string;
   anthropicApiKey: string;
   claudeCodeOauthToken: string;
@@ -501,6 +578,8 @@ export interface UnifiedProviderPublic {
   weight: number;
   anthropicBaseUrl: string;
   anthropicModel: string;
+  /** null for providers saved before the explicit choice existed. */
+  anthropicAuthMode: ProviderAuthMode | null;
   hasAnthropicAuthToken: boolean;
   anthropicAuthTokenMasked: string | null;
   hasAnthropicApiKey: boolean;
@@ -569,6 +648,12 @@ function normalizeBaseUrl(input: unknown): string {
     throw new Error('Invalid field: anthropicBaseUrl');
   }
   return value;
+}
+
+function normalizeProviderAuthMode(
+  input: unknown,
+): ProviderAuthMode | undefined {
+  return input === 'bearer' || input === 'x-api-key' ? input : undefined;
 }
 
 function normalizeModel(input: unknown): string {
@@ -1224,6 +1309,9 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     weight: Math.max(1, Math.min(100, provider.weight || 1)),
     anthropicBaseUrl: provider.anthropicBaseUrl || '',
     anthropicModel: provider.anthropicModel || '',
+    ...(provider.anthropicAuthMode
+      ? { anthropicAuthMode: provider.anthropicAuthMode }
+      : {}),
     secrets: encryptSecrets(secrets),
     ...(Object.keys(sanitizedEnv).length > 0
       ? { customEnv: sanitizedEnv }
@@ -1242,6 +1330,13 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     weight: Math.max(1, Math.min(100, stored.weight || 1)),
     anthropicBaseUrl: stored.anthropicBaseUrl || '',
     anthropicAuthToken: secrets.anthropicAuthToken || '',
+    ...(normalizeProviderAuthMode(stored.anthropicAuthMode)
+      ? {
+          anthropicAuthMode: normalizeProviderAuthMode(
+            stored.anthropicAuthMode,
+          ),
+        }
+      : {}),
     anthropicModel: stored.anthropicModel || '',
     anthropicApiKey: secrets.anthropicApiKey || '',
     claudeCodeOauthToken: secrets.claudeCodeOauthToken || '',
@@ -1545,6 +1640,7 @@ export function createProvider(input: {
   type: 'official' | 'third_party';
   anthropicBaseUrl?: string;
   anthropicAuthToken?: string;
+  anthropicAuthMode?: ProviderAuthMode;
   anthropicModel?: string;
   anthropicApiKey?: string;
   claudeCodeOauthToken?: string;
@@ -1576,6 +1672,9 @@ export function createProvider(input: {
     anthropicAuthToken: input.anthropicAuthToken
       ? normalizeSecret(input.anthropicAuthToken, 'anthropicAuthToken')
       : '',
+    ...(input.anthropicAuthMode
+      ? { anthropicAuthMode: input.anthropicAuthMode }
+      : {}),
     anthropicModel: input.anthropicModel
       ? normalizeModel(input.anthropicModel)
       : '',
@@ -1603,6 +1702,7 @@ export function updateProvider(
   patch: {
     name?: string;
     anthropicBaseUrl?: string;
+    anthropicAuthMode?: ProviderAuthMode;
     anthropicModel?: string;
     customEnv?: Record<string, string>;
     weight?: number;
@@ -1622,6 +1722,9 @@ export function updateProvider(
       : {}),
     ...(patch.anthropicBaseUrl !== undefined
       ? { anthropicBaseUrl: normalizeBaseUrl(patch.anthropicBaseUrl) }
+      : {}),
+    ...(patch.anthropicAuthMode !== undefined
+      ? { anthropicAuthMode: patch.anthropicAuthMode }
       : {}),
     ...(patch.anthropicModel !== undefined
       ? { anthropicModel: normalizeModel(patch.anthropicModel) }
@@ -1815,6 +1918,19 @@ export function getProviderById(id: string): UnifiedProvider | null {
   return getProviders().find((provider) => provider.id === id) ?? null;
 }
 
+/** Whether a provider holds a credential its runtime can authenticate with. */
+export function providerHasCredentials(provider: UnifiedProvider): boolean {
+  if (provider.codexOAuthCredentials) return true;
+  if (provider.type === 'third_party') {
+    return !!(provider.anthropicAuthToken || provider.anthropicApiKey);
+  }
+  return !!(
+    provider.anthropicApiKey ||
+    provider.claudeCodeOauthToken ||
+    provider.claudeOAuthCredentials
+  );
+}
+
 export function setProviderEnabled(
   id: string,
   enabled: boolean,
@@ -1827,6 +1943,11 @@ export function setProviderEnabled(
 
   const provider = state.providers[idx];
   if (provider.enabled === enabled) return provider;
+  // An enabled provider joins the automatic pool at once; without a
+  // credential every turn routed to it would fail authentication.
+  if (enabled && !providerHasCredentials(provider)) {
+    throw new Error('该模型配置还没有可用的凭据，请先填写密钥或完成授权');
+  }
 
   state.providers[idx] = {
     ...provider,
@@ -1835,6 +1956,40 @@ export function setProviderEnabled(
   };
   writeStoredStateV4(state.providers, state.balancing);
   return state.providers[idx];
+}
+
+/**
+ * Copy a provider together with its encrypted secrets, disabled, right after
+ * the original. OAuth providers are refused: two configurations rotating one
+ * refresh token would invalidate each other on the first refresh.
+ */
+export function duplicateProvider(id: string): UnifiedProvider {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('Claude 配置不存在');
+
+  const idx = state.providers.findIndex((p) => p.id === id);
+  if (idx < 0) throw new Error('未找到指定供应商');
+  if (state.providers.length >= MAX_PROVIDERS) {
+    throw new Error(`最多只能创建 ${MAX_PROVIDERS} 个供应商`);
+  }
+
+  const source = state.providers[idx];
+  if (source.codexOAuthCredentials || source.claudeOAuthCredentials) {
+    throw new Error(
+      'OAuth 授权的模型配置不能复制：两份配置轮换同一个刷新令牌会互相失效，请新建后重新授权',
+    );
+  }
+  const suffix = ' (副本)';
+  const copy: UnifiedProvider = {
+    ...structuredClone(source),
+    id: crypto.randomBytes(8).toString('hex'),
+    name: `${source.name.slice(0, 64 - suffix.length)}${suffix}`,
+    enabled: false,
+    updatedAt: new Date().toISOString(),
+  };
+  state.providers.splice(idx + 1, 0, copy);
+  writeStoredStateV4(state.providers, state.balancing);
+  return copy;
 }
 
 export function deleteProvider(id: string): void {
@@ -1856,6 +2011,9 @@ export function providerToConfig(
   return {
     anthropicBaseUrl: provider.anthropicBaseUrl,
     anthropicAuthToken: provider.anthropicAuthToken,
+    ...(provider.anthropicAuthMode
+      ? { anthropicAuthMode: provider.anthropicAuthMode }
+      : {}),
     anthropicApiKey: provider.anthropicApiKey,
     claudeCodeOauthToken: provider.claudeCodeOauthToken,
     claudeOAuthCredentials: provider.claudeOAuthCredentials,
@@ -1876,6 +2034,7 @@ export function toPublicProvider(
     weight: provider.weight,
     anthropicBaseUrl: provider.anthropicBaseUrl,
     anthropicModel: provider.anthropicModel,
+    anthropicAuthMode: provider.anthropicAuthMode ?? null,
     hasAnthropicAuthToken: !!provider.anthropicAuthToken,
     anthropicAuthTokenMasked: maskSecret(provider.anthropicAuthToken),
     hasAnthropicApiKey: !!provider.anthropicApiKey,
@@ -2245,21 +2404,20 @@ export function buildClaudeEnvLines(
   }
   if (config.anthropicAuthToken) {
     const bearerMatch = /^Bearer\s+(.+)$/i.exec(config.anthropicAuthToken);
-    if (config.anthropicBaseUrl && !bearerMatch) {
-      // Most third-party Anthropic-compatible endpoints expect API-key style
-      // auth (the SDK sends a bare token as `X-Api-Key`). A plain token maps to
-      // ANTHROPIC_API_KEY so non-Anthropic endpoints don't 404 on the OAuth path.
-      lines.push(
-        `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicAuthToken)}`,
-      );
-    } else {
-      // An explicit `Bearer <token>` (or first-party usage) goes to
-      // ANTHROPIC_AUTH_TOKEN so the SDK emits `Authorization: Bearer <token>`.
-      // The SDK adds the `Bearer ` prefix itself, so strip the user-supplied
-      // one to avoid a doubled `Authorization: Bearer Bearer <token>`.
-      const token = bearerMatch ? bearerMatch[1] : config.anthropicAuthToken;
-      lines.push(`ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(token)}`);
-    }
+    // The SDK adds the `Bearer ` prefix itself, so strip a user-supplied one
+    // to avoid a doubled `Authorization: Bearer Bearer <token>`.
+    const token = bearerMatch ? bearerMatch[1] : config.anthropicAuthToken;
+    // An explicit mode wins. Legacy providers keep the old inference: a bare
+    // token behind a custom endpoint is sent as `X-Api-Key`, an explicit
+    // `Bearer <token>` (or first-party usage) as `Authorization: Bearer`.
+    const sendAsApiKey = config.anthropicAuthMode
+      ? config.anthropicAuthMode === 'x-api-key'
+      : !!config.anthropicBaseUrl && !bearerMatch;
+    lines.push(
+      sendAsApiKey
+        ? `ANTHROPIC_API_KEY=${sanitizeEnvValue(token)}`
+        : `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(token)}`,
+    );
   }
   if (config.anthropicModel) {
     lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
@@ -2273,22 +2431,19 @@ export function buildClaudeEnvLines(
   // [1m] suffix, while allowing provider-level advanced settings to replace
   // any default explicitly.
   if (config.anthropicBaseUrl) {
+    // A blank override means "use the default": an empty model mapping would
+    // send Claude Code back to first-party model IDs the gateway lacks.
     const configuredValue = (key: string, fallback: string): string =>
-      Object.hasOwn(customEnv, key)
+      Object.hasOwn(customEnv, key) && customEnv[key].trim()
         ? sanitizeCustomEnvValue(key, customEnv[key])
         : fallback;
 
-    if (config.anthropicModel) {
-      const model = sanitizeEnvValue(config.anthropicModel);
-      lines.push(
-        `ANTHROPIC_DEFAULT_OPUS_MODEL=${configuredValue('ANTHROPIC_DEFAULT_OPUS_MODEL', model)}`,
-      );
-      lines.push(
-        `ANTHROPIC_DEFAULT_SONNET_MODEL=${configuredValue('ANTHROPIC_DEFAULT_SONNET_MODEL', model)}`,
-      );
-      lines.push(
-        `ANTHROPIC_DEFAULT_HAIKU_MODEL=${configuredValue('ANTHROPIC_DEFAULT_HAIKU_MODEL', model)}`,
-      );
+    // Every model tier follows the provider model by default. A pass-through
+    // relay leaves the model empty, so only explicit per-tier mappings apply.
+    const model = sanitizeEnvValue(config.anthropicModel);
+    for (const key of THIRD_PARTY_MODEL_ENV_KEYS) {
+      const value = configuredValue(key, model);
+      if (value) lines.push(`${key}=${value}`);
     }
 
     lines.push(
