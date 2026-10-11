@@ -26,10 +26,12 @@ import {
   type ContainerProxyConfig,
 } from './config.js';
 import { logger } from './logger.js';
+import { isCodexGatewayBaseUrl } from './codex-gateway/resolve-gateway-url.js';
 import {
-  resolveCodexGatewayBaseUrl,
-  isCodexGatewayBaseUrl,
-} from './codex-gateway/resolve-gateway-url.js';
+  CodexGatewayRunnerLease,
+  applyCodexGatewayNoProxy,
+  resolveCodexGatewayLaunchConfig,
+} from './codex-gateway/runner-tokens.js';
 import {
   buildEffectiveMcpManifest,
   loadPluginMcpDefinitions,
@@ -85,6 +87,7 @@ import {
 } from './db.js';
 import { isApiError } from './agent-output-parser.js';
 import {
+  CODEX_REAUTH_REQUIRED_USER_NOTICE,
   DEFAULT_MAX_TRANSIENT_RETRIES,
   TransientRetryLedger,
   resolveProviderFailureClass,
@@ -803,6 +806,30 @@ function quarantineFromOutput(
     return;
   }
   providerPool.reportFailure(profileId, true, output.providerRateLimitResetsAt);
+}
+
+/**
+ * Reconcile a runner's provider-failure verdict with what the embedded Codex
+ * gateway last answered it. Claude Code reports every exhausted 429 as an
+ * account-wide limit, but a throttle the gateway applied itself (its local
+ * per-runner window, a token refresh in backoff) says nothing about the
+ * ChatGPT account and must not quarantine the provider. A rejected refresh
+ * grant stays an account verdict, with a notice naming the remedy.
+ */
+export function applyCodexGatewayVerdict(
+  output: ContainerOutput,
+  lease: Pick<CodexGatewayRunnerLease, 'lastVerdict'>,
+): void {
+  if (!output.providerFailure) return;
+  if (resolveProviderFailureClass(output) !== 'account') return;
+  switch (lease.lastVerdict) {
+    case 'local_transient':
+      output.providerFailureClass = 'transient';
+      break;
+    case 'reauth_required':
+      output.providerFailureNotice ??= CODEX_REAUTH_REQUIRED_USER_NOTICE;
+      break;
+  }
 }
 
 /**
@@ -1894,6 +1921,8 @@ function prepareVolumeMounts(
     envLines: [],
     addHostGateway: false,
   },
+  /** Mints this runner's Codex gateway token; revoked when the runner exits. */
+  codexGatewayLease?: CodexGatewayRunnerLease,
 ): PreparedVolumeMounts {
   if (group.containerConfigError) {
     throw new AdditionalMountValidationError([
@@ -2198,13 +2227,11 @@ function prepareVolumeMounts(
   );
   fs.mkdirSync(envDir, { recursive: true });
   const rawGlobalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
-  const globalConfig = {
-    ...rawGlobalConfig,
-    anthropicBaseUrl: resolveCodexGatewayBaseUrl(
-      rawGlobalConfig.anthropicBaseUrl,
-      'container',
-    ),
-  };
+  const globalConfig = resolveCodexGatewayLaunchConfig(
+    rawGlobalConfig,
+    'container',
+    codexGatewayLease,
+  );
   const usesCodexGateway = isCodexGatewayBaseUrl(
     rawGlobalConfig.anthropicBaseUrl,
   );
@@ -2257,6 +2284,7 @@ function prepareVolumeMounts(
   }
   applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
   applyContainerProxyEnvLines(envLines, containerProxy.envLines);
+  if (usesCodexGateway) applyCodexGatewayNoProxyToEnvLines(envLines);
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -2663,6 +2691,20 @@ export function applyContainerProxyEnvLines(
   }
 }
 
+/** Keep the local gateway hop out of any proxy configured for the runner. */
+function applyCodexGatewayNoProxyToEnvLines(envLines: string[]): void {
+  const env: Record<string, string | undefined> = {};
+  for (const key of ['NO_PROXY', 'no_proxy']) {
+    const index = envLines.findIndex((line) => line.startsWith(`${key}=`));
+    if (index >= 0) {
+      env[key] = envLines[index].slice(key.length + 1);
+      envLines.splice(index, 1);
+    }
+  }
+  applyCodexGatewayNoProxy(env, 'container');
+  envLines.push(`NO_PROXY=${env.NO_PROXY}`, `no_proxy=${env.no_proxy}`);
+}
+
 export function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -2838,6 +2880,13 @@ export async function runContainerAgent(
     workspaceMemoryCapabilityScope,
     input.turnId,
   );
+  const codexGatewayLease = new CodexGatewayRunnerLease({
+    kind: 'container',
+    groupFolder: group.folder,
+    agentId: input.agentId ?? null,
+    taskRunId: input.taskRunId ?? null,
+    agentEffort: resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
+  });
   try {
     const isAdminHome = !!input.isAdminHome;
     // Per-user skills: always mount if the group has an owner
@@ -2859,6 +2908,7 @@ export async function runContainerAgent(
       poolResult?.modelOverride,
       modelSelectionPinned,
       containerProxy,
+      codexGatewayLease,
     );
     const mounts = preparedLaunch.mounts;
     const dockerPlugins = group.created_by
@@ -3042,6 +3092,7 @@ export async function runContainerAgent(
         return outcome;
       };
       const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        applyCodexGatewayVerdict(output, codexGatewayLease);
         if (
           output.providerQuotaObservation ||
           output.inputTurnCompleted === true ||
@@ -3243,6 +3294,7 @@ export async function runContainerAgent(
       });
     });
 
+    applyCodexGatewayVerdict(result, codexGatewayLease);
     // ─── Provider Pool health reporting ───
     if (selectedProfileId) {
       if (result.providerFailure) {
@@ -3287,6 +3339,7 @@ export async function runContainerAgent(
 
     return result;
   } finally {
+    codexGatewayLease.revoke();
     revokeWorkspaceMemoryWriteCapability(
       workspaceMemoryCapabilityScope,
       workspaceMemoryRunnerInstanceId,
@@ -3941,13 +3994,6 @@ export async function runHostAgent(
   );
   const rawGlobalConfig =
     hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
-  const globalConfig = {
-    ...rawGlobalConfig,
-    anthropicBaseUrl: resolveCodexGatewayBaseUrl(
-      rawGlobalConfig.anthropicBaseUrl,
-      'host',
-    ),
-  };
   let hostProviderFailureReported = false;
   let hostProviderFailureTerminal: boolean | undefined;
   let hostProviderFailureMaintenance = false;
@@ -3966,7 +4012,20 @@ export async function runHostAgent(
     workspaceMemoryCapabilityScope,
     input.turnId,
   );
+  const codexGatewayLease = new CodexGatewayRunnerLease({
+    kind: 'host',
+    groupFolder: group.folder,
+    agentId: input.agentId ?? null,
+    taskRunId: input.taskRunId ?? null,
+    agentEffort: resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
+  });
   try {
+    // Minted inside try so the finally below always revokes the token.
+    const globalConfig = resolveCodexGatewayLaunchConfig(
+      rawGlobalConfig,
+      'host',
+      codexGatewayLease,
+    );
     // 配置层环境变量
     const envLines = buildContainerEnvLines(
       globalConfig,
@@ -4000,6 +4059,9 @@ export async function runHostAgent(
       delete hostEnv['HAPPYCLAW_FALLBACK_MODEL'];
     }
     if (tierEnv.model) hostEnv['ANTHROPIC_MODEL'] = tierEnv.model;
+    if (isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl)) {
+      applyCodexGatewayNoProxy(hostEnv, 'host');
+    }
 
     // Resolve symlinks up front: this exact string becomes CLAUDE_CONFIG_DIR
     // below, and the macOS Keychain entry the CLI reads is addressed by a
@@ -4330,6 +4392,7 @@ export async function runHostAgent(
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
       const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        applyCodexGatewayVerdict(output, codexGatewayLease);
         if (
           consumeProviderQuotaControlOutput(
             hostSelectedProfileId,
@@ -4504,6 +4567,7 @@ export async function runHostAgent(
       });
     });
 
+    applyCodexGatewayVerdict(hostResult, codexGatewayLease);
     // ─── Provider Pool health reporting (host mode) ───
     if (hostSelectedProfileId) {
       if (hostResult.providerFailure) {
@@ -4554,6 +4618,7 @@ export async function runHostAgent(
 
     return hostResult;
   } finally {
+    codexGatewayLease.revoke();
     revokeWorkspaceMemoryWriteCapability(
       workspaceMemoryCapabilityScope,
       workspaceMemoryRunnerInstanceId,

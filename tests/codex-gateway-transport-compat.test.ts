@@ -11,12 +11,16 @@ vi.mock('../src/runtime-config.js', () => ({
   getProviders: mocks.getProviders,
   getProviderById: mocks.getProviderById,
   updateProviderCodexOAuthCredentialsIfCurrent: vi.fn(),
+  setProviderCodexOAuthRefreshErrorIfCurrent: vi.fn(),
 }));
 vi.mock('../src/logger.js', () => ({ logger: mocks.logger }));
 vi.mock('../src/codex-gateway/model-catalog-sync.js', () => ({
   getResolvedCodexCatalog: mocks.getResolvedCodexCatalog,
 }));
 const { codexGatewayApp } = await import('../src/codex-gateway/gateway.js');
+const { issueCodexGatewayToken, revokeCodexGatewayToken } =
+  await import('../src/codex-gateway/runner-tokens.js');
+let runnerToken = '';
 const { codexRequestContext } =
   await import('../src/codex-gateway/request-context.js');
 const encoder = new TextEncoder();
@@ -62,26 +66,30 @@ function request(
   payload: Record<string, unknown> = {},
   headers: Record<string, string> = {},
 ): Promise<Response> {
-  return codexGatewayApp.request('/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': 'transport-key',
-      ...headers,
+  return codexGatewayApp.request(
+    '/v1/messages',
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': runnerToken,
+        ...headers,
+      },
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: 'hi' }],
+        stream,
+        ...payload,
+      }),
     },
-    body: JSON.stringify({
-      messages: [{ role: 'user', content: 'hi' }],
-      stream,
-      ...payload,
-    }),
-  });
+    { incoming: { socket: { remoteAddress: '127.0.0.1' } } } as never,
+  );
 }
 beforeEach(() => {
   vi.clearAllMocks();
   const provider = {
     id: `transport-provider-${++providerNumber}`,
     enabled: true,
-    anthropicAuthToken: 'transport-key',
+    anthropicAuthToken: 'transport-identifier',
     anthropicModel: 'gpt-6-sol',
     codexOAuthCredentials: {
       accessToken: 'test-upstream-token',
@@ -94,8 +102,10 @@ beforeEach(() => {
   mocks.getProviderById.mockReturnValue(provider);
   mocks.getResolvedCodexCatalog.mockReturnValue({ models: [] });
   vi.stubGlobal('fetch', mocks.fetch);
+  runnerToken = issueCodexGatewayToken(provider.id, { kind: 'host' }).token;
 });
 afterEach(() => {
+  revokeCodexGatewayToken(runnerToken);
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -116,16 +126,11 @@ describe('Codex executor transport compatibility', () => {
         ),
       );
       const response = await request(stream);
-      if (stream) {
-        const text = await response.text();
-        expect(text).toContain('event: error');
-        expect(text).not.toContain('event: message_stop');
-      } else {
-        expect(response.status).toBe(502);
-        expect(await response.json()).toMatchObject({
-          error: { type: 'api_error' },
-        });
-      }
+      // Nothing reached the client yet, so a stream also reports a real status.
+      expect(response.status).toBe(502);
+      expect(await response.json()).toMatchObject({
+        error: { type: 'api_error' },
+      });
       expect(cancel).toHaveBeenCalledOnce();
     },
   );
@@ -258,37 +263,60 @@ describe('Codex executor transport compatibility', () => {
   );
 
   test.each([
+    // Inheriting Agent: the SDK's effort mirrors CLAUDE_CODE_EFFORT_LEVEL, so
+    // the provider effort (or the catalog default) decides.
     [
       { thinking: { type: 'adaptive' }, output_config: { effort: 'high' } },
       undefined,
+      undefined,
+      ['low', 'medium', 'high'],
+      'medium',
+      'medium',
+    ],
+    [
+      { thinking: { type: 'adaptive' }, output_config: { effort: 'high' } },
+      'low',
+      undefined,
+      ['low', 'medium', 'high'],
+      'medium',
+      'low',
+    ],
+    // Explicit Agent: the SDK's requested effort, else the Agent's own level.
+    [
+      { thinking: { type: 'adaptive' }, output_config: { effort: 'high' } },
+      'low',
+      'xhigh',
       ['low', 'medium', 'high'],
       'medium',
       'high',
     ],
     [
-      { thinking: { type: 'adaptive' }, output_config: { effort: 'high' } },
-      'low',
-      ['low', 'medium', 'high'],
-      'medium',
-      'low',
-    ],
-    [
-      { thinking: { type: 'enabled', budget_tokens: 256 } },
-      undefined,
-      ['low', 'medium', 'high'],
-      'medium',
-      'low',
-    ],
-    [
       { thinking: { type: 'enabled', budget_tokens: 32000 } },
       undefined,
+      'max',
       ['low', 'medium'],
       'low',
       'low',
     ],
+    // Disabled thinking: lowest supported level, never an unsupported none.
+    [
+      { thinking: { type: 'disabled' } },
+      'high',
+      undefined,
+      ['medium', 'high'],
+      'high',
+      'medium',
+    ],
   ])(
-    'resolves request effort and provider overrides before the final catalog clamp',
-    async (payload, override, efforts, defaultEffort, expected) => {
+    'resolves Agent/provider effort precedence before the final catalog clamp (%#)',
+    async (
+      payload,
+      override,
+      agentEffort,
+      efforts,
+      defaultEffort,
+      expected,
+    ) => {
       mocks.getProviderById.mockReturnValue({
         ...mocks.getProviderById(),
         customEnv: { CODEX_REASONING_EFFORT: override },
@@ -297,6 +325,13 @@ describe('Codex executor transport compatibility', () => {
         models: [{ value: 'gpt-6-sol', efforts, defaultEffort }],
       });
       mocks.fetch.mockResolvedValue(upstream(frame(completed)));
+      if (agentEffort) {
+        revokeCodexGatewayToken(runnerToken);
+        runnerToken = issueCodexGatewayToken(
+          mocks.getProviderById().id as string,
+          { kind: 'container', agentEffort },
+        ).token;
+      }
       expect((await request(false, payload)).status).toBe(200);
       const body = JSON.parse(mocks.fetch.mock.calls[0][1].body);
       expect(body.reasoning.effort).toBe(expected);
@@ -626,11 +661,26 @@ describe('Codex executor transport compatibility', () => {
 
   test('a malformed streaming frame produces error with no successful terminal', async () => {
     mocks.fetch.mockResolvedValue(
-      upstream(frame(created) + 'data: {broken\n\n' + frame(completed)),
+      upstream(
+        frame(created) + frame(delta) + 'data: {broken\n\n' + frame(completed),
+      ),
     );
-    const body = await (await request(true)).text();
+    const response = await request(true);
+    expect(response.status).toBe(200);
+    const body = await response.text();
     expect(body).toContain('event: error');
     expect(body).not.toContain('event: message_stop');
+  });
+
+  test('a malformed frame before any content fails the stream with a real status', async () => {
+    mocks.fetch.mockResolvedValue(
+      upstream(frame(created) + 'data: {broken\n\n' + frame(completed)),
+    );
+    const response = await request(true);
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({
+      error: { type: 'api_error' },
+    });
   });
 
   test('[DONE] without a Responses terminal cannot fabricate a successful completion', async () => {
@@ -663,24 +713,24 @@ describe('Codex executor transport compatibility', () => {
   });
 
   test.each([
-    [400, 'invalid_request_error'],
-    [401, 'authentication_error'],
-    [403, 'permission_error'],
-    [404, 'not_found_error'],
-    [413, 'invalid_request_error'],
-    [422, 'invalid_request_error'],
-    [429, 'rate_limit_error'],
-    [503, 'api_error'],
-    [529, 'overloaded_error'],
+    [400, 400, 'invalid_request_error'],
+    [403, 403, 'permission_error'],
+    [404, 404, 'not_found_error'],
+    [413, 413, 'invalid_request_error'],
+    [422, 422, 'invalid_request_error'],
+    [429, 429, 'rate_limit_error'],
+    [503, 503, 'api_error'],
+    [529, 529, 'overloaded_error'],
   ])(
-    'HTTP %s maps to Anthropic %s without reading private error data',
-    async (status, type) => {
+    'HTTP %s maps to %s Anthropic %s with a bounded body and safe headers',
+    async (status, mapped, type) => {
       const cancel = vi.fn();
       mocks.fetch.mockResolvedValue(
         new Response(
           new ReadableStream({
             start(c) {
               c.enqueue(encoder.encode('PRIVATE_UPSTREAM_ERROR_BODY'));
+              c.close();
             },
             cancel,
           }),
@@ -694,16 +744,28 @@ describe('Codex executor transport compatibility', () => {
         ),
       );
       const response = await request();
-      expect(response.status).toBe(status);
+      expect(response.status).toBe(mapped);
       expect(await response.json()).toMatchObject({ error: { type } });
       expect(response.headers.get('retry-after')).toBe('3');
       expect(response.headers.get('set-cookie')).toBeNull();
-      expect(cancel).toHaveBeenCalledOnce();
       expect(JSON.stringify(mocks.logger.warn.mock.calls)).not.toContain(
         'PRIVATE_UPSTREAM',
       );
     },
   );
+
+  test('an HTML error page is not echoed into the error message', async () => {
+    mocks.fetch.mockResolvedValue(
+      new Response('<html><body>PRIVATE edge page</body></html>', {
+        status: 502,
+      }),
+    );
+    const response = await request();
+    expect(response.status).toBe(502);
+    const { error } = await response.json();
+    expect(error.message).not.toContain('PRIVATE');
+    expect(error.message).toContain('502');
+  });
 
   test('unexpected Retry-After data is not forwarded', async () => {
     mocks.fetch.mockResolvedValue(

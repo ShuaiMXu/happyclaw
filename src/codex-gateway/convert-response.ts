@@ -166,12 +166,26 @@ export interface CodexUpstreamFailure {
   code: string | null;
   message: string;
   status?: number;
+  /** Seconds until the upstream says the request may succeed again. */
+  retryAfterSeconds?: number;
+  /**
+   * The client must surface this instead of retrying: a usage limit hours
+   * away or a plan that does not include Codex will not clear on a retry.
+   */
+  noRetry?: boolean;
 }
 
-const RATE_LIMIT_CODES = new Set([
-  'rate_limit_exceeded',
-  'usage_limit_reached',
-  'insufficient_quota',
+const RATE_LIMIT_CODES = new Set(['rate_limit_exceeded', 'insufficient_quota']);
+const USAGE_LIMIT_CODES = new Set(['usage_limit_reached']);
+const OVERLOADED_CODES = new Set([
+  'server_is_overloaded',
+  'server_overloaded',
+  'overloaded',
+  'slow_down',
+]);
+const CONTEXT_LENGTH_CODES = new Set([
+  'context_length_exceeded',
+  'context_too_large',
 ]);
 
 const HTTP_STATUS_BY_ERROR_TYPE: Readonly<Record<AnthropicErrorType, number>> =
@@ -185,12 +199,93 @@ const HTTP_STATUS_BY_ERROR_TYPE: Readonly<Record<AnthropicErrorType, number>> =
     api_error: 502,
   };
 
+const UPSTREAM_DETAIL_LIMIT = 500;
+
 /**
- * 把上游失败翻译成 Anthropic 错误类型。类型决定客户端是否重试：SDK 对
- * api_error 会反复重试，而 invalid_prompt（上游安全策略拒绝）重试同一请求
- * 并不会改变判定，必须以 invalid_request_error 暴露真实原因。
+ * Upstream error text may echo request content or credentials. Keep a bounded,
+ * single-line excerpt with bearer tokens, API keys, JWTs and long opaque
+ * strings redacted; it is returned to the runner that sent the request.
  */
-export function describeUpstreamFailure(raw: Json): CodexUpstreamFailure {
+export function sanitizeUpstreamText(
+  value: string,
+  limit = UPSTREAM_DETAIL_LIMIT,
+): string {
+  const cleaned = value
+    .replace(/[\x00-\x1f\x7f]+/g, ' ')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [redacted]')
+    .replace(
+      /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g,
+      '[redacted]',
+    )
+    .replace(/\b(?:sk|rt|hcgw)[-_][A-Za-z0-9_-]{8,}/g, '[redacted]')
+    .replace(/[A-Za-z0-9+/_=-]{40,}/g, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned.length > limit ? `${cleaned.slice(0, limit)}…` : cleaned;
+}
+
+function positiveSeconds(value: unknown): number | undefined {
+  const number =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim())
+        ? Number(value)
+        : NaN;
+  return Number.isFinite(number) && number > 0 ? number : undefined;
+}
+
+function formatResetDelay(seconds: number): string {
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours < 48) return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
+  return `${Math.round(hours / 24)} 天`;
+}
+
+/** usage_limit_reached carries resets_at (epoch seconds) or resets_in_seconds. */
+function usageLimitRetry(
+  nested: Json,
+  now: number,
+): { retryAfterSeconds?: number; resetsAt?: number } {
+  const resetsAt = positiveSeconds(nested.resets_at);
+  if (resetsAt !== undefined && resetsAt * 1000 > now) {
+    return {
+      retryAfterSeconds: Math.max(1, Math.ceil((resetsAt * 1000 - now) / 1000)),
+      resetsAt: resetsAt * 1000,
+    };
+  }
+  const resetsIn = positiveSeconds(nested.resets_in_seconds);
+  if (resetsIn !== undefined) {
+    return {
+      retryAfterSeconds: Math.ceil(resetsIn),
+      resetsAt: now + Math.ceil(resetsIn) * 1000,
+    };
+  }
+  return {};
+}
+
+function isContextLengthMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('context window') ||
+    lower.includes('context length') ||
+    lower.includes('context_length') ||
+    lower.includes('maximum context') ||
+    lower.includes('too many tokens')
+  );
+}
+
+/**
+ * 把上游失败翻译成 Anthropic 错误类型与 HTTP 状态。类型决定客户端是否重试：
+ * SDK 对 api_error 会反复重试，而 invalid_prompt（上游安全策略拒绝）重试同一
+ * 请求并不会改变判定，必须以 invalid_request_error 暴露真实原因。SSE 终止事件
+ * 与非 2xx HTTP 响应体共用这一套映射。
+ */
+export function describeUpstreamFailure(
+  raw: Json,
+  options: { httpStatus?: number; now?: number } = {},
+): CodexUpstreamFailure {
   // response.failed 的详情在 response.error 下；裸 error 事件在 error 下，
   // 少数旧形态直接放在顶层 code/message。
   const response = object(raw.response);
@@ -208,17 +303,89 @@ export function describeUpstreamFailure(raw: Json): CodexUpstreamFailure {
       value >= 400 &&
       value <= 599,
   ) as number | undefined;
-  const detail =
+  const httpStatus =
+    options.httpStatus !== undefined &&
+    options.httpStatus >= 400 &&
+    options.httpStatus <= 599
+      ? options.httpStatus
+      : undefined;
+  const status = declaredStatus ?? httpStatus;
+  const detail = sanitizeUpstreamText(
     asString(nested.message) ??
-    asString(error) ??
-    asString(raw.message) ??
-    'Upstream Codex request failed';
+      asString(error) ??
+      asString(raw.message) ??
+      'Upstream Codex request failed',
+  );
+  const now = options.now ?? Date.now();
+  const isCode = (codes: Set<string>) =>
+    codes.has(normalizedCode) || codes.has(upstreamType);
+
+  // Plan/quota verdicts first: Codex sends them with error.type, not code.
+  if (isCode(USAGE_LIMIT_CODES)) {
+    const retry = usageLimitRetry(nested, now);
+    const reset =
+      retry.resetsAt !== undefined && retry.retryAfterSeconds !== undefined
+        ? `，将于 ${new Date(retry.resetsAt).toISOString()} 重置（约 ${formatResetDelay(retry.retryAfterSeconds)}后）`
+        : '';
+    return {
+      type: 'rate_limit_error',
+      code: code ?? 'usage_limit_reached',
+      message: `ChatGPT 订阅的 Codex 用量已达上限（usage_limit_reached）${reset}。${detail}`,
+      status: 429,
+      noRetry: true,
+      ...(retry.retryAfterSeconds !== undefined
+        ? { retryAfterSeconds: retry.retryAfterSeconds }
+        : {}),
+    };
+  }
+  if (
+    normalizedCode === 'usage_not_included' ||
+    upstreamType === 'usage_not_included'
+  ) {
+    return {
+      type: 'permission_error',
+      code: code ?? 'usage_not_included',
+      message: `当前 ChatGPT 套餐不包含 Codex 用量（usage_not_included），请升级套餐或改用其他模型配置。${detail}`,
+      status: 403,
+      noRetry: true,
+    };
+  }
+  if (
+    isCode(OVERLOADED_CODES) ||
+    upstreamType === 'service_unavailable_error' ||
+    upstreamType === 'overloaded_error' ||
+    status === 529
+  ) {
+    return {
+      type: 'overloaded_error',
+      code,
+      message: code
+        ? `Codex upstream overloaded (${code}): ${detail}`
+        : `Codex upstream overloaded: ${detail}`,
+      status: 529,
+    };
+  }
+  if (
+    isCode(CONTEXT_LENGTH_CODES) ||
+    status === 413 ||
+    ((upstreamType === '' || upstreamType === 'invalid_request_error') &&
+      isContextLengthMessage(detail))
+  ) {
+    // Claude Code recognises "prompt is too long" (case-insensitive) on a 400
+    // and compacts the conversation instead of failing the turn.
+    return {
+      type: 'invalid_request_error',
+      code,
+      message: `Prompt is too long: Codex upstream rejected the request${code ? ` (${code})` : ''}: ${detail}`,
+      status: status === 413 ? 413 : 400,
+    };
+  }
 
   let type: AnthropicErrorType = 'api_error';
   if (
     RATE_LIMIT_CODES.has(normalizedCode) ||
     upstreamType.includes('rate_limit') ||
-    declaredStatus === 429
+    status === 429
   ) {
     type = 'rate_limit_error';
   } else if (
@@ -227,41 +394,31 @@ export function describeUpstreamFailure(raw: Json): CodexUpstreamFailure {
     upstreamType === 'bad_request_error' ||
     normalizedCode === 'cyber_policy' ||
     normalizedCode === 'invalid_prompt' ||
-    normalizedCode === 'context_length_exceeded' ||
-    normalizedCode === 'context_too_large' ||
-    declaredStatus === 400 ||
-    declaredStatus === 413 ||
-    declaredStatus === 422
+    status === 400 ||
+    status === 422
   ) {
     type = 'invalid_request_error';
   } else if (
     upstreamType === 'authentication_error' ||
     normalizedCode === 'invalid_api_key' ||
     normalizedCode === 'unauthorized' ||
-    declaredStatus === 401
+    status === 401
   ) {
     type = 'authentication_error';
   } else if (
     upstreamType === 'permission_error' ||
     normalizedCode === 'forbidden' ||
     normalizedCode === 'permission_denied' ||
-    declaredStatus === 403
+    status === 403
   ) {
     type = 'permission_error';
   } else if (
     upstreamType === 'not_found_error' ||
     normalizedCode === 'not_found' ||
     normalizedCode === 'model_not_found' ||
-    declaredStatus === 404
+    status === 404
   ) {
     type = 'not_found_error';
-  } else if (
-    upstreamType === 'overloaded_error' ||
-    normalizedCode === 'server_overloaded' ||
-    normalizedCode === 'overloaded' ||
-    declaredStatus === 529
-  ) {
-    type = 'overloaded_error';
   }
 
   const message =
@@ -274,14 +431,50 @@ export function describeUpstreamFailure(raw: Json): CodexUpstreamFailure {
     type,
     code,
     message,
-    ...(declaredStatus ? { status: declaredStatus } : {}),
+    ...(status ? { status } : {}),
   };
+}
+
+/**
+ * Classify a non-2xx upstream HTTP response from its bounded body. ChatGPT
+ * answers with `{error: {...}}`, `{detail: ...}` or plain text.
+ */
+export function describeUpstreamHttpFailure(
+  status: number,
+  bodyText: string,
+  now = Date.now(),
+): CodexUpstreamFailure {
+  let body: unknown;
+  try {
+    body = bodyText.trim() ? JSON.parse(bodyText) : undefined;
+  } catch {
+    body = undefined;
+  }
+  const record = object(body);
+  const text = bodyText.trim();
+  // Plain-text bodies ("Unauthorized") are informative; HTML error pages from
+  // an edge proxy are not, and would only crowd the message.
+  const plainText =
+    body === undefined && text && !text.startsWith('<') ? text : undefined;
+  const error =
+    record.error ??
+    record.detail ??
+    (typeof body === 'string' ? body : undefined) ??
+    plainText ??
+    `Upstream Codex backend returned ${status}`;
+  const failure = describeUpstreamFailure(
+    { error, ...(record.code !== undefined ? { code: record.code } : {}) },
+    { httpStatus: status, now },
+  );
+  return { ...failure, status: failure.status ?? status };
 }
 
 export class CodexUpstreamError extends Error {
   readonly errorType: AnthropicErrorType;
   readonly code: string | null;
   readonly status: number;
+  readonly retryAfterSeconds?: number;
+  readonly noRetry: boolean;
 
   constructor(failure: CodexUpstreamFailure) {
     super(failure.message);
@@ -289,7 +482,14 @@ export class CodexUpstreamError extends Error {
     this.errorType = failure.type;
     this.code = failure.code;
     this.status = failure.status ?? HTTP_STATUS_BY_ERROR_TYPE[failure.type];
+    this.retryAfterSeconds = failure.retryAfterSeconds;
+    this.noRetry = failure.noRetry === true;
   }
+}
+
+/** HTTP status for a failure reported inside an SSE stream. */
+export function upstreamFailureStatus(failure: CodexUpstreamFailure): number {
+  return failure.status ?? HTTP_STATUS_BY_ERROR_TYPE[failure.type];
 }
 
 export class ResponsesToAnthropicConverter {

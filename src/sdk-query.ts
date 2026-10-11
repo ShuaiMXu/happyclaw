@@ -11,6 +11,11 @@ import {
   getClaudeProviderConfig,
 } from './runtime-config.js';
 import { logger } from './logger.js';
+import {
+  CodexGatewayRunnerLease,
+  applyCodexGatewayNoProxy,
+  resolveCodexGatewayLaunchConfig,
+} from './codex-gateway/runner-tokens.js';
 
 /**
  * Send a prompt to Claude and return the plain-text response.
@@ -30,24 +35,34 @@ export async function sdkQuery(
   // 构造隔离的 env 副本传给 SDK（options.env 是子进程 env 的权威来源）。
   // 不再突变全局 process.env、也无需 mutex 串行化，因此多个 sdkQuery（/recall、
   // 自动标题、bug 上报、task 解析等）可并发执行、凭据互不串扰。
-  const config = getClaudeProviderConfig();
-  const envLines = buildClaudeEnvLines(config);
-  const env: Record<string, string | undefined> = { ...process.env };
-  clearInheritedClaudeProviderEnv(env);
-  for (const line of envLines) {
-    const eq = line.indexOf('=');
-    if (eq <= 0) continue;
-    env[line.slice(0, eq)] = line.slice(eq + 1);
-  }
-  // Third-party providers default the Agent effort to max. These are short
-  // text utilities (titles, recall, task parsing), so the effort below must
-  // not be outranked by that provider-wide environment default.
-  delete env.CLAUDE_CODE_EFFORT_LEVEL;
-
+  const storedConfig = getClaudeProviderConfig();
+  // A Codex provider gets a gateway token scoped to this one query.
+  const codexGatewayLease = new CodexGatewayRunnerLease({
+    kind: 'sdk-query',
+  });
   const abortController = new AbortController();
   const timer = setTimeout(() => abortController.abort(), timeout);
 
   try {
+    const config = resolveCodexGatewayLaunchConfig(
+      storedConfig,
+      'host',
+      codexGatewayLease,
+    );
+    const envLines = buildClaudeEnvLines(config);
+    const env: Record<string, string | undefined> = { ...process.env };
+    clearInheritedClaudeProviderEnv(env);
+    for (const line of envLines) {
+      const eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      env[line.slice(0, eq)] = line.slice(eq + 1);
+    }
+    if (config !== storedConfig) applyCodexGatewayNoProxy(env, 'host');
+    // Third-party providers default the Agent effort to max. These are short
+    // text utilities (titles, recall, task parsing), so the effort below must
+    // not be outranked by that provider-wide environment default.
+    delete env.CLAUDE_CODE_EFFORT_LEVEL;
+
     const model = opts?.model || config.anthropicModel || undefined;
 
     let result = '';
@@ -95,5 +110,6 @@ export async function sdkQuery(
     return null;
   } finally {
     clearTimeout(timer);
+    codexGatewayLease.revoke();
   }
 }
