@@ -21,8 +21,8 @@ const mocks = vi.hoisted(() => {
       brandBannerUrl: null,
     },
     fetchAppearance: vi.fn().mockResolvedValue(undefined),
-    user: null,
-    setupStatus: null,
+    user: null as { role: string; must_change_password: boolean } | null,
+    setupStatus: null as { needsSetup: boolean } | null,
   };
   return {
     authState,
@@ -68,6 +68,10 @@ let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
 beforeEach(() => {
+  mocks.navigate.mockClear();
+  mocks.authState.login.mockReset();
+  mocks.authState.user = null;
+  mocks.authState.setupStatus = null;
   mocks.authState.fetchAppearance.mockClear();
   mocks.getRegisterStatus.mockClear();
   container = document.createElement('div');
@@ -105,4 +109,31 @@ describe('LoginPage public appearance', () => {
       );
     }
   });
+});
+
+describe('login before provider configuration', () => {
+  test.each([false, true])(
+    'honors mandatory password changes (%s) without forcing provider setup',
+    async (mustChange) => {
+      mocks.authState.login.mockImplementation(async () => {
+        mocks.authState.user = {
+          role: 'admin',
+          must_change_password: mustChange,
+        };
+        mocks.authState.setupStatus = { needsSetup: true };
+      });
+      await act(async () => root?.render(<LoginPage />));
+      await act(async () => {
+        container
+          ?.querySelector('form')
+          ?.dispatchEvent(
+            new Event('submit', { bubbles: true, cancelable: true }),
+          );
+      });
+      expect(mocks.authState.login).toHaveBeenCalledTimes(1);
+      expect(mocks.navigate).toHaveBeenCalledWith(
+        mustChange ? '/settings' : '/chat',
+      );
+    },
+  );
 });

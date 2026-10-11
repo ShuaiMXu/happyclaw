@@ -283,7 +283,7 @@ export function SetupProvidersPage() {
           <p className="text-caption text-muted-foreground">步骤 2/2</p>
           <h1 className="mt-1 text-title-lg text-foreground">系统接入初始化</h1>
           <p className="mt-1 text-body text-muted-foreground">
-            此页面保存的是系统全局默认配置。完成后才进入正式后台。
+            可以暂时跳过模型配置，稍后在后台设置中配置。
           </p>
         </header>
 
@@ -642,6 +642,13 @@ export function SetupProvidersPage() {
             <ShieldCheck className="mt-px size-3.5 shrink-0" />
             当前页保存的数据会作为系统全局默认配置，后续可在后台设置页继续修改。
           </div>
+          <Button
+            variant="outline"
+            disabled={saving}
+            onClick={() => navigate('/chat', { replace: true })}
+          >
+            暂不配置，进入后台
+          </Button>
           <Button onClick={handleFinish} disabled={saving} className="shrink-0">
             {saving && <Loader2 className="animate-spin" />}
             保存全局默认并进入后台

@@ -23,7 +23,6 @@ export function AuthGuard({
     checkAuth,
     user,
     initialized,
-    setupStatus,
     hasPermission,
   } = useAuthStore();
   const location = useLocation();
@@ -94,15 +93,6 @@ export function AuthGuard({
   // Users with must_change_password go to settings
   if (user?.must_change_password && location.pathname !== '/settings') {
     return <Navigate to="/settings" replace />;
-  }
-
-  // Admin onboarding: force provider setup flow before entering full app.
-  if (
-    user?.role === 'admin' &&
-    setupStatus?.needsSetup &&
-    location.pathname !== '/setup/providers'
-  ) {
-    return <Navigate to="/setup/providers" replace />;
   }
 
   if (requireAdmin && user?.role !== 'admin') {
