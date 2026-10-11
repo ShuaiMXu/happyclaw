@@ -5,6 +5,7 @@ import {
   normalizeCodexEffort,
   normalizeLegacyCodexModel,
   resolveCodexModel,
+  type ResponsesRequest,
 } from '../src/codex-gateway/convert-request.js';
 import {
   ResponsesToAnthropicConverter,
@@ -750,6 +751,66 @@ describe('local token estimate', () => {
     // Serialized structure uses the code ratio even when it reads as prose.
     expect(estimateTextTokens(prose, true)).toBe(Math.ceil(prose.length / 3.2));
     expect(estimateTextTokens('你好世界')).toBe(4);
+  });
+
+  test('Responses Lite tools inside additional_tools count like top-level tools', () => {
+    const bash = {
+      type: 'function',
+      name: 'Bash',
+      description: 'Run a shell command',
+      strict: false,
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+    };
+    const developer = {
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text: 'You are a careful agent.' }],
+    };
+    const user = {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'list files' }],
+    };
+    // Lite requests set neither top-level tools nor instructions.
+    const request = (fields: Record<string, unknown>) =>
+      ({
+        model: 'gpt-6-sol',
+        store: false,
+        stream: true,
+        ...fields,
+      }) as unknown as ResponsesRequest;
+    const classic = estimateCodexInputTokens(
+      request({ input: [developer, user], tools: [bash] }),
+    );
+    const lite = estimateCodexInputTokens(
+      request({
+        input: [
+          {
+            type: 'additional_tools',
+            role: 'developer',
+            tools: [
+              {
+                type: 'namespace',
+                name: 'functions',
+                description: '',
+                tools: [bash],
+              },
+            ],
+          },
+          developer,
+          user,
+        ],
+      }),
+    );
+    // One more input item and the namespace header; no tool is lost.
+    expect(lite).toBe(classic + 3 + estimateTextTokens('functions\n'));
+    expect(estimateCodexInputTokens(request({ input: [developer] }))).toBe(
+      3 + estimateTextTokens('You are a careful agent.'),
+    );
   });
 
   test('replayed encrypted reasoning counts by ciphertext length like the official client', () => {

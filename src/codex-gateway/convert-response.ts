@@ -646,6 +646,9 @@ export function upstreamFailureStatus(failure: CodexUpstreamFailure): number {
   return failure.status ?? HTTP_STATUS_BY_ERROR_TYPE[failure.type];
 }
 
+/** Namespace Responses Lite puts every client function in. */
+const DEFAULT_FUNCTION_NAMESPACE = 'functions';
+
 /** Prefixed item IDs survive replay, like the official client's history. */
 function replayItemId(value: unknown): string | undefined {
   const id = asString(value);
@@ -999,6 +1002,27 @@ export class ResponsesToAnthropicConverter {
     };
   }
 
+  /**
+   * The original Anthropic name of a function call. Responses Lite calls
+   * carry the default `functions` namespace beside an unqualified name
+   * (official ToolName::with_default_namespace); the namespace is dropped,
+   * as is a `functions.`/`functions__` qualification of the name itself.
+   */
+  private restoreToolName(item: Json): string | null {
+    let name = asString(item.name);
+    if (!name) return null;
+    const namespace = asString(item.namespace) || DEFAULT_FUNCTION_NAMESPACE;
+    if (!this.originalToolNames.has(name))
+      for (const separator of ['.', '__']) {
+        const prefix = `${namespace}${separator}`;
+        if (name.startsWith(prefix) && name.length > prefix.length) {
+          name = name.slice(prefix.length);
+          break;
+        }
+      }
+    return this.originalToolNames.get(name) ?? name;
+  }
+
   private toolFor(item: OutputItem): OutputBlock {
     this.responseHasToolCall = true;
     if (!item.tool) {
@@ -1101,9 +1125,9 @@ export class ResponsesToAnthropicConverter {
     if (type === 'function_call') {
       const block = this.toolFor(item);
       if (block.closed) return;
-      const name = asString(data.name);
+      const name = this.restoreToolName(data);
       if (name) {
-        block.name = this.originalToolNames.get(name) ?? name;
+        block.name = name;
         block.initialEmptyDelta = !done;
       }
       block.callId = asString(data.call_id) || block.callId || item.id || '';
@@ -1401,8 +1425,8 @@ export class ResponsesToAnthropicConverter {
         );
         const block = this.toolFor(target);
         if (block.closed) return;
-        const name = asString(item.name);
-        if (name) block.name = this.originalToolNames.get(name) ?? name;
+        const name = this.restoreToolName(item);
+        if (name) block.name = name;
         block.callId =
           asString(item.call_id) || block.callId || target.id || '';
         this.setSnapshot(block, asString(item.arguments) ?? '');

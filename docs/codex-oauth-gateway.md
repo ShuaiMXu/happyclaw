@@ -115,9 +115,10 @@ access token keeps serving.
 - `POST /gateway/chatgpt/v1/messages/count_tokens` answers a local estimate
   without calling the backend: about 4 characters per token for prose, 3.2
   for JSON and code (tool arguments, schemas, symbol-dense text), one token
-  per CJK character, a fixed cost for images and files, and replayed
-  encrypted reasoning by ciphertext length using the official client's
-  formula. The same estimate fills `message_start` usage; the final
+  per CJK character, a fixed cost for images and files, tool definitions
+  whether top-level or inside a Responses Lite `additional_tools` item, and
+  replayed encrypted reasoning by ciphertext length using the official
+  client's formula. The same estimate fills `message_start` usage; the final
   `message_delta` reports the exact cache-exclusive counts. Because Claude
   Code keeps the `message_start` input whenever the delta reports 0, a fully
   cached prompt reports one cached token as input so the total stays exact.

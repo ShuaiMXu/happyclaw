@@ -1537,3 +1537,88 @@ describe('official turn semantics on the Anthropic side', () => {
     ).toMatchObject({ input_tokens: 0, cache_read_input_tokens: 50 });
   });
 });
+
+describe('Responses Lite namespaced function calls', () => {
+  const original = `mcp__server__${'operation_'.repeat(10)}`;
+  const tools = [{ name: original }, { name: 'Read' }];
+  const short = buildCodexToolNameMap(tools).get(original)!;
+  const call = (name: string, extra: Json = {}) => ({
+    type: 'function_call',
+    id: 'fc_lite',
+    call_id: 'call_lite',
+    namespace: 'functions',
+    name,
+    ...extra,
+  });
+
+  test.each([
+    ['unqualified', short],
+    ['dot-qualified', `functions.${short}`],
+    ['flat-qualified', `functions__${short}`],
+  ])('a streamed %s call restores the original name', (_label, wireName) => {
+    const events = [
+      created,
+      added(call(wireName, { arguments: '' })),
+      {
+        type: 'response.function_call_arguments.delta',
+        item_id: 'fc_lite',
+        delta: '{"path":"a"}',
+      },
+      {
+        type: 'response.function_call_arguments.done',
+        item_id: 'fc_lite',
+        arguments: '{"path":"a"}',
+      },
+      done(call(wireName, { arguments: '{"path":"a"}' })),
+      completed,
+    ];
+    const { message } = translate(events, tools);
+    expect(message.stopReason).toBe('tool_use');
+    expect(message.content).toEqual([
+      {
+        type: 'tool_use',
+        id: 'call_lite',
+        name: original,
+        input: { path: 'a' },
+      },
+    ]);
+    expect(
+      aggregateResponsesStream(events, 'gpt-6-sol', { tools }).content,
+    ).toEqual(message.content);
+  });
+
+  test('done-only and terminal-hydrated calls drop the namespace too', () => {
+    const doneOnly = [
+      created,
+      done(call('Read', { arguments: '{}' })),
+      completed,
+    ];
+    expect(translate(doneOnly, tools).message.content[0]).toMatchObject({
+      name: 'Read',
+    });
+    const hydrated = [
+      added(call('functions.Read')),
+      {
+        type: 'response.completed',
+        response: {
+          output: [call('functions.Read', { arguments: '{"x":1}' })],
+        },
+      },
+    ];
+    expect(
+      aggregateResponsesStream(hydrated, 'gpt-6-sol', { tools }).content,
+    ).toEqual([
+      { type: 'tool_use', id: 'call_lite', name: 'Read', input: { x: 1 } },
+    ]);
+  });
+
+  test('a tool literally named with the namespace prefix keeps its name', () => {
+    const literal = [{ name: 'functions.Read' }];
+    expect(
+      translate(
+        [created, done(call('functions.Read', { arguments: '{}' })), completed],
+        literal,
+      ).message.content[0],
+    ).toMatchObject({ name: 'functions.Read' });
+  });
+});

@@ -1305,6 +1305,19 @@ describe('official error and retry semantics', () => {
     expect(runnerGrant.lastVerdict).toBe('upstream_failure');
   });
 
+  test('an attempt that hit its own headers deadline counts as a timeout', async () => {
+    vi.useFakeTimers({ now: 0 });
+    mocks.fetch.mockRejectedValue(
+      new DOMException('The operation timed out.', 'TimeoutError'),
+    );
+    const pending = request();
+    await vi.advanceTimersByTimeAsync(5_000);
+    const response = await pending;
+    expect(response.status).toBe(504);
+    expect((await response.json()).error.message).toContain('timed out');
+    expect(mocks.fetch).toHaveBeenCalledTimes(5);
+  });
+
   test('a nonstream stall answers 504 like the stream does', async () => {
     vi.useFakeTimers();
     const upstream = controlledUpstream();

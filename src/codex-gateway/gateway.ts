@@ -885,7 +885,12 @@ codexGatewayApp.post(
           upstream = await sendUpstream(access, currentPayload());
         } catch (err) {
           if (clientCancelled) throw err;
-          const timedOut = controller.signal.aborted;
+          // A headers deadline aborts the shared controller or only the
+          // attempt's own signal; either way the attempt timed out.
+          const timedOut =
+            controller.signal.aborted ||
+            (err instanceof Error &&
+              (err.name === 'AbortError' || err.name === 'TimeoutError'));
           const delay = nextRetryDelay();
           logger.warn(
             { ...logContext, err, timedOut, retrying: delay !== null },

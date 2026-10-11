@@ -89,7 +89,28 @@ function contentTokens(content: unknown, code = false): number {
   return partTokens(content, code);
 }
 
+/** Tool definitions, including the functions nested in a Lite namespace. */
+function toolsTokens(tools: unknown, depth = 0): number {
+  if (!Array.isArray(tools) || depth > 2) return 0;
+  let total = 0;
+  for (const tool of tools) {
+    if (!isRecord(tool)) continue;
+    total += estimateTextTokens(
+      [
+        typeof tool.name === 'string' ? tool.name : '',
+        typeof tool.description === 'string' ? tool.description : '',
+      ].join('\n'),
+    );
+    if (tool.parameters)
+      total += estimateTextTokens(JSON.stringify(tool.parameters), true);
+    total += toolsTokens(tool.tools, depth + 1);
+  }
+  return total;
+}
+
 export function estimateCodexInputTokens(request: ResponsesRequest): number {
+  // The system prompt travels as a developer message; top-level
+  // instructions only appear in older request shapes.
   let total = estimateTextTokens(request.instructions ?? '');
   for (const item of request.input) {
     total += ITEM_OVERHEAD_TOKENS;
@@ -112,22 +133,17 @@ export function estimateCodexInputTokens(request: ResponsesRequest): number {
             ? estimateEncryptedReasoningTokens(item.encrypted_content)
             : contentTokens(item.summary);
         break;
+      case 'additional_tools':
+        // Responses Lite has no top-level tools: they ride in this item.
+        total += toolsTokens(item.tools);
+        break;
       default:
         // Other items contribute any plain text they carry.
         if (typeof item.text === 'string')
           total += estimateTextTokens(item.text);
     }
   }
-  for (const tool of request.tools ?? []) {
-    total += estimateTextTokens(
-      [
-        typeof tool.name === 'string' ? tool.name : '',
-        typeof tool.description === 'string' ? tool.description : '',
-      ].join('\n'),
-    );
-    if (tool.parameters)
-      total += estimateTextTokens(JSON.stringify(tool.parameters), true);
-  }
+  total += toolsTokens(request.tools);
   const format = request.text?.format;
   if (isRecord(format)) {
     total += estimateTextTokens(

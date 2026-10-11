@@ -56,7 +56,9 @@ Anthropic side follows what the Claude Code CLI expects.
 | `end_turn: false`, `interrupted` incomplete | Follow-up request replaying the previous output items, continued in the same Anthropic message (≤4) | `core/src/session/turn.rs` `needs_follow_up`                |
 | Rate-limit headers                          | `x-codex-*` windows, credits, active limit and rejection type kept per provider for the usage route | `codex-api/src/rate_limits.rs`                              |
 | Invalid SSE JSON                            | Logged with a counter and skipped                                                                   | `process_sse_with_treatment`                                |
+| Responses Lite function calls               | The default `functions` namespace is dropped before the shortened name is restored                  | `ToolName::with_default_namespace`                          |
 | Replayed reasoning size                     | `count_tokens` uses `(len·3/4 − 650) / 4` tokens per encrypted reasoning item                       | `context_manager/history.rs`                                |
+| Lite tool prefix                            | `count_tokens` counts the functions inside an `additional_tools` input item                         | `create_tools_json_for_responses_lite`                      |
 | Stream idle                                 | 300-second upstream idle deadline                                                                   | `DEFAULT_STREAM_IDLE_TIMEOUT_MS`                            |
 
 ## Intentional runtime differences
