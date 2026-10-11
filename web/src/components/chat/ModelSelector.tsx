@@ -195,7 +195,7 @@ export function ModelSelector({
                 <span className="block truncate text-micro text-muted-foreground">
                   {KIND_LABELS[option.kind]}
                   {option.model ? ` · ${option.model}` : ''}
-                  {option.enabled ? '' : ' · 未启用（仅手动选择）'}
+                  {option.enabled ? '' : ' · 未启用'}
                 </span>
               </span>
             </DropdownMenuRadioItem>
