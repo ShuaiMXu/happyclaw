@@ -8,6 +8,8 @@ export interface UnifiedProviderPublic {
   weight: number;
   anthropicBaseUrl: string;
   anthropicModel: string;
+  /** null for third-party providers saved before the explicit choice. */
+  anthropicAuthMode: 'bearer' | 'x-api-key' | null;
   hasAnthropicAuthToken: boolean;
   anthropicAuthTokenMasked: string | null;
   hasAnthropicApiKey: boolean;
@@ -17,10 +19,32 @@ export interface UnifiedProviderPublic {
   hasClaudeOAuthCredentials: boolean;
   claudeOAuthCredentialsExpiresAt: number | null;
   claudeOAuthCredentialsAccessTokenMasked: string | null;
+  /** Which official credential is active; null for third-party providers. */
+  claudeAuthKind?: 'oauth' | 'setup_token' | 'api_key' | null;
+  claudeOAuthAccountEmail?: string | null;
+  claudeOAuthOrganizationName?: string | null;
+  claudeOAuthSubscriptionType?: string | null;
+  claudeOAuthScopes?: string[];
+  claudeOAuthLastRefreshAt?: number | null;
+  claudeOAuthNeedsReLogin?: boolean;
+  claudeOAuthLastRefreshError?: {
+    kind: 'invalid_grant' | 'rejected' | 'account_mismatch';
+    message: string;
+    at: number;
+  } | null;
   hasCodexOAuthCredentials: boolean;
   codexOAuthCredentialsExpiresAt: number | null;
   codexOAuthCredentialsEmail: string | null;
   codexOAuthCredentialsPlanType: string | null;
+  /** ChatGPT login was refused on refresh; the user must log in again. */
+  codexOAuthNeedsReauth?: boolean;
+  codexOAuthLastRefreshError?: {
+    kind: 'reauth_required' | 'transient';
+    message: string;
+    at: string;
+  } | null;
+  /** Effort the gateway applies when the Agent does not choose one. */
+  codexDefaultEffort?: string | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -158,6 +182,9 @@ export interface OAuthUsageResponse {
 export interface CachedOAuthUsage {
   data: OAuthUsageResponse;
   fetchedAt: number;
+  /** Set when the grant cannot read usage or needs a new login. */
+  status?: 'unsupported' | 'needs_relogin';
+  unsupportedReason?: 'inference_only' | 'setup_token' | 'no_oauth';
   error?: string;
   observation?: ProviderQuotaObservation | null;
 }

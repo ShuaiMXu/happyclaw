@@ -65,21 +65,82 @@ interface RawTokenResponse {
   expires_in?: number;
 }
 
+/** expires_in 与 JWT exp 都缺失时的兜底有效期。 */
+const DEFAULT_ACCESS_TOKEN_TTL_MS = 3600 * 1000;
+
+/**
+ * token 端点失败。transient 区分"稍后重试可能成功"（网络、超时、5xx、429、
+ * 响应体异常）与"凭据/授权码已被拒"（400/401/403，如 invalid_grant、
+ * refresh_token_reused）；后者只能重新登录。message 不含上游原文。
+ */
+export class CodexOAuthTokenError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | null,
+    readonly code: string | null,
+    readonly transient: boolean,
+  ) {
+    super(message);
+    this.name = 'CodexOAuthTokenError';
+  }
+}
+
+/** 上游错误码只用于分类和提示，限制成短 token，避免把任意响应内容带进日志/界面。 */
+function oauthErrorCode(body: Record<string, unknown>): string | null {
+  const error = body.error;
+  const candidate =
+    typeof error === 'string'
+      ? error
+      : error && typeof error === 'object' && !Array.isArray(error)
+        ? ((error as Record<string, unknown>).code ??
+          (error as Record<string, unknown>).type)
+        : body.code;
+  return typeof candidate === 'string' &&
+    /^[A-Za-z0-9_.-]{1,64}$/.test(candidate)
+    ? candidate
+    : null;
+}
+
+function isTransientTokenStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+/** access_token 没有 expires_in 时用其 JWT exp 推算到期时间，再不行才兜底一小时。 */
+function accessTokenExpiry(accessToken: string): number {
+  const exp = decodeJwtPayload(accessToken)?.exp;
+  return typeof exp === 'number' && Number.isFinite(exp) && exp > 0
+    ? Math.trunc(exp * 1000)
+    : Date.now() + DEFAULT_ACCESS_TOKEN_TTL_MS;
+}
+
 function toTokenResponse(raw: RawTokenResponse): CodexTokenResponse {
   if (typeof raw.access_token !== 'string' || !raw.access_token.trim()) {
-    throw new Error('Codex OAuth response missing access_token');
+    throw new CodexOAuthTokenError(
+      'Codex OAuth response missing access_token',
+      null,
+      null,
+      true,
+    );
   }
   if (
     raw.expires_in !== undefined &&
     (!Number.isFinite(raw.expires_in) || raw.expires_in <= 0)
   ) {
-    throw new Error('Codex OAuth response has invalid expires_in');
+    throw new CodexOAuthTokenError(
+      'Codex OAuth response has invalid expires_in',
+      null,
+      null,
+      true,
+    );
   }
   return {
     accessToken: raw.access_token,
     refreshToken: raw.refresh_token ?? null,
     idToken: raw.id_token ?? null,
-    expiresAt: Date.now() + (raw.expires_in ?? 3600) * 1000,
+    expiresAt:
+      raw.expires_in !== undefined
+        ? Date.now() + raw.expires_in * 1000
+        : accessTokenExpiry(raw.access_token),
   };
 }
 
@@ -89,19 +150,36 @@ async function postTokenEndpoint(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
-    const response = await fetch(CODEX_OAUTH_TOKEN_URL, {
-      ...init,
-      signal: controller.signal,
-    });
-    const body = (await response.json().catch(() => ({}))) as RawTokenResponse;
-    if (!response.ok) {
-      const detail =
-        typeof (body as Record<string, unknown>).error === 'string'
-          ? String((body as Record<string, unknown>).error)
-          : `HTTP ${response.status}`;
-      throw new Error(`Codex OAuth token endpoint rejected: ${detail}`);
+    let response: Response;
+    try {
+      response = await fetch(CODEX_OAUTH_TOKEN_URL, {
+        ...init,
+        signal: controller.signal,
+      });
+    } catch {
+      throw new CodexOAuthTokenError(
+        controller.signal.aborted
+          ? 'Codex OAuth token endpoint timed out'
+          : 'Codex OAuth token endpoint unreachable',
+        null,
+        null,
+        true,
+      );
     }
-    return toTokenResponse(body);
+    const body = (await response.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
+    if (!response.ok) {
+      const code = oauthErrorCode(body);
+      throw new CodexOAuthTokenError(
+        `Codex OAuth token endpoint rejected: ${code ?? `HTTP ${response.status}`}`,
+        response.status,
+        code,
+        isTransientTokenStatus(response.status),
+      );
+    }
+    return toTokenResponse(body as RawTokenResponse);
   } finally {
     clearTimeout(timeout);
   }

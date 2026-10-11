@@ -50,6 +50,11 @@
 
 `/ws` 不是 Public。Upgrade 时必须同时通过 Cookie Session 与 Origin 校验。
 
+内嵌 ChatGPT/Codex 网关 `/gateway/chatgpt/v1/messages`（含 `/count_tokens`）不使用
+Cookie Session，也不是 Public：只接受当前存活 Runner 或宿主机一次性查询的临时网关
+token（Runner/查询退出即吊销），并拒绝带 `Forwarded`、`X-Forwarded-*`、`X-Real-IP`
+或来自非回环、非私网地址的请求。Provider 落盘的网关标识不是可用凭据。
+
 ## 3. 当前用户资源
 
 以下资源以登录用户 ID 为作用域，不接受客户端指定其他 owner：
@@ -84,6 +89,7 @@
 
 - 列表中的工作区投影
 - 读取消息与文件
+- 查看会话当前使用的模型配置
 - 发送普通消息
 - 查看 Runtime Session、绑定和项目能力
 - 打开 Web 终端前的资源检查
@@ -100,6 +106,7 @@ Host Workspace 在 Access 之外还要求 admin。
 
 - 重命名、切换 Agent、修改执行方式
 - stop、interrupt、reset-session、clear-history
+- 切换会话模型（`PUT /api/groups/:jid/model-selection`）
 - 创建、修改、删除 Runtime Session
 - 写入工作区 Skills/MCP
 - 修改群聊绑定、激活方式、响应对象和 owner

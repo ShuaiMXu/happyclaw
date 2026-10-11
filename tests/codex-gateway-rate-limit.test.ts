@@ -22,4 +22,16 @@ describe('bounded provider rate windows', () => {
     expect(limiter.isLimited('new', 1001)).toBe(false);
     expect(limiter.size).toBe(1);
   });
+
+  test('reports when a limited key may retry', () => {
+    const limiter = new CodexProviderRateLimiter(2, 1, 1000);
+    expect(limiter.retryAfterMs('runner', 0)).toBe(0);
+    expect(limiter.isLimited('runner', 100)).toBe(false);
+    expect(limiter.isLimited('runner', 400)).toBe(true);
+    expect(limiter.retryAfterMs('runner', 400)).toBe(700);
+    // A full table points at the oldest live window.
+    expect(limiter.isLimited('other', 500)).toBe(false);
+    expect(limiter.isLimited('third', 600)).toBe(true);
+    expect(limiter.retryAfterMs('third', 600)).toBe(500);
+  });
 });

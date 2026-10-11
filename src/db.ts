@@ -1128,6 +1128,24 @@ export function initDatabase(
       ON subagent_checkpoints(updated_at);
   `);
 
+  // v77 -> v78: per-conversation model selection from the chat composer. One
+  // row pins one logical Session (main: agent_id = '') to a saved model
+  // configuration; no row means "follow the Agent/system default". Kept apart
+  // from `sessions`, whose rows are SDK resume state and are deleted on every
+  // context reset or provider switch — the user's choice must survive both.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_model_selections (
+      group_folder TEXT NOT NULL,
+      agent_id TEXT NOT NULL DEFAULT '',
+      model_config_id TEXT NOT NULL,
+      updated_by TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (group_folder, agent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_model_selections_model
+      ON session_model_selections(model_config_id);
+  `);
+
   // Top-level Agent Profiles: runtime identities/personas that own workspaces.
   // Do not confuse this with the legacy `agents` table above, which stores
   // workspace-scoped conversation/task/spawn agents.
@@ -8637,6 +8655,78 @@ export function setSessionProviderId(
   })();
 }
 
+/**
+ * The model configuration the user picked for one logical Session in the chat
+ * composer, or null to follow the Agent/system default. Callers must still
+ * check that the configuration exists: deleting a provider clears its rows,
+ * but a stale id must degrade to the default rather than fail the turn.
+ */
+export function getSessionModelSelection(
+  groupFolder: string,
+  agentId?: string | null,
+): string | null {
+  if (!isDatabaseInitialized()) return null;
+  const row =
+    prepareCached(`SELECT model_config_id FROM session_model_selections
+       WHERE group_folder = ? AND agent_id = ?`).get(
+      groupFolder,
+      agentId || '',
+    ) as { model_config_id: string } | undefined;
+  return row?.model_config_id || null;
+}
+
+/** Pin one logical Session to a model configuration, or clear it with null. */
+export function setSessionModelSelection(
+  groupFolder: string,
+  agentId: string | null | undefined,
+  modelConfigId: string | null,
+  updatedBy?: string | null,
+): void {
+  const effectiveAgentId = agentId || '';
+  if (!modelConfigId) {
+    prepareCached(`DELETE FROM session_model_selections
+       WHERE group_folder = ? AND agent_id = ?`).run(
+      groupFolder,
+      effectiveAgentId,
+    );
+    return;
+  }
+  prepareCached(`INSERT INTO session_model_selections
+       (group_folder, agent_id, model_config_id, updated_by, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(group_folder, agent_id) DO UPDATE SET
+       model_config_id = excluded.model_config_id,
+       updated_by = excluded.updated_by,
+       updated_at = excluded.updated_at`).run(
+    groupFolder,
+    effectiveAgentId,
+    modelConfigId,
+    updatedBy ?? null,
+    new Date().toISOString(),
+  );
+}
+
+/** How many conversations currently pin this model configuration. */
+export function countSessionModelSelectionsForModelConfig(
+  modelConfigId: string,
+): number {
+  if (!isDatabaseInitialized()) return 0;
+  const row = prepareCached(`SELECT COUNT(*) AS count
+       FROM session_model_selections
+       WHERE model_config_id = ?`).get(modelConfigId) as { count: number };
+  return Number(row.count ?? 0);
+}
+
+/** Drop every Session selection pointing at a deleted model configuration. */
+export function clearSessionModelSelectionsForModelConfig(
+  modelConfigId: string,
+): number {
+  if (!isDatabaseInitialized()) return 0;
+  return prepareCached(
+    'DELETE FROM session_model_selections WHERE model_config_id = ?',
+  ).run(modelConfigId).changes;
+}
+
 /** Persisted session namespaces currently bound to one Provider account. */
 export function listSessionNamespacesForProviderId(providerId: string): Array<{
   groupFolder: string;
@@ -12397,6 +12487,10 @@ export function rebuildWorkspacePersistentState(input: {
            WHERE agent_id IN (${placeholders})`,
         ).run(...deletedAgentIds);
       }
+      // The workspace shell (and its main Session's model choice) survives a
+      // rebuild; only the deleted Runtime Sessions lose theirs.
+      prepareCached(`DELETE FROM session_model_selections
+         WHERE group_folder = ? AND agent_id != ''`).run(input.groupFolder);
       prepareCached('DELETE FROM agents WHERE group_folder = ?').run(
         input.groupFolder,
       );
@@ -12455,6 +12549,8 @@ export function deleteImGroupRecord(jid: string): void {
       jid,
     );
     prepareCached(`DELETE FROM sessions
+       WHERE agent_id IN (SELECT id FROM agents WHERE chat_jid = ?)`).run(jid);
+    prepareCached(`DELETE FROM session_model_selections
        WHERE agent_id IN (SELECT id FROM agents WHERE chat_jid = ?)`).run(jid);
     prepareCached('DELETE FROM agents WHERE chat_jid = ?').run(jid);
     prepareCached('DELETE FROM subagent_checkpoints WHERE chat_jid = ?').run(
@@ -12551,6 +12647,9 @@ export function deleteGroupData(
     prepareCached('DELETE FROM registered_groups WHERE jid = ?').run(jid);
     // 5. 删除会话与 workspace-owned agents
     prepareCached('DELETE FROM sessions WHERE group_folder = ?').run(folder);
+    prepareCached(
+      'DELETE FROM session_model_selections WHERE group_folder = ?',
+    ).run(folder);
     prepareCached(
       'DELETE FROM agents WHERE group_folder = ? OR chat_jid = ?',
     ).run(folder, jid);
@@ -14205,6 +14304,9 @@ export function deleteAgent(id: string): void {
       'DELETE FROM workspace_runtime_sessions WHERE runtime_agent_id = ?',
     ).run(id);
     prepareCached('DELETE FROM sessions WHERE agent_id = ?').run(id);
+    prepareCached(
+      'DELETE FROM session_model_selections WHERE agent_id = ?',
+    ).run(id);
     deleteImContextBindingsByAgent(id);
     prepareCached('DELETE FROM agents WHERE id = ?').run(id);
   })();

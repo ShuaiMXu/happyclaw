@@ -26,20 +26,31 @@ describe('GroupQueue query identity', () => {
     const queue = new GroupQueue();
     const matchingJid = 'web:credential-drain-match';
     const otherJid = 'web:credential-drain-other';
+    const bootingJid = 'web:credential-drain-booting';
     const matching = (queue as any).getGroup(matchingJid);
     matching.active = true;
+    matching.process = { pid: 1001 };
     matching.groupFolder = 'credential-drain-match';
     matching.selectedProviderId = 'provider-refresh';
     matching.queryInFlight = true;
     matching.queryId = 'query-in-progress';
     const other = (queue as any).getGroup(otherJid);
     other.active = true;
+    other.process = { pid: 1002 };
     other.groupFolder = 'credential-drain-other';
     other.selectedProviderId = 'provider-other';
+    // Marked active but not yet spawned: it reads rotated credentials at
+    // launch, and its selectedProviderId is left over from the last run.
+    const booting = (queue as any).getGroup(bootingJid);
+    booting.active = true;
+    booting.process = null;
+    booting.groupFolder = 'credential-drain-booting';
+    booting.selectedProviderId = 'provider-refresh';
 
     expect(
       queue.drainProviderRunnersForCredentialRefresh('provider-refresh'),
     ).toBe(1);
+    expect(booting.drainSentinelWritten).toBeFalsy();
 
     const matchingInput = path.join(
       '/tmp/happyclaw-query-identity-test',
@@ -56,6 +67,17 @@ describe('GroupQueue query identity', () => {
     expect(fs.existsSync(path.join(matchingInput, '_drain'))).toBe(true);
     expect(fs.existsSync(path.join(matchingInput, '_close'))).toBe(false);
     expect(fs.existsSync(path.join(otherInput, '_drain'))).toBe(false);
+    expect(
+      fs.existsSync(
+        path.join(
+          '/tmp/happyclaw-query-identity-test',
+          'ipc',
+          'credential-drain-booting',
+          'input',
+          '_drain',
+        ),
+      ),
+    ).toBe(false);
     expect(matching.queryInFlight).toBe(true);
     expect(matching.pendingMessages).toBe(false);
     expect(

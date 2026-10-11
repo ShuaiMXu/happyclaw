@@ -84,6 +84,7 @@ Public：
 - `POST /api/groups/:jid/stop`
 - `POST /api/groups/:jid/interrupt`
 - `POST /api/groups/:jid/reset-session`
+- `GET|PUT /api/groups/:jid/model-selection`，聊天输入框的会话级模型选择
 - `POST /api/groups/:jid/clear-history`，重建工作区内容：永久清除聊天、
   Runtime Session、子对话、工作目录及 Workspace Memory（含版本历史和
   Home Owner Profile），关联定时任务停止并移入回收站；保留工作区外壳、
@@ -97,6 +98,12 @@ Public：
 - `POST /api/messages`
 - `GET /api/follow-ups`
 - `POST /api/follow-ups/:messageId/action`
+
+`model-selection` 以 `agentId`（GET 查询参数、PUT 请求体）区分 Runtime Session，
+缺省表示主会话。GET 返回当前选择、默认值的解析来源和全部已保存模型配置（不含凭据）；
+PUT 的 `modelConfigId` 为 `null` 时恢复默认。会话选择优先于智能体绑定的模型配置，
+可以选择未启用的配置；切换后该会话的暖 Runner 在当前轮次结束后退出，下一条消息
+使用新配置。
 
 `POST /api/messages` 可以携带 Web 附件和 Runtime Session 标识。`/clear` 与
 `/fresh` 会进入与 `reset-session` 相同的 owner 级破坏性检查。`/fresh` 会开启
@@ -308,23 +315,48 @@ owner 明确拒绝首次设置时可提交
 Provider：
 
 - `GET /api/config/claude`
-- `GET|POST /api/config/claude/providers`
-- `PATCH|DELETE /api/config/claude/providers/:id`
-- `PUT /api/config/claude/providers/:id/secrets`
-- `POST /api/config/claude/providers/:id/toggle`
+- `GET|POST /api/config/claude/providers`；创建请求可用
+  `claudeCredentialInput` 提交官方凭据原文（`.credentials.json` 内容或
+  setup-token），由服务端解析，格式无效时返回 400；官方 Provider 同一时刻只保留
+  OAuth、setup-token、API Key 中的一种
+- `PATCH|DELETE /api/config/claude/providers/:id`，第三方 Provider 的 PATCH
+  可同时携带 `anthropicAuthToken` / `clearAnthropicAuthToken`，与其他字段在同一
+  请求内提交
+- `PUT /api/config/claude/providers/:id/secrets`，同样接受
+  `claudeCredentialInput`；凭据变更只排空该 Provider 的 Runner
+- `POST /api/config/claude/providers/:id/toggle`，没有可用凭据的 Provider
+  不能启用
+- `POST /api/config/claude/providers/:id/duplicate`，服务端连同加密密钥复制为
+  停用的新 Provider；OAuth 授权的 Provider 拒绝复制
+- `POST /api/config/claude/providers/test`，按草稿字段（可选 `providerId`
+  回退到已保存的端点与密钥）向第三方端点发送一次最小 `/v1/messages` 请求，
+  返回每个模型的状态码、耗时和脱敏错误摘要，不回传密钥；按用户限流
 - `POST /api/config/claude/providers/:id/reset-health`
 - `GET /api/config/claude/providers/health`
-- `GET /api/config/claude/providers/:id/usage`
+- `GET /api/config/claude/providers/:id/usage`，读不到用量时以 `status`
+  区分 `unsupported`（setup-token、仅推理权限或非 OAuth 凭据，见
+  `unsupportedReason`）与 `needs_relogin`（刷新授权被拒）
 - `PUT /api/config/claude/balancing`
 - `POST /api/config/claude/apply`
-- `POST /api/config/claude/oauth/start`
-- `POST /api/config/claude/oauth/callback`
+- `POST /api/config/claude/oauth/start`，可选 `targetProviderId`（必须是已有的
+  官方 Provider）与 `profile`（`full` 默认，或 `setup_token`）；流程绑定发起用户
+- `POST /api/config/claude/oauth/callback`，`code` 接受裸授权码、回调页显示的
+  `code#state` 或回调页完整 URL；网络错误、429 与 5xx 返回 502 并保留流程以便重试
 - `POST /api/config/codex/oauth/start`，启动 ChatGPT/Codex 订阅 OAuth
   PKCE 流程，返回 `authorizeUrl` 与 `state`；可选 `targetProviderId`
   用于对已有 Provider 重新授权
 - `POST /api/config/codex/oauth/callback`，用 `{ state, code }`（`code`
-  接受回调页完整 URL 或裸授权码）换取 token，创建或更新 ChatGPT
-  订阅型 Provider；其 `anthropicBaseUrl` 落盘为内嵌网关占位值
+  接受 `localhost:1455` / `127.0.0.1:1455` 回调页完整 URL、其 query 或裸授权码）
+  换取 token，创建或更新 ChatGPT 订阅型 Provider，成功返回公开 Provider；其
+  `anthropicBaseUrl` 落盘为内嵌网关占位值。新建时写入目录默认模型与
+  `CODEX_REASONING_EFFORT`；回调带 `error=` 或 token 交换瞬时失败时返回
+  `{ error, retryable: true }`（400 / 502）并保留挂起流程，授权码被拒返回
+  `{ error, retryable: false }`（400）；目标 Provider 不存在返回 404。换账号或由
+  其他类型转换时会停稳运行器并清除该 Provider 的会话，停稳失败返回 503
+  `{ error, applied, provider? }`
+- 内嵌网关（不在 `/api` 下）：`POST /gateway/chatgpt/v1/messages` 与
+  `POST /gateway/chatgpt/v1/messages/count_tokens`（本地估算），只接受存活 Runner
+  的临时 token，并拒绝带反代转发头或非回环/私网来源的请求
 - `GET /api/config/codex/model-catalog`，返回 Codex 模型目录
   `{ models: [{ value, label, efforts, defaultEffort? }], defaultModel,
 defaultEffort, source, fetchedAt }`（条目内 `defaultEffort` 是上游
@@ -335,6 +367,11 @@ defaultEffort, source, fetchedAt }`（条目内 `defaultEffort` 是上游
   （`src/codex-gateway/model-catalog.ts`）作离线兜底，供设置页模型/
   推理力度下拉使用
 - `PUT /api/config/claude/custom-env`
+
+第三方 Provider 的 `anthropicAuthMode` 为 `bearer`（`Authorization: Bearer`，
+等同 `ANTHROPIC_AUTH_TOKEN`）或 `x-api-key`（等同 `ANTHROPIC_API_KEY`）；旧配置
+为 `null`，沿用原推断规则。`customEnv` 写入时会拒绝危险变量、由专用字段管理的
+变量以及非法的数值或推理档位，而不是静默丢弃。
 
 系统：
 

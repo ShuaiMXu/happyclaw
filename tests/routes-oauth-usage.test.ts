@@ -66,6 +66,8 @@ const app = web.createAppForTest({
 } as any);
 
 const originalFetch = globalThis.fetch;
+/** Beyond the host's maximum renewal lead (45 ± 15 minutes). */
+const FRESH_TOKEN_TTL_MS = 8 * 60 * 60_000;
 
 beforeAll(() => {
   fs.mkdirSync(path.join(tmpDir, 'db'), { recursive: true });
@@ -94,7 +96,7 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'fixture-access-token',
         refreshToken: 'fixture-refresh-token',
-        expiresAt: Date.now() + 60_000,
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
         scopes: ['user:inference', 'user:profile'],
       },
     });
@@ -231,8 +233,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'old-access',
         refreshToken: 'old-refresh',
-        expiresAt: Date.now() + 60_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     quotaObservation.observeProviderQuota(provider.id, {
@@ -245,8 +247,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'new-access',
         refreshToken: 'new-refresh',
-        expiresAt: Date.now() + 120_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS + 60_000,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     expect(
@@ -262,8 +264,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'cached-old-access',
         refreshToken: 'cached-old-refresh',
-        expiresAt: Date.now() + 60_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     let requestCount = 0;
@@ -298,8 +300,8 @@ describe('Claude provider usage route', () => {
           claudeOAuthCredentials: {
             accessToken: 'cached-new-access',
             refreshToken: 'cached-new-refresh',
-            expiresAt: Date.now() + 120_000,
-            scopes: ['user:inference'],
+            expiresAt: Date.now() + FRESH_TOKEN_TTL_MS + 60_000,
+            scopes: ['user:inference', 'user:profile'],
           },
         }),
       },
@@ -321,8 +323,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'fieldless-access',
         refreshToken: 'fieldless-refresh',
-        expiresAt: Date.now() + 60 * 60_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     let requestCount = 0;
@@ -359,8 +361,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'passive-fallback-access',
         refreshToken: 'passive-fallback-refresh',
-        expiresAt: Date.now() + 60_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     quotaObservation.observeProviderQuota(provider.id, {
@@ -391,8 +393,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'hung-access',
         refreshToken: 'hung-refresh',
-        expiresAt: Date.now() + 60_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     globalThis.fetch = vi.fn(
@@ -436,8 +438,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'stalled-body-access',
         refreshToken: 'stalled-body-refresh',
-        expiresAt: Date.now() + 60_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     globalThis.fetch = vi.fn(async (_url, init) => {
@@ -490,11 +492,17 @@ describe('Claude provider usage route', () => {
     });
     globalThis.fetch = vi.fn(async (url, init) => {
       if (String(url).endsWith('/v1/oauth/token')) {
-        expect(JSON.parse(String(init?.body))).toMatchObject({
+        // Claude Code's refresh body, field order and rebuilt scope.
+        expect(JSON.parse(String(init?.body))).toEqual({
           grant_type: 'refresh_token',
           refresh_token: 'refresh-before-rotation',
-          scope: 'user:inference user:profile',
+          client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+          scope:
+            'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins',
         });
+        expect(new Headers(init?.headers).get('User-Agent')).toBe(
+          'axios/1.15.2',
+        );
         return Response.json({
           access_token: 'refreshed-access',
           refresh_token: 'rotated-refresh',
@@ -543,8 +551,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'rejected-access',
         refreshToken: '401-refresh',
-        expiresAt: Date.now() + 60_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     const calls: string[] = [];
@@ -591,8 +599,9 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'soon-expired-access',
         refreshToken: 'refresh-fallback-token',
-        expiresAt: Date.now() + 60_000,
-        scopes: ['user:inference'],
+        // Outside the 30–60 minute renewal lead now, inside it 32 minutes on.
+        expiresAt: Date.now() + 61 * 60_000,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     let call = 0;
@@ -617,7 +626,7 @@ describe('Claude provider usage route', () => {
     const usageUrl = `/api/config/claude/providers/${provider.id}/usage`;
 
     const first = await (await app.request(usageUrl)).json();
-    await vi.advanceTimersByTimeAsync(3 * 60_000 + 1);
+    await vi.advanceTimersByTimeAsync(32 * 60_000);
     const secondResponse = await app.request(usageUrl);
     const second = await secondResponse.json();
 
@@ -636,8 +645,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'in-flight-old-access',
         refreshToken: 'in-flight-old-refresh',
-        expiresAt: Date.now() + 60_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     let resolveOld!: (response: Response) => void;
@@ -666,8 +675,8 @@ describe('Claude provider usage route', () => {
           claudeOAuthCredentials: {
             accessToken: 'in-flight-new-access',
             refreshToken: 'in-flight-new-refresh',
-            expiresAt: Date.now() + 120_000,
-            scopes: ['user:inference'],
+            expiresAt: Date.now() + FRESH_TOKEN_TTL_MS + 60_000,
+            scopes: ['user:inference', 'user:profile'],
           },
         }),
       },
@@ -724,7 +733,7 @@ describe('Claude provider usage route', () => {
         accessToken: 'cas-old-access',
         refreshToken: 'cas-old-refresh',
         expiresAt: Date.now() - 1,
-        scopes: ['user:inference'],
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     let resolveOldRefresh!: (response: Response) => void;
@@ -757,8 +766,8 @@ describe('Claude provider usage route', () => {
           claudeOAuthCredentials: {
             accessToken: 'cas-admin-access',
             refreshToken: 'cas-admin-refresh',
-            expiresAt: Date.now() + 60_000,
-            scopes: ['user:inference'],
+            expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+            scopes: ['user:inference', 'user:profile'],
           },
         }),
       },
@@ -798,8 +807,8 @@ describe('Claude provider usage route', () => {
       claudeOAuthCredentials: {
         accessToken: 'deleted-access',
         refreshToken: 'deleted-refresh',
-        expiresAt: Date.now() + 60_000,
-        scopes: ['user:inference'],
+        expiresAt: Date.now() + FRESH_TOKEN_TTL_MS,
+        scopes: ['user:inference', 'user:profile'],
       },
     });
     quotaObservation.observeProviderQuota(provider.id, {

@@ -7,8 +7,10 @@ import {
   EyeOff,
   Key,
   Loader2,
+  PlugZap,
   Plus,
   RotateCcw,
+  TriangleAlert,
   X,
 } from 'lucide-react';
 
@@ -24,6 +26,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import {
   NativeSelect,
   NativeSelectOption,
@@ -32,12 +35,25 @@ import { Switch } from '@/components/ui/switch';
 import { IconButton } from '@/components/common/IconButton';
 import { SegmentedControl } from '@/components/common/SegmentedControl';
 import { SettingsField } from './SettingsLayout';
+import { ProviderEnvImportPanel } from './ProviderEnvImportPanel';
+import {
+  ProviderConnectivityResult,
+  type ProviderConnectivityResponse,
+} from './ProviderConnectivityResult';
 import { api } from '../../api/client';
 import {
   buildDefaultProviderEnv,
   buildProviderModel,
   parseProviderModel,
 } from '../../utils/provider-model';
+import type {
+  ProviderAuthMode,
+  ProviderEnvImport,
+} from '../../utils/provider-env-import';
+import {
+  PROVIDER_PRESETS,
+  describeBaseUrlProblem,
+} from '../../utils/provider-presets';
 import type { ProviderWithHealth, EnvRow } from './types';
 import { getErrorMessage } from './types';
 
@@ -134,6 +150,9 @@ const CODEX_FALLBACK_CATALOG: CodexCatalog = {
   defaultEffort: CODEX_FALLBACK_DEFAULT_EFFORT,
 };
 
+const PROXY_ENV_KEY_RE = /^(https?|all|no)_proxy$/i;
+const ONE_MILLION_SUFFIX_RE = /\[1m\]\s*$/i;
+
 const MANAGED_ENV_SOURCE_LABELS = {
   model: '跟随模型',
   context: '跟随上下文',
@@ -164,10 +183,13 @@ function buildCustomEnv(
         error: `环境变量 Key "${key}" 格式无效（需匹配 [A-Za-z_][A-Za-z0-9_]*）`,
       };
     }
-    if (
-      RESERVED_ENV_KEYS.has(key) ||
-      (manageThirdPartyDefaults && DEFAULTED_THIRD_PARTY_ENV_KEYS.has(key))
-    ) {
+    if (RESERVED_ENV_KEYS.has(key)) {
+      return {
+        customEnv: {},
+        error: `${key} 由端点、密钥或模型字段管理，请在对应字段中填写`,
+      };
+    }
+    if (manageThirdPartyDefaults && DEFAULTED_THIRD_PARTY_ENV_KEYS.has(key)) {
       return {
         customEnv: {},
         error: `${key} 已在系统预填列表中，请直接修改对应值`,
@@ -180,6 +202,21 @@ function buildCustomEnv(
   }
 
   return { customEnv, error: null };
+}
+
+/** Blank prefilled overrides mean "use the default"; never persist them. */
+function nonBlank(values: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value.trim()),
+  );
+}
+
+function hostnameOf(url: string): string {
+  try {
+    return new URL(url.trim()).hostname;
+  } catch {
+    return '';
+  }
 }
 
 interface ProviderEditorProps {
@@ -269,6 +306,15 @@ export function ProviderEditor({
   const [authToken, setAuthToken] = useState('');
   const [authTokenDirty, setAuthTokenDirty] = useState(false);
   const [clearTokenOnSave, setClearTokenOnSave] = useState(false);
+  // 'legacy' = 旧配置未选择过认证方式，后端沿用旧的推断规则
+  const [authMode, setAuthMode] = useState<ProviderAuthMode | 'legacy'>(
+    'bearer',
+  );
+
+  // 测试连接
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] =
+    useState<ProviderConnectivityResponse | null>(null);
 
   // 环境变量
   const [customEnvRows, setCustomEnvRows] = useState<EnvRow[]>([]);
@@ -283,6 +329,18 @@ export function ProviderEditor({
   const [saving, setSaving] = useState(false);
 
   const defaultProviderEnv = buildDefaultProviderEnv(model, oneMillionContext);
+  const effectiveCompactWindow =
+    providerEnvOverrides.CLAUDE_CODE_AUTO_COMPACT_WINDOW?.trim() ||
+    (oneMillionContext ? '1000000' : '200000');
+  const baseUrlProblem = describeBaseUrlProblem(baseUrl);
+  const customProxyKeys = customEnvRows
+    .map((row) => row.key.trim())
+    .filter((key) => PROXY_ENV_KEY_RE.test(key));
+
+  // A result describes the draft it was run against; drop it once that changes.
+  useEffect(() => {
+    setTestResult(null);
+  }, [baseUrl, authToken, authMode, model, oneMillionContext, open]);
 
   // 当前值不在预设里（如后端已配置其他模型，例如旧目录的 gpt-5.1-*）时，
   // 追加为额外选项，避免 select 显示空白。
@@ -324,6 +382,7 @@ export function ProviderEditor({
       setAuthToken('');
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
+      setAuthMode('bearer');
       setCustomEnvRows([]);
       setProviderEnvOverrides({});
     } else {
@@ -338,8 +397,11 @@ export function ProviderEditor({
       setCodexModel(
         provider.anthropicModel || codexCatalogRef.current.defaultModel,
       );
+      // The server resolves the effort the gateway really applies, clamped
+      // to the model's catalog entry; prefer it over a raw stored value.
       setCodexEffort(
-        provider.customEnv?.CODEX_REASONING_EFFORT ||
+        provider.codexDefaultEffort ||
+          provider.customEnv?.CODEX_REASONING_EFFORT ||
           codexCatalogRef.current.defaultEffort,
       );
       setAuthTab('oauth');
@@ -350,6 +412,7 @@ export function ProviderEditor({
       setAuthToken('');
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
+      setAuthMode(provider.anthropicAuthMode ?? 'legacy');
       const providerCustomEnv = provider.customEnv || {};
       const defaultEnv = Object.fromEntries(
         buildDefaultProviderEnv(
@@ -414,29 +477,115 @@ export function ProviderEditor({
     });
   };
 
-  // ─── OAuth 流程 ─────────────────────────────────────────────
-  const handleOAuthStart = useCallback(async () => {
-    setOauthLoading(true);
+  /** A pasted `glm-5.3[1m]` turns the 1M switch on instead of being lost. */
+  const handleModelChange = (value: string) => {
+    if (ONE_MILLION_SUFFIX_RE.test(value)) {
+      setModel(value.replace(ONE_MILLION_SUFFIX_RE, ''));
+      setOneMillionContext(true);
+    } else {
+      setModel(value);
+    }
+  };
+
+  const applyPreset = (preset: (typeof PROVIDER_PRESETS)[number]) => {
+    setBaseUrl(preset.baseUrl);
+    if (!model.trim()) {
+      setModel(preset.model);
+      setOneMillionContext(preset.oneMillionContext);
+    }
+    if (!name.trim()) setName(preset.label);
+  };
+
+  const applyImport = (imported: ProviderEnvImport) => {
+    if (imported.name && !name.trim()) setName(imported.name);
+    if (imported.baseUrl) setBaseUrl(imported.baseUrl);
+    if (imported.token) {
+      setAuthToken(imported.token);
+      setAuthTokenDirty(true);
+      setClearTokenOnSave(false);
+    }
+    if (imported.authMode) setAuthMode(imported.authMode);
+    if (imported.model !== null) {
+      setModel(imported.model);
+      setOneMillionContext(imported.oneMillionContext);
+    }
+    setProviderEnvOverrides(imported.envOverrides);
+    const importedRows = Object.entries(imported.customEnv).map(
+      ([key, value]) => ({ key, value }),
+    );
+    if (importedRows.length > 0) {
+      setCustomEnvRows((current) => [
+        ...current.filter(
+          (row) => row.key.trim() && !(row.key.trim() in imported.customEnv),
+        ),
+        ...importedRows,
+      ]);
+    }
+    setNotice('已从粘贴内容填入表单，请检查后保存');
+  };
+
+  // ─── 测试连接 ───────────────────────────────────────────────
+  const handleTestConnection = async () => {
+    const envResult = buildCustomEnv(customEnvRows, true);
+    if (envResult.error) {
+      setError(envResult.error);
+      return;
+    }
+    setTesting(true);
     setError(null);
     try {
-      const body: Record<string, unknown> = {};
-      // 编辑模式下传入目标提供商 ID
-      if (!isCreate && provider) {
-        body.targetProviderId = provider.id;
-      }
-      const data = await api.post<{ authorizeUrl: string; state: string }>(
-        '/api/config/claude/oauth/start',
-        Object.keys(body).length > 0 ? body : undefined,
+      const draftToken = authTokenDirty ? authToken.trim() : '';
+      const result = await api.post<ProviderConnectivityResponse>(
+        '/api/config/claude/providers/test',
+        {
+          ...(provider ? { providerId: provider.id } : {}),
+          anthropicBaseUrl: baseUrl.trim(),
+          ...(draftToken ? { anthropicAuthToken: draftToken } : {}),
+          ...(authMode !== 'legacy' ? { anthropicAuthMode: authMode } : {}),
+          anthropicModel: buildProviderModel(model, oneMillionContext),
+          customEnv: {
+            ...envResult.customEnv,
+            ...nonBlank(providerEnvOverrides),
+          },
+        },
+        60_000,
       );
-      setOauthState(data.state);
-      setOauthCode('');
-      window.open(data.authorizeUrl, '_blank', 'noopener,noreferrer');
+      setTestResult(result);
     } catch (err) {
-      setError(getErrorMessage(err, 'OAuth 授权启动失败'));
+      setError(getErrorMessage(err, '测试连接失败'));
     } finally {
-      setOauthLoading(false);
+      setTesting(false);
     }
-  }, [isCreate, provider, setError]);
+  };
+
+  // ─── OAuth 流程 ─────────────────────────────────────────────
+  // 'full' = 完整登录（自动续期）；'setup_token' = 1 年期、仅推理权限
+  const handleOAuthStart = useCallback(
+    async (profile: 'full' | 'setup_token' = 'full') => {
+      setOauthLoading(true);
+      setError(null);
+      try {
+        const body: Record<string, unknown> = {};
+        // 编辑模式下传入目标提供商 ID
+        if (!isCreate && provider) {
+          body.targetProviderId = provider.id;
+        }
+        if (profile === 'setup_token') body.profile = 'setup_token';
+        const data = await api.post<{ authorizeUrl: string; state: string }>(
+          '/api/config/claude/oauth/start',
+          Object.keys(body).length > 0 ? body : undefined,
+        );
+        setOauthState(data.state);
+        setOauthCode('');
+        window.open(data.authorizeUrl, '_blank', 'noopener,noreferrer');
+      } catch (err) {
+        setError(getErrorMessage(err, 'OAuth 授权启动失败'));
+      } finally {
+        setOauthLoading(false);
+      }
+    },
+    [isCreate, provider, setError],
+  );
 
   const handleOAuthCallback = useCallback(async () => {
     if (!oauthState || !oauthCode.trim()) {
@@ -455,6 +604,14 @@ export function ProviderEditor({
       setNotice('OAuth 登录成功，凭据已保存。');
       onSave();
     } catch (err) {
+      // A definitive rejection consumed the flow server-side; only transient
+      // failures (retryable) can be retried with the same code.
+      const retryable = (err as { body?: { retryable?: unknown } })?.body
+        ?.retryable;
+      if (retryable === false) {
+        setOauthState(null);
+        setOauthCode('');
+      }
       setError(getErrorMessage(err, 'OAuth 授权码换取失败'));
     } finally {
       setOauthExchanging(false);
@@ -506,6 +663,14 @@ export function ProviderEditor({
       setNotice('ChatGPT 授权成功，凭据已保存。');
       onSave();
     } catch (err) {
+      // retryable=false means the code was spent: start over. Otherwise the
+      // pending flow survives and the same URL can be submitted again.
+      const retryable = (err as { body?: { retryable?: unknown } })?.body
+        ?.retryable;
+      if (retryable === false) {
+        setOauthState(null);
+        setOauthCode('');
+      }
       setError(getErrorMessage(err, 'ChatGPT 授权码换取失败'));
     } finally {
       setOauthExchanging(false);
@@ -518,14 +683,12 @@ export function ProviderEditor({
       providerType === 'third_party'
         ? buildProviderModel(model, oneMillionContext)
         : model.trim();
-    if (providerType === 'third_party' && !normalizedModel) {
-      setError('请填写第三方 API 支持的模型名称');
-      return;
-    }
+    // An empty third-party model is a pass-through relay: Claude Code keeps
+    // requesting its own model names and the relay routes them.
     const trimmedName =
       name.trim() ||
       (providerType === 'third_party'
-        ? parseProviderModel(normalizedModel).model
+        ? parseProviderModel(normalizedModel).model || hostnameOf(baseUrl)
         : '');
     if (!trimmedName) {
       setError('请填写模型配置名称');
@@ -577,7 +740,7 @@ export function ProviderEditor({
     }
     const savedCustomEnv = {
       ...envResult.customEnv,
-      ...(providerType === 'third_party' ? providerEnvOverrides : {}),
+      ...(providerType === 'third_party' ? nonBlank(providerEnvOverrides) : {}),
     };
 
     setSaving(true);
@@ -601,6 +764,7 @@ export function ProviderEditor({
           }
           createBody.anthropicBaseUrl = trimmedBaseUrl;
           createBody.anthropicAuthToken = trimmedToken;
+          if (authMode !== 'legacy') createBody.anthropicAuthMode = authMode;
         } else {
           // 官方模式 — 根据认证方式设置凭据
           if (authTab === 'setup_token') {
@@ -610,31 +774,8 @@ export function ProviderEditor({
               setSaving(false);
               return;
             }
-            // 检测是否为 .credentials.json
-            if (trimmed.startsWith('{')) {
-              try {
-                const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-                const oauth = parsed.claudeAiOauth as
-                  | Record<string, unknown>
-                  | undefined;
-                if (oauth?.accessToken && oauth?.refreshToken) {
-                  createBody.claudeOAuthCredentials = {
-                    accessToken: oauth.accessToken,
-                    refreshToken: oauth.refreshToken,
-                    expiresAt: oauth.expiresAt
-                      ? new Date(oauth.expiresAt as string).getTime()
-                      : Date.now() + 8 * 60 * 60 * 1000,
-                    scopes: Array.isArray(oauth.scopes) ? oauth.scopes : [],
-                  };
-                } else {
-                  createBody.claudeCodeOauthToken = trimmed;
-                }
-              } catch {
-                createBody.claudeCodeOauthToken = trimmed;
-              }
-            } else {
-              createBody.claudeCodeOauthToken = trimmed;
-            }
+            // .credentials.json 或 setup-token 原文交给服务端解析与校验
+            createBody.claudeCredentialInput = trimmed;
           } else if (authTab === 'api_key') {
             const trimmed = apiKey.trim();
             if (!trimmed) {
@@ -662,6 +803,14 @@ export function ProviderEditor({
 
         if (providerType === 'third_party') {
           patchBody.anthropicBaseUrl = trimmedBaseUrl;
+          if (authMode !== 'legacy') patchBody.anthropicAuthMode = authMode;
+          // The key travels with the other fields: one request, one runner
+          // restart, and never an endpoint saved without its key.
+          if (clearTokenOnSave) {
+            patchBody.clearAnthropicAuthToken = true;
+          } else if (authTokenDirty && authToken.trim()) {
+            patchBody.anthropicAuthToken = authToken.trim();
+          }
         }
         patchBody.anthropicModel = normalizedModel;
 
@@ -670,57 +819,18 @@ export function ProviderEditor({
           patchBody,
         );
 
-        // 更新密钥（如果有变更）
+        // 官方配置的凭据仍走 /secrets
         const secretsBody: Record<string, unknown> = {};
         let hasSecretsChange = false;
 
-        if (providerType === 'third_party') {
-          if (clearTokenOnSave) {
-            secretsBody.clearAnthropicAuthToken = true;
-            hasSecretsChange = true;
-          } else if (authTokenDirty && authToken.trim()) {
-            secretsBody.anthropicAuthToken = authToken.trim();
-            hasSecretsChange = true;
-          }
-        } else {
+        if (providerType === 'official') {
           // 官方模式编辑时更新凭据
+          // 服务端解析粘贴原文，并保证官方配置只保留一种凭据
           if (authTab === 'setup_token' && setupToken.trim()) {
-            const trimmed = setupToken.trim();
-            if (trimmed.startsWith('{')) {
-              try {
-                const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-                const oauth = parsed.claudeAiOauth as
-                  | Record<string, unknown>
-                  | undefined;
-                if (oauth?.accessToken && oauth?.refreshToken) {
-                  secretsBody.claudeOAuthCredentials = {
-                    accessToken: oauth.accessToken,
-                    refreshToken: oauth.refreshToken,
-                    expiresAt: oauth.expiresAt
-                      ? new Date(oauth.expiresAt as string).getTime()
-                      : Date.now() + 8 * 60 * 60 * 1000,
-                    scopes: Array.isArray(oauth.scopes) ? oauth.scopes : [],
-                  };
-                  secretsBody.clearAnthropicAuthToken = true;
-                  secretsBody.clearAnthropicApiKey = true;
-                  secretsBody.clearClaudeCodeOauthToken = true;
-                  hasSecretsChange = true;
-                }
-              } catch {
-                // 不是 JSON，视为 setup-token
-              }
-            }
-            if (!hasSecretsChange) {
-              secretsBody.claudeCodeOauthToken = trimmed;
-              secretsBody.clearAnthropicAuthToken = true;
-              secretsBody.clearAnthropicApiKey = true;
-              hasSecretsChange = true;
-            }
+            secretsBody.claudeCredentialInput = setupToken.trim();
+            hasSecretsChange = true;
           } else if (authTab === 'api_key' && apiKey.trim()) {
             secretsBody.anthropicApiKey = apiKey.trim();
-            secretsBody.clearAnthropicAuthToken = true;
-            secretsBody.clearClaudeCodeOauthToken = true;
-            secretsBody.clearClaudeOAuthCredentials = true;
             hasSecretsChange = true;
           }
         }
@@ -841,9 +951,47 @@ export function ProviderEditor({
                     </div>
                   </div>
 
+                  {/* 编辑模式：需要重新登录 */}
+                  {!isCreate && provider?.claudeOAuthNeedsReLogin && (
+                    <div
+                      role="alert"
+                      className="flex gap-2 rounded-lg bg-error/10 px-3 py-2.5 text-caption leading-5 text-error"
+                    >
+                      <TriangleAlert
+                        className="mt-0.5 size-4 shrink-0"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <div className="font-medium">
+                          {provider.claudeOAuthLastRefreshError?.kind ===
+                          'account_mismatch'
+                            ? '续期返回了另一个账号，已拒绝写入，请重新登录'
+                            : '授权已失效，需要重新登录 Claude'}
+                        </div>
+                        {provider.claudeOAuthLastRefreshError?.message && (
+                          <div className="break-words opacity-80">
+                            {provider.claudeOAuthLastRefreshError.message}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
                   {/* 编辑模式显示现有凭据 */}
                   {!isCreate && provider?.hasClaudeOAuthCredentials && (
                     <div className="space-y-1 rounded-lg bg-success/10 px-3 py-2.5 text-caption text-success">
+                      {(provider.claudeOAuthAccountEmail ||
+                        provider.claudeOAuthSubscriptionType) && (
+                        <div>
+                          账号：{provider.claudeOAuthAccountEmail ?? '未知'}
+                          {provider.claudeOAuthSubscriptionType
+                            ? `（${provider.claudeOAuthSubscriptionType}）`
+                            : ''}
+                          {provider.claudeOAuthOrganizationName
+                            ? ` · ${provider.claudeOAuthOrganizationName}`
+                            : ''}
+                        </div>
+                      )}
                       <div>
                         Access Token:{' '}
                         <span className="font-mono">
@@ -870,31 +1018,48 @@ export function ProviderEditor({
                         </div>
                       )}
                       <div className="text-muted-foreground">
-                        SDK 会在 token 过期时自动刷新。
+                        HappyClaw 会在过期前自动续期
+                        {provider.claudeOAuthLastRefreshAt
+                          ? `，上次续期 ${new Date(
+                              provider.claudeOAuthLastRefreshAt,
+                            ).toLocaleString('zh-CN')}`
+                          : ''}
+                        。
                       </div>
                     </div>
                   )}
 
                   {!oauthState ? (
-                    <Button
-                      variant="outline"
-                      onClick={handleOAuthStart}
-                      disabled={saving || oauthLoading}
-                    >
-                      {oauthLoading ? (
-                        <Loader2 className="animate-spin" />
-                      ) : (
-                        <ExternalLink />
-                      )}
-                      {!isCreate && provider?.hasClaudeOAuthCredentials
-                        ? '重新登录 Claude'
-                        : '一键登录 Claude'}
-                    </Button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        variant="outline"
+                        onClick={() => void handleOAuthStart('full')}
+                        disabled={saving || oauthLoading}
+                      >
+                        {oauthLoading ? (
+                          <Loader2 className="animate-spin" />
+                        ) : (
+                          <ExternalLink />
+                        )}
+                        {!isCreate && provider?.hasClaudeOAuthCredentials
+                          ? '重新登录 Claude'
+                          : '一键登录 Claude'}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void handleOAuthStart('setup_token')}
+                        disabled={saving || oauthLoading}
+                        title="与 claude setup-token 相同：1 年有效、仅推理权限，不支持用量查询"
+                      >
+                        改为获取 1 年期 Setup Token
+                      </Button>
+                    </div>
                   ) : (
                     <div className="space-y-2">
                       <div className="rounded-lg bg-warning/10 px-3 py-2 text-caption leading-5 text-warning">
-                        授权窗口已打开，请在 claude.ai
-                        完成授权后，将页面上显示的授权码粘贴到下方。
+                        授权窗口已打开，请在 Claude
+                        完成授权后，把页面上显示的授权码（或回调页完整地址）粘贴到下方。
                       </div>
                       <div className="flex gap-2">
                         <Input
@@ -902,7 +1067,7 @@ export function ProviderEditor({
                           value={oauthCode}
                           onChange={(e) => setOauthCode(e.target.value)}
                           disabled={oauthExchanging}
-                          placeholder="粘贴授权码"
+                          placeholder="粘贴授权码或回调页地址"
                           aria-label="粘贴授权码"
                           className="flex-1"
                         />
@@ -1035,6 +1200,28 @@ export function ProviderEditor({
                 </div>
               </div>
 
+              {!isCreate && provider?.codexOAuthNeedsReauth && (
+                <div
+                  role="alert"
+                  className="flex gap-2 rounded-lg bg-error/10 px-3 py-2.5 text-caption leading-5 text-error"
+                >
+                  <TriangleAlert
+                    className="mt-0.5 size-4 shrink-0"
+                    aria-hidden="true"
+                  />
+                  <div className="min-w-0">
+                    <div className="font-medium">
+                      ChatGPT 授权已失效，请重新登录
+                    </div>
+                    {provider.codexOAuthLastRefreshError?.message && (
+                      <div className="break-words opacity-80">
+                        {provider.codexOAuthLastRefreshError.message}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* 编辑模式显示现有凭据 */}
               {!isCreate && provider?.hasCodexOAuthCredentials && (
                 <div className="space-y-1 rounded-lg bg-success/10 px-3 py-2.5 text-caption text-success">
@@ -1165,7 +1352,7 @@ export function ProviderEditor({
                       value={oauthCode}
                       onChange={(e) => setOauthCode(e.target.value)}
                       disabled={oauthExchanging}
-                      placeholder="粘贴 localhost:1455 回调完整地址"
+                      placeholder="粘贴 localhost:1455（或 127.0.0.1:1455）回调完整地址"
                       aria-label="粘贴 localhost:1455 回调完整地址"
                       className="flex-1"
                     />
@@ -1195,11 +1382,43 @@ export function ProviderEditor({
           {/* ─── 第三方模式 ─── */}
           {providerType === 'third_party' && (
             <div className="space-y-4">
+              <ProviderEnvImportPanel disabled={saving} onApply={applyImport} />
+
               <SettingsField
                 label={<FieldLabel text="API 端点" hint="ANTHROPIC_BASE_URL" />}
                 htmlFor="provider-base-url"
-                description="填写 Anthropic 兼容接口的完整地址。"
+                description={
+                  baseUrlProblem ? (
+                    <span className="flex gap-1.5 text-warning">
+                      <TriangleAlert
+                        className="mt-0.5 size-3.5 shrink-0"
+                        aria-hidden="true"
+                      />
+                      {baseUrlProblem}
+                    </span>
+                  ) : (
+                    '填写 Anthropic 兼容接口的地址，或点选常用服务商。'
+                  )
+                }
               >
+                <div
+                  className="flex flex-wrap gap-1.5"
+                  role="group"
+                  aria-label="常用服务商"
+                >
+                  {PROVIDER_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => applyPreset(preset)}
+                      disabled={saving}
+                      aria-pressed={baseUrl.trim() === preset.baseUrl}
+                      className="inline-flex h-7 items-center rounded-md px-2 text-caption text-muted-foreground ring-1 ring-surface-border transition-colors duration-100 hover:bg-surface-hover hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none aria-pressed:bg-surface-selected aria-pressed:text-foreground pointer-coarse:h-9"
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
                 <Input
                   id="provider-base-url"
                   type="url"
@@ -1209,6 +1428,7 @@ export function ProviderEditor({
                   disabled={saving}
                   placeholder="https://api.example.com/anthropic"
                   autoComplete="off"
+                  aria-invalid={baseUrlProblem ? true : undefined}
                 />
               </SettingsField>
 
@@ -1219,7 +1439,9 @@ export function ProviderEditor({
                     hint={
                       !isCreate && provider?.hasAnthropicAuthToken
                         ? `当前 ${provider.anthropicAuthTokenMasked}`
-                        : 'ANTHROPIC_AUTH_TOKEN'
+                        : authMode === 'x-api-key'
+                          ? 'ANTHROPIC_API_KEY'
+                          : 'ANTHROPIC_AUTH_TOKEN'
                     }
                   />
                 }
@@ -1268,16 +1490,41 @@ export function ProviderEditor({
               </SettingsField>
 
               <SettingsField
+                label="认证方式"
+                description={
+                  authMode === 'x-api-key'
+                    ? '以 x-api-key 请求头发送，等同 ANTHROPIC_API_KEY。'
+                    : authMode === 'bearer'
+                      ? '以 Authorization: Bearer 发送，等同 ANTHROPIC_AUTH_TOKEN，大多数服务商和 alias 用这种方式。'
+                      : '旧配置沿用原规则：密钥以 Bearer 开头时用 Authorization，否则用 x-api-key。选择一种即可固定下来。'
+                }
+              >
+                <SegmentedControl
+                  label="认证方式"
+                  value={authMode}
+                  onChange={setAuthMode}
+                  options={[
+                    { value: 'bearer', label: 'Bearer' },
+                    { value: 'x-api-key', label: 'x-api-key' },
+                    ...(authMode === 'legacy'
+                      ? [{ value: 'legacy' as const, label: '自动（旧规则）' }]
+                      : []),
+                  ]}
+                />
+              </SettingsField>
+
+              <SettingsField
                 label={<FieldLabel text="模型名称" hint="ANTHROPIC_MODEL" />}
                 htmlFor="provider-model"
+                description="留空表示透传：Claude Code 继续请求 Claude 模型名，由中转站自行路由。"
               >
                 <Input
                   id="provider-model"
                   type="text"
                   value={model}
-                  onChange={(e) => setModel(e.target.value)}
+                  onChange={(e) => handleModelChange(e.target.value)}
                   disabled={saving}
-                  placeholder="例如 glm-5.2、k3、qwen3.7-max"
+                  placeholder="例如 glm-5.3、kimi-for-coding、deepseek-v4-pro"
                   autoComplete="off"
                 />
               </SettingsField>
@@ -1292,14 +1539,14 @@ export function ProviderEditor({
                       1M 上下文
                     </span>
                     <span className="mt-0.5 block text-caption text-muted-foreground">
-                      自动添加 [1m]
+                      自动添加 [1m]；粘贴带 [1m] 的模型名会自动打开
                     </span>
                   </label>
                   <Switch
                     id="provider-one-million-context"
                     checked={oneMillionContext}
                     onCheckedChange={setOneMillionContext}
-                    disabled={saving}
+                    disabled={saving || !model.trim()}
                     aria-label="启用 1M 上下文"
                   />
                 </div>
@@ -1314,18 +1561,24 @@ export function ProviderEditor({
                       实际模型：
                       <code className="break-all font-mono font-medium text-foreground">
                         {buildProviderModel(model, oneMillionContext) ||
-                          '填写模型后生成'}
+                          '透传 Claude 模型名'}
                       </code>
                       {' · '}
-                      上下文窗口：
-                      {oneMillionContext ? '1,000,000' : '200,000'} tokens
+                      压缩窗口：
+                      {Number(effectiveCompactWindow).toLocaleString(
+                        'en-US',
+                      )}{' '}
+                      tokens
                     </p>
                     <p className="mt-0.5 text-caption leading-5 text-faint-foreground">
-                      默认同步模型映射、压缩窗口、请求超时与兼容参数；可在高级设置中调整。
+                      默认同步 Opus / Sonnet / Haiku / 子 Agent
+                      模型映射、压缩窗口、请求超时与兼容参数；可在高级设置中调整。
                     </p>
                   </div>
                 </div>
               </div>
+
+              {testResult && <ProviderConnectivityResult result={testResult} />}
             </div>
           )}
 
@@ -1443,7 +1696,11 @@ export function ProviderEditor({
                                   )
                                 }
                                 disabled={saving}
-                                placeholder="填写模型后生成"
+                                placeholder={
+                                  row.source === 'model'
+                                    ? '跟随 Claude Code 默认（透传）'
+                                    : '使用默认值'
+                                }
                                 autoComplete="off"
                                 className="min-w-0 font-mono text-caption md:text-caption"
                               />
@@ -1482,7 +1739,9 @@ export function ProviderEditor({
                         自定义环境变量
                       </h3>
                       <p className="mt-0.5 text-caption leading-5 text-muted-foreground">
-                        仅用于 API 自定义 Header 等特殊需求。
+                        用于
+                        ANTHROPIC_CUSTOM_HEADERS、CLAUDE_CODE_MAX_CONTEXT_TOKENS
+                        等特殊需求。
                       </p>
                     </div>
                     <Button
@@ -1497,6 +1756,18 @@ export function ProviderEditor({
                     </Button>
                   </div>
 
+                  {customProxyKeys.length > 0 && (
+                    <p className="mb-2 flex gap-1.5 text-caption leading-5 text-warning">
+                      <TriangleAlert
+                        className="mt-0.5 size-3.5 shrink-0"
+                        aria-hidden="true"
+                      />
+                      {customProxyKeys.join('、')}
+                      会作用于 Agent 的全部网络请求（包括 Bash 和
+                      MCP）；Container 模式下 127.0.0.1
+                      指向容器自身。建议改在系统或工作区层面配置代理。
+                    </p>
+                  )}
                   {customEnvRows.length === 0 ? (
                     <p className="text-caption text-muted-foreground">
                       没有自定义环境变量，大多数配置无需添加。
@@ -1519,18 +1790,33 @@ export function ProviderEditor({
                             className="w-full font-mono text-caption sm:w-[38%] md:text-caption"
                           />
                           <div className="flex min-w-0 flex-1 items-center gap-1">
-                            <Input
-                              type={
-                                showCustomEnvValues[idx] ? 'text' : 'password'
-                              }
-                              value={row.value}
-                              onChange={(e) =>
-                                updateRow(idx, 'value', e.target.value)
-                              }
-                              placeholder="value"
-                              aria-label={`第 ${idx + 1} 行环境变量值`}
-                              className="min-w-0 flex-1 font-mono text-caption md:text-caption"
-                            />
+                            {row.key.trim() === 'ANTHROPIC_CUSTOM_HEADERS' ? (
+                              // Claude Code reads one `Name: value` per line.
+                              <Textarea
+                                value={row.value}
+                                onChange={(e) =>
+                                  updateRow(idx, 'value', e.target.value)
+                                }
+                                rows={2}
+                                spellCheck={false}
+                                placeholder={'X-Header: value\nX-Other: value'}
+                                aria-label={`第 ${idx + 1} 行环境变量值`}
+                                className="min-h-9 min-w-0 flex-1 font-mono text-caption md:text-caption"
+                              />
+                            ) : (
+                              <Input
+                                type={
+                                  showCustomEnvValues[idx] ? 'text' : 'password'
+                                }
+                                value={row.value}
+                                onChange={(e) =>
+                                  updateRow(idx, 'value', e.target.value)
+                                }
+                                placeholder="value"
+                                aria-label={`第 ${idx + 1} 行环境变量值`}
+                                className="min-w-0 flex-1 font-mono text-caption md:text-caption"
+                              />
+                            )}
                             <IconButton
                               label={
                                 showCustomEnvValues[idx]
@@ -1566,6 +1852,17 @@ export function ProviderEditor({
 
         {/* ─── 操作按钮 ─── */}
         <DialogFooter>
+          {providerType === 'third_party' && (
+            <Button
+              variant="ghost"
+              onClick={() => void handleTestConnection()}
+              disabled={saving || testing || !baseUrl.trim()}
+              className="sm:mr-auto"
+            >
+              {testing ? <Loader2 className="animate-spin" /> : <PlugZap />}
+              测试连接
+            </Button>
+          )}
           <Button
             variant="outline"
             onClick={handleClose}

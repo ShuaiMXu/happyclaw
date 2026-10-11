@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
@@ -10,6 +10,7 @@ import {
   GroupCreateSchema,
   GroupPatchSchema,
   ContainerEnvSchema,
+  SessionModelSelectionSchema,
 } from '../schemas.js';
 import type {
   AuthUser,
@@ -79,6 +80,8 @@ import {
   getWorkspaceInteractionMode,
   setWorkspaceInteractionMode,
   getUserById,
+  getSessionModelSelection,
+  setSessionModelSelection,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
@@ -90,7 +93,9 @@ import {
 } from '../agent-profile-runtime.js';
 import {
   getContainerEnvConfig,
+  getProviders,
   getSystemSettings,
+  providerHasCredentials,
   saveContainerEnvConfig,
   toPublicContainerEnvConfig,
 } from '../runtime-config.js';
@@ -2138,6 +2143,175 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   );
 
   return c.json({ success: true, dividerMessageId });
+});
+
+// ─── 会话模型选择（聊天输入框的模型选择器） ──────────────────────────
+// Session-level pick of a saved model configuration. No selection means the
+// conversation follows the default: the Agent's model configuration, else the
+// automatic pool of enabled configurations.
+
+type SessionModelSelectionScope =
+  | { error: Response }
+  | { group: RegisteredGroup; agentId: string | null };
+
+function resolveSessionModelSelectionScope(
+  c: Context<{ Variables: Variables }>,
+  agentIdInput: string | null | undefined,
+  requireModify: boolean,
+): SessionModelSelectionScope {
+  const jid = c.req.param('jid');
+  const group = jid ? getRegisteredGroup(jid) : undefined;
+  if (!jid || !group) {
+    return { error: c.json({ error: 'Group not found' }, 404) };
+  }
+  const authUser = c.get('user') as AuthUser;
+  const actor = { id: authUser.id, role: authUser.role };
+  if (!canAccessGroup(actor, group)) {
+    return { error: c.json({ error: 'Group not found' }, 404) };
+  }
+  if (requireModify && !canModifyGroup(actor, { ...group, jid })) {
+    return {
+      error: c.json(
+        { error: 'Only the workspace owner can change the model' },
+        403,
+      ),
+    };
+  }
+  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    return {
+      error: c.json(
+        { error: 'Insufficient permissions for host execution mode' },
+        403,
+      ),
+    };
+  }
+  const agentId = agentIdInput || null;
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || agent.chat_jid !== jid) {
+      return { error: c.json({ error: 'Agent not found' }, 404) };
+    }
+  }
+  return { group, agentId };
+}
+
+function buildSessionModelSelectionPayload(
+  group: RegisteredGroup,
+  agentId: string | null,
+) {
+  const providers = getProviders();
+  const exists = (id: string | null | undefined): id is string =>
+    !!id && providers.some((provider) => provider.id === id);
+  const stored = getSessionModelSelection(group.folder, agentId);
+  const profile = peekAgentProfileForWorkspace(group.folder, group.created_by);
+  const enabled = providers.filter((provider) => provider.enabled);
+  const envOverride = getContainerEnvConfig(group.folder);
+
+  let defaultSource: 'agent' | 'single' | 'pool' | 'workspace_env' | 'none';
+  let defaultModelConfigId: string | null = null;
+  if (exists(profile?.model_config_id)) {
+    defaultSource = 'agent';
+    defaultModelConfigId = profile.model_config_id;
+  } else if (
+    envOverride.anthropicApiKey ||
+    envOverride.anthropicAuthToken ||
+    envOverride.anthropicBaseUrl
+  ) {
+    defaultSource = 'workspace_env';
+  } else if (enabled.length === 1) {
+    defaultSource = 'single';
+    defaultModelConfigId = enabled[0].id;
+  } else {
+    defaultSource = enabled.length > 1 ? 'pool' : 'none';
+  }
+
+  return {
+    selectedModelConfigId: exists(stored) ? stored : null,
+    default: {
+      source: defaultSource,
+      modelConfigId: defaultModelConfigId,
+      enabledCount: enabled.length,
+    },
+    options: providers.map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      kind: provider.codexOAuthCredentials ? ('codex' as const) : provider.type,
+      enabled: provider.enabled,
+      model: provider.anthropicModel,
+      // A configuration without a credential (e.g. an old copy that lost its
+      // key) would fail every turn; the picker shows it but cannot pick it.
+      usable: providerHasCredentials(provider),
+    })),
+  };
+}
+
+// GET /api/groups/:jid/model-selection?agentId= - 读取会话模型选择
+groupRoutes.get('/:jid/model-selection', authMiddleware, (c) => {
+  const scope = resolveSessionModelSelectionScope(
+    c,
+    c.req.query('agentId'),
+    false,
+  );
+  if ('error' in scope) return scope.error;
+  return c.json(buildSessionModelSelectionPayload(scope.group, scope.agentId));
+});
+
+// PUT /api/groups/:jid/model-selection - 切换会话模型（null 恢复默认）
+groupRoutes.put('/:jid/model-selection', authMiddleware, async (c) => {
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = SessionModelSelectionSchema.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: 'Invalid request body' }, 400);
+  }
+  const scope = resolveSessionModelSelectionScope(c, parsed.data.agentId, true);
+  if ('error' in scope) return scope.error;
+  const { group, agentId } = scope;
+  const modelConfigId = parsed.data.modelConfigId;
+  if (modelConfigId) {
+    const target = getProviders().find(
+      (provider) => provider.id === modelConfigId,
+    );
+    if (!target) return c.json({ error: '模型配置不存在' }, 404);
+    if (!providerHasCredentials(target)) {
+      return c.json(
+        { error: '该模型配置缺少凭据，请先在模型配置中补全密钥或完成授权' },
+        400,
+      );
+    }
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  const jid = c.req.param('jid');
+  const previous = getSessionModelSelection(group.folder, agentId);
+  setSessionModelSelection(group.folder, agentId, modelConfigId, authUser.id);
+
+  // A warm runner keeps the provider environment it was spawned with; retire
+  // it so the next message of this conversation starts on the new selection.
+  const drained =
+    previous === modelConfigId
+      ? 0
+      : deps.queue.drainRunnersForModelSelection(
+          agentId ? [`${jid}#agent:${agentId}`] : getJidsByFolder(group.folder),
+          modelConfigId,
+        );
+  logger.info(
+    {
+      jid,
+      folder: group.folder,
+      agentId,
+      previous,
+      modelConfigId,
+      drained,
+    },
+    'Session model selection updated',
+  );
+  return c.json({
+    ...buildSessionModelSelectionPayload(group, agentId),
+    drained,
+  });
 });
 
 // POST /api/groups/:jid/clear-history - 清除聊天历史

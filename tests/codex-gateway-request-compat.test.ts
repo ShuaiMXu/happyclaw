@@ -6,11 +6,15 @@ import {
   anthropicToResponses,
   buildCodexToolNameMap,
   resolveCodexRequestEffort,
+  resolveGatewayReasoningEffort,
   shortenCodexCallId,
   type AnthropicRequestSubset,
 } from '../src/codex-gateway/convert-request.js';
 import { encodeReasoningSignature } from '../src/codex-gateway/reasoning-signature.js';
-import { CodexMessagesRequestSchema } from '../src/codex-gateway/request-validation.js';
+import {
+  CodexMessagesRequestSchema,
+  describeCodexRequestIssue,
+} from '../src/codex-gateway/request-validation.js';
 
 type Json = Record<string, unknown>;
 const options = { targetModel: 'gpt-6-sol' };
@@ -696,6 +700,100 @@ describe('reasoning replay and request intent', () => {
     expect(resolveCodexRequestEffort({}, 'minimal')).toBe('low');
   });
 
+  describe('gateway effort precedence', () => {
+    const catalog = [
+      {
+        value: 'gpt-6-sol',
+        label: 'sol',
+        efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+        defaultEffort: 'medium',
+      },
+      {
+        value: 'capped',
+        label: 'capped',
+        efforts: ['medium', 'high'],
+        defaultEffort: 'high',
+      },
+    ];
+    const adaptive = {
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'max' },
+    };
+    const resolve = (
+      request: AnthropicRequestSubset,
+      policy: {
+        model?: string;
+        providerEffort?: string;
+        agentEffort?: string;
+      } = {},
+    ) =>
+      resolveGatewayReasoningEffort(request, {
+        catalog,
+        model: policy.model ?? 'gpt-6-sol',
+        providerEffort: policy.providerEffort,
+        agentEffort: policy.agentEffort,
+      });
+
+    test('inheriting Agents get the provider effort or the catalog default', () => {
+      expect(resolve(adaptive)).toBe('medium');
+      expect(resolve(adaptive, { providerEffort: 'xhigh' })).toBe('xhigh');
+      expect(resolve(adaptive, { providerEffort: 'minimal' })).toBe('low');
+      expect(resolve(adaptive, { model: 'capped' })).toBe('high');
+      expect(
+        resolve(adaptive, { model: 'capped', providerEffort: 'ultra' }),
+      ).toBe('high');
+    });
+
+    test('an explicit Agent effort wins over the provider effort', () => {
+      expect(
+        resolve(
+          { thinking: { type: 'adaptive' } },
+          { providerEffort: 'low', agentEffort: 'xhigh' },
+        ),
+      ).toBe('xhigh');
+      expect(
+        resolve(
+          { thinking: { type: 'adaptive' }, output_config: { effort: 'high' } },
+          { providerEffort: 'low', agentEffort: 'xhigh' },
+        ),
+      ).toBe('high');
+      expect(
+        resolve(
+          { thinking: { type: 'adaptive' } },
+          { model: 'capped', agentEffort: 'max' },
+        ),
+      ).toBe('high');
+    });
+
+    test('disabled thinking maps to the lowest supported level, never none', () => {
+      expect(resolve({ thinking: { type: 'disabled' } })).toBe('low');
+      expect(
+        resolve({ thinking: { type: 'disabled' } }, { model: 'capped' }),
+      ).toBe('medium');
+      expect(
+        resolve(
+          { thinking: { type: 'enabled', budget_tokens: 0 } },
+          { agentEffort: 'max', providerEffort: 'high' },
+        ),
+      ).toBe('low');
+    });
+
+    test('haiku-tier background requests use low', () => {
+      expect(
+        resolve(
+          { model: 'claude-3-5-haiku-latest', ...adaptive },
+          { providerEffort: 'xhigh', agentEffort: 'max' },
+        ),
+      ).toBe('low');
+      expect(
+        resolve(
+          { model: 'claude-haiku-4-5', ...adaptive },
+          { model: 'capped' },
+        ),
+      ).toBe('medium');
+    });
+  });
+
   test('translates speed/service-tier priority without forwarding unsupported tier names', () => {
     expect(
       convert({ messages: [user('hi')], speed: 'fast' }).service_tier,
@@ -869,35 +967,108 @@ describe('consumed-shape validation', () => {
     ).toBe(false);
   });
 
-  test('rejects unsupported image URLs/PDF sources instead of silently omitting user content', () => {
-    expect(
-      CodexMessagesRequestSchema.safeParse({
-        messages: [
-          user([
-            {
-              type: 'image',
-              source: { type: 'url', url: 'https://example.com/image.png' },
+  test('degrades unsupported image and document sources to visible placeholders', () => {
+    const request = CodexMessagesRequestSchema.parse({
+      messages: [
+        user([
+          {
+            type: 'image',
+            source: { type: 'url', url: 'https://example.com/image.png' },
+          },
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: 'image/bmp', data: 'Ym1w' },
+          },
+          {
+            type: 'document',
+            title: 'Notes',
+            source: {
+              type: 'base64',
+              media_type: 'text/plain',
+              data: Buffer.from('plain text body').toString('base64'),
             },
-          ]),
-        ],
-      }).success,
-    ).toBe(false);
-    expect(
-      CodexMessagesRequestSchema.safeParse({
-        messages: [
-          user([
-            {
-              type: 'document',
-              source: {
-                type: 'base64',
-                media_type: 'text/plain',
-                data: 'text',
+          },
+          {
+            type: 'document',
+            source: { type: 'text', media_type: 'text/plain', data: 'inline' },
+          },
+          {
+            type: 'document',
+            source: { type: 'url', url: 'https://example.com/a.pdf' },
+          },
+        ]),
+      ],
+    });
+    const texts = convert(request).input[0].content.map(
+      (part: Record<string, unknown>) => part.text,
+    );
+    expect(texts[0]).toContain('[Image omitted');
+    expect(texts[0]).toContain('https://example.com/image.png');
+    expect(texts[1]).toContain('image/bmp');
+    expect(texts[2]).toBe('Notes\n\nplain text body');
+    expect(texts[3]).toBe('inline');
+    expect(texts[4]).toContain('[Document omitted');
+  });
+
+  test('degrades tool-result documents and unknown blocks instead of rejecting the history', () => {
+    const request = CodexMessagesRequestSchema.parse({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call', name: 'Read', input: {} },
+            { type: 'mcp_tool_use', id: 'server', name: 'x', input: {} },
+          ],
+        },
+        user([
+          {
+            type: 'tool_result',
+            tool_use_id: 'call',
+            content: [
+              { type: 'text', text: 'head' },
+              {
+                type: 'document',
+                source: {
+                  type: 'base64',
+                  media_type: 'application/pdf',
+                  data: 'JVBERi0=',
+                },
               },
-            },
-          ]),
-        ],
-      }).success,
-    ).toBe(false);
+              {
+                type: 'search_result',
+                content: [{ type: 'text', text: 'hit' }],
+              },
+            ],
+          },
+          { type: 'container_upload', file_id: 'file_1' },
+        ]),
+      ],
+    });
+    const converted = convert(request);
+    // The server-side assistant block is dropped, not replayed as a call.
+    expect(
+      converted.input.filter((item) => item.type === 'function_call'),
+    ).toHaveLength(1);
+    const output = converted.input.find(
+      (item) => item.type === 'function_call_output',
+    )!.output as Array<Record<string, unknown>>;
+    expect(output[0]).toEqual({ type: 'input_text', text: 'head' });
+    expect(output[1].text).toContain('[Document omitted from tool result');
+    expect(output[2].text).toContain('hit');
+    const trailing = converted.input.at(-1)!;
+    expect(JSON.stringify(trailing)).toContain(
+      'Unsupported container_upload content omitted',
+    );
+  });
+
+  test('still rejects malformed known blocks and names their field path', () => {
+    const result = CodexMessagesRequestSchema.safeParse({
+      messages: [user([{ type: 'tool_result', content: 'missing id' }])],
+    });
+    expect(result.success).toBe(false);
+    expect(describeCodexRequestIssue(result.error!)).toBe(
+      'Invalid messages request at messages.0.content.0.tool_use_id (invalid_type)',
+    );
   });
 
   test('preserves unrelated SDK fields through validation but omits them upstream', () => {

@@ -42,6 +42,7 @@ describe('third-party provider model settings', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5.2[1m]',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5.2[1m]',
+      CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.2[1m]',
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       CLAUDE_CODE_EFFORT_LEVEL: 'max',
@@ -53,7 +54,7 @@ describe('third-party provider model settings', () => {
   test('keeps model-derived rows pending until a model is entered', () => {
     const rows = buildDefaultProviderEnv('', false);
 
-    expect(rows.filter((row) => row.source === 'model')).toHaveLength(3);
+    expect(rows.filter((row) => row.source === 'model')).toHaveLength(4);
     expect(rows.filter((row) => row.source === 'model')).toSatisfy((items) =>
       items.every((row) => row.value === ''),
     );

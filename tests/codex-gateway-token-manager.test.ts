@@ -1,14 +1,19 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
-import type { CodexOAuthCredentials } from '../src/codex-gateway/types.js';
+import type {
+  CodexOAuthCredentials,
+  CodexOAuthRefreshErrorState,
+} from '../src/codex-gateway/types.js';
 
 const mocks = vi.hoisted(() => ({
   getProviders: vi.fn(),
   persist: vi.fn(),
+  persistError: vi.fn(),
   refresh: vi.fn(),
 }));
 vi.mock('../src/runtime-config.js', () => ({
   getProviders: mocks.getProviders,
   updateProviderCodexOAuthCredentialsIfCurrent: mocks.persist,
+  setProviderCodexOAuthRefreshErrorIfCurrent: mocks.persistError,
 }));
 vi.mock('../src/codex-gateway/oauth.js', async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -16,8 +21,13 @@ vi.mock('../src/codex-gateway/oauth.js', async (importOriginal) => ({
 }));
 vi.mock('../src/logger.js', () => ({ logger: { warn: vi.fn() } }));
 
+import { CodexOAuthTokenError } from '../src/codex-gateway/oauth.js';
 import {
   CodexGatewayAuthError,
+  CodexReauthRequiredError,
+  CodexRefreshUnavailableError,
+  findCodexProviderByGatewayIdentifier,
+  resetCodexTokenManagerForTests,
   resolveCodexAccess,
 } from '../src/codex-gateway/token-manager.js';
 
@@ -52,19 +62,37 @@ function gate<T>() {
   });
   return { promise, resolve, reject };
 }
+const rejected = (code = 'invalid_grant', status = 400) =>
+  new CodexOAuthTokenError(
+    `Codex OAuth token endpoint rejected: ${code}`,
+    status,
+    code,
+    false,
+  );
+const unreachable = () =>
+  new CodexOAuthTokenError(
+    'Codex OAuth token endpoint unreachable',
+    null,
+    null,
+    true,
+  );
+
 let provider: {
   id: string;
   enabled: boolean;
   anthropicAuthToken: string;
   codexOAuthCredentials: CodexOAuthCredentials | null;
+  codexOAuthLastRefreshError?: CodexOAuthRefreshErrorState | null;
 };
 beforeEach(() => {
   vi.clearAllMocks();
+  resetCodexTokenManagerForTests();
   provider = {
     id: 'provider',
     enabled: true,
-    anthropicAuthToken: 'gateway-token',
+    anthropicAuthToken: 'gateway-identifier',
     codexOAuthCredentials: credentials(),
+    codexOAuthLastRefreshError: null,
   };
   // Production getProviders deserializes a fresh credential snapshot per call.
   mocks.getProviders.mockImplementation(() => [structuredClone(provider)]);
@@ -72,31 +100,48 @@ beforeEach(() => {
     if (provider.codexOAuthCredentials?.accessToken !== expected.accessToken)
       return false;
     provider.codexOAuthCredentials = refreshed;
+    provider.codexOAuthLastRefreshError = null;
+    return true;
+  });
+  mocks.persistError.mockImplementation((_id, expected, state) => {
+    if (provider.codexOAuthCredentials?.accessToken !== expected.accessToken)
+      return false;
+    provider.codexOAuthLastRefreshError = state;
     return true;
   });
 });
 
 describe('resolveCodexAccess', () => {
-  test('rejects disabled providers even with the matching token', async () => {
+  test('serves a disabled provider: grants exist only for launches that selected it', async () => {
     provider.enabled = false;
-    await expect(resolveCodexAccess('gateway-token')).rejects.toThrow(
-      CodexGatewayAuthError,
-    );
+    await expect(resolveCodexAccess('provider')).resolves.toMatchObject({
+      accessToken: 'upstream-token',
+    });
   });
-  test('returns current credentials for an enabled provider', async () => {
-    await expect(resolveCodexAccess('gateway-token')).resolves.toEqual({
+  test('returns current credentials without a refresh', async () => {
+    await expect(resolveCodexAccess('provider')).resolves.toEqual({
       providerId: 'provider',
       accessToken: 'upstream-token',
       accountId: 'account-id',
     });
     expect(mocks.refresh).not.toHaveBeenCalled();
   });
+  test('the stored identifier finds its provider but is not an access path', async () => {
+    expect(findCodexProviderByGatewayIdentifier('gateway-identifier')?.id).toBe(
+      'provider',
+    );
+    expect(findCodexProviderByGatewayIdentifier('other')).toBeNull();
+    expect(findCodexProviderByGatewayIdentifier('')).toBeNull();
+    await expect(resolveCodexAccess('gateway-identifier')).rejects.toThrow(
+      CodexGatewayAuthError,
+    );
+  });
   test('concurrent snapshots share one rotating-token refresh', async () => {
     provider.codexOAuthCredentials = credentials('old', true);
     const exchange = gate<ReturnType<typeof tokenResponse>>();
     mocks.refresh.mockReturnValue(exchange.promise);
     const requests = Array.from({ length: 8 }, () =>
-      resolveCodexAccess('gateway-token'),
+      resolveCodexAccess('provider'),
     );
     expect(mocks.refresh).toHaveBeenCalledTimes(1);
     exchange.resolve(tokenResponse('new'));
@@ -109,8 +154,8 @@ describe('resolveCodexAccess', () => {
     const exchange = gate<ReturnType<typeof tokenResponse>>();
     mocks.refresh.mockReturnValue(exchange.promise);
     const requests = [
-      resolveCodexAccess('gateway-token'),
-      resolveCodexAccess('gateway-token'),
+      resolveCodexAccess('provider'),
+      resolveCodexAccess('provider'),
     ];
     provider.codexOAuthCredentials = credentials('admin-new');
     provider.codexOAuthCredentials.accountId = 'admin-workspace';
@@ -129,8 +174,8 @@ describe('resolveCodexAccess', () => {
       .mockReturnValueOnce(exchange.promise)
       .mockResolvedValueOnce(tokenResponse('latest'));
     const requests = [
-      resolveCodexAccess('gateway-token'),
-      resolveCodexAccess('gateway-token'),
+      resolveCodexAccess('provider'),
+      resolveCodexAccess('provider'),
     ];
     provider.codexOAuthCredentials = credentials('admin-expired', true);
     exchange.resolve(tokenResponse('discarded'));
@@ -139,54 +184,165 @@ describe('resolveCodexAccess', () => {
     expect(mocks.refresh).toHaveBeenCalledTimes(2);
     expect(mocks.refresh).toHaveBeenNthCalledWith(2, 'refresh-admin-expired');
   });
-  test.each(['disable', 'rotate', 'clear'])(
-    'revalidates authorization after admin %s during refresh',
+  test.each(['delete', 'clear'])(
+    'revalidates the provider after admin %s during refresh',
     async (action) => {
       provider.codexOAuthCredentials = credentials('old', true);
       const exchange = gate<ReturnType<typeof tokenResponse>>();
       mocks.refresh.mockReturnValue(exchange.promise);
-      const request = resolveCodexAccess('gateway-token');
-      if (action === 'disable') provider.enabled = false;
-      if (action === 'rotate')
-        provider.anthropicAuthToken = 'new-gateway-token';
+      const request = resolveCodexAccess('provider');
+      if (action === 'delete') mocks.getProviders.mockImplementation(() => []);
       if (action === 'clear') provider.codexOAuthCredentials = null;
       exchange.resolve(tokenResponse('new'));
-      await expect(request).rejects.toThrow(
-        'Unknown or disabled Codex gateway token',
-      );
+      await expect(request).rejects.toThrow(CodexGatewayAuthError);
     },
   );
   test('a failed old refresh can use credentials concurrently replaced by admin', async () => {
     provider.codexOAuthCredentials = credentials('old', true);
     const exchange = gate<ReturnType<typeof tokenResponse>>();
     mocks.refresh.mockReturnValue(exchange.promise);
-    const request = resolveCodexAccess('gateway-token');
+    const request = resolveCodexAccess('provider');
     provider.codexOAuthCredentials = credentials('admin-valid');
-    exchange.reject(new Error('invalid_grant'));
+    exchange.reject(rejected());
     await expect(request).resolves.toMatchObject({
       accessToken: 'admin-valid',
     });
-  });
-  test('refresh rejection releases singleflight for a later retry', async () => {
-    provider.codexOAuthCredentials = credentials('old', true);
-    mocks.refresh
-      .mockRejectedValueOnce(new Error('transient'))
-      .mockResolvedValueOnce(tokenResponse('retry'));
-    await expect(resolveCodexAccess('gateway-token')).rejects.toThrow(
-      'transient',
-    );
-    await expect(resolveCodexAccess('gateway-token')).resolves.toMatchObject({
-      accessToken: 'retry',
-    });
-    expect(mocks.refresh).toHaveBeenCalledTimes(2);
   });
   test('persistent CAS conflicts are bounded and never return expired credentials', async () => {
     provider.codexOAuthCredentials = credentials('old', true);
     mocks.persist.mockReturnValue(false);
     mocks.refresh.mockResolvedValue(tokenResponse('discarded'));
-    await expect(resolveCodexAccess('gateway-token')).rejects.toThrow(
+    await expect(resolveCodexAccess('provider')).rejects.toThrow(
       'changed concurrently',
     );
     expect(mocks.refresh).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('forced refresh after an upstream 401', () => {
+  test('refreshes an unexpired token once and shares it across concurrent 401s', async () => {
+    const exchange = gate<ReturnType<typeof tokenResponse>>();
+    mocks.refresh.mockReturnValue(exchange.promise);
+    const requests = Array.from({ length: 3 }, () =>
+      resolveCodexAccess('provider', { rejectedAccessToken: 'upstream-token' }),
+    );
+    expect(mocks.refresh).toHaveBeenCalledTimes(1);
+    exchange.resolve(tokenResponse('rotated'));
+    for (const value of await Promise.all(requests))
+      expect(value.accessToken).toBe('rotated');
+  });
+  test('a token already replaced by another request is used without refreshing', async () => {
+    await expect(
+      resolveCodexAccess('provider', { rejectedAccessToken: 'older-token' }),
+    ).resolves.toMatchObject({ accessToken: 'upstream-token' });
+    expect(mocks.refresh).not.toHaveBeenCalled();
+  });
+});
+
+describe('refresh failures', () => {
+  test('a rejected refresh grant persists reauth_required and stops refreshing', async () => {
+    provider.codexOAuthCredentials = credentials('old', true);
+    mocks.refresh.mockRejectedValue(rejected('refresh_token_reused', 401));
+    await expect(resolveCodexAccess('provider')).rejects.toThrow(
+      CodexReauthRequiredError,
+    );
+    expect(provider.codexOAuthLastRefreshError).toMatchObject({
+      kind: 'reauth_required',
+      accessTokenRejected: true,
+    });
+    expect(provider.codexOAuthLastRefreshError?.message).toContain(
+      'refresh_token_reused',
+    );
+    const second = resolveCodexAccess('provider');
+    await expect(second).rejects.toThrow('重新登录 ChatGPT');
+    expect(mocks.refresh).toHaveBeenCalledTimes(1);
+  });
+  test('an unexpired token keeps serving after its refresh grant is rejected, until upstream rejects it', async () => {
+    provider.codexOAuthCredentials = credentials('near-expiry');
+    provider.codexOAuthCredentials.expiresAt = Date.now() + 60_000;
+    mocks.refresh.mockRejectedValue(rejected());
+    await expect(resolveCodexAccess('provider')).resolves.toMatchObject({
+      accessToken: 'near-expiry',
+    });
+    expect(provider.codexOAuthLastRefreshError?.kind).toBe('reauth_required');
+    await expect(resolveCodexAccess('provider')).resolves.toMatchObject({
+      accessToken: 'near-expiry',
+    });
+    await expect(
+      resolveCodexAccess('provider', { rejectedAccessToken: 'near-expiry' }),
+    ).rejects.toThrow(CodexReauthRequiredError);
+    expect(provider.codexOAuthLastRefreshError?.accessTokenRejected).toBe(true);
+    await expect(resolveCodexAccess('provider')).rejects.toThrow(
+      CodexReauthRequiredError,
+    );
+    expect(mocks.refresh).toHaveBeenCalledTimes(1);
+  });
+  test('new credentials clear the re-login requirement', async () => {
+    provider.codexOAuthCredentials = credentials('old', true);
+    mocks.refresh.mockRejectedValue(rejected());
+    await expect(resolveCodexAccess('provider')).rejects.toThrow(
+      CodexReauthRequiredError,
+    );
+    // runtime-config clears the state whenever credentials are written.
+    provider.codexOAuthCredentials = credentials('relogin');
+    provider.codexOAuthLastRefreshError = null;
+    await expect(resolveCodexAccess('provider')).resolves.toMatchObject({
+      accessToken: 'relogin',
+    });
+  });
+  test('missing refresh tokens require a new login', async () => {
+    provider.codexOAuthCredentials = {
+      ...credentials('old', true),
+      refreshToken: '',
+    };
+    await expect(resolveCodexAccess('provider')).rejects.toThrow(
+      CodexReauthRequiredError,
+    );
+    expect(provider.codexOAuthLastRefreshError?.kind).toBe('reauth_required');
+    expect(mocks.refresh).not.toHaveBeenCalled();
+  });
+  test('transient failures back off, keep valid tokens serving and retry later', async () => {
+    vi.useFakeTimers({ now: Date.now() });
+    try {
+      provider.codexOAuthCredentials = credentials('old', true);
+      mocks.refresh
+        .mockRejectedValueOnce(unreachable())
+        .mockResolvedValueOnce(tokenResponse('recovered'));
+      const first = resolveCodexAccess('provider');
+      await expect(first).rejects.toThrow(CodexRefreshUnavailableError);
+      await first.catch((err: CodexRefreshUnavailableError) => {
+        expect(err.retryAfterMs).toBeGreaterThan(20_000);
+        expect(err.retryAfterMs).toBeLessThanOrEqual(30_000);
+      });
+      expect(provider.codexOAuthLastRefreshError).toMatchObject({
+        kind: 'transient',
+      });
+      // Inside the backoff window the endpoint is not called again.
+      await expect(resolveCodexAccess('provider')).rejects.toThrow(
+        CodexRefreshUnavailableError,
+      );
+      expect(mocks.refresh).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(31_000);
+      await expect(resolveCodexAccess('provider')).resolves.toMatchObject({
+        accessToken: 'recovered',
+      });
+      expect(provider.codexOAuthLastRefreshError).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  test('transient failures escalate the backoff only once per failed exchange', async () => {
+    provider.codexOAuthCredentials = credentials('near-expiry');
+    provider.codexOAuthCredentials.expiresAt = Date.now() + 60_000;
+    const exchange = gate<ReturnType<typeof tokenResponse>>();
+    mocks.refresh.mockReturnValue(exchange.promise);
+    const requests = Array.from({ length: 4 }, () =>
+      resolveCodexAccess('provider'),
+    );
+    exchange.reject(unreachable());
+    // Still unexpired: every waiter keeps the current token.
+    for (const value of await Promise.all(requests))
+      expect(value.accessToken).toBe('near-expiry');
+    expect(mocks.persistError).toHaveBeenCalledTimes(1);
   });
 });

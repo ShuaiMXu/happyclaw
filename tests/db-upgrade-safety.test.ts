@@ -151,7 +151,7 @@ describe('database upgrade safety gate', () => {
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = migrationBackups;
     const backupsBeforeCurrentOnlyRefusal = fs.readdirSync(migrationBackups);
     expect(() => db.initDatabase({ requireCurrentSchema: true })).toThrow(
-      'Database must already be schema v77',
+      'Database must already be schema v78',
     );
     expect(fs.readdirSync(migrationBackups)).toEqual(
       backupsBeforeCurrentOnlyRefusal,
@@ -190,9 +190,9 @@ describe('schema version head', () => {
     // one assertion that fails when the head moves, forcing whoever bumps it
     // to confirm the matching migration block — and a test covering it —
     // actually landed. Update the literal in the same commit as the migration.
-    // v77: subagent_checkpoints, the sub-agent result hand-back for a
-    // replayed turn. Migration coverage:
-    // schema-v77-subagent-checkpoints.test.ts.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(77);
+    // v78: session_model_selections, the chat composer's per-conversation
+    // model choice. Migration coverage:
+    // schema-v78-session-model-selections.test.ts.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(78);
   });
 });

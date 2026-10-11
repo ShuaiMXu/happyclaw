@@ -26,34 +26,60 @@ not read or update the host's Codex CLI login file.
 
 HappyClaw exchanges the code with PKCE, reads the official namespaced JWT
 identity claims, and saves OAuth secrets encrypted in its provider secret
-store. **重新登录 ChatGPT** replaces that provider's login; clearing or
-disabling it stops authorization through its gateway key. No additional
-Docker gateway service or device-code-login switch is needed for this flow.
+store. A callback URL from `localhost:1455` or `127.0.0.1:1455` is accepted;
+an `error=` returned by the authorization page is shown as such. A transient
+token-exchange failure keeps the pending login, so pasting the same URL again
+retries it; a rejected code requires a new login. A new provider stores the
+catalog default model and its default reasoning effort.
+
+**重新登录 ChatGPT** replaces that provider's login, clears any refresh
+failure and provider-health verdict, and lets the provider's warm runners
+finish their current query and restart. Logging in with a different ChatGPT
+account, or converting a non-ChatGPT provider, also stops runners and drops
+the provider's saved sessions, because encrypted reasoning from one account
+cannot be replayed to another. A converted provider gets the catalog default
+model unless it already uses a Codex catalog model. No additional Docker
+gateway service or device-code-login switch is needed for this flow.
 
 ### Runtime and account isolation
 
 ```text
 Claude Agent SDK (host or agent container)
-       | Anthropic Messages + provider gateway key
+       | Anthropic Messages + runner-scoped gateway token
        v
-HappyClaw /gateway/chatgpt/v1/messages
+HappyClaw /gateway/chatgpt/v1/messages (loopback / private source only)
        | OAuth access token + selected ChatGPT account header
        v
 ChatGPT / Codex Responses backend
 ```
 
-The provider's gateway key is distinct from the upstream OAuth secrets.
-Only that key is given to the runner; the host service owns access-token
-refresh. HappyClaw derives the local gateway address for host and container
-execution automatically. The saved internal URL is a routing placeholder,
-not an external service to deploy or expose separately.
+Every runner launch — container, host process, or a one-shot host query such
+as title generation — receives its own random gateway token, held only in the
+service's memory and revoked when that runner or query exits. The gateway
+accepts nothing else: the provider's saved key is only an internal identifier
+used to find the provider at launch. The gateway also refuses requests that
+carry `Forwarded`/`X-Forwarded-*`/`X-Real-IP` headers or come from a
+non-loopback, non-private address, so it is not reachable from the public
+internet even though it shares the web port. The upstream OAuth secrets never
+leave the host service. An agent can read its own runner's token while that
+runner lives; that is the remaining exposure.
+
+HappyClaw derives the local gateway address for host and container execution
+automatically and keeps that hop out of any configured HTTP proxy. The saved
+internal URL is a routing placeholder, not an external service to deploy or
+expose separately.
 
 Each provider identifies one authorization. It is not an account-rotation
 pool. Requests refresh short-lived tokens when needed, share a single refresh
 per provider, and re-read persisted credentials after concurrent changes.
 A failed compare-and-swap never returns an old credential snapshot or
-silently overwrites a reauthorization. A provider disabled or key rotated
-during refresh is checked again before serving the request.
+silently overwrites a reauthorization. An upstream 401 forces one shared
+refresh and a single retry. A rejected refresh grant (`invalid_grant`,
+`refresh_token_reused`, other 400/401 answers) is saved on the provider as
+"needs re-login"; the gateway stops refreshing and answers an authentication
+error that names the re-login until the credentials change. Transient refresh
+failures back off (30 seconds doubling to 5 minutes) while a still-valid
+access token keeps serving.
 
 ### Protocol and operating limits
 
@@ -72,23 +98,41 @@ during refresh is checked again before serving the request.
   `input_tokens` and reported separately as `cache_read_input_tokens` and
   `cache_creation_input_tokens`. Reasoning usage is preserved as a detail of
   output usage. Cache and reasoning details must not be counted twice.
-- Authentication runs before body buffering or rate-counter allocation.
-  Each authenticated provider has 120 requests per 60-second window, shared
-  across its gateway-key rotations. Rate state has a hard capacity of 1,024
-  active provider windows; a full table rejects new windows until expiry.
-- Requests are capped at 32 MiB. Invalid message, tool or image shapes return
-  400; unsupported image URL sources are rejected explicitly instead of
-  silently disappearing. Images must use the supported base64 source shape.
-- Upstream headers have a 30-second deadline and streams a 60-second idle
-  deadline. Nonstream aggregation also has a ten-minute deadline and a
-  32 MiB budget. Individual SSE events are bounded. Downstream backpressure
-  pauses upstream reading, and cancellation disconnects the upstream stream.
+- Source checks and authentication run before body buffering or
+  rate-counter allocation. Each runner token has 120 requests per 60-second
+  window; a limited request gets 429 with `Retry-After`. HappyClaw treats its
+  own throttle as transient, so it never quarantines the provider. Rate state
+  has a hard capacity of 1,024 active windows; a full table rejects new
+  windows until expiry.
+- Requests are capped at 32 MiB. Invalid message or tool shapes return 400
+  naming the offending field path, never its value. Content the backend cannot
+  take — image URLs or unsupported image types, non-PDF or URL documents,
+  documents inside tool results, unknown block types — becomes a visible
+  placeholder or its plain text, so one such block in the history does not
+  fail every later turn.
+- `POST /gateway/chatgpt/v1/messages/count_tokens` answers a local estimate
+  (characters per token, fixed cost for images and files) without calling the
+  backend.
+- Reasoning effort: disabled thinking uses the model's lowest supported level;
+  haiku-tier background requests use low; an Agent with an explicit effort
+  keeps it; otherwise `CODEX_REASONING_EFFORT` applies, falling back to the
+  model's catalog default. The settings page shows that same default.
+- Upstream headers have a 30-second deadline and streams a 300-second idle
+  deadline, matching the official Codex CLI. Nonstream aggregation also has a
+  ten-minute deadline and a 32 MiB budget. Individual SSE events are bounded.
+  Downstream backpressure pauses upstream reading, and cancellation
+  disconnects the upstream stream.
+- Streams hold their first frames until content starts (at most 48 events,
+  1 MiB or 20 seconds), so a failure reported before any content becomes a
+  real HTTP status instead of 200 followed by an error event.
 - Success logs record model and usage counts. Upstream HTTP error bodies are
-  cancelled without being buffered or logged; they can contain user content
-  or secrets. HTTP authentication, permission and rate-limit failures retain
-  their Anthropic error types and valid `Retry-After` hints. Semantic terminal
-  events close the upstream reader without waiting for the HTTP connection
-  to close. Malformed SSE fails the request.
+  read up to 64 KiB within five seconds; the client gets a redacted, bounded
+  excerpt, and logs keep only status, code and type. Usage limits become 429
+  with `Retry-After` and the reset time; overload and `slow_down` become 529;
+  a plan without Codex (`usage_not_included`) becomes 403; context-length
+  rejections become 400 "Prompt is too long", which Claude Code answers by
+  compacting. Semantic terminal events close the upstream reader without
+  waiting for the HTTP connection to close. Malformed SSE fails the request.
 
 The protocol implementation is ported from
 [CLIProxyAPI a2976eb8](https://github.com/router-for-me/CLIProxyAPI/tree/a2976eb8a303f11b4ea5177bce9f9ff752634dfc).
@@ -105,15 +149,17 @@ if your workflow uses screenshots), and usage history. Local protocol tests
 use synthetic tokens and mocked upstream streams; they do not establish
 that an account can access the live backend.
 
-| Symptom                         | Check                                                                                                                               |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| Login callback rejected         | Finish the same user's flow within ten minutes and paste its complete callback URL; do not reuse a consumed code.                   |
-| 401 or authentication error     | Verify the provider is enabled and still authorized. Use its HappyClaw re-login action if the refresh grant expired or was revoked. |
-| 429 from HappyClaw gateway      | Wait for the provider's fixed rate window to expire; all workspaces sharing that provider share its budget.                         |
-| 413                             | Reduce the request below the 32 MiB envelope, including image base64 overhead.                                                      |
-| 400 invalid messages request    | Check supported message/tool shapes and use base64 image sources.                                                                   |
-| Upstream model/plan rejection   | Select a model available to the linked account and check its current Codex access.                                                  |
-| Stream timeout or premature EOF | Retry after checking upstream connectivity; a partial reply is reported as an error, not a successful terminal.                     |
+| Symptom                         | Check                                                                                                                 |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Login callback rejected         | Finish the same user's flow within ten minutes and paste its complete callback URL; do not reuse a consumed code.     |
+| 401 or authentication error     | The provider page shows "needs re-login" when the refresh grant was rejected; use its HappyClaw re-login action.      |
+| 403 from HappyClaw gateway      | The request came through a reverse proxy or from a non-local address; runners reach the gateway directly.             |
+| 429 from HappyClaw gateway      | One runner exceeded its 120 requests per minute; it retries after `Retry-After`. Other runners keep their own budget. |
+| 429 usage limit                 | The ChatGPT plan's Codex usage window is exhausted; the message names the reset time.                                 |
+| 413                             | Reduce the request below the 32 MiB envelope, including image base64 overhead.                                        |
+| 400 invalid messages request    | The message names the field path that does not match a supported message/tool shape.                                  |
+| Upstream model/plan rejection   | Select a model available to the linked account and check its current Codex access.                                    |
+| Stream timeout or premature EOF | Retry after checking upstream connectivity; a partial reply is reported as an error, not a successful terminal.       |
 
 ## External CLIProxyAPI gateway (optional)
 

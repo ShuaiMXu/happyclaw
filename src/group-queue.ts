@@ -2308,12 +2308,16 @@ export class GroupQueue {
    * Gracefully retire only runners using the refreshed Provider. The drain
    * sentinel is consumed after the current query, so a read-only usage poll
    * can rotate credentials without interrupting unrelated or in-flight work.
+   * A lane that is active but has not registered its process yet is still
+   * launching: it reads the rotated credentials when it spawns, and its
+   * selectedProviderId may be left over from the previous run.
    */
   drainProviderRunnersForCredentialRefresh(providerId: string): number {
     let drained = 0;
     for (const [jid, state] of this.groups) {
       if (
         !state.active ||
+        !state.process ||
         !state.groupFolder ||
         state.selectedProviderId !== providerId ||
         state.drainSentinelWritten
@@ -2326,6 +2330,41 @@ export class GroupQueue {
       logger.info(
         { groupJid: jid, groupFolder: state.groupFolder, providerId },
         'Sent drain signal after provider credential refresh',
+      );
+    }
+    return drained;
+  }
+
+  /**
+   * Retire the runners of one conversation after its model selection changed.
+   * A warm runner keeps the provider environment it was spawned with, so the
+   * next message must reach a fresh one. The drain sentinel lets an in-flight
+   * query finish first. With a concrete target, runners already on it are
+   * left alone; a null target (back to the default) cannot be predicted
+   * before pool selection, so every active runner is drained.
+   */
+  drainRunnersForModelSelection(
+    groupJids: readonly string[],
+    targetProviderId: string | null,
+  ): number {
+    let drained = 0;
+    for (const jid of new Set(groupJids)) {
+      const state = this.groups.get(jid);
+      if (
+        !state?.active ||
+        !state.groupFolder ||
+        state.drainSentinelWritten ||
+        (targetProviderId !== null &&
+          state.selectedProviderId === targetProviderId)
+      ) {
+        continue;
+      }
+      if (!this.writeDrainSentinel(state as ActiveGroupState)) continue;
+      state.drainSentinelWritten = true;
+      drained++;
+      logger.info(
+        { groupJid: jid, groupFolder: state.groupFolder, targetProviderId },
+        'Sent drain signal after conversation model selection changed',
       );
     }
     return drained;

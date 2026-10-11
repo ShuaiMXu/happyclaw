@@ -62,13 +62,17 @@ afterAll(() => {
 });
 
 describe('schema v77 sub-agent checkpoints', () => {
-  test('backs up the v76 database, creates the table and stamps v77', () => {
+  test('backs up the v76 database, creates the table and stamps the head', () => {
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = backupDir;
     db.initDatabase();
-    expect(db.getRouterState('schema_version')).toBe('77');
+    expect(db.getRouterState('schema_version')).toBe(
+      String(db.CURRENT_SCHEMA_VERSION),
+    );
     const backups = fs.readdirSync(backupDir);
     expect(
-      backups.some((name) => name.startsWith('messages-v76-to-v77-')),
+      backups.some((name) =>
+        name.startsWith(`messages-v76-to-v${db.CURRENT_SCHEMA_VERSION}-`),
+      ),
     ).toBe(true);
 
     const backup = new Database(path.join(backupDir, backups[0]), {
@@ -120,10 +124,8 @@ describe('schema v77 sub-agent checkpoints', () => {
 
     const conn = new Database(databasePath);
     conn
-      .prepare(
-        "UPDATE router_state SET value = '78' WHERE key = 'schema_version'",
-      )
-      .run();
+      .prepare("UPDATE router_state SET value = ? WHERE key = 'schema_version'")
+      .run(String(db.CURRENT_SCHEMA_VERSION + 1));
     conn.close();
     expect(() => db.initDatabase()).toThrow('refusing downgrade');
   });

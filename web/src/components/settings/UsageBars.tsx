@@ -311,6 +311,31 @@ export function UsageBars({
 
   if (loading || !usage?.data) return null;
 
+  // An unsupported grant can still carry live SDK rate-limit observations;
+  // only the usage buckets are unavailable.
+  const statusNote =
+    usage.status === 'needs_relogin'
+      ? { tone: 'text-error', text: '授权已失效，重新登录后才能查看用量' }
+      : usage.status === 'unsupported' && usage.unsupportedReason !== 'no_oauth'
+        ? {
+            tone: 'text-muted-foreground',
+            text: 'Setup Token / 仅推理权限的授权不支持用量查询',
+          }
+        : null;
+  if (usage.status) {
+    if (!statusNote && !usage.observation) return null;
+    return (
+      <div className={cn('min-w-0 space-y-2', className)}>
+        {statusNote && (
+          <div className={cn('text-micro', statusNote.tone)}>
+            {statusNote.text}
+          </div>
+        )}
+        {usage.observation && <LiveStatus observation={usage.observation} />}
+      </div>
+    );
+  }
+
   const buckets: { label: string; bucket: OAuthUsageBucket }[] = [];
   if (usage.data.five_hour)
     buckets.push({ label: '5h', bucket: usage.data.five_hour });

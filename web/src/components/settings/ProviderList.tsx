@@ -95,27 +95,33 @@ function CredentialBadges({ provider }: { provider: ProviderWithHealth }) {
   const badges: { label: string; dot: BadgeDot; detail?: string }[] = [];
 
   if (provider.hasClaudeOAuthCredentials) {
-    const expired =
-      provider.claudeOAuthCredentialsExpiresAt != null &&
-      provider.claudeOAuthCredentialsExpiresAt <= Date.now();
     const expiry = formatOAuthExpiry(provider.claudeOAuthCredentialsExpiresAt);
+    // Host-side renewal keeps the access token fresh, so an elapsed expiry
+    // alone is not a failure; a refused renewal is.
     badges.push({
-      label: 'OAuth',
-      dot: expired ? 'error' : 'success',
-      detail: expiry ?? undefined,
+      label: provider.claudeOAuthNeedsReLogin
+        ? 'OAuth · 需重新登录'
+        : provider.claudeOAuthSubscriptionType
+          ? `Claude ${provider.claudeOAuthSubscriptionType}`
+          : 'OAuth',
+      dot: provider.claudeOAuthNeedsReLogin ? 'error' : 'success',
+      detail:
+        provider.claudeOAuthAccountEmail ??
+        (provider.claudeOAuthNeedsReLogin ? undefined : (expiry ?? undefined)),
     });
   }
   if (provider.hasCodexOAuthCredentials) {
-    const expired =
-      provider.codexOAuthCredentialsExpiresAt != null &&
-      provider.codexOAuthCredentialsExpiresAt <= Date.now();
+    // The gateway refreshes an elapsed access token on demand; only a refused
+    // refresh needs the user.
     const expiry = formatOAuthExpiry(provider.codexOAuthCredentialsExpiresAt);
     badges.push({
-      label: provider.codexOAuthCredentialsPlanType
-        ? `ChatGPT ${provider.codexOAuthCredentialsPlanType}`
-        : 'ChatGPT',
-      dot: expired ? 'error' : 'success',
-      detail: expiry ?? undefined,
+      label: provider.codexOAuthNeedsReauth
+        ? 'ChatGPT · 需重新登录'
+        : provider.codexOAuthCredentialsPlanType
+          ? `ChatGPT ${provider.codexOAuthCredentialsPlanType}`
+          : 'ChatGPT',
+      dot: provider.codexOAuthNeedsReauth ? 'error' : 'success',
+      detail: provider.codexOAuthCredentialsEmail ?? expiry ?? undefined,
     });
   }
   if (provider.hasClaudeCodeOauthToken) {
