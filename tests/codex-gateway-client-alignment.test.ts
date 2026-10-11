@@ -28,9 +28,9 @@ const { resetCodexTokenManagerForTests } =
   await import('../src/codex-gateway/token-manager.js');
 const {
   CODEX_BACKGROUND_SOURCE,
-  CODEX_BACKGROUND_SUBAGENT,
+  buildCodexUpstreamRequest,
   codexTurnBoundary,
-  encodeCodexRequestBody,
+  encodeCodexUpstreamBody,
 } = await import('../src/codex-gateway/request-context.js');
 const {
   codexCookieHeader,
@@ -232,6 +232,8 @@ describe('official /responses request shape', () => {
   test('sends exactly the official header set for a conversation turn', async () => {
     expect((await request()).status).toBe(200);
     const first = sent(0);
+    // The converter decides Responses Lite per request (see below).
+    const lite = first.body.reasoning?.context === 'all_turns';
     expect(first.url).toBe('https://chatgpt.com/backend-api/codex/responses');
     expect(Object.keys(first.headers).sort()).toEqual(
       [
@@ -249,7 +251,7 @@ describe('official /responses request shape', () => {
         'x-codex-routing-hint',
         'x-codex-turn-metadata',
         'x-codex-window-id',
-        'x-openai-internal-codex-responses-lite',
+        ...(lite ? ['x-openai-internal-codex-responses-lite'] : []),
       ].sort(),
     );
     expect(first.headers).toMatchObject({
@@ -262,7 +264,6 @@ describe('official /responses request shape', () => {
       originator: 'codex-tui',
       version: CODEX_CLIENT_VERSION,
       'x-codex-routing-hint': 'model=gpt-6-sol',
-      'x-openai-internal-codex-responses-lite': 'true',
     });
     const thread = first.headers['thread-id'];
     expect(first.headers['x-client-request-id']).toBe(thread);
@@ -314,14 +315,34 @@ describe('official /responses request shape', () => {
     });
   });
 
-  test('models outside Responses Lite omit its header', async () => {
-    await request({ model: 'gpt-5.5' });
-    const { headers } = sent(0);
-    expect(headers).not.toHaveProperty(
-      'x-openai-internal-codex-responses-lite',
-    );
-    expect(headers['x-codex-routing-hint']).toBe('model=gpt-5.5');
-  });
+  test.each([
+    [{ model: 'gpt-6-sol', reasoning: { context: 'all_turns' } }, true],
+    // A lite model whose request the converter kept classic (hosted tools).
+    [{ model: 'gpt-6-sol', reasoning: { effort: 'low' } }, false],
+    [{ model: 'gpt-6-sol' }, false],
+    [{ model: 'gpt-5.5', reasoning: { context: 'all_turns' } }, true],
+  ])(
+    'Responses Lite header follows the converted request %#',
+    (responsesRequest, lite) => {
+      const { headers } = buildCodexUpstreamRequest({
+        incomingHeaders: new Headers({ 'x-claude-code-session-id': 's' }),
+        anthropicRequest: { messages: [{ role: 'user', content: 'hi' }] },
+        responsesRequest,
+        access: {
+          providerId: 'p',
+          accessToken: 't',
+          accountId: 'a',
+        },
+        fallbackScope: 'g',
+      });
+      expect(headers['x-openai-internal-codex-responses-lite']).toBe(
+        lite ? 'true' : undefined,
+      );
+      expect(headers['x-codex-routing-hint']).toBe(
+        `model=${responsesRequest.model}`,
+      );
+    },
+  );
 
   test('a FedRAMP account adds X-OpenAI-Fedramp; others never send it', async () => {
     provider.codexOAuthCredentials.isFedramp = true;
@@ -338,33 +359,42 @@ describe('official /responses request shape', () => {
     expect(sent(0).headers).not.toHaveProperty('ChatGPT-Account-ID');
   });
 
-  test('background requests get their own thread and the internal sub-request cache key', async () => {
+  test('background requests take the official title-thread shape with their own cache key', async () => {
     await request();
+    await request({ model: 'claude-haiku-4-5' });
     await request({ model: 'claude-haiku-4-5' });
     const main = sent(0);
     const background = sent(1);
-    const parent = main.headers['thread-id'];
-    expect(background.headers['thread-id']).not.toBe(parent);
-    expect(background.headers['x-codex-parent-thread-id']).toBe(parent);
-    expect(background.headers['session-id']).toBe(main.headers['session-id']);
-    expect(background.body.prompt_cache_key).toBe(
-      `${CODEX_BACKGROUND_SOURCE}:${parent}`,
-    );
+    const conversation = main.headers['thread-id'];
+    const thread = background.headers['thread-id'];
+    expect(thread).not.toBe(conversation);
+    // Stable per conversation thread.
+    expect(sent(2).headers['thread-id']).toBe(thread);
+    const cacheKey = `${CODEX_BACKGROUND_SOURCE}:${conversation}`;
+    expect(background.body.prompt_cache_key).toBe(cacheKey);
+    expect(background.headers['session-id']).toBe(cacheKey);
+    expect(background.headers['x-client-request-id']).toBe(thread);
+    // A root thread of its own, like the TUI's hidden title thread.
     expect(background.metadata).toMatchObject({
-      parent_thread_id: parent,
+      session_id: thread,
+      thread_id: thread,
+      agent_name: '/root',
       thread_source: CODEX_BACKGROUND_SOURCE,
     });
-    expect(background.metadata).not.toHaveProperty('agent_name');
-    expect(background.body.client_metadata['x-codex-parent-thread-id']).toBe(
-      parent,
-    );
-    if (CODEX_BACKGROUND_SUBAGENT)
-      expect(background.headers['x-openai-subagent']).toBe(
-        CODEX_BACKGROUND_SUBAGENT,
-      );
-    else expect(background.headers).not.toHaveProperty('x-openai-subagent');
-    expect(main.headers).not.toHaveProperty('x-openai-subagent');
-    expect(main.headers).not.toHaveProperty('x-codex-parent-thread-id');
+    expect(background.body.client_metadata).toMatchObject({
+      session_id: thread,
+      thread_id: thread,
+    });
+    for (const call of [main, background]) {
+      expect(call.headers).not.toHaveProperty('x-openai-subagent');
+      expect(call.headers).not.toHaveProperty('x-codex-parent-thread-id');
+      expect(call.metadata).not.toHaveProperty('parent_thread_id');
+    }
+    // Another account never shares the background thread or its key.
+    provider.codexOAuthCredentials.accountId = 'account-2';
+    await request({ model: 'claude-haiku-4-5' });
+    expect(sent(3).headers['thread-id']).not.toBe(thread);
+    expect(sent(3).body.prompt_cache_key).not.toBe(cacheKey);
   });
 
   test('without an SDK session id the request still sends a deterministic cache key', async () => {
@@ -610,11 +640,17 @@ describe('ChatGPT infrastructure cookies', () => {
 
 describe('request body compression', () => {
   test.skipIf(!zstdAvailable)('zstd round-trips the exact JSON body', () => {
+    const request = { input: 'x'.repeat(10_000), emoji: '你好 🌍' };
+    const extras = {
+      promptCacheKey: 'key',
+      clientMetadata: { turn_id: 'turn' },
+    };
     const json = JSON.stringify({
-      input: 'x'.repeat(10_000),
-      emoji: '你好 🌍',
+      ...request,
+      prompt_cache_key: 'key',
+      client_metadata: { turn_id: 'turn' },
     });
-    const encoded = encodeCodexRequestBody(json);
+    const encoded = encodeCodexUpstreamBody(request, extras);
     expect(encoded.contentEncoding).toBe('zstd');
     expect(
       zlib.zstdDecompressSync(encoded.body as Uint8Array).toString('utf8'),
@@ -626,7 +662,14 @@ describe('request body compression', () => {
     const original = zlib.zstdCompressSync;
     (zlib as { zstdCompressSync?: unknown }).zstdCompressSync = undefined;
     try {
-      expect(encodeCodexRequestBody('{"a":1}')).toEqual({ body: '{"a":1}' });
+      expect(
+        encodeCodexUpstreamBody(
+          { a: 1 },
+          { promptCacheKey: 'k', clientMetadata: {} },
+        ),
+      ).toEqual({
+        body: '{"a":1,"prompt_cache_key":"k","client_metadata":{}}',
+      });
       await request();
       const init = mocks.fetch.mock.calls[0][1];
       expect(init.headers).not.toHaveProperty('Content-Encoding');

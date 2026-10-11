@@ -184,15 +184,17 @@ Requests to the Codex backend mirror the official Codex CLI 0.162.1
   `_cfuvid`, `cf_clearance`, `cf_ob_info`, `cf_use_ob`, `cf_chl_*`) are stored,
   in a separate in-memory jar for each provider and account, and sent back on
   that account's requests. Account and session cookies are never stored.
-- Background requests (haiku tier) use their own thread under the
-  conversation's thread: `x-codex-parent-thread-id`, `thread_source:
-thread_title` in the turn metadata and the internal sub-request cache key
-  `thread_title:{parent thread}`. They send no `x-openai-subagent`: the
-  official client sends none for its own title thread, and that header's
-  official values describe reviewers, compaction, memory jobs and spawned
-  agents.
-- `x-openai-internal-codex-responses-lite: true` is sent for models whose
-  traits use Responses Lite.
+- Background requests (haiku tier) take the shape of the official TUI's
+  hidden title thread: a separate root thread (stable per conversation
+  thread) with `thread_source: thread_title` in the turn metadata and no
+  `x-openai-subagent`, whose official values describe reviewers, compaction,
+  memory jobs and spawned agents. Their prompt cache key, also their
+  `session-id`, is `thread_title:{conversation thread}`, so they share a
+  cache without joining the conversation's.
+- `x-openai-internal-codex-responses-lite: true` is sent exactly when the
+  converted request is a Responses Lite request (it carries
+  `reasoning.context: "all_turns"`); a request kept in the classic shape,
+  such as one with hosted web search, omits it even on a Lite model.
 - `x-codex-beta-features` is omitted. The official default list is only
   `remote_compaction_v2`, which advertises remote compaction and `compaction`
   output items; Claude Code compacts locally, so HappyClaw cannot honor it.

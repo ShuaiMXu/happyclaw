@@ -20,7 +20,6 @@ import {
   type AnthropicRequestSubset,
 } from './convert-request.js';
 import { codexInstallationId } from './installation-id.js';
-import { getCodexModelTraits } from './model-catalog.js';
 import {
   codexCookieHeader,
   codexTransportScope,
@@ -48,18 +47,16 @@ export const CODEX_BETA_FEATURES: readonly string[] = [];
 
 /**
  * Claude Code's background calls (haiku tier: titles, summaries, command
- * checks) run like the official client's internal sub-requests: a thread of
- * their own under the conversation's thread, with the prompt cache key
- * `{source}:{parent_thread_id}` (client.rs prompt_cache_key) and
- * `x-codex-parent-thread-id`. The official client's own utility call of this
- * kind is the TUI's hidden title thread (thread_source `thread_title`), which
- * sends no `x-openai-subagent`; that header's official values name
- * reviewers, compaction, memory jobs and spawned agents, none of which these
- * calls are.
+ * checks) take the shape of the official client's own utility call, the TUI's
+ * hidden title thread (tui/src/app/thread_title.rs): a separate root thread
+ * with thread_source `thread_title` and no `x-openai-subagent` (that header's
+ * official values name reviewers, compaction, memory jobs and spawned agents).
+ * The thread is stable per conversation thread, and its prompt cache key is
+ * `thread_title:{conversation thread}`, the official internal sub-request
+ * form (client.rs prompt_cache_key), so background calls share a cache
+ * without joining the conversation's.
  */
 export const CODEX_BACKGROUND_SOURCE = 'thread_title';
-/** `x-openai-subagent` for background calls; null = not sent. */
-export const CODEX_BACKGROUND_SUBAGENT: string | null = null;
 
 function identityPart(value: unknown): string | undefined {
   if (typeof value !== 'string') return;
@@ -147,12 +144,10 @@ export function codexTurnBoundary(request: unknown): CodexTurnBoundary {
 }
 
 export interface CodexRequestIdentity {
-  /** Official session id: one Claude Code session. */
+  /** Official session id: one Claude Code session, or a background thread. */
   sessionId: string;
   /** Official thread id: the session's main agent, a sub-agent, or a background thread. */
   threadId: string;
-  /** Set for background requests: the conversation thread they serve. */
-  parentThreadId?: string;
   promptCacheKey: string;
   /** `session-id` header: the cache-affinity key (client.rs responses_session_id). */
   responsesSessionId: string;
@@ -223,13 +218,14 @@ export function codexRequestIdentity(
         conversationThreadId,
       ]),
     );
+    const promptCacheKey = `${CODEX_BACKGROUND_SOURCE}:${conversationThreadId}`;
+    // A root thread of its own: it is its own session, and its session-id
+    // header is its cache key (client.rs responses_session_id).
     return {
-      sessionId,
+      sessionId: threadId,
       threadId,
-      parentThreadId: conversationThreadId,
-      promptCacheKey: `${CODEX_BACKGROUND_SOURCE}:${conversationThreadId}`,
-      // A non-root thread reports the session it belongs to.
-      responsesSessionId: sessionId,
+      promptCacheKey,
+      responsesSessionId: promptCacheKey,
       background: true,
       agentId,
     };
@@ -267,16 +263,14 @@ function turnMetadataJson(fields: {
     installation_id: fields.installationId,
     session_id: identity.sessionId,
     thread_id: identity.threadId,
-    ...(identity.agentId === 'main' && !identity.background
+    // AgentPath::root for a root thread; a sub-agent's path is unknown.
+    ...(identity.background || identity.agentId === 'main'
       ? { agent_name: '/root' }
       : {}),
     turn_id: fields.turnId,
     window_id: fields.windowId,
     window_number: 0,
     request_kind: 'turn',
-    ...(identity.parentThreadId
-      ? { parent_thread_id: identity.parentThreadId }
-      : {}),
     thread_source: identity.background
       ? CODEX_BACKGROUND_SOURCE
       : identity.agentId === 'main'
@@ -287,14 +281,21 @@ function turnMetadataJson(fields: {
 }
 
 /**
- * Request body compression like the official client's default for ChatGPT
- * auth (features EnableRequestCompression, http-client request.rs: zstd
- * level 3). Node without zlib zstd support sends the body uncompressed.
+ * The final upstream body: the converted request plus the gateway's cache key
+ * and client metadata, serialized, then compressed like the official
+ * client's default for ChatGPT auth (features EnableRequestCompression,
+ * http-client request.rs: zstd level 3). Node without zlib zstd support
+ * sends the body uncompressed.
  */
-export function encodeCodexRequestBody(json: string): {
-  body: string | Uint8Array;
-  contentEncoding?: 'zstd';
-} {
+export function encodeCodexUpstreamBody(
+  request: object,
+  extras: { promptCacheKey: string; clientMetadata: Record<string, string> },
+): { body: string | Uint8Array; contentEncoding?: 'zstd' } {
+  const json = JSON.stringify({
+    ...request,
+    prompt_cache_key: extras.promptCacheKey,
+    client_metadata: extras.clientMetadata,
+  });
   if (typeof zlib.zstdCompressSync !== 'function') return { body: json };
   return {
     body: zlib.zstdCompressSync(Buffer.from(json), {
@@ -302,6 +303,20 @@ export function encodeCodexRequestBody(json: string): {
     }),
     contentEncoding: 'zstd',
   };
+}
+
+/**
+ * Responses Lite is decided per request by the converter: every lite request
+ * carries `reasoning.context: "all_turns"` and a classic one never does
+ * (e.g. a request with hosted web search stays classic on a lite model).
+ */
+export function isCodexResponsesLiteRequest(request: object): boolean {
+  const reasoning = (request as { reasoning?: unknown }).reasoning;
+  return (
+    !!reasoning &&
+    typeof reasoning === 'object' &&
+    (reasoning as Record<string, unknown>).context === 'all_turns'
+  );
 }
 
 export interface CodexUpstreamAccess {
@@ -359,26 +374,17 @@ export function buildCodexUpstreamRequest(input: {
     turnStartedAtMs: turn.startedAtMs,
   });
 
-  const encoded = encodeCodexRequestBody(
-    JSON.stringify({
-      ...responsesRequest,
-      prompt_cache_key: identity.promptCacheKey,
-      client_metadata: {
-        'x-codex-installation-id': installationId,
-        session_id: identity.sessionId,
-        thread_id: identity.threadId,
-        'x-codex-window-id': windowId,
-        turn_id: turn.turnId,
-        ...(identity.background && CODEX_BACKGROUND_SUBAGENT
-          ? { 'x-openai-subagent': CODEX_BACKGROUND_SUBAGENT }
-          : {}),
-        ...(identity.parentThreadId
-          ? { 'x-codex-parent-thread-id': identity.parentThreadId }
-          : {}),
-        'x-codex-turn-metadata': turnMetadata,
-      },
-    }),
-  );
+  const encoded = encodeCodexUpstreamBody(responsesRequest, {
+    promptCacheKey: identity.promptCacheKey,
+    clientMetadata: {
+      'x-codex-installation-id': installationId,
+      session_id: identity.sessionId,
+      thread_id: identity.threadId,
+      'x-codex-window-id': windowId,
+      turn_id: turn.turnId,
+      'x-codex-turn-metadata': turnMetadata,
+    },
+  });
 
   const model = responsesRequest.model;
   const tier =
@@ -405,13 +411,7 @@ export function buildCodexUpstreamRequest(input: {
     ...(turn.turnState ? { 'x-codex-turn-state': turn.turnState } : {}),
     'x-codex-window-id': windowId,
     'x-codex-turn-metadata': turnMetadata,
-    ...(identity.parentThreadId
-      ? { 'x-codex-parent-thread-id': identity.parentThreadId }
-      : {}),
-    ...(identity.background && CODEX_BACKGROUND_SUBAGENT
-      ? { 'x-openai-subagent': CODEX_BACKGROUND_SUBAGENT }
-      : {}),
-    ...(getCodexModelTraits(model).useResponsesLite
+    ...(isCodexResponsesLiteRequest(responsesRequest)
       ? { 'x-openai-internal-codex-responses-lite': 'true' }
       : {}),
     'x-client-request-id': identity.threadId,
