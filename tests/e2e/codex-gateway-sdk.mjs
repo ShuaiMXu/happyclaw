@@ -48,6 +48,7 @@ const gatewayStreams = [];
 const sdkMessages = [];
 const checks = {};
 let blockedFetches = 0;
+let modelsCatalogFetches = 0;
 let blockedProxyRequests = 0;
 let unexpectedHttpRequests = 0;
 let sdkStderrBytes = 0;
@@ -73,6 +74,15 @@ async function listen(server) {
     server.listen(0, '127.0.0.1', resolve);
   });
   return `http://127.0.0.1:${server.address().port}`;
+}
+
+/** Function tools of a Responses body: top-level, or the Lite prefix. */
+function upstreamTools(body) {
+  if (Array.isArray(body.tools)) return body.tools;
+  const prefix = body.input?.find((item) => item.type === 'additional_tools');
+  return (prefix?.tools ?? []).flatMap((tool) =>
+    tool.type === 'namespace' ? (tool.tools ?? []) : [tool],
+  );
 }
 
 async function jsonBody(request) {
@@ -382,8 +392,8 @@ try {
       );
       upstreamRequests.push(body);
       assert.ok(upstreamRequests.length <= 2, 'exactly two model turns');
-      const shortenedMcp = body.tools?.find((entry) =>
-        entry.name.includes('verify_'),
+      const shortenedMcp = upstreamTools(body).find((entry) =>
+        entry.name?.includes('verify_'),
       )?.name;
       check(
         'longMcpSchemaMapped',
@@ -449,6 +459,12 @@ try {
         : input instanceof URL
           ? input.href
           : input.url;
+    // The gateway refreshes the account's /models catalog in the background
+    // like the official client; failing it keeps the synced catalog.
+    if (url.startsWith('https://chatgpt.com/backend-api/codex/models')) {
+      modelsCatalogFetches++;
+      throw new Error('Models catalog fetch failed shut by E2E fixture');
+    }
     if (url !== CODEX_BACKEND_RESPONSES_URL) {
       blockedFetches++;
       throw new Error('Unexpected network request blocked by E2E fixture');
@@ -790,6 +806,7 @@ console.log(
       sdkCachedInputTokens,
       sdkOutputTokens,
       blockedFetches,
+      modelsCatalogFetches,
       blockedProxyRequests,
       unexpectedHttpRequests,
     },
