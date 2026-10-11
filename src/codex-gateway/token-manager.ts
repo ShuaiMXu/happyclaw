@@ -7,9 +7,10 @@
 // refresh_token，同一时刻只允许一个网络刷新，其余请求共享同一结果，避免
 // 输家拿到 invalid_grant 造成假 401。
 //
-// 刷新失败分两类：refresh_token 被拒（invalid_grant 等 400/401）落盘为
-// reauth_required，凭据更换前不再刷新；网络/5xx 等瞬时失败按指数退避，
-// 退避期间仍在有效期内的 access_token 继续使用。
+// 刷新失败分两类（与官方 login/src/auth/manager.rs 一致）：refresh_token 被拒
+// （401、400 + invalid_grant、refresh_token_expired/reused/invalidated）落盘为
+// reauth_required，凭据更换前不再刷新；其余失败（网络、5xx/429、Cloudflare 403
+// 等其他 4xx）是瞬时失败，按指数退避，退避期间仍在有效期内的 access_token 继续使用。
 
 import { timingSafeEqual } from 'node:crypto';
 import { logger } from '../logger.js';
@@ -22,6 +23,7 @@ import {
 import {
   buildCodexCredentials,
   CodexOAuthTokenError,
+  describeCodexRefreshRejection,
   refreshCodexToken,
 } from './oauth.js';
 import {
@@ -149,14 +151,14 @@ function describeRefreshFailure(err: unknown): CodexOAuthRefreshErrorState {
   if (err instanceof CodexOAuthTokenError && !err.transient) {
     return {
       kind: 'reauth_required',
-      message: `refresh_token 被拒绝（${err.code ?? `HTTP ${err.status}`}）`,
+      message: describeCodexRefreshRejection(err.code, err.status),
       at,
     };
   }
   const detail =
     err instanceof CodexOAuthTokenError
       ? err.status
-        ? `HTTP ${err.status}`
+        ? `${err.code ? `${err.code}, ` : ''}HTTP ${err.status}`
         : err.message.includes('timed out')
           ? '超时'
           : '网络不可达'
@@ -232,6 +234,8 @@ export interface CodexAccessContext {
   providerId: string;
   accessToken: string;
   accountId: string | null;
+  /** Requests for a FedRAMP account carry `X-OpenAI-Fedramp: true`. */
+  isFedramp: boolean;
 }
 
 export interface ResolveCodexAccessOptions {
@@ -251,6 +255,7 @@ function accessContext(
     providerId,
     accessToken: credentials.accessToken,
     accountId: credentials.accountId,
+    isFedramp: credentials.isFedramp === true,
   };
 }
 
