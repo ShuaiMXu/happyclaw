@@ -48,10 +48,16 @@ The port and derived compatibility fixtures retain the original
 - HappyClaw explicitly requests `reasoning.summary: auto` for its thinking UI.
 - Empty tools and unused tool-choice/parallel fields are removed, matching the
   final Codex executor cleanup rather than the raw translator output.
-- HappyClaw's provider override and current model catalog constrain the final
-  reasoning effort; a removed `minimal` level is normalized to `low`.
-- URL images are rejected with 400. The pinned reference translator drops
-  them; silent image loss is unsuitable for the HappyClaw request boundary.
+- HappyClaw resolves the final reasoning effort itself (disabled thinking →
+  lowest supported level, haiku-tier → low, explicit Agent effort, then the
+  provider's `CODEX_REASONING_EFFORT` or catalog default) and clamps it to the
+  current model catalog; a removed `minimal` level is normalized to `low`.
+- URL images become a visible `[Image omitted: …]` placeholder. The pinned
+  reference translator drops them silently; rejecting them would fail every
+  later turn of a session that contains one.
+- Streams buffer their first frames until content starts, so a failure before
+  any content returns a real HTTP status (as CLIProxyAPI's optional bootstrap
+  buffering does), and `count_tokens` is answered with a local estimate.
 - Gateway authentication, bounded rate/body/event/aggregation budgets,
   backpressure, cancellation and idle deadlines remain in force. CLIProxyAPI's
   account pools, WebSocket continuation, distributed replay cache and management

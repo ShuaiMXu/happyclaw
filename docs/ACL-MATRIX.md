@@ -50,6 +50,11 @@
 
 `/ws` 不是 Public。Upgrade 时必须同时通过 Cookie Session 与 Origin 校验。
 
+内嵌 ChatGPT/Codex 网关 `/gateway/chatgpt/v1/messages`（含 `/count_tokens`）不使用
+Cookie Session，也不是 Public：只接受当前存活 Runner 或宿主机一次性查询的临时网关
+token（Runner/查询退出即吊销），并拒绝带 `Forwarded`、`X-Forwarded-*`、`X-Real-IP`
+或来自非回环、非私网地址的请求。Provider 落盘的网关标识不是可用凭据。
+
 ## 3. 当前用户资源
 
 以下资源以登录用户 ID 为作用域，不接受客户端指定其他 owner：
