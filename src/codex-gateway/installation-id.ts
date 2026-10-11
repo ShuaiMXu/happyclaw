@@ -19,10 +19,16 @@ let cachedInstallationId: string | undefined;
 /** Tests: a different file, or null for an in-memory ID only. */
 let pathOverride: string | null | undefined;
 
+/**
+ * HAPPYCLAW_CODEX_INSTALLATION_ID_FILE relocates the file; an empty value
+ * keeps the ID in memory only (the test runner sets that so suites never
+ * write into a real data directory).
+ */
 function installationIdPath(): string | null {
-  return pathOverride === undefined
-    ? path.join(DATA_DIR, 'config', 'codex-installation-id')
-    : pathOverride;
+  if (pathOverride !== undefined) return pathOverride;
+  const configured = process.env.HAPPYCLAW_CODEX_INSTALLATION_ID_FILE;
+  if (configured !== undefined) return configured.trim() || null;
+  return path.join(DATA_DIR, 'config', 'codex-installation-id');
 }
 
 export function codexInstallationId(): string {
