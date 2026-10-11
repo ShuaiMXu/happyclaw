@@ -650,8 +650,15 @@ export interface GatewayEffortPolicy {
   agentEffort?: string;
 }
 
-/** Haiku-tier names come from Claude Code's background and utility queries. */
-function isBackgroundRequest(request: AnthropicRequestSubset): boolean {
+/**
+ * Whether a request is one of Claude Code's background/utility queries
+ * (titles, summaries, small-fast model calls) rather than the agent turn.
+ * Shared contract: the effort policy lowers these, and the HTTP layer marks
+ * them like the official client's internal sub-requests.
+ */
+export function isCodexBackgroundRequest(
+  request: AnthropicRequestSubset,
+): boolean {
   return typeof request.model === 'string' && /haiku/i.test(request.model);
 }
 
@@ -679,7 +686,7 @@ export function resolveGatewayReasoningEffort(
     (thinking?.type === 'enabled' && thinking.budget_tokens === 0)
   )
     return lowestCodexEffortWithCatalog(catalog, model);
-  if (isBackgroundRequest(request)) {
+  if (isCodexBackgroundRequest(request)) {
     const entry = catalog.find((candidate) => candidate.value === model);
     return !entry || entry.efforts.includes('low')
       ? 'low'

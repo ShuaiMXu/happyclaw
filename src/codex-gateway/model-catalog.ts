@@ -189,3 +189,23 @@ export function resolveCodexDefaultEffort(
   const entry = catalog.find((candidate) => candidate.value === model);
   return entry ? resolveEntryFallbackEffort(entry) : CODEX_DEFAULT_EFFORT;
 }
+
+/**
+ * Request-shape traits of one upstream model, taken from the official
+ * models.json (`use_responses_lite`, `default_verbosity`, ...). Unknown
+ * models get the conservative classic Responses shape.
+ */
+export interface CodexModelTraits {
+  /** Official clients send the Responses Lite shape for this model. */
+  useResponsesLite: boolean;
+  /** `text.verbosity` the official client sends; null = omit. */
+  defaultVerbosity: 'low' | 'medium' | 'high' | null;
+}
+
+export function getCodexModelTraits(model: string): CodexModelTraits {
+  const current = /^gpt-(?:6|5\.6)/.test(model);
+  return {
+    useResponsesLite: current,
+    defaultVerbosity: current ? 'low' : null,
+  };
+}
