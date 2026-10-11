@@ -1091,6 +1091,12 @@ const ClaudeOAuthCredentialsSchema = z.object({
   subscriptionType: z.string().optional(),
 });
 
+/**
+ * Raw paste for an official provider: `.credentials.json` content or a
+ * setup-token. Parsed server-side by parseClaudeCredentialInput.
+ */
+const ClaudeCredentialInputSchema = z.string().min(1).max(65536);
+
 const ProviderBaseUrlSchema = z
   .string()
   .max(2000)
@@ -1120,6 +1126,7 @@ export const UnifiedProviderCreateSchema = z
     anthropicApiKey: z.string().max(2000).optional(),
     claudeCodeOauthToken: z.string().max(2000).optional(),
     claudeOAuthCredentials: ClaudeOAuthCredentialsSchema.optional(),
+    claudeCredentialInput: ClaudeCredentialInputSchema.optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),
     enabled: z.boolean().optional(),
@@ -1188,10 +1195,12 @@ export const UnifiedProviderSecretsSchema = z
     clearClaudeCodeOauthToken: z.boolean().optional(),
     claudeOAuthCredentials: ClaudeOAuthCredentialsSchema.optional(),
     clearClaudeOAuthCredentials: z.boolean().optional(),
+    claudeCredentialInput: ClaudeCredentialInputSchema.optional(),
   })
   .refine(
     (data) => {
       return (
+        typeof data.claudeCredentialInput === 'string' ||
         typeof data.anthropicAuthToken === 'string' ||
         data.clearAnthropicAuthToken === true ||
         typeof data.anthropicApiKey === 'string' ||

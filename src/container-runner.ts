@@ -143,6 +143,11 @@ import {
   type DockerOAuthReconcileOutcome,
 } from './docker-oauth-credentials.js';
 import {
+  isClaudeOAuthRefreshDue,
+  refreshClaudeProviderOAuth,
+  type ClaudeOAuthRefreshOutcome,
+} from './claude-oauth-refresh.js';
+import {
   resolveHostSkillPolicy,
   type HostSkillPolicy,
 } from './agent-profile-policy.js';
@@ -1454,6 +1459,115 @@ export function willClearSessionOnProviderSwitch(
 }
 
 /**
+ * Providers the next pool selection for this session may return, among those
+ * holding Claude OAuth credentials. Mirrors trySelectPoolProvider's branches.
+ */
+export function launchOAuthRefreshCandidates(
+  groupFolder: string,
+  agentId?: string | null,
+  modelConfigId?: string | null,
+): string[] {
+  const pinned = resolvePinnedModelConfigId(modelConfigId, {
+    groupFolder,
+    agentId,
+  });
+  const providers = pinned
+    ? getProviders().filter((provider) => provider.id === pinned)
+    : (() => {
+        const override = getContainerEnvConfig(groupFolder);
+        if (
+          override.anthropicApiKey ||
+          override.anthropicAuthToken ||
+          override.anthropicBaseUrl
+        ) {
+          return [];
+        }
+        return getEnabledProviders();
+      })();
+  return providers
+    .filter((provider) => !!provider.claudeOAuthCredentials)
+    .map((provider) => provider.id);
+}
+
+/**
+ * When the access token is this close to expiry, a launch waits for the
+ * host refresh however long it takes (bounded by its own timeout):
+ * otherwise the runner's Claude Code would refresh the same token itself.
+ */
+const LAUNCH_REFRESH_BLOCKING_WINDOW_MS = 10 * 60_000;
+/** Otherwise a launch waits at most this long; the refresh keeps going. */
+const LAUNCH_REFRESH_WAIT_MS = 5_000;
+
+/**
+ * Renew the OAuth credentials a launch may use before the provider is
+ * selected, so the runner starts from host-refreshed credentials and the
+ * selection-to-spawn path stays synchronous. Never throws: a failed renewal
+ * leaves the stored credential, which Claude Code can still refresh.
+ */
+export async function refreshLaunchOAuthCredentials(
+  groupFolder: string,
+  agentId?: string | null,
+  modelConfigId?: string | null,
+  refresh: (
+    providerId: string,
+  ) => Promise<ClaudeOAuthRefreshOutcome> = refreshClaudeProviderOAuth,
+): Promise<void> {
+  let candidates: string[];
+  try {
+    candidates = launchOAuthRefreshCandidates(
+      groupFolder,
+      agentId,
+      modelConfigId,
+    );
+  } catch {
+    // Selection reports configuration errors with full context.
+    return;
+  }
+  const now = Date.now();
+  await Promise.all(
+    candidates.map(async (providerId) => {
+      const credentials = getProviders().find(
+        (provider) => provider.id === providerId,
+      )?.claudeOAuthCredentials;
+      if (
+        !credentials ||
+        !isClaudeOAuthRefreshDue(providerId, credentials, now)
+      ) {
+        return;
+      }
+      const refreshing = refresh(providerId).then(
+        (outcome) => {
+          if (outcome.status === 'failed' || outcome.status === 'backoff') {
+            logger.warn(
+              { groupFolder, providerId, outcome },
+              'Launch-time Claude OAuth refresh did not complete',
+            );
+          }
+        },
+        (err) => {
+          logger.warn(
+            { err, groupFolder, providerId },
+            'Launch-time Claude OAuth refresh failed',
+          );
+        },
+      );
+      if (credentials.expiresAt - now <= LAUNCH_REFRESH_BLOCKING_WINDOW_MS) {
+        await refreshing;
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        refreshing,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, LAUNCH_REFRESH_WAIT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    }),
+  );
+}
+
+/**
  * Try to select a provider from the pool. Returns profileId + resolved config,
  * or null if no providers are enabled / group has env-level provider override / selection fails.
  * For single-provider setups, returns the provider for display without pool balancing.
@@ -1860,7 +1974,7 @@ export function cleanupContainerTaskRuntimeEnvDirs(
   }
 }
 
-export interface DockerOauthLaunchSnapshot {
+export interface OAuthLaunchSnapshot {
   credentialsFilePath: string;
   launchCredentials: ClaudeOAuthCredentials;
 }
@@ -1870,7 +1984,7 @@ interface PreparedVolumeMounts {
   claudeContextPlan: ReturnType<typeof buildClaudeContextPlan>;
   runtimeMcpServers: Record<string, Record<string, unknown>>;
   hostPlugins: SdkPluginConfig[];
-  dockerOauthLaunch: DockerOauthLaunchSnapshot | null;
+  dockerOauthLaunch: OAuthLaunchSnapshot | null;
   /** Selected provider routes through the ChatGPT/Codex 订阅网关; docker run needs host.docker.internal. */
   usesCodexGateway: boolean;
   /** Selected provider endpoint was rewritten from host loopback to host.docker.internal. */
@@ -2748,14 +2862,17 @@ export function buildContainerArgs(
 }
 
 /**
- * Reconcile a Docker SDK credential rotation at a safe output/exit boundary.
- * The lower-level helper performs the launch-snapshot CAS; on success, fan the
- * adopted credential out to other persisted sessions so the next runner does
- * not start from an invalidated refresh token.
+ * Reconcile a runner's own credential rotation at a safe output/exit
+ * boundary: Docker runners, and host runners wherever Claude Code keeps its
+ * credentials in the session `.credentials.json` (everywhere but macOS, where
+ * the Keychain reconciliation owns it). The lower-level helper performs the
+ * launch-snapshot CAS (newer expiry wins); on success, fan the adopted
+ * credential out to other persisted sessions so the next runner does not start
+ * from an invalidated refresh token.
  */
-export function reconcileDockerOAuthAfterExit(
+export function reconcileSessionOAuthAfterExit(
   providerId: string | null,
-  launch: DockerOauthLaunchSnapshot | null,
+  launch: OAuthLaunchSnapshot | null,
   dependencies: {
     reconcile?: typeof reconcileDockerOAuthCredentials;
     fanOutUpdatedCredentials?: (providerId: string) => void;
@@ -2839,6 +2956,13 @@ export async function runContainerAgent(
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   mkdirForContainer(groupDir);
+  // Like the probe above, the host-owned OAuth renewal awaits ahead of the
+  // synchronous selection-to-spawn block.
+  await refreshLaunchOAuthCredentials(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile?.modelConfigId,
+  );
 
   // ─── Provider Pool selection ───
   const poolResult = trySelectPoolProvider(
@@ -3047,7 +3171,7 @@ export async function runContainerAgent(
       const reconcileDockerOAuth = (
         phase: 'output' | 'exit',
       ): DockerOAuthReconcileOutcome | 'error' | null => {
-        const outcome = reconcileDockerOAuthAfterExit(
+        const outcome = reconcileSessionOAuthAfterExit(
           selectedProfileId,
           preparedLaunch.dockerOauthLaunch,
         );
@@ -3962,6 +4086,11 @@ export async function runHostAgent(
   delete hostEnv['XPC_FLAGS'];
 
   // ─── Provider Pool selection (host mode) ───
+  await refreshLaunchOAuthCredentials(
+    group.folder,
+    sessionAgentId,
+    input.agentProfile?.modelConfigId,
+  );
   const containerOverride = getContainerEnvConfig(group.folder);
   const hostPoolResult = trySelectPoolProvider(
     group.folder,
@@ -3990,6 +4119,7 @@ export async function runHostAgent(
   let hostProviderFailureTerminal: boolean | undefined;
   let hostProviderFailureMaintenance = false;
   let hostHealthyInputTurnCompleted = false;
+  let hostOauthLaunch: OAuthLaunchSnapshot | null = null;
   input = applyProviderSwitchToInput(input, hostPoolResult, sessionAgentId);
 
   const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
@@ -4135,6 +4265,15 @@ export async function runHostAgent(
         return hostModeSetupError(
           '无法写入宿主机会话 OAuth 凭据文件，已阻止启动',
         );
+      }
+      // Off macOS, Claude Code refreshes into this file. Remember what was
+      // written so a rotation is persisted back instead of being overwritten
+      // by the stale stored credential on the next launch.
+      if (process.platform !== 'darwin') {
+        hostOauthLaunch = {
+          credentialsFilePath: path.join(groupSessionsDir, '.credentials.json'),
+          launchCredentials: effectiveOauth,
+        };
       }
     }
 
@@ -4367,7 +4506,42 @@ export async function runHostAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
+      const reconcileHostOAuth = (phase: 'output' | 'exit'): void => {
+        const outcome = reconcileSessionOAuthAfterExit(
+          hostSelectedProfileId,
+          hostOauthLaunch,
+        );
+        if (outcome === 'updated') {
+          logger.info(
+            { group: group.name, providerId: hostSelectedProfileId, phase },
+            'Persisted host SDK-refreshed OAuth credentials',
+          );
+        } else if (outcome === 'invalid' || outcome === 'not_newer') {
+          logger.warn(
+            {
+              group: group.name,
+              providerId: hostSelectedProfileId,
+              outcome,
+              phase,
+            },
+            'Ignored invalid host OAuth credential rewrite',
+          );
+        } else if (outcome === 'error') {
+          logger.warn(
+            { group: group.name, providerId: hostSelectedProfileId, phase },
+            'Host OAuth credential reconciliation failed',
+          );
+        }
+      };
       const handleOutput = async (output: ContainerOutput): Promise<void> => {
+        if (
+          output.providerQuotaObservation ||
+          output.inputTurnCompleted === true ||
+          output.status === 'success' ||
+          output.status === 'error'
+        ) {
+          reconcileHostOAuth('output');
+        }
         if (
           consumeProviderQuotaControlOutput(
             hostSelectedProfileId,
@@ -4492,6 +4666,7 @@ export async function runHostAgent(
         // background jobs that intentionally outlive this turn.
         if (proc.pid) cleanupHostBrowserResources(proc.pid);
         const duration = Date.now() - startTime;
+        reconcileHostOAuth('exit');
 
         const closeCtx: CloseHandlerContext = {
           groupName: group.name,
