@@ -186,7 +186,8 @@ export const CODEX_MODEL_CATALOG: readonly CodexModelCatalogEntry[] = [
   },
 ];
 
-export const CODEX_DEFAULT_MODEL = 'gpt-6-sol';
+/** Official picker default: the highest-priority listed model. */
+export const CODEX_DEFAULT_MODEL = 'gpt-6.1-sol';
 export const CODEX_DEFAULT_EFFORT = 'medium';
 
 export function resolveCodexCatalogEntry(

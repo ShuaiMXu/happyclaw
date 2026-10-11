@@ -362,7 +362,9 @@ Provider：
 planType? }`。`models` 条目为 `{ value, label, efforts, defaultEffort?,
 useResponsesLite, supportsVerbosity, defaultVerbosity, contextWindow?,
 minimalClientVersion?, availableInPlans?, serviceTiers }`（字段取自官方
-  `models.json`；`defaultEffort` 是 per-model 默认推理档，可能缺省；
+  `models.json`；条目内 `defaultEffort` 是 per-model 默认推理档，可能缺省；
+  顶层 `defaultModel` 同官方默认（目前 `gpt-6.1-sol`），`defaultEffort` 是该
+  模型的目录默认档，与新建 Provider 写入的值一致；
   `serviceTiers` 含 `priority` 才可用 Fast）。全局目录由
   `src/codex-gateway/model-catalog-sync.ts` 从上游 openai/codex 仓库
   `codex-rs/models-manager/models.json` 同步（`source` 为

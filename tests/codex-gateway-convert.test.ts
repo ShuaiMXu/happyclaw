@@ -55,7 +55,7 @@ describe('resolveCodexModel', () => {
   });
 
   test('falls back to a default when no request model or configured model exists', () => {
-    expect(resolveCodexModel(undefined, '')).toBe('gpt-6-sol');
+    expect(resolveCodexModel(undefined, '')).toBe('gpt-6.1-sol');
   });
 
   test('normalizes legacy gpt-5.1 configured models to the current catalog', () => {

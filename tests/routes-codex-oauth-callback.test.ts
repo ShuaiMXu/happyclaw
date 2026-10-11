@@ -147,12 +147,12 @@ describe('POST /api/config/codex/oauth/callback', () => {
     const provider = await response.json();
     expect(provider).toMatchObject({
       anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
-      anthropicModel: 'gpt-6-sol',
-      customEnv: { CODEX_REASONING_EFFORT: 'medium' },
+      anthropicModel: 'gpt-6.1-sol',
+      customEnv: { CODEX_REASONING_EFFORT: 'low' },
       hasCodexOAuthCredentials: true,
       codexOAuthNeedsReauth: false,
       codexOAuthLastRefreshError: null,
-      codexDefaultEffort: 'medium',
+      codexDefaultEffort: 'low',
     });
   });
 
@@ -274,9 +274,9 @@ describe('POST /api/config/codex/oauth/callback', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
       anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
-      anthropicModel: 'gpt-6-sol',
-      customEnv: { CODEX_REASONING_EFFORT: 'medium' },
-      codexDefaultEffort: 'medium',
+      anthropicModel: 'gpt-6.1-sol',
+      customEnv: { CODEX_REASONING_EFFORT: 'low' },
+      codexDefaultEffort: 'low',
     });
     const stored = runtimeConfig.getProviderById(thirdParty.id)!;
     expect(stored.anthropicAuthToken).not.toBe('real-third-party-secret');

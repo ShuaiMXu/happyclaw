@@ -185,8 +185,8 @@ import {
 } from '../codex-gateway/types.js';
 import {
   CODEX_DEFAULT_MODEL,
-  CODEX_DEFAULT_EFFORT,
   filterCodexCatalogByPlan,
+  resolveCodexDefaultEffort,
 } from '../codex-gateway/model-catalog.js';
 import {
   ensureCodexProviderCatalog,
@@ -2370,12 +2370,16 @@ configRoutes.get(
       resolved = await ensureCodexProviderCatalog(provider.id);
     }
     const models = filterCodexCatalogByPlan(resolved.models, planType);
+    const defaultModel = models.some(
+      (entry) => entry.value === CODEX_DEFAULT_MODEL,
+    )
+      ? CODEX_DEFAULT_MODEL
+      : (models[0]?.value ?? CODEX_DEFAULT_MODEL);
     return c.json({
       models,
-      defaultModel: models.some((entry) => entry.value === CODEX_DEFAULT_MODEL)
-        ? CODEX_DEFAULT_MODEL
-        : (models[0]?.value ?? CODEX_DEFAULT_MODEL),
-      defaultEffort: CODEX_DEFAULT_EFFORT,
+      defaultModel,
+      // The default model's own default level, as new providers are created.
+      defaultEffort: resolveCodexDefaultEffort(models, defaultModel),
       source: resolved.source,
       fetchedAt: resolved.fetchedAt,
       ...(providerId ? { providerId, planType } : {}),

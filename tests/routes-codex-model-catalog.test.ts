@@ -122,8 +122,9 @@ describe('GET /api/config/codex/model-catalog', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body).toMatchObject({
-      defaultModel: 'gpt-6-sol',
-      defaultEffort: 'medium',
+      defaultModel: 'gpt-6.1-sol',
+      // gpt-6.1-sol's own catalog default, as new providers get it.
+      defaultEffort: 'low',
       source: 'builtin',
     });
     expect(body).not.toHaveProperty('providerId');
@@ -150,7 +151,6 @@ describe('GET /api/config/codex/model-catalog', () => {
     const values = body.models.map((entry: any) => entry.value);
     expect(values).not.toContain('gpt-6-sol');
     expect(values).toContain('gpt-6.1-sol');
-    // The default is not available on this plan: the first model stands in.
     expect(body.defaultModel).toBe('gpt-6.1-sol');
   });
 
@@ -168,7 +168,11 @@ describe('GET /api/config/codex/model-catalog', () => {
               support_verbosity: true,
               default_verbosity: 'low',
               available_in_plans: ['plus'],
-              supported_reasoning_levels: [{ effort: 'low' }],
+              default_reasoning_level: 'medium',
+              supported_reasoning_levels: [
+                { effort: 'low' },
+                { effort: 'medium' },
+              ],
             },
             {
               slug: 'gpt-team-only',
@@ -185,6 +189,11 @@ describe('GET /api/config/codex/model-catalog', () => {
     const body = await (await catalog(`?providerId=${providerId}`)).json();
     expect(body.source).toBe('live');
     expect(body.models.map((entry: any) => entry.value)).toEqual(['gpt-6-sol']);
+    // The account lacks the default model: its first model and level stand in.
+    expect(body).toMatchObject({
+      defaultModel: 'gpt-6-sol',
+      defaultEffort: 'medium',
+    });
     const [, init] = modelsEndpoint.mock.calls[0];
     expect(init.headers).toMatchObject({
       Authorization: 'Bearer access-plus',
