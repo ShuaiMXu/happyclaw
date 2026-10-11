@@ -36,6 +36,15 @@ export interface UnifiedProviderPublic {
   codexOAuthCredentialsExpiresAt: number | null;
   codexOAuthCredentialsEmail: string | null;
   codexOAuthCredentialsPlanType: string | null;
+  /** ChatGPT login was refused on refresh; the user must log in again. */
+  codexOAuthNeedsReauth?: boolean;
+  codexOAuthLastRefreshError?: {
+    kind: 'reauth_required' | 'transient';
+    message: string;
+    at: string;
+  } | null;
+  /** Effort the gateway applies when the Agent does not choose one. */
+  codexDefaultEffort?: string | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }

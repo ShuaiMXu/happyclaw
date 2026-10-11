@@ -111,16 +111,17 @@ function CredentialBadges({ provider }: { provider: ProviderWithHealth }) {
     });
   }
   if (provider.hasCodexOAuthCredentials) {
-    const expired =
-      provider.codexOAuthCredentialsExpiresAt != null &&
-      provider.codexOAuthCredentialsExpiresAt <= Date.now();
+    // The gateway refreshes an elapsed access token on demand; only a refused
+    // refresh needs the user.
     const expiry = formatOAuthExpiry(provider.codexOAuthCredentialsExpiresAt);
     badges.push({
-      label: provider.codexOAuthCredentialsPlanType
-        ? `ChatGPT ${provider.codexOAuthCredentialsPlanType}`
-        : 'ChatGPT',
-      dot: expired ? 'error' : 'success',
-      detail: expiry ?? undefined,
+      label: provider.codexOAuthNeedsReauth
+        ? 'ChatGPT · 需重新登录'
+        : provider.codexOAuthCredentialsPlanType
+          ? `ChatGPT ${provider.codexOAuthCredentialsPlanType}`
+          : 'ChatGPT',
+      dot: provider.codexOAuthNeedsReauth ? 'error' : 'success',
+      detail: provider.codexOAuthCredentialsEmail ?? expiry ?? undefined,
     });
   }
   if (provider.hasClaudeCodeOauthToken) {

@@ -397,8 +397,11 @@ export function ProviderEditor({
       setCodexModel(
         provider.anthropicModel || codexCatalogRef.current.defaultModel,
       );
+      // The server resolves the effort the gateway really applies, clamped
+      // to the model's catalog entry; prefer it over a raw stored value.
       setCodexEffort(
-        provider.customEnv?.CODEX_REASONING_EFFORT ||
+        provider.codexDefaultEffort ||
+          provider.customEnv?.CODEX_REASONING_EFFORT ||
           codexCatalogRef.current.defaultEffort,
       );
       setAuthTab('oauth');
@@ -660,6 +663,14 @@ export function ProviderEditor({
       setNotice('ChatGPT 授权成功，凭据已保存。');
       onSave();
     } catch (err) {
+      // retryable=false means the code was spent: start over. Otherwise the
+      // pending flow survives and the same URL can be submitted again.
+      const retryable = (err as { body?: { retryable?: unknown } })?.body
+        ?.retryable;
+      if (retryable === false) {
+        setOauthState(null);
+        setOauthCode('');
+      }
       setError(getErrorMessage(err, 'ChatGPT 授权码换取失败'));
     } finally {
       setOauthExchanging(false);
@@ -1189,6 +1200,28 @@ export function ProviderEditor({
                 </div>
               </div>
 
+              {!isCreate && provider?.codexOAuthNeedsReauth && (
+                <div
+                  role="alert"
+                  className="flex gap-2 rounded-lg bg-error/10 px-3 py-2.5 text-caption leading-5 text-error"
+                >
+                  <TriangleAlert
+                    className="mt-0.5 size-4 shrink-0"
+                    aria-hidden="true"
+                  />
+                  <div className="min-w-0">
+                    <div className="font-medium">
+                      ChatGPT 授权已失效，请重新登录
+                    </div>
+                    {provider.codexOAuthLastRefreshError?.message && (
+                      <div className="break-words opacity-80">
+                        {provider.codexOAuthLastRefreshError.message}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* 编辑模式显示现有凭据 */}
               {!isCreate && provider?.hasCodexOAuthCredentials && (
                 <div className="space-y-1 rounded-lg bg-success/10 px-3 py-2.5 text-caption text-success">
@@ -1319,7 +1352,7 @@ export function ProviderEditor({
                       value={oauthCode}
                       onChange={(e) => setOauthCode(e.target.value)}
                       disabled={oauthExchanging}
-                      placeholder="粘贴 localhost:1455 回调完整地址"
+                      placeholder="粘贴 localhost:1455（或 127.0.0.1:1455）回调完整地址"
                       aria-label="粘贴 localhost:1455 回调完整地址"
                       className="flex-1"
                     />
