@@ -89,6 +89,7 @@ const CODEX_LEGACY_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
 
 // 每个模型支持的 reasoning.effort 档位不同（如 gpt-6-luna 无 ultra、gpt-5.5 无
 // max/ultra），选了模型目录不支持的档位会被上游 Responses API 拒绝（400）。
+// 顺序、标签与 defaultEffort 逐项照抄后端 CODEX_MODEL_CATALOG。
 const CODEX_FALLBACK_MODEL_OPTIONS: ReadonlyArray<{
   value: string;
   label: string;
@@ -102,43 +103,54 @@ const CODEX_FALLBACK_MODEL_OPTIONS: ReadonlyArray<{
     defaultEffort: 'low',
   },
   {
-    value: 'gpt-6-sol',
-    label: 'gpt-6-sol（上一代编码）',
-    efforts: CODEX_FULL_EFFORTS,
-  },
-  {
     value: 'gpt-6-astra',
     label: 'gpt-6-astra（旗舰·最强推理）',
     efforts: CODEX_FULL_EFFORTS,
+    defaultEffort: 'low',
+  },
+  {
+    value: 'gpt-6-sol',
+    label: 'gpt-6-sol（上一代编码）',
+    efforts: CODEX_FULL_EFFORTS,
+    defaultEffort: 'medium',
   },
   {
     value: 'gpt-6-luna',
     label: 'gpt-6-luna（快速轻量）',
     efforts: CODEX_CAPPED_EFFORTS,
+    defaultEffort: 'medium',
   },
   {
     value: 'gpt-5.6-sol',
-    label: 'gpt-5.6-sol（上一代编码）',
+    label: 'gpt-5.6-sol（旧款编码）',
     efforts: CODEX_FULL_EFFORTS,
+    defaultEffort: 'low',
   },
   {
     value: 'gpt-5.6-terra',
-    label: 'gpt-5.6-terra（上一代均衡）',
+    label: 'gpt-5.6-terra（旧款均衡）',
     efforts: CODEX_FULL_EFFORTS,
+    defaultEffort: 'medium',
   },
   {
     value: 'gpt-5.6-luna',
-    label: 'gpt-5.6-luna（上一代快速）',
+    label: 'gpt-5.6-luna（旧款快速）',
     efforts: CODEX_CAPPED_EFFORTS,
+    defaultEffort: 'medium',
   },
   {
     value: 'gpt-5.5',
-    label: 'gpt-5.5（旧款）',
+    label: 'gpt-5.5（遗留）',
     efforts: CODEX_LEGACY_EFFORTS,
+    defaultEffort: 'medium',
   },
 ] as const;
 const CODEX_FALLBACK_DEFAULT_MODEL = 'gpt-6.1-sol';
-const CODEX_FALLBACK_DEFAULT_EFFORT = 'medium';
+// 与目录接口一致：目录级默认档就是默认模型自己的默认档。
+const CODEX_FALLBACK_DEFAULT_EFFORT =
+  CODEX_FALLBACK_MODEL_OPTIONS.find(
+    (option) => option.value === CODEX_FALLBACK_DEFAULT_MODEL,
+  )?.defaultEffort ?? 'medium';
 
 interface CodexCatalog {
   models: ReadonlyArray<{
