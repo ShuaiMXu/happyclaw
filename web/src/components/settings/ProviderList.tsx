@@ -337,8 +337,9 @@ export function ProviderList({
               }
             />
 
-            {/* OAuth 用量 */}
-            {provider.type === 'official' && (
+            {/* 订阅用量：Claude OAuth 与 ChatGPT 订阅 */}
+            {(provider.type === 'official' ||
+              provider.hasCodexOAuthCredentials) && (
               <UsageBars
                 providerId={provider.id}
                 providerVersion={provider.updatedAt}

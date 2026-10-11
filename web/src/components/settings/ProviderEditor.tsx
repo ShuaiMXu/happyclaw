@@ -93,10 +93,17 @@ const CODEX_FALLBACK_MODEL_OPTIONS: ReadonlyArray<{
   value: string;
   label: string;
   efforts: readonly string[];
+  defaultEffort?: string;
 }> = [
   {
+    value: 'gpt-6.1-sol',
+    label: 'gpt-6.1-sol（主力编码）',
+    efforts: CODEX_FULL_EFFORTS,
+    defaultEffort: 'low',
+  },
+  {
     value: 'gpt-6-sol',
-    label: 'gpt-6-sol（主力编码）',
+    label: 'gpt-6-sol（上一代编码）',
     efforts: CODEX_FULL_EFFORTS,
   },
   {
@@ -130,7 +137,7 @@ const CODEX_FALLBACK_MODEL_OPTIONS: ReadonlyArray<{
     efforts: CODEX_LEGACY_EFFORTS,
   },
 ] as const;
-const CODEX_FALLBACK_DEFAULT_MODEL = 'gpt-6-sol';
+const CODEX_FALLBACK_DEFAULT_MODEL = 'gpt-6.1-sol';
 const CODEX_FALLBACK_DEFAULT_EFFORT = 'medium';
 
 interface CodexCatalog {
@@ -262,10 +269,17 @@ export function ProviderEditor({
   useEffect(() => {
     codexCatalogRef.current = codexCatalog;
   }, [codexCatalog]);
+  // An existing ChatGPT login asks for its own account's catalog: the
+  // server filters by plan and prefers the account's live /models list.
+  const codexCatalogProviderId =
+    open && provider?.hasCodexOAuthCredentials ? provider.id : null;
   useEffect(() => {
     let cancelled = false;
+    const query = codexCatalogProviderId
+      ? `?providerId=${encodeURIComponent(codexCatalogProviderId)}`
+      : '';
     api
-      .get<CodexCatalog>('/api/config/codex/model-catalog')
+      .get<CodexCatalog>(`/api/config/codex/model-catalog${query}`)
       .then((catalog) => {
         if (
           cancelled ||
@@ -289,7 +303,7 @@ export function ProviderEditor({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [codexCatalogProviderId]);
 
   // 官方认证
   const [authTab, setAuthTab] = useState<OfficialAuthTab>('oauth');
