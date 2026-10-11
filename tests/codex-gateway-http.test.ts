@@ -1,3 +1,4 @@
+import zlib from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -102,8 +103,19 @@ function jsonResponse(status: number, body: unknown): Response {
     headers: { 'content-type': 'application/json' },
   });
 }
+/** Upstream bodies are zstd-compressed like the official client's. */
+function upstreamJson(init: {
+  headers: Record<string, string>;
+  body: string | Uint8Array;
+}): Record<string, any> {
+  const bytes =
+    init.headers['Content-Encoding'] === 'zstd'
+      ? zlib.zstdDecompressSync(init.body as Uint8Array)
+      : Buffer.from(init.body);
+  return JSON.parse(bytes.toString('utf8'));
+}
 function sentBody(call = 0): Record<string, any> {
-  return JSON.parse(mocks.fetch.mock.calls[call][1].body);
+  return upstreamJson(mocks.fetch.mock.calls[call][1]);
 }
 beforeEach(() => {
   vi.clearAllMocks();
@@ -363,7 +375,7 @@ describe('Codex gateway HTTP boundary', () => {
     });
     expect(mocks.fetch.mock.calls[0][1].headers).toMatchObject({
       Authorization: 'Bearer fake-upstream',
-      'chatgpt-account-id': 'business-workspace',
+      'ChatGPT-Account-ID': 'business-workspace',
     });
   });
 
@@ -401,7 +413,7 @@ describe('Codex gateway HTTP boundary', () => {
     });
     expect(response.status).toBe(200);
     await response.text();
-    const body = JSON.parse(mocks.fetch.mock.calls[0][1].body);
+    const body = sentBody();
     expect(body.instructions).toBe('');
     expect(body.input).toEqual([
       {
@@ -476,7 +488,7 @@ describe('Codex gateway HTTP boundary', () => {
       ],
     });
     expect(response.status).toBe(200);
-    const translated = JSON.parse(mocks.fetch.mock.calls[0][1].body);
+    const translated = sentBody();
     expect(translated.input[1]).toMatchObject({
       type: 'function_call_output',
       call_id: 'screen',

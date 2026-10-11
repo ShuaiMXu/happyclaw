@@ -1,3 +1,4 @@
+import zlib from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -21,8 +22,10 @@ const { codexGatewayApp } = await import('../src/codex-gateway/gateway.js');
 const { issueCodexGatewayToken, revokeCodexGatewayToken } =
   await import('../src/codex-gateway/runner-tokens.js');
 let runnerToken = '';
-const { codexRequestContext } =
+const { codexRequestIdentity } =
   await import('../src/codex-gateway/request-context.js');
+const { codexUserAgent } =
+  await import('../src/codex-gateway/client-identity.js');
 const encoder = new TextEncoder();
 let providerNumber = 0;
 const created = {
@@ -40,6 +43,17 @@ const completed = {
     },
   },
 };
+/** Upstream bodies are zstd-compressed like the official client's. */
+function upstreamJson(init: {
+  headers: Record<string, string>;
+  body: string | Uint8Array;
+}): Record<string, any> {
+  const bytes =
+    init.headers['Content-Encoding'] === 'zstd'
+      ? zlib.zstdDecompressSync(init.body as Uint8Array)
+      : Buffer.from(init.body);
+  return JSON.parse(bytes.toString('utf8'));
+}
 function frame(event: unknown, ending = '\n'): string {
   return `data: ${JSON.stringify(event)}${ending}${ending}`;
 }
@@ -333,7 +347,7 @@ describe('Codex executor transport compatibility', () => {
         ).token;
       }
       expect((await request(false, payload)).status).toBe(200);
-      const body = JSON.parse(mocks.fetch.mock.calls[0][1].body);
+      const body = upstreamJson(mocks.fetch.mock.calls[0][1]);
       expect(body.reasoning.effort).toBe(expected);
     },
   );
@@ -355,10 +369,12 @@ describe('Codex executor transport compatibility', () => {
       ).status,
     ).toBe(200);
     const headers = new Headers(mocks.fetch.mock.calls[0][1].headers);
-    expect(headers.get('user-agent')).toBe(
-      'codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)',
+    expect(headers.get('user-agent')).toBe(codexUserAgent());
+    expect(headers.get('user-agent')).toMatch(
+      /^codex-tui\/0\.162\.1 \(.+; .+\) \S+ \(codex-tui; 0\.162\.1\)$/,
     );
     expect(headers.get('originator')).toBe('codex-tui');
+    expect(headers.get('version')).toBe('0.162.1');
     expect(headers.get('x-codex-routing-hint')).toBe(
       'model=gpt-6-astra;tier=priority',
     );
@@ -386,7 +402,7 @@ describe('Codex executor transport compatibility', () => {
       ).status,
     ).toBe(200);
     const [first, second] = mocks.fetch.mock.calls.map((call) => ({
-      body: JSON.parse(call[1].body),
+      body: upstreamJson(call[1]),
       headers: new Headers(call[1].headers),
     }));
     expect(first.body.prompt_cache_key).toMatch(
@@ -396,48 +412,59 @@ describe('Codex executor transport compatibility', () => {
     expect(first.headers.get('session-id')).toBe(first.body.prompt_cache_key);
     expect(first.body).not.toHaveProperty('metadata');
     expect(JSON.stringify(first)).not.toContain('PRIVATE_DEVICE');
+    expect(JSON.stringify(first)).not.toContain('own-test-session');
   });
 
-  test('cache scope separates providers, accounts, models, sessions, and agents', () => {
+  test('cache scope separates providers, accounts, sessions, and agents, not models', () => {
     const scope = {
       providerId: 'provider-a',
       accountId: 'account-a',
-      model: 'gpt-6-sol',
+      fallbackScope: 'grant-a',
     };
     const headers = new Headers({ 'x-claude-code-session-id': 'session-a' });
-    const key = codexRequestContext(headers, {}, scope).promptCacheKey;
+    const key = codexRequestIdentity(headers, {}, scope).promptCacheKey;
     expect(key).toBeTruthy();
-    expect(codexRequestContext(headers, {}, scope).promptCacheKey).toBe(key);
+    expect(codexRequestIdentity(headers, {}, scope).promptCacheKey).toBe(key);
+    // Like the official client, the key follows the session across models
+    // and runner restarts.
+    expect(
+      codexRequestIdentity(
+        headers,
+        { model: 'gpt-6-astra' },
+        { ...scope, fallbackScope: 'grant-b' },
+      ).promptCacheKey,
+    ).toBe(key);
     for (const other of [
       { ...scope, providerId: 'provider-b' },
       { ...scope, accountId: 'account-b' },
-      { ...scope, model: 'gpt-6-astra' },
     ])
-      expect(codexRequestContext(headers, {}, other).promptCacheKey).not.toBe(
+      expect(codexRequestIdentity(headers, {}, other).promptCacheKey).not.toBe(
         key,
       );
     expect(
-      codexRequestContext(
+      codexRequestIdentity(
         new Headers({ 'x-claude-code-session-id': 'session-b' }),
         {},
         scope,
       ).promptCacheKey,
     ).not.toBe(key);
-    expect(
-      codexRequestContext(
-        new Headers({
-          'x-claude-code-session-id': 'session-a',
-          'x-claude-code-agent-id': 'agent-b',
-        }),
-        {},
-        scope,
-      ).promptCacheKey,
-    ).not.toBe(key);
+    const subAgent = codexRequestIdentity(
+      new Headers({
+        'x-claude-code-session-id': 'session-a',
+        'x-claude-code-agent-id': 'agent-b',
+      }),
+      {},
+      scope,
+    );
+    expect(subAgent.promptCacheKey).not.toBe(key);
+    // A sub-agent is its own thread within the same session.
+    expect(subAgent.sessionId).toBe(key);
+    expect(subAgent.threadId).toBe(subAgent.promptCacheKey);
   });
 
   test('header session identity wins over both supported SDK metadata encodings', () => {
-    const scope = { providerId: 'p', accountId: null, model: 'gpt-6-sol' };
-    const fromHeader = codexRequestContext(
+    const scope = { providerId: 'p', accountId: null, fallbackScope: 'grant' };
+    const fromHeader = codexRequestIdentity(
       new Headers({ 'x-claude-code-session-id': 'aabb-1234' }),
       {},
       scope,
@@ -447,14 +474,14 @@ describe('Codex executor transport compatibility', () => {
       '{"session_id":"aabb-1234","device_id":"PRIVATE"}',
     ]) {
       expect(
-        codexRequestContext(
+        codexRequestIdentity(
           new Headers(),
           { metadata: { user_id: userId } },
           scope,
         ).promptCacheKey,
       ).toBe(fromHeader);
       expect(
-        codexRequestContext(
+        codexRequestIdentity(
           new Headers({ 'x-claude-code-session-id': 'other' }),
           { metadata: { user_id: userId } },
           scope,
@@ -472,15 +499,39 @@ describe('Codex executor transport compatibility', () => {
     { user_id: JSON.stringify({ session_id: 'x'.repeat(1025) }) },
     { user_id: 'x'.repeat(8193) },
   ])(
-    'does not establish a shared cache scope for absent/invalid metadata',
+    'absent/invalid metadata falls back to a deterministic runner-scoped key',
     (metadata) => {
-      const context = codexRequestContext(
-        new Headers(),
-        { metadata },
-        { providerId: 'p', accountId: null, model: 'gpt-6-sol' },
-      );
-      expect(context.promptCacheKey).toBeUndefined();
-      expect(context.headers).not.toHaveProperty('Session-Id');
+      const scope = { providerId: 'p', accountId: null, fallbackScope: 'g1' };
+      const request = {
+        metadata,
+        messages: [{ role: 'user', content: 'opening' }],
+      };
+      const identity = codexRequestIdentity(new Headers(), request, scope);
+      expect(identity.promptCacheKey).toMatch(/^[a-f0-9-]{36}$/);
+      // Later turns of the same conversation keep the key.
+      expect(
+        codexRequestIdentity(
+          new Headers(),
+          {
+            ...request,
+            messages: [
+              ...request.messages,
+              { role: 'assistant', content: 'reply' },
+              { role: 'user', content: 'next' },
+            ],
+          },
+          scope,
+        ).promptCacheKey,
+      ).toBe(identity.promptCacheKey);
+      // Another runner or another conversation never shares it.
+      for (const [otherRequest, otherScope] of [
+        [request, { ...scope, fallbackScope: 'g2' }],
+        [{ ...request, messages: [{ role: 'user', content: 'other' }] }, scope],
+      ] as const)
+        expect(
+          codexRequestIdentity(new Headers(), otherRequest, otherScope)
+            .promptCacheKey,
+        ).not.toBe(identity.promptCacheKey);
     },
   );
 
@@ -514,7 +565,7 @@ describe('Codex executor transport compatibility', () => {
     });
     const stream = await (await request(true, { tools })).text();
     expect(stream).toContain(JSON.stringify(name));
-    expect(JSON.parse(mocks.fetch.mock.calls[0][1].body).tools[0].name).toBe(
+    expect(upstreamJson(mocks.fetch.mock.calls[0][1]).tools[0].name).toBe(
       'mcp__do_action',
     );
   });
