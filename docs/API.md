@@ -316,9 +316,17 @@ Provider：
 
 - `GET /api/config/claude`
 - `GET|POST /api/config/claude/providers`
-- `PATCH|DELETE /api/config/claude/providers/:id`
+- `PATCH|DELETE /api/config/claude/providers/:id`，第三方 Provider 的 PATCH
+  可同时携带 `anthropicAuthToken` / `clearAnthropicAuthToken`，与其他字段在同一
+  请求内提交
 - `PUT /api/config/claude/providers/:id/secrets`
-- `POST /api/config/claude/providers/:id/toggle`
+- `POST /api/config/claude/providers/:id/toggle`，没有可用凭据的 Provider
+  不能启用
+- `POST /api/config/claude/providers/:id/duplicate`，服务端连同加密密钥复制为
+  停用的新 Provider；OAuth 授权的 Provider 拒绝复制
+- `POST /api/config/claude/providers/test`，按草稿字段（可选 `providerId`
+  回退到已保存的端点与密钥）向第三方端点发送一次最小 `/v1/messages` 请求，
+  返回每个模型的状态码、耗时和脱敏错误摘要，不回传密钥；按用户限流
 - `POST /api/config/claude/providers/:id/reset-health`
 - `GET /api/config/claude/providers/health`
 - `GET /api/config/claude/providers/:id/usage`
@@ -342,6 +350,11 @@ defaultEffort, source, fetchedAt }`（条目内 `defaultEffort` 是上游
   （`src/codex-gateway/model-catalog.ts`）作离线兜底，供设置页模型/
   推理力度下拉使用
 - `PUT /api/config/claude/custom-env`
+
+第三方 Provider 的 `anthropicAuthMode` 为 `bearer`（`Authorization: Bearer`，
+等同 `ANTHROPIC_AUTH_TOKEN`）或 `x-api-key`（等同 `ANTHROPIC_API_KEY`）；旧配置
+为 `null`，沿用原推断规则。`customEnv` 写入时会拒绝危险变量、由专用字段管理的
+变量以及非法的数值或推理档位，而不是静默丢弃。
 
 系统：
 
