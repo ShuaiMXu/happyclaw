@@ -346,8 +346,17 @@ Provider：
   PKCE 流程，返回 `authorizeUrl` 与 `state`；可选 `targetProviderId`
   用于对已有 Provider 重新授权
 - `POST /api/config/codex/oauth/callback`，用 `{ state, code }`（`code`
-  接受回调页完整 URL 或裸授权码）换取 token，创建或更新 ChatGPT
-  订阅型 Provider；其 `anthropicBaseUrl` 落盘为内嵌网关占位值
+  接受 `localhost:1455` / `127.0.0.1:1455` 回调页完整 URL、其 query 或裸授权码）
+  换取 token，创建或更新 ChatGPT 订阅型 Provider，成功返回公开 Provider；其
+  `anthropicBaseUrl` 落盘为内嵌网关占位值。新建时写入目录默认模型与
+  `CODEX_REASONING_EFFORT`；回调带 `error=` 或 token 交换瞬时失败时返回
+  `{ error, retryable: true }`（400 / 502）并保留挂起流程，授权码被拒返回
+  `{ error, retryable: false }`（400）；目标 Provider 不存在返回 404。换账号或由
+  其他类型转换时会停稳运行器并清除该 Provider 的会话，停稳失败返回 503
+  `{ error, applied, provider? }`
+- 内嵌网关（不在 `/api` 下）：`POST /gateway/chatgpt/v1/messages` 与
+  `POST /gateway/chatgpt/v1/messages/count_tokens`（本地估算），只接受存活 Runner
+  的临时 token，并拒绝带反代转发头或非回环/私网来源的请求
 - `GET /api/config/codex/model-catalog`，返回 Codex 模型目录
   `{ models: [{ value, label, efforts, defaultEffort? }], defaultModel,
 defaultEffort, source, fetchedAt }`（条目内 `defaultEffort` 是上游

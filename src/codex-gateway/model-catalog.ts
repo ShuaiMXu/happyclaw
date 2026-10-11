@@ -136,3 +136,56 @@ export function clampCodexEffort(
 ): string | undefined {
   return clampCodexEffortWithCatalog(CODEX_MODEL_CATALOG, model, effort);
 }
+
+/** 档位从低到高的固定顺序，用于在模型支持的档位里找最低档。 */
+const EFFORT_RANK = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+];
+
+/**
+ * 模型支持的最低档。thinking 被显式关闭时用它代替上游不接受的 `none`；
+ * 目录外模型无法确认支持集合，用所有现役模型都支持的 low。
+ */
+export function lowestCodexEffortWithCatalog(
+  catalog: readonly CodexModelCatalogEntry[],
+  model: string,
+): string {
+  const entry = catalog.find((candidate) => candidate.value === model);
+  if (!entry?.efforts.length) return 'low';
+  return [...entry.efforts].sort((a, b) => {
+    const rankA = EFFORT_RANK.indexOf(a);
+    const rankB = EFFORT_RANK.indexOf(b);
+    return (
+      (rankA < 0 ? EFFORT_RANK.length : rankA) -
+      (rankB < 0 ? EFFORT_RANK.length : rankB)
+    );
+  })[0];
+}
+
+/**
+ * Provider 级默认推理档：显式配置的 CODEX_REASONING_EFFORT（minimal 归一为 low）
+ * 按目录钳制；未配置时取模型的目录默认档。设置页展示与网关请求共用这一份结果。
+ */
+export function resolveCodexDefaultEffort(
+  catalog: readonly CodexModelCatalogEntry[],
+  model: string,
+  configured?: string,
+): string {
+  const normalized = configured?.trim().toLowerCase();
+  if (normalized) {
+    return clampCodexEffortWithCatalog(
+      catalog,
+      model,
+      normalized === 'minimal' ? 'low' : normalized,
+    )!;
+  }
+  const entry = catalog.find((candidate) => candidate.value === model);
+  return entry ? resolveEntryFallbackEffort(entry) : CODEX_DEFAULT_EFFORT;
+}

@@ -1,21 +1,35 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
 const query = vi.hoisted(() => vi.fn());
+const providerConfig = vi.hoisted(() => ({
+  current: { anthropicModel: 'test-model' } as Record<string, string>,
+  providers: [] as Array<Record<string, unknown>>,
+}));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query }));
 vi.mock('../src/runtime-config.js', () => ({
-  buildClaudeEnvLines: () => [
-    'ANTHROPIC_API_KEY=test-key',
-    'CLAUDE_CODE_EFFORT_LEVEL=max',
-  ],
+  buildClaudeEnvLines: (config: Record<string, string>) =>
+    config.anthropicBaseUrl
+      ? [
+          `ANTHROPIC_BASE_URL=${config.anthropicBaseUrl}`,
+          `ANTHROPIC_API_KEY=${config.anthropicAuthToken}`,
+        ]
+      : ['ANTHROPIC_API_KEY=test-key', 'CLAUDE_CODE_EFFORT_LEVEL=max'],
   clearInheritedClaudeProviderEnv: () => {},
-  getClaudeProviderConfig: () => ({ anthropicModel: 'test-model' }),
+  getClaudeProviderConfig: () => providerConfig.current,
+  getProviders: () => providerConfig.providers,
+  updateProviderCodexOAuthCredentialsIfCurrent: vi.fn(),
+  setProviderCodexOAuthRefreshErrorIfCurrent: vi.fn(),
 }));
 vi.mock('../src/logger.js', () => ({
   logger: { warn: vi.fn() },
 }));
 
 const { sdkQuery } = await import('../src/sdk-query.js');
+const { resolveCodexGatewayToken } =
+  await import('../src/codex-gateway/runner-tokens.js');
+const { CODEX_GATEWAY_BASE_URL_PLACEHOLDER } =
+  await import('../src/codex-gateway/types.js');
 
 function successfulConversation(result: string, isError = false) {
   return (async function* () {
@@ -23,7 +37,11 @@ function successfulConversation(result: string, isError = false) {
   })();
 }
 
-beforeEach(() => query.mockReset());
+beforeEach(() => {
+  query.mockReset();
+  providerConfig.current = { anthropicModel: 'test-model' };
+  providerConfig.providers = [];
+});
 
 describe('sdkQuery', () => {
   test('runs one-turn text queries without exposing tools or filesystem settings', async () => {
@@ -57,5 +75,38 @@ describe('sdkQuery', () => {
       successfulConversation('API Error: 401 invalid x-api-key', true),
     );
     await expect(sdkQuery('generate a title')).resolves.toBeNull();
+  });
+
+  test('a Codex provider gets a loopback gateway URL and a token scoped to the query', async () => {
+    providerConfig.current = {
+      anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+      anthropicAuthToken: 'stored-identifier',
+      anthropicModel: 'gpt-6-sol',
+    };
+    providerConfig.providers = [
+      {
+        id: 'codex-provider',
+        anthropicAuthToken: 'stored-identifier',
+        codexOAuthCredentials: { accessToken: 'upstream' },
+      },
+    ];
+    let liveDuringQuery: unknown;
+    let token = '';
+    query.mockImplementation(({ options }) => {
+      token = options.env.ANTHROPIC_API_KEY;
+      liveDuringQuery = resolveCodexGatewayToken(token);
+      expect(options.env.ANTHROPIC_BASE_URL).toMatch(
+        /^http:\/\/127\.0\.0\.1:\d+\/gateway\/chatgpt$/,
+      );
+      expect(options.env.NO_PROXY).toContain('127.0.0.1');
+      return successfulConversation('title');
+    });
+    await expect(sdkQuery('generate a title')).resolves.toBe('title');
+    expect(token).toMatch(/^hcgw_/);
+    expect(liveDuringQuery).toMatchObject({
+      providerId: 'codex-provider',
+      owner: { kind: 'sdk-query' },
+    });
+    expect(resolveCodexGatewayToken(token)).toBeNull();
   });
 });

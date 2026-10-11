@@ -5,6 +5,12 @@
 
 import { createHash } from 'node:crypto';
 
+import {
+  clampCodexEffortWithCatalog,
+  lowestCodexEffortWithCatalog,
+  resolveCodexDefaultEffort,
+  type CodexModelCatalogEntry,
+} from './model-catalog.js';
 import { decodeReasoningSignature } from './reasoning-signature.js';
 
 type Json = Record<string, unknown>;
@@ -257,17 +263,45 @@ function normalizeToolParameters(value: unknown): Json {
   return root;
 }
 
+const SUPPORTED_IMAGE_MEDIA_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+]);
+
 function imageToInputImage(source: unknown): Json | null {
   if (
     !isRecord(source) ||
     source.type !== 'base64' ||
-    typeof source.data !== 'string'
+    typeof source.data !== 'string' ||
+    typeof source.media_type !== 'string' ||
+    !SUPPORTED_IMAGE_MEDIA_TYPES.has(source.media_type)
   )
     return null;
   return {
     type: 'input_image',
     image_url: `data:${source.media_type};base64,${source.data}`,
   };
+}
+
+/** Request strings echoed into placeholders stay short and single-line. */
+function placeholderValue(value: unknown, limit = 200): string {
+  return truncateUtf8(String(value ?? 'unknown').replace(/\s+/g, ' '), limit);
+}
+
+/**
+ * Images the backend cannot take are replaced by a visible note instead of a
+ * 400: the block usually sits in session history and would otherwise fail
+ * every later turn. The model still learns that something was omitted.
+ */
+function omittedImageText(source: unknown): string {
+  const record = isRecord(source) ? source : {};
+  if (record.type === 'url')
+    return `[Image omitted: the ChatGPT backend does not fetch image URLs (${placeholderValue(record.url)})]`;
+  if (record.type === 'base64')
+    return `[Image omitted: unsupported image type ${placeholderValue(record.media_type, 64)}]`;
+  return `[Image omitted: ${placeholderValue(record.type, 64)} image sources are not supported by the ChatGPT backend]`;
 }
 
 function documentToInputFile(source: unknown): Json | null {
@@ -283,6 +317,67 @@ function documentToInputFile(source: unknown): Json | null {
     file_data: `data:application/pdf;base64,${source.data}`,
     filename: 'document.pdf',
   };
+}
+
+function textBlocksOf(content: unknown): string | null {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return null;
+  const texts = content
+    .filter(
+      (block): block is Json =>
+        isRecord(block) &&
+        block.type === 'text' &&
+        typeof block.text === 'string',
+    )
+    .map((block) => block.text as string);
+  return texts.length ? texts.join('\n') : null;
+}
+
+/** Plain-text documents become text input; binary non-PDF documents do not. */
+function documentText(block: Json): string | null {
+  const source = isRecord(block.source) ? block.source : {};
+  let text: string | null = null;
+  if (source.type === 'text' && typeof source.data === 'string')
+    text = source.data;
+  else if (
+    source.type === 'base64' &&
+    typeof source.media_type === 'string' &&
+    source.media_type.startsWith('text/') &&
+    typeof source.data === 'string'
+  )
+    text = Buffer.from(source.data, 'base64').toString('utf8');
+  else if (source.type === 'content') text = textBlocksOf(source.content);
+  if (text === null) return null;
+  const title =
+    typeof block.title === 'string' && block.title.trim()
+      ? block.title.trim()
+      : '';
+  return title ? `${title}\n\n${text}` : text;
+}
+
+function omittedDocumentText(block: Json, context = ''): string {
+  const source = isRecord(block.source) ? block.source : {};
+  const kind =
+    source.type === 'base64'
+      ? placeholderValue(source.media_type, 64)
+      : `${placeholderValue(source.type, 64)} source`;
+  return `[Document omitted${context}: ${kind} documents are not supported by the ChatGPT backend]`;
+}
+
+/** Flatten a block type this translator does not know into visible text. */
+function unsupportedBlockText(block: Json): string {
+  const type = placeholderValue(block.type, 64);
+  const title =
+    typeof block.title === 'string' && block.title.trim()
+      ? `: ${placeholderValue(block.title)}`
+      : '';
+  const text =
+    (typeof block.text === 'string' ? block.text : null) ??
+    textBlocksOf(block.content) ??
+    (isRecord(block.source) ? textBlocksOf(block.source.content) : null);
+  return text
+    ? `[${type}${title}]\n${text}`
+    : `[Unsupported ${type} content omitted${title}]`;
 }
 
 function alignToolResults(
@@ -312,11 +407,26 @@ function toolResultOutput(content: unknown): unknown {
   if (typeof content === 'string') return content;
   const converted: Json[] = [];
   for (const block of contentBlocks(content)) {
-    if (block.type === 'text' && typeof block.text === 'string')
-      converted.push({ type: 'input_text', text: block.text });
-    if (block.type === 'image') {
-      const image = imageToInputImage(block.source);
-      if (image) converted.push(image);
+    if (block.type === 'text') {
+      if (typeof block.text === 'string')
+        converted.push({ type: 'input_text', text: block.text });
+    } else if (block.type === 'image') {
+      converted.push(
+        imageToInputImage(block.source) ?? {
+          type: 'input_text',
+          text: omittedImageText(block.source),
+        },
+      );
+    } else if (block.type === 'document') {
+      // Files are not accepted inside function_call_output; keep text.
+      converted.push({
+        type: 'input_text',
+        text:
+          documentText(block) ??
+          omittedDocumentText(block, ' from tool result'),
+      });
+    } else {
+      converted.push({ type: 'input_text', text: unsupportedBlockText(block) });
     }
   }
   return converted.length ? converted : '';
@@ -353,14 +463,23 @@ function messageToInputItems(
         break;
       case 'image': {
         flushReminders();
-        const image = imageToInputImage(block.source);
-        if (image) content.push(image);
+        content.push(
+          imageToInputImage(block.source) ?? {
+            type: role === 'assistant' ? 'output_text' : 'input_text',
+            text: omittedImageText(block.source),
+          },
+        );
         break;
       }
       case 'document': {
         flushReminders();
-        const document = documentToInputFile(block.source);
-        if (document) content.push(document);
+        const text = documentText(block);
+        content.push(
+          documentToInputFile(block.source) ?? {
+            type: role === 'assistant' ? 'output_text' : 'input_text',
+            text: text ?? omittedDocumentText(block),
+          },
+        );
         break;
       }
       case 'thinking': {
@@ -402,6 +521,12 @@ function messageToInputItems(
       case 'web_search_tool_result':
       case 'redacted_thinking':
         break;
+      default:
+        // Server-side blocks in assistant history were never client output;
+        // user-side content is kept visible rather than dropped.
+        if (role === 'assistant' || typeof block.type !== 'string') break;
+        flushReminders();
+        content.push({ type: 'input_text', text: unsupportedBlockText(block) });
     }
   }
   flush();
@@ -478,7 +603,12 @@ export function normalizeCodexEffort(effort: string | undefined): string {
   return effort === 'minimal' ? 'low' : effort;
 }
 
-/** Explicit provider configuration wins; otherwise preserve the SDK's intent. */
+/**
+ * Reference (CLIProxyAPI) mapping of the SDK's thinking intent to a Responses
+ * effort, used by the pure translator. An explicit override wins. The gateway
+ * applies HappyClaw's precedence first via resolveGatewayReasoningEffort and
+ * passes the final value in as that override.
+ */
 export function resolveCodexRequestEffort(
   request: AnthropicRequestSubset,
   configuredOverride?: string,
@@ -508,6 +638,66 @@ export function resolveCodexRequestEffort(
     }
   }
   return 'medium';
+}
+
+export interface GatewayEffortPolicy {
+  catalog: readonly CodexModelCatalogEntry[];
+  /** Upstream model this request will run on. */
+  model: string;
+  /** Provider-level CODEX_REASONING_EFFORT, if configured. */
+  providerEffort?: string;
+  /** Explicit Agent effort of the calling runner; undefined = inherit. */
+  agentEffort?: string;
+}
+
+/** Haiku-tier names come from Claude Code's background and utility queries. */
+function isBackgroundRequest(request: AnthropicRequestSubset): boolean {
+  return typeof request.model === 'string' && /haiku/i.test(request.model);
+}
+
+/**
+ * HappyClaw's effort precedence for one gateway request, already clamped to
+ * the model's supported levels:
+ * 1. thinking disabled → the lowest level the model supports (never `none`,
+ *    which the current catalog rejects);
+ * 2. background/haiku-tier requests → low;
+ * 3. an explicit Agent effort → the SDK's requested effort for this call,
+ *    else the Agent's own level (sub-agents may ask for a different level);
+ * 4. otherwise the provider default: CODEX_REASONING_EFFORT, else the model's
+ *    catalog default. Claude Code's own output_config.effort is ignored here:
+ *    for inheriting Agents it only mirrors the third-party CLAUDE_CODE_EFFORT_LEVEL
+ *    default, not a user choice, and the settings page shows the provider default.
+ */
+export function resolveGatewayReasoningEffort(
+  request: AnthropicRequestSubset,
+  policy: GatewayEffortPolicy,
+): string {
+  const { catalog, model } = policy;
+  const thinking = request.thinking;
+  if (
+    thinking?.type === 'disabled' ||
+    (thinking?.type === 'enabled' && thinking.budget_tokens === 0)
+  )
+    return lowestCodexEffortWithCatalog(catalog, model);
+  if (isBackgroundRequest(request)) {
+    const entry = catalog.find((candidate) => candidate.value === model);
+    return !entry || entry.efforts.includes('low')
+      ? 'low'
+      : lowestCodexEffortWithCatalog(catalog, model);
+  }
+  if (policy.agentEffort) {
+    const requested = request.output_config?.effort;
+    const effort =
+      typeof requested === 'string' && requested.trim()
+        ? requested.trim().toLowerCase()
+        : policy.agentEffort;
+    return clampCodexEffortWithCatalog(
+      catalog,
+      model,
+      normalizeCodexEffort(effort),
+    )!;
+  }
+  return resolveCodexDefaultEffort(catalog, model, policy.providerEffort);
 }
 
 function convertOutputFormat(

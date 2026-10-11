@@ -6,7 +6,14 @@ import os from 'os';
 import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
 import { clearProviderQuotaObservation } from './provider-quota-observation.js';
-import type { CodexOAuthCredentials } from './codex-gateway/types.js';
+import {
+  CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+  type CodexOAuthCredentials,
+  type CodexOAuthRefreshErrorState,
+} from './codex-gateway/types.js';
+import { resolveCodexDefaultEffort } from './codex-gateway/model-catalog.js';
+import { getResolvedCodexCatalog } from './codex-gateway/model-catalog-sync.js';
+import { normalizeLegacyCodexModel } from './codex-gateway/convert-request.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
@@ -561,6 +568,8 @@ interface StoredProviderV4 {
   anthropicAuthMode?: ProviderAuthMode;
   secrets: EncryptedSecrets;
   customEnv?: Record<string, string>;
+  /** ChatGPT/Codex 订阅：最近一次 token 刷新失败（非机密运行态，凭据写入时清除）。 */
+  codexOAuthLastRefreshError?: CodexOAuthRefreshErrorState;
   updatedAt: string;
 }
 
@@ -599,6 +608,8 @@ export interface UnifiedProvider {
   claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
   claudeOAuthLastRefreshAt?: number | null;
   claudeOAuthLastRefreshError?: ClaudeOAuthRefreshError | null;
+  /** 缺省视为无刷新失败；存量配置没有这个字段。 */
+  codexOAuthLastRefreshError?: CodexOAuthRefreshErrorState | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -637,6 +648,20 @@ export interface UnifiedProviderPublic {
   claudeOAuthLastRefreshAt: number | null;
   claudeOAuthNeedsReLogin: boolean;
   claudeOAuthLastRefreshError: ClaudeOAuthRefreshError | null;
+  /** ChatGPT 订阅登录已失效，需要在模型配置里重新登录。 */
+  codexOAuthNeedsReauth: boolean;
+  /** 最近一次上游 token 刷新失败；成功刷新或重新登录后为 null。 */
+  codexOAuthLastRefreshError: {
+    kind: CodexOAuthRefreshErrorState['kind'];
+    message: string;
+    at: string;
+  } | null;
+  /**
+   * Codex provider 在 Agent 未显式指定推理力度时实际使用的默认档：
+   * CODEX_REASONING_EFFORT 按模型目录钳制后的值，未配置时取该模型的目录默认档。
+   * 非 Codex provider 为 null。网关请求侧使用同一个解析函数。
+   */
+  codexDefaultEffort: string | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -1422,7 +1447,34 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     ...(Object.keys(sanitizedEnv).length > 0
       ? { customEnv: sanitizedEnv }
       : {}),
+    ...(provider.codexOAuthLastRefreshError
+      ? { codexOAuthLastRefreshError: provider.codexOAuthLastRefreshError }
+      : {}),
     updatedAt: provider.updatedAt || new Date().toISOString(),
+  };
+}
+
+const MAX_REFRESH_ERROR_MESSAGE_LENGTH = 300;
+
+/** 只接受结构完整的刷新失败记录；手改或损坏的字段视为没有失败。 */
+function normalizeCodexRefreshErrorState(
+  raw: unknown,
+): CodexOAuthRefreshErrorState | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  if (record.kind !== 'reauth_required' && record.kind !== 'transient') {
+    return null;
+  }
+  if (typeof record.message !== 'string' || typeof record.at !== 'string') {
+    return null;
+  }
+  return {
+    kind: record.kind,
+    message: record.message.slice(0, MAX_REFRESH_ERROR_MESSAGE_LENGTH),
+    at: record.at,
+    ...(record.accessTokenRejected === true
+      ? { accessTokenRejected: true }
+      : {}),
   };
 }
 
@@ -1451,6 +1503,9 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     claudeOAuthAccount: secrets.claudeOAuthAccount ?? null,
     claudeOAuthLastRefreshAt: secrets.claudeOAuthLastRefreshAt ?? null,
     claudeOAuthLastRefreshError: secrets.claudeOAuthLastRefreshError ?? null,
+    codexOAuthLastRefreshError: normalizeCodexRefreshErrorState(
+      stored.codexOAuthLastRefreshError,
+    ),
     customEnv: sanitizeCustomEnvMap(stored.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
@@ -1987,8 +2042,11 @@ export function updateProviderSecrets(
 
   if (secrets.codexOAuthCredentials) {
     updated.codexOAuthCredentials = secrets.codexOAuthCredentials;
+    // New credentials end any refresh backoff or re-login requirement.
+    updated.codexOAuthLastRefreshError = null;
   } else if (secrets.clearCodexOAuthCredentials) {
     updated.codexOAuthCredentials = null;
+    updated.codexOAuthLastRefreshError = null;
   }
 
   // Account facts and refresh state describe one Claude grant. A new or
@@ -2151,10 +2209,71 @@ export function updateProviderCodexOAuthCredentialsIfCurrent(
   state.providers[idx] = {
     ...current,
     codexOAuthCredentials: refreshed,
+    codexOAuthLastRefreshError: null,
     updatedAt: new Date().toISOString(),
   };
   writeStoredStateV4(state.providers, state.balancing);
   return true;
+}
+
+/**
+ * Record (or clear, with null) the gateway's last Codex token refresh failure,
+ * guarded by the same credential snapshot as the refresh itself: a failure
+ * observed for credentials an admin has since replaced must not mark the new
+ * login as needing re-authorization. This is runtime state, so updatedAt and
+ * the provider's configuration fields are left untouched.
+ */
+export function setProviderCodexOAuthRefreshErrorIfCurrent(
+  id: string,
+  expected: CodexOAuthCredentials,
+  error: CodexOAuthRefreshErrorState | null,
+): boolean {
+  const state = readStoredStateV4();
+  if (!state) return false;
+  const idx = state.providers.findIndex((provider) => provider.id === id);
+  if (idx < 0) return false;
+  const current = state.providers[idx];
+  if (
+    !current.codexOAuthCredentials ||
+    codexOAuthCredentialsSnapshot(current.codexOAuthCredentials) !==
+      codexOAuthCredentialsSnapshot(expected)
+  ) {
+    return false;
+  }
+  const normalized = error ? normalizeCodexRefreshErrorState(error) : null;
+  if (
+    JSON.stringify(current.codexOAuthLastRefreshError ?? null) ===
+    JSON.stringify(normalized)
+  ) {
+    return true;
+  }
+  state.providers[idx] = {
+    ...current,
+    codexOAuthLastRefreshError: normalized,
+  };
+  writeStoredStateV4(state.providers, state.balancing);
+  return true;
+}
+
+/** Whether a stored provider routes through the embedded ChatGPT/Codex gateway. */
+export function isCodexGatewayProvider(
+  provider: Pick<UnifiedProvider, 'anthropicBaseUrl'>,
+): boolean {
+  return provider.anthropicBaseUrl === CODEX_GATEWAY_BASE_URL_PLACEHOLDER;
+}
+
+/**
+ * The reasoning effort a Codex provider uses when the Agent does not set one.
+ * Shared by the settings payload and the gateway so both always agree.
+ */
+export function resolveCodexProviderDefaultEffort(
+  provider: Pick<UnifiedProvider, 'anthropicModel' | 'customEnv'>,
+): string {
+  return resolveCodexDefaultEffort(
+    getResolvedCodexCatalog().models,
+    normalizeLegacyCodexModel(provider.anthropicModel || ''),
+    provider.customEnv?.CODEX_REASONING_EFFORT,
+  );
 }
 
 export function getProviderById(id: string): UnifiedProvider | null {
@@ -2312,6 +2431,18 @@ export function toPublicProvider(
     claudeOAuthLastRefreshAt: provider.claudeOAuthLastRefreshAt ?? null,
     claudeOAuthNeedsReLogin: !!provider.claudeOAuthLastRefreshError,
     claudeOAuthLastRefreshError: provider.claudeOAuthLastRefreshError ?? null,
+    codexOAuthNeedsReauth:
+      provider.codexOAuthLastRefreshError?.kind === 'reauth_required',
+    codexOAuthLastRefreshError: provider.codexOAuthLastRefreshError
+      ? {
+          kind: provider.codexOAuthLastRefreshError.kind,
+          message: provider.codexOAuthLastRefreshError.message,
+          at: provider.codexOAuthLastRefreshError.at,
+        }
+      : null,
+    codexDefaultEffort: isCodexGatewayProvider(provider)
+      ? resolveCodexProviderDefaultEffort(provider)
+      : null,
     customEnv: provider.customEnv || {},
     updatedAt: provider.updatedAt,
   };

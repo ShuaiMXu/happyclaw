@@ -19,6 +19,23 @@ export interface CodexOAuthCredentials {
 }
 
 /**
+ * 最近一次上游 token 刷新失败的状态，落在 provider 的非机密配置里（不进 secrets）。
+ * - reauth_required：refresh_token 被拒（invalid_grant / refresh_token_reused /
+ *   400 / 401），只有重新登录 ChatGPT 才能恢复；凭据更换前不再发起刷新。
+ * - transient：网络、超时或上游 5xx/429，按退避自动重试。
+ * 凭据写入（重新登录、刷新成功、清除）时一并清掉。
+ */
+export interface CodexOAuthRefreshErrorState {
+  kind: 'reauth_required' | 'transient';
+  /** 已脱敏、有长度上限的原因描述，可直接展示给管理员。 */
+  message: string;
+  /** ISO 时间。 */
+  at: string;
+  /** reauth_required 时：上游已经拒绝了当前 access_token，凭据彻底不可用。 */
+  accessTokenRejected?: boolean;
+}
+
+/**
  * ChatGPT 订阅型 provider 的 anthropicBaseUrl 存储占位值。
  * 保留 http(s) 形式以通过 URL 校验并复用第三方 endpoint 的运行时默认值；
  * 在 env 构建时按执行模式改写为实际网关地址（127.0.0.1 / host.docker.internal）。
@@ -35,6 +52,11 @@ export const CODEX_OAUTH_AUTHORIZE_URL =
 export const CODEX_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 export const CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 export const CODEX_OAUTH_REDIRECT_URI = 'http://localhost:1455/auth/callback';
+/** 用户粘贴回调 URL 时接受的来源：浏览器可能把 localhost 解析/改写成 127.0.0.1。 */
+export const CODEX_OAUTH_CALLBACK_ORIGINS: readonly string[] = [
+  'http://localhost:1455',
+  'http://127.0.0.1:1455',
+];
 export const CODEX_OAUTH_SCOPES =
   'openid profile email offline_access api.connectors.read api.connectors.invoke';
 

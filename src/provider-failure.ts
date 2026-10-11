@@ -22,6 +22,13 @@ export const PROVIDER_TRANSIENT_FAILURE_USER_NOTICE =
 export const PROVIDER_MODEL_CONFIG_USER_NOTICE =
   '⚠️ 当前配置的模型在该服务端不存在或不可用，本次请求未被执行。这不是额度问题，重试或切换账号都无法解决，请在「模型配置」中检查模型名称。';
 
+/**
+ * An account verdict with a known remedy: the embedded ChatGPT/Codex gateway
+ * found the provider's refresh grant rejected, so only a new login helps.
+ */
+export const CODEX_REAUTH_REQUIRED_USER_NOTICE =
+  '⚠️ ChatGPT 订阅登录已失效，本次请求未被执行。请管理员在「模型配置」中重新登录 ChatGPT 后再发送。';
+
 /** Failure classes as reported by the agent runner. */
 export type ProviderFailureClass = 'account' | 'transient' | 'config';
 

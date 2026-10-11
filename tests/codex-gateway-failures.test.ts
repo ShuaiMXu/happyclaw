@@ -2,6 +2,10 @@ import { describe, expect, test } from 'vitest';
 import {
   ResponsesToAnthropicConverter,
   aggregateResponsesStream,
+  describeUpstreamFailure,
+  describeUpstreamHttpFailure,
+  sanitizeUpstreamText,
+  upstreamFailureStatus,
 } from '../src/codex-gateway/convert-response.js';
 
 const created = {
@@ -115,5 +119,108 @@ describe('Codex upstream failure semantics', () => {
         'gpt-6-sol',
       ).stopReason,
     ).toBe('end_turn');
+  });
+
+  describe('upstream classification', () => {
+    const now = Date.UTC(2026, 9, 11, 12, 0, 0);
+
+    test('usage limits are detected by error.type and carry the reset time', () => {
+      const failure = describeUpstreamFailure(
+        {
+          type: 'response.failed',
+          response: {
+            error: {
+              type: 'usage_limit_reached',
+              message: 'The usage limit has been reached',
+              resets_at: now / 1000 + 3 * 3600 + 120,
+            },
+          },
+        },
+        { now },
+      );
+      expect(failure).toMatchObject({
+        type: 'rate_limit_error',
+        status: 429,
+        retryAfterSeconds: 3 * 3600 + 120,
+        noRetry: true,
+      });
+      expect(failure.message).toContain('2026-10-11T15:02:00.000Z');
+      expect(failure.message).toContain('3 小时 2 分钟');
+    });
+
+    test('resets_in_seconds is honoured when resets_at is absent or past', () => {
+      expect(
+        describeUpstreamFailure(
+          {
+            error: {
+              code: 'usage_limit_reached',
+              resets_at: now / 1000 - 10,
+              resets_in_seconds: '90',
+            },
+          },
+          { now },
+        ),
+      ).toMatchObject({ status: 429, retryAfterSeconds: 90 });
+    });
+
+    test.each([
+      [{ code: 'server_is_overloaded' }, 'overloaded_error', 529],
+      [{ code: 'slow_down' }, 'overloaded_error', 529],
+      [{ type: 'service_unavailable_error' }, 'overloaded_error', 529],
+      [{ code: 'usage_not_included' }, 'permission_error', 403],
+      [{ type: 'usage_not_included' }, 'permission_error', 403],
+      [{ code: 'context_length_exceeded' }, 'invalid_request_error', 400],
+      [
+        {
+          type: 'invalid_request_error',
+          message: 'maximum context length is 272000 tokens',
+        },
+        'invalid_request_error',
+        400,
+      ],
+      [{ code: 'rate_limit_exceeded' }, 'rate_limit_error', 429],
+    ])('maps %j to %s %i', (error, type, status) => {
+      const failure = describeUpstreamFailure({ type: 'error', error });
+      expect(failure.type).toBe(type);
+      expect(upstreamFailureStatus(failure)).toBe(status);
+    });
+
+    test('context-length failures start with the wording Claude Code compacts on', () => {
+      const { message } = describeUpstreamFailure({
+        type: 'error',
+        error: { code: 'context_length_exceeded', message: 'too big' },
+      });
+      expect(message.startsWith('Prompt is too long')).toBe(true);
+    });
+
+    test.each([
+      [
+        401,
+        '{"detail":"Unauthorized"}',
+        'authentication_error',
+        'Unauthorized',
+      ],
+      [500, 'Internal failure', 'api_error', 'Internal failure'],
+      [502, '<html>edge</html>', 'api_error', 'returned 502'],
+      [
+        403,
+        '{"detail":{"code":"usage_not_included"}}',
+        'permission_error',
+        'usage_not_included',
+      ],
+    ])('HTTP %i body %s → %s', (status, body, type, fragment) => {
+      const failure = describeUpstreamHttpFailure(status, body);
+      expect(failure.type).toBe(type);
+      expect(failure.message).toContain(fragment);
+    });
+
+    test('sanitizes secrets and bounds the length', () => {
+      const text = sanitizeUpstreamText(
+        `Bearer abc.def-ghi sk-proj-0123456789abcdef eyJhbGciOi.eyJzdWIiOi.sig ${'A'.repeat(64)}\n${'y '.repeat(600)}`,
+      );
+      expect(text).not.toMatch(/abc\.def|0123456789abcdef|eyJ|AAAA/);
+      expect(text).not.toContain('\n');
+      expect(text.length).toBeLessThanOrEqual(501);
+    });
   });
 });

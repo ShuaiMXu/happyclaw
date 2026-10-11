@@ -21,6 +21,17 @@ function requestBusinessPayload(request: Json): Json {
   }
   // HappyClaw's current model catalog normalizes removed minimal to low.
   if (payload.reasoning.effort === 'minimal') payload.reasoning.effort = 'low';
+  // URL images become a visible placeholder; the reference drops them.
+  payload.input = payload.input.filter(
+    (item: Json) =>
+      !(
+        item.type === 'message' &&
+        item.content?.length &&
+        item.content.every((part: Json) =>
+          String(part.text ?? '').startsWith('[Image omitted:'),
+        )
+      ),
+  );
   return payload;
 }
 

@@ -19,7 +19,9 @@ const originalLogLevel = process.env.LOG_LEVEL;
 const scratch = await mkdtemp(path.join(os.tmpdir(), 'hc-codex-sdk-e2e-'));
 const workspace = path.join(scratch, 'workspace');
 const claudeConfig = path.join(scratch, 'claude-config');
-const gatewayKey = 'e2e-gateway-not-a-real-secret';
+// The provider's stored identifier; runners authenticate with a minted token.
+const gatewayIdentifier = 'e2e-gateway-identifier-not-a-real-secret';
+let gatewayKey = '';
 const upstreamKey = 'e2e-upstream-not-a-real-secret';
 const accountId = 'e2e-account';
 const model = 'gpt-6-sol';
@@ -320,6 +322,12 @@ try {
   const { codexGatewayApp } = await import(
     pathToFileURL(path.join(repository, 'dist/codex-gateway/gateway.js')).href
   );
+  const { CodexGatewayRunnerLease, resolveCodexGatewayLaunchConfig } =
+    await import(
+      pathToFileURL(
+        path.join(repository, 'dist/codex-gateway/runner-tokens.js'),
+      ).href
+    );
   const { CodexMessagesRequestSchema } = await import(
     pathToFileURL(
       path.join(repository, 'dist/codex-gateway/request-validation.js'),
@@ -338,7 +346,7 @@ try {
     type: 'third_party',
     enabled: true,
     anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
-    anthropicAuthToken: gatewayKey,
+    anthropicAuthToken: gatewayIdentifier,
     anthropicModel: model,
     codexOAuthCredentials: {
       accessToken: upstreamKey,
@@ -492,6 +500,21 @@ try {
   });
   servers.push(gateway);
   const gatewayUrl = `http://127.0.0.1:${gateway.address().port}${CODEX_GATEWAY_ROUTE}`;
+  // Same substitution the runner launch performs: the stored identifier maps
+  // to the provider and is replaced by a runner-scoped token.
+  const runnerLease = new CodexGatewayRunnerLease({ kind: 'host' });
+  gatewayKey = resolveCodexGatewayLaunchConfig(
+    {
+      anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+      anthropicAuthToken: gatewayIdentifier,
+    },
+    'host',
+    runnerLease,
+  ).anthropicAuthToken;
+  check(
+    'runnerScopedGatewayToken',
+    gatewayKey.startsWith('hcgw_') && gatewayKey !== gatewayIdentifier,
+  );
   const env = {
     PATH: process.env.PATH,
     LANG: 'C.UTF-8',

@@ -4,36 +4,33 @@ import { z } from 'zod';
 const text = z
   .object({ type: z.literal('text'), text: z.string() })
   .passthrough();
-const image = z
+// A base64 source must carry its bytes; every other source shape (URL, Files
+// API, inline text, unsupported media types) is accepted so the converter can
+// degrade it to a visible placeholder. Rejecting it would 400 every later
+// turn of a session that once contained such a block.
+const mediaSource = z
   .object({
-    type: z.literal('image'),
-    // URL sources remain an explicit unsupported-input error rather than losing
-    // the image silently, as the reference translator currently does.
-    source: z
-      .object({
-        type: z.literal('base64'),
-        media_type: z.enum([
-          'image/png',
-          'image/jpeg',
-          'image/gif',
-          'image/webp',
-        ]),
-        data: z.string().min(1),
-      })
-      .passthrough(),
+    type: z.string().min(1),
+    media_type: z.string().optional(),
+    data: z.string().optional(),
   })
+  .passthrough()
+  .superRefine((source, context) => {
+    if (source.type !== 'base64') return;
+    for (const field of ['media_type', 'data'] as const) {
+      if (!source[field])
+        context.addIssue({
+          code: 'custom',
+          path: [field],
+          message: `base64 sources require ${field}`,
+        });
+    }
+  });
+const image = z
+  .object({ type: z.literal('image'), source: mediaSource })
   .passthrough();
 const document = z
-  .object({
-    type: z.literal('document'),
-    source: z
-      .object({
-        type: z.literal('base64'),
-        media_type: z.literal('application/pdf'),
-        data: z.string().min(1),
-      })
-      .passthrough(),
-  })
+  .object({ type: z.literal('document'), source: mediaSource })
   .passthrough();
 const toolUseShape = {
   id: z.string().min(1),
@@ -48,7 +45,37 @@ const searchResult = z
     page_age: z.string().nullable().optional(),
   })
   .passthrough();
-const block = z.discriminatedUnion('type', [
+/** Content types the converter translates; anything else is degraded. */
+const KNOWN_BLOCK_TYPES = new Set([
+  'text',
+  'image',
+  'document',
+  'tool_use',
+  'tool_result',
+  'thinking',
+  'redacted_thinking',
+  'server_tool_use',
+  'web_search_tool_result',
+]);
+/**
+ * Newer or server-side block types (search results, MCP connector blocks,
+ * code execution results …) from session history. Known types never fall
+ * through to this shape, so their own validation stays strict.
+ */
+const unsupportedBlock = z
+  .object({
+    type: z
+      .string()
+      .min(1)
+      // Aborting, so a malformed known block reports its own issue instead.
+      .refine((type) => !KNOWN_BLOCK_TYPES.has(type), { abort: true }),
+  })
+  .passthrough();
+const toolResultItem = z.union([
+  z.discriminatedUnion('type', [text, image, document]),
+  unsupportedBlock,
+]);
+const knownBlock = z.discriminatedUnion('type', [
   text,
   image,
   document,
@@ -57,9 +84,7 @@ const block = z.discriminatedUnion('type', [
     .object({
       type: z.literal('tool_result'),
       tool_use_id: z.string().min(1),
-      content: z
-        .union([z.string(), z.array(z.union([text, image]))])
-        .optional(),
+      content: z.union([z.string(), z.array(toolResultItem)]).optional(),
       is_error: z.boolean().optional(),
     })
     .passthrough(),
@@ -94,6 +119,7 @@ const block = z.discriminatedUnion('type', [
     })
     .passthrough(),
 ]);
+const block = z.union([knownBlock, unsupportedBlock]);
 const parallelChoice = { disable_parallel_tool_use: z.boolean().optional() };
 const toolChoice = z.union([
   z
@@ -218,3 +244,34 @@ export const CodexMessagesRequestSchema = z
       });
     }
   });
+
+/**
+ * Name the offending field path of a validation failure without echoing any
+ * request value. A union failure reports its deepest branch issue: the branch
+ * that got furthest is the shape the caller was attempting.
+ */
+export function describeCodexRequestIssue(error: z.ZodError): string {
+  const deepest = (
+    issue: z.core.$ZodIssue,
+  ): { path: PropertyKey[]; code: string } => {
+    let best: { path: PropertyKey[]; code: string } | null = null;
+    if (issue.code === 'invalid_union') {
+      for (const branch of issue.errors) {
+        for (const nested of branch) {
+          const candidate = deepest(nested);
+          if (!best || candidate.path.length > best.path.length)
+            best = candidate;
+        }
+      }
+    }
+    return best
+      ? { path: [...issue.path, ...best.path], code: best.code }
+      : { path: issue.path, code: issue.code };
+  };
+  const first = error.issues[0];
+  const { path, code } = first ? deepest(first) : { path: [], code: 'invalid' };
+  const location = path.length
+    ? path.map((segment) => String(segment)).join('.')
+    : '(root)';
+  return `Invalid messages request at ${location} (${code})`;
+}
