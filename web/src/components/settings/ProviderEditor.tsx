@@ -601,6 +601,14 @@ export function ProviderEditor({
       setNotice('OAuth 登录成功，凭据已保存。');
       onSave();
     } catch (err) {
+      // A definitive rejection consumed the flow server-side; only transient
+      // failures (retryable) can be retried with the same code.
+      const retryable = (err as { body?: { retryable?: unknown } })?.body
+        ?.retryable;
+      if (retryable === false) {
+        setOauthState(null);
+        setOauthCode('');
+      }
       setError(getErrorMessage(err, 'OAuth 授权码换取失败'));
     } finally {
       setOauthExchanging(false);
