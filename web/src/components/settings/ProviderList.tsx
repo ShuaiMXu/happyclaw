@@ -95,14 +95,19 @@ function CredentialBadges({ provider }: { provider: ProviderWithHealth }) {
   const badges: { label: string; dot: BadgeDot; detail?: string }[] = [];
 
   if (provider.hasClaudeOAuthCredentials) {
-    const expired =
-      provider.claudeOAuthCredentialsExpiresAt != null &&
-      provider.claudeOAuthCredentialsExpiresAt <= Date.now();
     const expiry = formatOAuthExpiry(provider.claudeOAuthCredentialsExpiresAt);
+    // Host-side renewal keeps the access token fresh, so an elapsed expiry
+    // alone is not a failure; a refused renewal is.
     badges.push({
-      label: 'OAuth',
-      dot: expired ? 'error' : 'success',
-      detail: expiry ?? undefined,
+      label: provider.claudeOAuthNeedsReLogin
+        ? 'OAuth · 需重新登录'
+        : provider.claudeOAuthSubscriptionType
+          ? `Claude ${provider.claudeOAuthSubscriptionType}`
+          : 'OAuth',
+      dot: provider.claudeOAuthNeedsReLogin ? 'error' : 'success',
+      detail:
+        provider.claudeOAuthAccountEmail ??
+        (provider.claudeOAuthNeedsReLogin ? undefined : (expiry ?? undefined)),
     });
   }
   if (provider.hasCodexOAuthCredentials) {

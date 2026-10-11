@@ -556,28 +556,33 @@ export function ProviderEditor({
   };
 
   // ─── OAuth 流程 ─────────────────────────────────────────────
-  const handleOAuthStart = useCallback(async () => {
-    setOauthLoading(true);
-    setError(null);
-    try {
-      const body: Record<string, unknown> = {};
-      // 编辑模式下传入目标提供商 ID
-      if (!isCreate && provider) {
-        body.targetProviderId = provider.id;
+  // 'full' = 完整登录（自动续期）；'setup_token' = 1 年期、仅推理权限
+  const handleOAuthStart = useCallback(
+    async (profile: 'full' | 'setup_token' = 'full') => {
+      setOauthLoading(true);
+      setError(null);
+      try {
+        const body: Record<string, unknown> = {};
+        // 编辑模式下传入目标提供商 ID
+        if (!isCreate && provider) {
+          body.targetProviderId = provider.id;
+        }
+        if (profile === 'setup_token') body.profile = 'setup_token';
+        const data = await api.post<{ authorizeUrl: string; state: string }>(
+          '/api/config/claude/oauth/start',
+          Object.keys(body).length > 0 ? body : undefined,
+        );
+        setOauthState(data.state);
+        setOauthCode('');
+        window.open(data.authorizeUrl, '_blank', 'noopener,noreferrer');
+      } catch (err) {
+        setError(getErrorMessage(err, 'OAuth 授权启动失败'));
+      } finally {
+        setOauthLoading(false);
       }
-      const data = await api.post<{ authorizeUrl: string; state: string }>(
-        '/api/config/claude/oauth/start',
-        Object.keys(body).length > 0 ? body : undefined,
-      );
-      setOauthState(data.state);
-      setOauthCode('');
-      window.open(data.authorizeUrl, '_blank', 'noopener,noreferrer');
-    } catch (err) {
-      setError(getErrorMessage(err, 'OAuth 授权启动失败'));
-    } finally {
-      setOauthLoading(false);
-    }
-  }, [isCreate, provider, setError]);
+    },
+    [isCreate, provider, setError],
+  );
 
   const handleOAuthCallback = useCallback(async () => {
     if (!oauthState || !oauthCode.trim()) {
@@ -750,31 +755,8 @@ export function ProviderEditor({
               setSaving(false);
               return;
             }
-            // 检测是否为 .credentials.json
-            if (trimmed.startsWith('{')) {
-              try {
-                const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-                const oauth = parsed.claudeAiOauth as
-                  | Record<string, unknown>
-                  | undefined;
-                if (oauth?.accessToken && oauth?.refreshToken) {
-                  createBody.claudeOAuthCredentials = {
-                    accessToken: oauth.accessToken,
-                    refreshToken: oauth.refreshToken,
-                    expiresAt: oauth.expiresAt
-                      ? new Date(oauth.expiresAt as string).getTime()
-                      : Date.now() + 8 * 60 * 60 * 1000,
-                    scopes: Array.isArray(oauth.scopes) ? oauth.scopes : [],
-                  };
-                } else {
-                  createBody.claudeCodeOauthToken = trimmed;
-                }
-              } catch {
-                createBody.claudeCodeOauthToken = trimmed;
-              }
-            } else {
-              createBody.claudeCodeOauthToken = trimmed;
-            }
+            // .credentials.json 或 setup-token 原文交给服务端解析与校验
+            createBody.claudeCredentialInput = trimmed;
           } else if (authTab === 'api_key') {
             const trimmed = apiKey.trim();
             if (!trimmed) {
@@ -824,43 +806,12 @@ export function ProviderEditor({
 
         if (providerType === 'official') {
           // 官方模式编辑时更新凭据
+          // 服务端解析粘贴原文，并保证官方配置只保留一种凭据
           if (authTab === 'setup_token' && setupToken.trim()) {
-            const trimmed = setupToken.trim();
-            if (trimmed.startsWith('{')) {
-              try {
-                const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-                const oauth = parsed.claudeAiOauth as
-                  | Record<string, unknown>
-                  | undefined;
-                if (oauth?.accessToken && oauth?.refreshToken) {
-                  secretsBody.claudeOAuthCredentials = {
-                    accessToken: oauth.accessToken,
-                    refreshToken: oauth.refreshToken,
-                    expiresAt: oauth.expiresAt
-                      ? new Date(oauth.expiresAt as string).getTime()
-                      : Date.now() + 8 * 60 * 60 * 1000,
-                    scopes: Array.isArray(oauth.scopes) ? oauth.scopes : [],
-                  };
-                  secretsBody.clearAnthropicAuthToken = true;
-                  secretsBody.clearAnthropicApiKey = true;
-                  secretsBody.clearClaudeCodeOauthToken = true;
-                  hasSecretsChange = true;
-                }
-              } catch {
-                // 不是 JSON，视为 setup-token
-              }
-            }
-            if (!hasSecretsChange) {
-              secretsBody.claudeCodeOauthToken = trimmed;
-              secretsBody.clearAnthropicAuthToken = true;
-              secretsBody.clearAnthropicApiKey = true;
-              hasSecretsChange = true;
-            }
+            secretsBody.claudeCredentialInput = setupToken.trim();
+            hasSecretsChange = true;
           } else if (authTab === 'api_key' && apiKey.trim()) {
             secretsBody.anthropicApiKey = apiKey.trim();
-            secretsBody.clearAnthropicAuthToken = true;
-            secretsBody.clearClaudeCodeOauthToken = true;
-            secretsBody.clearClaudeOAuthCredentials = true;
             hasSecretsChange = true;
           }
         }
@@ -981,9 +932,47 @@ export function ProviderEditor({
                     </div>
                   </div>
 
+                  {/* 编辑模式：需要重新登录 */}
+                  {!isCreate && provider?.claudeOAuthNeedsReLogin && (
+                    <div
+                      role="alert"
+                      className="flex gap-2 rounded-lg bg-error/10 px-3 py-2.5 text-caption leading-5 text-error"
+                    >
+                      <TriangleAlert
+                        className="mt-0.5 size-4 shrink-0"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <div className="font-medium">
+                          {provider.claudeOAuthLastRefreshError?.kind ===
+                          'account_mismatch'
+                            ? '续期返回了另一个账号，已拒绝写入，请重新登录'
+                            : '授权已失效，需要重新登录 Claude'}
+                        </div>
+                        {provider.claudeOAuthLastRefreshError?.message && (
+                          <div className="break-words opacity-80">
+                            {provider.claudeOAuthLastRefreshError.message}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
                   {/* 编辑模式显示现有凭据 */}
                   {!isCreate && provider?.hasClaudeOAuthCredentials && (
                     <div className="space-y-1 rounded-lg bg-success/10 px-3 py-2.5 text-caption text-success">
+                      {(provider.claudeOAuthAccountEmail ||
+                        provider.claudeOAuthSubscriptionType) && (
+                        <div>
+                          账号：{provider.claudeOAuthAccountEmail ?? '未知'}
+                          {provider.claudeOAuthSubscriptionType
+                            ? `（${provider.claudeOAuthSubscriptionType}）`
+                            : ''}
+                          {provider.claudeOAuthOrganizationName
+                            ? ` · ${provider.claudeOAuthOrganizationName}`
+                            : ''}
+                        </div>
+                      )}
                       <div>
                         Access Token:{' '}
                         <span className="font-mono">
@@ -1010,31 +999,48 @@ export function ProviderEditor({
                         </div>
                       )}
                       <div className="text-muted-foreground">
-                        SDK 会在 token 过期时自动刷新。
+                        HappyClaw 会在过期前自动续期
+                        {provider.claudeOAuthLastRefreshAt
+                          ? `，上次续期 ${new Date(
+                              provider.claudeOAuthLastRefreshAt,
+                            ).toLocaleString('zh-CN')}`
+                          : ''}
+                        。
                       </div>
                     </div>
                   )}
 
                   {!oauthState ? (
-                    <Button
-                      variant="outline"
-                      onClick={handleOAuthStart}
-                      disabled={saving || oauthLoading}
-                    >
-                      {oauthLoading ? (
-                        <Loader2 className="animate-spin" />
-                      ) : (
-                        <ExternalLink />
-                      )}
-                      {!isCreate && provider?.hasClaudeOAuthCredentials
-                        ? '重新登录 Claude'
-                        : '一键登录 Claude'}
-                    </Button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        variant="outline"
+                        onClick={() => void handleOAuthStart('full')}
+                        disabled={saving || oauthLoading}
+                      >
+                        {oauthLoading ? (
+                          <Loader2 className="animate-spin" />
+                        ) : (
+                          <ExternalLink />
+                        )}
+                        {!isCreate && provider?.hasClaudeOAuthCredentials
+                          ? '重新登录 Claude'
+                          : '一键登录 Claude'}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void handleOAuthStart('setup_token')}
+                        disabled={saving || oauthLoading}
+                        title="与 claude setup-token 相同：1 年有效、仅推理权限，不支持用量查询"
+                      >
+                        改为获取 1 年期 Setup Token
+                      </Button>
+                    </div>
                   ) : (
                     <div className="space-y-2">
                       <div className="rounded-lg bg-warning/10 px-3 py-2 text-caption leading-5 text-warning">
-                        授权窗口已打开，请在 claude.ai
-                        完成授权后，将页面上显示的授权码粘贴到下方。
+                        授权窗口已打开，请在 Claude
+                        完成授权后，把页面上显示的授权码（或回调页完整地址）粘贴到下方。
                       </div>
                       <div className="flex gap-2">
                         <Input
@@ -1042,7 +1048,7 @@ export function ProviderEditor({
                           value={oauthCode}
                           onChange={(e) => setOauthCode(e.target.value)}
                           disabled={oauthExchanging}
-                          placeholder="粘贴授权码"
+                          placeholder="粘贴授权码或回调页地址"
                           aria-label="粘贴授权码"
                           className="flex-1"
                         />

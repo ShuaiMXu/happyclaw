@@ -311,6 +311,23 @@ export function UsageBars({
 
   if (loading || !usage?.data) return null;
 
+  if (usage.status === 'needs_relogin') {
+    return (
+      <div className={cn('text-micro text-error', className)}>
+        授权已失效，重新登录后才能查看用量
+      </div>
+    );
+  }
+  if (usage.status === 'unsupported') {
+    return (
+      <div className={cn('text-micro text-muted-foreground', className)}>
+        {usage.unsupportedReason === 'no_oauth'
+          ? '该配置不是 OAuth 授权，没有订阅用量'
+          : 'Setup Token / 仅推理权限的授权不支持用量查询'}
+      </div>
+    );
+  }
+
   const buckets: { label: string; bucket: OAuthUsageBucket }[] = [];
   if (usage.data.five_hour)
     buckets.push({ label: '5h', bucket: usage.data.five_hour });

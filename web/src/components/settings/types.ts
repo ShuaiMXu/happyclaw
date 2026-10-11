@@ -19,6 +19,19 @@ export interface UnifiedProviderPublic {
   hasClaudeOAuthCredentials: boolean;
   claudeOAuthCredentialsExpiresAt: number | null;
   claudeOAuthCredentialsAccessTokenMasked: string | null;
+  /** Which official credential is active; null for third-party providers. */
+  claudeAuthKind?: 'oauth' | 'setup_token' | 'api_key' | null;
+  claudeOAuthAccountEmail?: string | null;
+  claudeOAuthOrganizationName?: string | null;
+  claudeOAuthSubscriptionType?: string | null;
+  claudeOAuthScopes?: string[];
+  claudeOAuthLastRefreshAt?: number | null;
+  claudeOAuthNeedsReLogin?: boolean;
+  claudeOAuthLastRefreshError?: {
+    kind: 'invalid_grant' | 'rejected' | 'account_mismatch';
+    message: string;
+    at: number;
+  } | null;
   hasCodexOAuthCredentials: boolean;
   codexOAuthCredentialsExpiresAt: number | null;
   codexOAuthCredentialsEmail: string | null;
@@ -160,6 +173,9 @@ export interface OAuthUsageResponse {
 export interface CachedOAuthUsage {
   data: OAuthUsageResponse;
   fetchedAt: number;
+  /** Set when the grant cannot read usage or needs a new login. */
+  status?: 'unsupported' | 'needs_relogin';
+  unsupportedReason?: 'inference_only' | 'setup_token' | 'no_oauth';
   error?: string;
   observation?: ProviderQuotaObservation | null;
 }

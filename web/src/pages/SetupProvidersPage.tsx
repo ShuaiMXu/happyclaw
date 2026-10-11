@@ -238,44 +238,14 @@ export function SetupProvidersPage() {
             enabled: true,
           });
         } else {
-          // Setup token or .credentials.json
-          const trimmed = officialToken.trim();
-          let created = false;
-          if (trimmed.startsWith('{')) {
-            try {
-              const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-              const oauth = parsed.claudeAiOauth as
-                | Record<string, unknown>
-                | undefined;
-              if (oauth?.accessToken && oauth?.refreshToken) {
-                created = true;
-                await api.post('/api/config/claude/providers', {
-                  name: '官方 Claude (OAuth)',
-                  type: 'official',
-                  claudeOAuthCredentials: {
-                    accessToken: oauth.accessToken,
-                    refreshToken: oauth.refreshToken,
-                    expiresAt: oauth.expiresAt
-                      ? new Date(oauth.expiresAt as string).getTime()
-                      : Date.now() + 8 * 60 * 60 * 1000,
-                    scopes: Array.isArray(oauth.scopes) ? oauth.scopes : [],
-                  },
-                  enabled: true,
-                });
-              }
-            } catch {
-              // Not valid JSON, treat as setup-token
-            }
-          }
-
-          if (!created) {
-            await api.post('/api/config/claude/providers', {
-              name: '官方 Claude (Setup Token)',
-              type: 'official',
-              claudeCodeOauthToken: trimmed,
-              enabled: true,
-            });
-          }
+          // Setup token or .credentials.json: the server parses and
+          // validates the raw paste instead of guessing here.
+          await api.post('/api/config/claude/providers', {
+            name: '官方 Claude',
+            type: 'official',
+            claudeCredentialInput: officialToken.trim(),
+            enabled: true,
+          });
         }
       } else {
         await api.post<UnifiedProviderPublic>('/api/config/claude/providers', {
