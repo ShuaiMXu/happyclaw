@@ -138,7 +138,13 @@ import {
   buildCodexAuthorizeUrl,
   exchangeCodexCode,
   buildCodexCredentials,
+  CodexOAuthTokenError,
 } from '../codex-gateway/oauth.js';
+import {
+  codexProviderCreationDefaults,
+  extractCodexCallbackParams,
+  planCodexReauthorization,
+} from '../codex-gateway/provider-authorization.js';
 import {
   CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
   CODEX_OAUTH_FLOW_TTL_MS,
@@ -803,26 +809,6 @@ setInterval(() => {
     if (flow.expiresAt < now) codexOauthFlows.delete(key);
   }
 }, 60_000);
-
-/** 粘贴回来的可能是完整跳转失败的 URL，也可能是裸 code；两种都接受。 */
-function extractCodexCallbackParams(
-  input: string,
-): { code: string; state: string | null } | null {
-  const trimmed = input.trim();
-  if (!trimmed) return null;
-  try {
-    const url = new URL(trimmed);
-    // 只接受官方回调地址（localhost:1455）；其他来源的 code 一律拒绝，
-    // 防止把任意第三方 URL 里的参数误当授权码（纵深防御：伪造 code 本身
-    // 也会因 PKCE 校验失败）。
-    if (url.origin !== 'http://localhost:1455') return null;
-    const code = url.searchParams.get('code');
-    if (code) return { code, state: url.searchParams.get('state') };
-  } catch {
-    // 不是 URL，当作裸 code 处理
-  }
-  return { code: trimmed, state: null };
-}
 
 // --- OAuth Usage Cache ---
 
@@ -1936,8 +1922,8 @@ configRoutes.post(
       codexOauthFlows.delete(state);
       return c.json({ error: 'OAuth flow expired' }, 400);
     }
-    codexOauthFlows.delete(state);
 
+    // Input problems keep the flow: the user can paste the right URL again.
     const parsed = extractCodexCallbackParams(rawCode);
     if (!parsed) {
       return c.json({ error: 'Invalid code/callback URL' }, 400);
@@ -1946,53 +1932,169 @@ configRoutes.post(
     if (parsed.state && parsed.state !== state) {
       return c.json({ error: 'State mismatch' }, 400);
     }
-
-    try {
-      const tokenResponse = await exchangeCodexCode(
-        parsed.code,
-        flow.codeVerifier,
+    if (parsed.kind === 'error') {
+      return c.json(
+        {
+          error: `ChatGPT 授权未完成：${parsed.error}${
+            parsed.description ? `（${parsed.description}）` : ''
+          }。请重新打开授权链接完成登录。`,
+          retryable: true,
+        },
+        400,
       );
-      const codexCredentials = buildCodexCredentials(tokenResponse);
+    }
 
-      const actor = (c.get('user') as AuthUser).username;
-      const gatewayToken = randomBytes(32).toString('hex');
-
-      let provider;
-      if (flow.targetProviderId) {
-        provider = updateProvider(flow.targetProviderId, {
-          anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
-        });
-        provider = updateProviderSecrets(flow.targetProviderId, {
-          codexOAuthCredentials: codexCredentials,
-          anthropicAuthToken: gatewayToken,
-          clearAnthropicApiKey: true,
-          clearClaudeOAuthCredentials: true,
-          clearClaudeCodeOauthToken: true,
-        });
-      } else {
-        provider = createProvider({
-          name: `ChatGPT 订阅${codexCredentials.email ? ` (${codexCredentials.email})` : ''}`,
-          type: 'third_party',
-          anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
-          anthropicAuthToken: gatewayToken,
-          anthropicModel: 'gpt-6-sol',
-          codexOAuthCredentials: codexCredentials,
-          enabled: true,
-        });
-      }
-
-      appendClaudeConfigAudit(actor, 'codex_oauth_login', [
-        `providerId:${provider.id}`,
-        'codexOAuthCredentials:set',
-      ]);
-
-      return c.json(toPublicProvider(provider));
+    // Claim the flow so one code is exchanged at a time; restore it when the
+    // exchange failed transiently and the same code can still be retried.
+    codexOauthFlows.delete(state);
+    let codexCredentials;
+    try {
+      codexCredentials = buildCodexCredentials(
+        await exchangeCodexCode(parsed.code, flow.codeVerifier),
+      );
     } catch (err) {
-      logger.error({ err }, 'Codex OAuth token exchange error');
+      const transient = !(err instanceof CodexOAuthTokenError) || err.transient;
+      if (transient && flow.expiresAt > Date.now()) {
+        codexOauthFlows.set(state, flow);
+      }
+      logger.warn({ err, transient }, 'Codex OAuth token exchange error');
       const message =
         err instanceof Error
           ? err.message
           : 'Codex OAuth token exchange failed';
+      return c.json(
+        {
+          error: transient
+            ? `${message}；可以直接重试，无需重新授权`
+            : `${message}；授权码已失效，请重新登录 ChatGPT`,
+          retryable: transient,
+        },
+        transient ? 502 : 400,
+      );
+    }
+
+    const actor = (c.get('user') as AuthUser).username;
+    const catalog = getResolvedCodexCatalog().models;
+    try {
+      return await withClaudeConfigMutationLock(async () => {
+        if (!flow.targetProviderId) {
+          const defaults = codexProviderCreationDefaults(catalog);
+          const provider = createProvider({
+            name: `ChatGPT 订阅${codexCredentials.email ? ` (${codexCredentials.email})` : ''}`,
+            type: 'third_party',
+            anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+            // Internal identifier only; runners receive per-launch tokens.
+            anthropicAuthToken: randomBytes(32).toString('hex'),
+            anthropicModel: defaults.anthropicModel,
+            customEnv: defaults.customEnv,
+            codexOAuthCredentials: codexCredentials,
+            enabled: true,
+          });
+          appendClaudeConfigAuditBestEffort(actor, 'codex_oauth_login', [
+            `providerId:${provider.id}`,
+            'codexOAuthCredentials:set',
+          ]);
+          return c.json(toPublicProvider(provider));
+        }
+
+        const id = flow.targetProviderId;
+        const previous = getProviders().find((provider) => provider.id === id);
+        if (!previous) {
+          return c.json({ error: '未找到指定供应商' }, 404);
+        }
+        const plan = planCodexReauthorization(
+          previous,
+          codexCredentials,
+          catalog,
+        );
+        const commit = () => {
+          updateProvider(id, {
+            anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
+            ...(plan.anthropicModel !== previous.anthropicModel
+              ? { anthropicModel: plan.anthropicModel }
+              : {}),
+            ...(plan.customEnv ? { customEnv: plan.customEnv } : {}),
+          });
+          const updated = updateProviderSecrets(id, {
+            codexOAuthCredentials: codexCredentials,
+            ...(plan.rotateGatewayIdentifier
+              ? { anthropicAuthToken: randomBytes(32).toString('hex') }
+              : {}),
+            clearAnthropicApiKey: true,
+            clearClaudeOAuthCredentials: true,
+            clearClaudeCodeOauthToken: true,
+          });
+          appendClaudeConfigAuditBestEffort(actor, 'codex_oauth_login', [
+            `providerId:${id}`,
+            'codexOAuthCredentials:set',
+            ...(plan.converted ? ['converted'] : []),
+            ...(plan.accountChanged ? ['accountChanged'] : []),
+          ]);
+          return updated;
+        };
+
+        // Encrypted reasoning from another account (or another protocol) must
+        // never be replayed: quiesce runners and drop this provider's sessions.
+        // The same account keeps its sessions; its runners only need to drain.
+        const mutation: ClaudeMutationResult<ReturnType<typeof commit>> =
+          plan.accountChanged
+            ? await mutateClaudeConfigForAllGroups(
+                actor,
+                {
+                  trigger: 'codex_oauth_reauthorize',
+                  providerId: id,
+                  converted: plan.converted,
+                },
+                commit,
+                {
+                  clearSessionsForProviderId: id,
+                  sessionInvalidation: {
+                    modelChanged: true,
+                    baseUrlChanged: true,
+                  },
+                },
+              )
+            : {
+                value: commit(),
+                applied: {
+                  success: true,
+                  stoppedCount: 0,
+                  failedCount: 0,
+                  persisted: true,
+                },
+              };
+        if (mutation.value) {
+          // A new login settles any account verdict held against the old one.
+          providerPool.resetHealth(id);
+          try {
+            deps?.queue?.drainProviderRunnersForCredentialRefresh?.(id);
+          } catch (err) {
+            logger.warn(
+              { err, providerId: id },
+              'Failed to drain runners after ChatGPT re-authorization',
+            );
+          }
+        }
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json(toPublicProvider(mutation.value!));
+      });
+    } catch (err) {
+      logger.error({ err }, 'Codex OAuth provider update error');
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Codex OAuth provider update failed';
       return c.json({ error: message }, 500);
     }
   },
