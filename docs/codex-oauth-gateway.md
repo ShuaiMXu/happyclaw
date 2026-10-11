@@ -25,11 +25,15 @@ not read or update the host's Codex CLI login file.
    than a model name copied from an old example.
 
 HappyClaw exchanges the code with PKCE, reads the official namespaced JWT
-identity claims, and saves OAuth secrets encrypted in its provider secret
-store. A callback URL from `localhost:1455` or `127.0.0.1:1455` is accepted;
-an `error=` returned by the authorization page is shown as such. A transient
-token-exchange failure keeps the pending login, so pasting the same URL again
-retries it; a rejected code requires a new login. A new provider stores the
+identity claims (including `chatgpt_account_is_fedramp`), and saves OAuth
+secrets encrypted in its provider secret store. A callback URL from
+`localhost:1455` or `127.0.0.1:1455` is accepted; an `error=` returned by the
+authorization page is shown as such. Like the official login server, a code
+is sent to the token endpoint at most once unless the connection provably
+never opened (DNS, refused connection, connect timeout, TLS handshake): then
+the pending login is kept and pasting the same URL again retries it. After a
+response timeout, an HTTP error or a dropped connection the code may already
+be consumed, so the login has to start over. A new provider stores the
 catalog default model and its default reasoning effort.
 
 **重新登录 ChatGPT** replaces that provider's login, clears any refresh
@@ -37,7 +41,11 @@ failure and provider-health verdict, and lets the provider's warm runners
 finish their current query and restart. Logging in with a different ChatGPT
 account, or converting a non-ChatGPT provider, also stops runners and drops
 the provider's saved sessions, because encrypted reasoning from one account
-cannot be replayed to another. A converted provider gets the catalog default
+cannot be replayed to another. When a different account replaces a login, or
+a ChatGPT provider is deleted, HappyClaw revokes the old refresh token in the
+background (`POST https://auth.openai.com/oauth/revoke`, the official logout
+request). The revocation is best effort: the login or deletion never waits
+for it or fails because of it. A converted provider gets the catalog default
 model unless it already uses a Codex catalog model. No additional Docker
 gateway service or device-code-login switch is needed for this flow.
 
@@ -74,12 +82,18 @@ pool. Requests refresh short-lived tokens when needed, share a single refresh
 per provider, and re-read persisted credentials after concurrent changes.
 A failed compare-and-swap never returns an old credential snapshot or
 silently overwrites a reauthorization. An upstream 401 forces one shared
-refresh and a single retry. A rejected refresh grant (`invalid_grant`,
-`refresh_token_reused`, other 400/401 answers) is saved on the provider as
-"needs re-login"; the gateway stops refreshing and answers an authentication
-error that names the re-login until the credentials change. Transient refresh
-failures back off (30 seconds doubling to 5 minutes) while a still-valid
-access token keeps serving.
+refresh and a single retry. Refresh failures are classified like the official
+client: only a 401, a 400 with `invalid_grant`, or the codes
+`refresh_token_expired`, `refresh_token_reused` and
+`refresh_token_invalidated` reject the grant. That is saved on the provider
+as "needs re-login"; the gateway stops refreshing and answers an
+authentication error that names the re-login until the credentials change.
+Every other failure — network, timeout, 5xx/429 and any other 4xx such as a
+Cloudflare 403 — is transient and backs off (30 seconds doubling to 5
+minutes) while a still-valid access token keeps serving. A "needs re-login"
+verdict saved by an earlier release for such a 4xx reads back as transient.
+Refresh and revocation requests carry the official auth-client `originator`
+and `User-Agent`.
 
 ### Protocol and operating limits
 
@@ -117,11 +131,13 @@ access token keeps serving.
   haiku-tier background requests use low; an Agent with an explicit effort
   keeps it; otherwise `CODEX_REASONING_EFFORT` applies, falling back to the
   model's catalog default. The settings page shows that same default.
-- Upstream headers have a 30-second deadline and streams a 300-second idle
-  deadline, matching the official Codex CLI. Nonstream aggregation also has a
-  ten-minute deadline and a 32 MiB budget. Individual SSE events are bounded.
-  Downstream backpressure pauses upstream reading, and cancellation
-  disconnects the upstream stream.
+- The official Codex CLI sets no response-header deadline on `/responses`
+  and a 300-second stream idle deadline. The gateway waits up to 300 seconds
+  for upstream headers (a queued request is not cut off early; the deadline
+  covers only that attempt) and 300 seconds between stream chunks.
+  Nonstream aggregation also has a ten-minute deadline and a 32 MiB budget.
+  Individual SSE events are bounded. Downstream backpressure pauses upstream
+  reading, and cancellation disconnects the upstream stream.
 - Streams hold their first frames until content starts (at most 48 events,
   1 MiB or 20 seconds), so a failure reported before any content becomes a
   real HTTP status instead of 200 followed by an error event.
@@ -133,6 +149,65 @@ access token keeps serving.
   rejections become 400 "Prompt is too long", which Claude Code answers by
   compacting. Semantic terminal events close the upstream reader without
   waiting for the HTTP connection to close. Malformed SSE fails the request.
+
+### Official client identity and transport
+
+Requests to the Codex backend mirror the official Codex CLI 0.162.1
+(`codex-tui`; see `src/codex-gateway/client-identity.ts`):
+
+- Identity: `originator: codex-tui`, `version: 0.162.1` on every request, and
+  the official User-Agent format
+  `codex-tui/0.162.1 (<OS> <version>; <arch>) <terminal> (codex-tui; 0.162.1)`
+  describing the host that runs HappyClaw (a service without a terminal
+  reports `unknown`). The authorization URL uses the same originator.
+- Auth: `ChatGPT-Account-ID`, and `X-OpenAI-Fedramp: true` for FedRAMP
+  accounts.
+- Session and turn: the Claude Code session is the official session and the
+  session plus Claude Code agent is the thread. Requests send `session-id`,
+  `thread-id`, `x-client-request-id` (the thread), `x-codex-window-id`
+  (`{thread}:0`; HappyClaw does not track Claude Code's local compaction
+  windows) and `x-codex-turn-metadata`, plus the body's `client_metadata`
+  with a per-install `installation_id` (`data/config/codex-installation-id`),
+  session, thread, window and turn ids. `prompt_cache_key` is always sent:
+  the thread id, or a deterministic key scoped to the runner and the
+  conversation's opening when the SDK sends no session id. All derived ids
+  are scoped to the provider and ChatGPT account.
+- A request whose last user message carries new user content starts a turn;
+  tool-result continuations (including reminders Claude Code attaches to the
+  results) and retries of the same request stay in it. The first
+  `x-codex-turn-state` the backend returns in a turn is replayed on the
+  turn's later requests and dropped when the next turn starts. Turn state is
+  kept in memory per provider, account and thread, with a one-hour idle TTL
+  and at most 4,096 threads.
+- Cookies: only the infrastructure cookies the official client keeps
+  (`__cf_bm`, `__cflb`, `__cfruid`, `__cfseq`, `__cfwaitingroom`, `__oailb`,
+  `_cfuvid`, `cf_clearance`, `cf_ob_info`, `cf_use_ob`, `cf_chl_*`) are stored,
+  in a separate in-memory jar for each provider and account, and sent back on
+  that account's requests. Account and session cookies are never stored.
+- Background requests (haiku tier) use their own thread under the
+  conversation's thread: `x-codex-parent-thread-id`, `thread_source:
+thread_title` in the turn metadata and the internal sub-request cache key
+  `thread_title:{parent thread}`. They send no `x-openai-subagent`: the
+  official client sends none for its own title thread, and that header's
+  official values describe reviewers, compaction, memory jobs and spawned
+  agents.
+- `x-openai-internal-codex-responses-lite: true` is sent for models whose
+  traits use Responses Lite.
+- `x-codex-beta-features` is omitted. The official default list is only
+  `remote_compaction_v2`, which advertises remote compaction and `compaction`
+  output items; Claude Code compacts locally, so HappyClaw cannot honor it.
+- Request bodies are compressed with zstd (`Content-Encoding: zstd`, level 3)
+  like the official ChatGPT-auth default when the Node runtime provides
+  `zlib.zstdCompressSync`; otherwise they are sent uncompressed.
+- HTTP/2: Node 26's built-in fetch already negotiates HTTP/2 for direct
+  connections. With `HTTPS_PROXY`/`HTTP_PROXY` set, the global
+  `EnvHttpProxyAgent` from the pinned undici 6 uses HTTP/1.1; enabling its
+  `allowH2` is experimental in that release and would change every
+  server-side fetch, so it is left off.
+- WebSocket transport is not implemented. The official client keeps HTTP SSE
+  as its supported fallback, and the gateway translates each Anthropic
+  request into one independent Responses request; the WebSocket session's
+  incremental input and connection reuse have no counterpart here.
 
 The protocol implementation is ported from
 [CLIProxyAPI a2976eb8](https://github.com/router-for-me/CLIProxyAPI/tree/a2976eb8a303f11b4ea5177bce9f9ff752634dfc).
@@ -152,6 +227,7 @@ that an account can access the live backend.
 | Symptom                         | Check                                                                                                                 |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | Login callback rejected         | Finish the same user's flow within ten minutes and paste its complete callback URL; do not reuse a consumed code.     |
+| Login says to start over        | The token request may have reached OpenAI (timeout, HTTP error, dropped connection); start a new ChatGPT login.       |
 | 401 or authentication error     | The provider page shows "needs re-login" when the refresh grant was rejected; use its HappyClaw re-login action.      |
 | 403 from HappyClaw gateway      | The request came through a reverse proxy or from a non-local address; runners reach the gateway directly.             |
 | 429 from HappyClaw gateway      | One runner exceeded its 120 requests per minute; it retries after `Retry-After`. Other runners keep their own budget. |
