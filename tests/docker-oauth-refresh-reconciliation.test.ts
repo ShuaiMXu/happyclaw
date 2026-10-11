@@ -92,7 +92,7 @@ describe('Docker SDK OAuth credential reconciliation', () => {
     db.setSessionProviderId('foreign', null, foreignProvider.id);
 
     expect(
-      containerRunner.reconcileDockerOAuthAfterExit(provider.id, {
+      containerRunner.reconcileSessionOAuthAfterExit(provider.id, {
         credentialsFilePath,
         launchCredentials: original,
       }),
@@ -127,7 +127,7 @@ describe('Docker SDK OAuth credential reconciliation', () => {
     const launch = { credentialsFilePath, launchCredentials: original };
 
     expect(
-      containerRunner.reconcileDockerOAuthAfterExit(provider.id, launch),
+      containerRunner.reconcileSessionOAuthAfterExit(provider.id, launch),
     ).toBe('updated');
     expect(launch.launchCredentials).toEqual({
       ...refreshed,
@@ -142,7 +142,7 @@ describe('Docker SDK OAuth credential reconciliation', () => {
     };
     writeCredentialFile(path.dirname(credentialsFilePath), refreshedAgain);
     expect(
-      containerRunner.reconcileDockerOAuthAfterExit(provider.id, launch),
+      containerRunner.reconcileSessionOAuthAfterExit(provider.id, launch),
     ).toBe('updated');
     expect(
       runtimeConfig.getProviders().find((item) => item.id === provider.id)
@@ -176,10 +176,10 @@ describe('Docker SDK OAuth credential reconciliation', () => {
     };
 
     expect(
-      containerRunner.reconcileDockerOAuthAfterExit(provider.id, launchA),
+      containerRunner.reconcileSessionOAuthAfterExit(provider.id, launchA),
     ).toBe('updated');
     expect(
-      containerRunner.reconcileDockerOAuthAfterExit(provider.id, launchB),
+      containerRunner.reconcileSessionOAuthAfterExit(provider.id, launchB),
     ).toBe('stale');
     expect(launchB.launchCredentials).toEqual({
       ...refreshed,
@@ -194,7 +194,7 @@ describe('Docker SDK OAuth credential reconciliation', () => {
     };
     writeCredentialFile(sessionB, refreshedAgain);
     expect(
-      containerRunner.reconcileDockerOAuthAfterExit(provider.id, launchB),
+      containerRunner.reconcileSessionOAuthAfterExit(provider.id, launchB),
     ).toBe('updated');
     expect(
       runtimeConfig.getProviders().find((item) => item.id === provider.id)
@@ -228,7 +228,7 @@ describe('Docker SDK OAuth credential reconciliation', () => {
     });
 
     expect(
-      containerRunner.reconcileDockerOAuthAfterExit(provider.id, {
+      containerRunner.reconcileSessionOAuthAfterExit(provider.id, {
         credentialsFilePath,
         launchCredentials: original,
       }),
@@ -301,7 +301,7 @@ describe('Docker SDK OAuth credential reconciliation', () => {
     expect(persist).not.toHaveBeenCalled();
   });
 
-  test('runs reconciliation on Docker output and close without changing the Host path', () => {
+  test('runs reconciliation on Docker and Host output and close', () => {
     const source = fs.readFileSync(
       path.resolve(process.cwd(), 'src/container-runner.ts'),
       'utf8',
@@ -330,9 +330,32 @@ describe('Docker SDK OAuth credential reconciliation', () => {
     expect(outputReconcile).toBeLessThan(dockerClose);
     expect(closeReconcile).toBeGreaterThan(dockerClose);
     expect(closeReconcile).toBeLessThan(closeHandling);
-    expect(source.slice(hostStart)).not.toContain(
-      'reconcileDockerOAuthAfterExit(',
+    // Host mode reconciles the same way, but only where Claude Code writes
+    // the session file: on macOS the Keychain reconciliation owns refreshes.
+    const hostSource = source.slice(hostStart);
+    const hostSnapshot = hostSource.indexOf(
+      "if (process.platform !== 'darwin') {\n        hostOauthLaunch = {",
     );
+    const hostOutput = hostSource.indexOf('const handleOutput = async');
+    const hostOutputReconcile = hostSource.indexOf(
+      "reconcileHostOAuth('output')",
+      hostOutput,
+    );
+    const hostClose = hostSource.indexOf("proc.on('close'");
+    const hostCloseReconcile = hostSource.indexOf(
+      "reconcileHostOAuth('exit')",
+      hostClose,
+    );
+    const hostCloseHandling = hostSource.indexOf(
+      'const closeCtx: CloseHandlerContext',
+      hostClose,
+    );
+    expect(hostSnapshot).toBeGreaterThanOrEqual(0);
+    expect(hostSource).toContain('reconcileSessionOAuthAfterExit(');
+    expect(hostOutputReconcile).toBeGreaterThan(hostOutput);
+    expect(hostOutputReconcile).toBeLessThan(hostClose);
+    expect(hostCloseReconcile).toBeGreaterThan(hostClose);
+    expect(hostCloseReconcile).toBeLessThan(hostCloseHandling);
   });
 
   test('contains reconciliation and fan-out failures after a completed run', () => {
@@ -341,14 +364,14 @@ describe('Docker SDK OAuth credential reconciliation', () => {
       launchCredentials: original,
     };
     expect(
-      containerRunner.reconcileDockerOAuthAfterExit('provider', launch, {
+      containerRunner.reconcileSessionOAuthAfterExit('provider', launch, {
         reconcile: () => {
           throw new Error('read or CAS failure');
         },
       }),
     ).toBe('error');
     expect(
-      containerRunner.reconcileDockerOAuthAfterExit('provider', launch, {
+      containerRunner.reconcileSessionOAuthAfterExit('provider', launch, {
         reconcile: () => 'updated',
         fanOutUpdatedCredentials: () => {
           throw new Error('fan-out failure');
