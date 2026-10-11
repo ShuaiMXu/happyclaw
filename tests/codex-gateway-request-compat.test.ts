@@ -958,7 +958,15 @@ describe('structured output and native web search', () => {
         name: 'web_search',
       });
       expect(converted.tool_choice).toEqual({ type: 'web_search' });
-      expect(converted.include).toEqual(['reasoning.encrypted_content']);
+      // Sources feed Claude Code's WebSearch result links.
+      expect(converted.include).toEqual([
+        'reasoning.encrypted_content',
+        'web_search_call.action.sources',
+      ]);
+      expect(
+        convert({ messages: [user('hi')], tools: [tool('web_search')] })
+          .include,
+      ).toEqual(['reasoning.encrypted_content']);
     },
   );
 
@@ -1596,4 +1604,46 @@ describe('background requests behind the Codex gateway', () => {
       ),
     ).toBe('xhigh');
   });
+});
+
+describe('Responses Lite body marker', () => {
+  // The HTTP layer sends x-openai-internal-codex-responses-lite exactly when
+  // the converted body carries reasoning.context "all_turns".
+  test.each([
+    undefined,
+    { type: 'disabled' },
+    { type: 'enabled', budget_tokens: 0 },
+    { type: 'adaptive' },
+  ])(
+    'marks every Lite request and no classic one (thinking %j)',
+    (thinking) => {
+      const request = {
+        messages: [user('hi')],
+        tools: [tool('Bash')],
+        thinking,
+      };
+      for (const [model, lite] of [
+        ['gpt-6-sol', true],
+        ['gpt-5.6-luna', true],
+        ['gpt-5.5', false],
+        ['gpt-9-future', false],
+      ] as const) {
+        const converted = anthropicToResponses(request, {
+          targetModel: model,
+          reasoningEffort: 'low',
+        });
+        expect(converted.reasoning.context === 'all_turns').toBe(lite);
+        expect(codexRequestUsesResponsesLite(request, model)).toBe(lite);
+      }
+      const search = anthropicToResponses(
+        {
+          ...request,
+          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        },
+        { targetModel: 'gpt-6-sol' },
+      );
+      expect(search.reasoning).not.toHaveProperty('context');
+      expect(search.include).toContain('web_search_call.action.sources');
+    },
+  );
 });

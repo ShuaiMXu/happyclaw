@@ -37,7 +37,9 @@ reference translator differ, the official client wins.
   `serializeCodexResponsesRequest`. No top-level `instructions`: the system
   prompt is a developer input item. `tool_choice` is always sent (`auto`
   unless the caller forces a choice). `include` is only
-  `reasoning.encrypted_content`.
+  `reasoning.encrypted_content`, plus `web_search_call.action.sources` when
+  the request carries hosted web search (Claude Code builds WebSearch result
+  links from the sources).
 - **Responses Lite** (catalog `use_responses_lite`, every current gpt-6 and
   gpt-5.6 model): no top-level `tools`; an input-prefix
   `{ type: "additional_tools", id: "at_<uuid>", role: "developer", tools }`
@@ -146,7 +148,7 @@ request payloads and original Go SSE output for 34 cases. The differential test
 compares all business fields after only the documented runtime normalizations;
 request cases run on the classic shape and normalize the official-client
 differences listed above (schema subset, image detail, verbosity, always-sent
-tool controls, no `instructions` or search sources).
+tool controls, no `instructions`).
 Golden data is generated with `scripts/reference/codex-claude-reference.go`
 inside a disposable checkout of the pinned CLIProxyAPI commit. Feed the existing
 corpus to the harness's standard input to regenerate it; the Go implementation

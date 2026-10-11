@@ -1377,7 +1377,11 @@ export function anthropicToResponses(
       ...(lite ? { context: 'all_turns' as const } : {}),
     },
     store: false,
-    include: ['reasoning.encrypted_content'],
+    // Official clients include only the reasoning cipher. Hosted search keeps
+    // its sources: Claude Code's WebSearch result links are built from them.
+    include: request.tools?.some(isWebSearchTool)
+      ? ['reasoning.encrypted_content', 'web_search_call.action.sources']
+      : ['reasoning.encrypted_content'],
     ...(verbosity || format
       ? {
           text: {
