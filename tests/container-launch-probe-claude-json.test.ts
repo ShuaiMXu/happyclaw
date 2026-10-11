@@ -34,13 +34,14 @@ const { getContainerClaudeJsonPath } =
 const hostJson = path.join(homeDir, '.claude.json');
 const target = path.join(dataDir, 'config', 'container-claude-json.json');
 
-/** The pre-change derivation, byte for byte. */
-function formerContent(): string {
+/** Expected sanitized content, including noninteractive container onboarding. */
+function expectedContent(): string {
   try {
     const parsed = JSON.parse(fs.readFileSync(hostJson, 'utf-8'));
     const stripped = { ...parsed };
     delete stripped.cachedGrowthBookFeatures;
     delete stripped.oauthAccount;
+    stripped.hasCompletedOnboarding = true;
     stripped.autoUpdates = false;
     return JSON.stringify(stripped, null, 2) + '\n';
   } catch {
@@ -102,15 +103,41 @@ afterAll(() => {
 
 describe('container .claude.json copy', () => {
   test.each([
+    ['empty settings', {}],
+    ['missing onboarding state', { userID: 'existing-device' }],
+    [
+      'unfinished onboarding',
+      { userID: 'existing-device', hasCompletedOnboarding: false },
+    ],
+    [
+      'completed onboarding',
+      { userID: 'existing-device', hasCompletedOnboarding: true },
+    ],
+  ])(
+    'skips interactive onboarding with %s without changing host settings',
+    (_name, value) => {
+      writeHost(value);
+      const original = fs.readFileSync(hostJson, 'utf8');
+      const derived = JSON.parse(
+        fs.readFileSync(getContainerClaudeJsonPath(), 'utf8'),
+      );
+      expect(derived.hasCompletedOnboarding).toBe(true);
+      expect(derived.autoUpdates).toBe(false);
+      if ('userID' in value) expect(derived.userID).toBe(value.userID);
+      expect(fs.readFileSync(hostJson, 'utf8')).toBe(original);
+    },
+  );
+
+  test.each([
     ['a normal host file', sampleHost],
     ['a host file with nothing to strip', { userID: 'x' }],
     ['JSON null', 'null'],
     ['a JSON array', '[1,2]'],
     ['invalid JSON', '{"userID":'],
-  ])('derives the same bytes as before from %s', (_name, value) => {
+  ])('derives sanitized container settings from %s', (_name, value) => {
     writeHost(value);
     expect(getContainerClaudeJsonPath()).toBe(target);
-    expect(fs.readFileSync(target, 'utf8')).toBe(formerContent());
+    expect(fs.readFileSync(target, 'utf8')).toBe(expectedContent());
   });
 
   test('a missing host file yields the onboarding stub', () => {
@@ -151,7 +178,7 @@ describe('container .claude.json copy', () => {
     expect(to).toBe(target);
     expect(path.dirname(String(from))).toBe(path.dirname(target));
     expect(fs.statSync(target).ino).not.toBe(inode);
-    expect(fs.readFileSync(target, 'utf8')).toBe(formerContent());
+    expect(fs.readFileSync(target, 'utf8')).toBe(expectedContent());
     expect(JSON.parse(fs.readFileSync(target, 'utf8')).numStartups).toBe(4);
     expect(
       fs.readdirSync(path.dirname(target)).filter((f) => f.endsWith('.tmp')),
@@ -182,7 +209,7 @@ describe('container .claude.json copy', () => {
 
   test('a removed or externally edited copy is restored', () => {
     getContainerClaudeJsonPath();
-    const expected = formerContent();
+    const expected = expectedContent();
     fs.rmSync(target);
     getContainerClaudeJsonPath();
     expect(fs.readFileSync(target, 'utf8')).toBe(expected);

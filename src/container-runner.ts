@@ -210,6 +210,7 @@ function deriveContainerClaudeJson(hostJsonPath: string): string {
     const stripped = { ...hostJson };
     delete stripped.cachedGrowthBookFeatures;
     delete stripped.oauthAccount;
+    stripped.hasCompletedOnboarding = true;
     stripped.autoUpdates = false;
     return JSON.stringify(stripped, null, 2) + '\n';
   } catch {
@@ -344,6 +345,8 @@ function writeContainerClaudeJsonIfChanged(
  * 同时剥离 oauthAccount：容器内不走宿主机的 OAuth 登录态，认证完全由
  * ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY 环境变量控制，避免 SDK 误检
  * OAuth 凭据后跳过标准 Bearer header（第三方 provider 返回 404）。
+ * 容器认证由 HappyClaw 配置，因此始终完成交互式初始化；宿主机未登录或
+ * 尚未完成引导时，也不能把该状态复制进已配置认证的容器。
  *
  * ~/.claude.json can be megabytes, so the copy is re-derived only when the
  * host file's stats change and rewritten only when its bytes would change.
