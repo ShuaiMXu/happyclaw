@@ -200,7 +200,8 @@ describe('third-party provider routes', () => {
     expect(mocks.connectivity).toHaveBeenCalledWith({
       baseUrl: 'https://open.bigmodel.cn/api/anthropic',
       token: 'glm-old-secret',
-      authMode: 'bearer',
+      // A legacy provider is probed with the header its runtime infers.
+      authMode: 'x-api-key',
       model: 'glm-5.3[1m]',
       haikuModel: 'glm-5.3-flash',
       customHeaders: undefined,
