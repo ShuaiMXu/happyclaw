@@ -315,17 +315,25 @@ owner 明确拒绝首次设置时可提交
 Provider：
 
 - `GET /api/config/claude`
-- `GET|POST /api/config/claude/providers`
+- `GET|POST /api/config/claude/providers`；创建请求可用
+  `claudeCredentialInput` 提交官方凭据原文（`.credentials.json` 内容或
+  setup-token），由服务端解析，格式无效时返回 400；官方 Provider 同一时刻只保留
+  OAuth、setup-token、API Key 中的一种
 - `PATCH|DELETE /api/config/claude/providers/:id`
-- `PUT /api/config/claude/providers/:id/secrets`
+- `PUT /api/config/claude/providers/:id/secrets`，同样接受
+  `claudeCredentialInput`；凭据变更只排空该 Provider 的 Runner
 - `POST /api/config/claude/providers/:id/toggle`
 - `POST /api/config/claude/providers/:id/reset-health`
 - `GET /api/config/claude/providers/health`
-- `GET /api/config/claude/providers/:id/usage`
+- `GET /api/config/claude/providers/:id/usage`，读不到用量时以 `status`
+  区分 `unsupported`（setup-token、仅推理权限或非 OAuth 凭据，见
+  `unsupportedReason`）与 `needs_relogin`（刷新授权被拒）
 - `PUT /api/config/claude/balancing`
 - `POST /api/config/claude/apply`
-- `POST /api/config/claude/oauth/start`
-- `POST /api/config/claude/oauth/callback`
+- `POST /api/config/claude/oauth/start`，可选 `targetProviderId`（必须是已有的
+  官方 Provider）与 `profile`（`full` 默认，或 `setup_token`）；流程绑定发起用户
+- `POST /api/config/claude/oauth/callback`，`code` 接受裸授权码、回调页显示的
+  `code#state` 或回调页完整 URL；网络错误、429 与 5xx 返回 502 并保留流程以便重试
 - `POST /api/config/codex/oauth/start`，启动 ChatGPT/Codex 订阅 OAuth
   PKCE 流程，返回 `authorizeUrl` 与 `state`；可选 `targetProviderId`
   用于对已有 Provider 重新授权

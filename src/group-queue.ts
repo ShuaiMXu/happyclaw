@@ -2308,12 +2308,16 @@ export class GroupQueue {
    * Gracefully retire only runners using the refreshed Provider. The drain
    * sentinel is consumed after the current query, so a read-only usage poll
    * can rotate credentials without interrupting unrelated or in-flight work.
+   * A lane that is active but has not registered its process yet is still
+   * launching: it reads the rotated credentials when it spawns, and its
+   * selectedProviderId may be left over from the previous run.
    */
   drainProviderRunnersForCredentialRefresh(providerId: string): number {
     let drained = 0;
     for (const [jid, state] of this.groups) {
       if (
         !state.active ||
+        !state.process ||
         !state.groupFolder ||
         state.selectedProviderId !== providerId ||
         state.drainSentinelWritten

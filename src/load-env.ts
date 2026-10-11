@@ -13,7 +13,7 @@ try {
 
 // 让后端的 Node 全局 fetch（undici）走系统代理。
 // undici 默认【不读】HTTP_PROXY/HTTPS_PROXY 环境变量，导致 server-side fetch
-// （如官方 Claude OAuth 交换 https://api.anthropic.com/v1/oauth/token、连通性测试）
+// （如官方 Claude OAuth 交换 https://platform.claude.com/v1/oauth/token、连通性测试）
 // 用裸出口 IP 直连。在大陆裸 IP 会被 Anthropic 以 403 {"type":"forbidden",
 // "message":"Request not allowed"} 拒绝。这里在最早时机设置一次全局 dispatcher，
 // EnvHttpProxyAgent 会读取 HTTP_PROXY/HTTPS_PROXY 并遵守 NO_PROXY（localhost 等不走代理）。

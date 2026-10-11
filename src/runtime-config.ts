@@ -219,8 +219,8 @@ const MAX_CUSTOM_ENV_ENTRIES = 50;
 const MAX_THIRD_PARTY_PROFILES = 20;
 
 // Fallback scopes for .credentials.json when stored credentials lack scopes.
-// Differs from OAUTH_SCOPES in routes/config.ts (the authorize-flow request):
-// authorize requests org:create_api_key; credential files need user:sessions:claude_code.
+// Differs from CLAUDE_OAUTH_LOGIN_SCOPES in claude-oauth.ts (the authorize
+// request): only the browser consent carries org:create_api_key.
 const DEFAULT_CREDENTIAL_SCOPES = [
   'user:inference',
   'user:profile',
@@ -233,6 +233,27 @@ export interface ClaudeOAuthCredentials {
   expiresAt: number; // Unix timestamp (ms)
   scopes: string[];
   subscriptionType?: string; // e.g. 'max', 'pro' — written to .credentials.json if present
+}
+
+/** Account facts Anthropic returns with a Claude token or its profile. */
+export interface ClaudeOAuthAccountInfo {
+  accountUuid?: string;
+  emailAddress?: string;
+  organizationUuid?: string;
+  organizationName?: string;
+  /** Known even for a setup-token grant, which has no credential file. */
+  subscriptionType?: string;
+}
+
+/**
+ * A refresh rejection that replaying the same refresh token cannot fix. It
+ * stays on the provider (stopping automatic refresh) until its Claude
+ * credentials change.
+ */
+export interface ClaudeOAuthRefreshError {
+  kind: 'invalid_grant' | 'rejected' | 'account_mismatch';
+  message: string;
+  at: number;
 }
 
 export interface OAuthUsageBucket {
@@ -269,6 +290,12 @@ export interface CachedOAuthUsage {
   data: OAuthUsageResponse;
   fetchedAt: number; // Unix timestamp ms
   error?: string;
+  /**
+   * Set when no usage can be read: the credential cannot reach the usage
+   * endpoint (`unsupported`), or the grant was rejected and needs a new login.
+   */
+  status?: 'unsupported' | 'needs_relogin';
+  unsupportedReason?: 'inference_only' | 'setup_token' | 'no_oauth';
   /** Latest bounded SDK rate_limit_event snapshot for this provider. */
   observation?:
     | import('./provider-quota-observation.js').ProviderQuotaSnapshot
@@ -352,6 +379,9 @@ interface SecretPayload {
   claudeCodeOauthToken: string;
   claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
   codexOAuthCredentials?: CodexOAuthCredentials | null;
+  claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
+  claudeOAuthLastRefreshAt?: number | null;
+  claudeOAuthLastRefreshError?: ClaudeOAuthRefreshError | null;
 }
 
 interface EncryptedSecrets {
@@ -488,6 +518,10 @@ export interface UnifiedProvider {
   claudeCodeOauthToken: string;
   claudeOAuthCredentials: ClaudeOAuthCredentials | null;
   codexOAuthCredentials: CodexOAuthCredentials | null;
+  /** Reset whenever the Claude credentials change; kept across refreshes. */
+  claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
+  claudeOAuthLastRefreshAt?: number | null;
+  claudeOAuthLastRefreshError?: ClaudeOAuthRefreshError | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -514,6 +548,16 @@ export interface UnifiedProviderPublic {
   codexOAuthCredentialsExpiresAt: number | null;
   codexOAuthCredentialsEmail: string | null;
   codexOAuthCredentialsPlanType: string | null;
+  /** Official providers only; null for third-party or no credential. */
+  claudeAuthKind: 'oauth' | 'setup_token' | 'api_key' | null;
+  claudeOAuthAccountEmail: string | null;
+  claudeOAuthOrganizationName: string | null;
+  claudeOAuthOrganizationUuid: string | null;
+  claudeOAuthSubscriptionType: string | null;
+  claudeOAuthScopes: string[];
+  claudeOAuthLastRefreshAt: number | null;
+  claudeOAuthNeedsReLogin: boolean;
+  claudeOAuthLastRefreshError: ClaudeOAuthRefreshError | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -889,7 +933,66 @@ function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
       };
     }
   }
+  const account = decodeClaudeOAuthAccount(parsed.claudeOAuthAccount);
+  if (account) result.claudeOAuthAccount = account;
+  if (
+    typeof parsed.claudeOAuthLastRefreshAt === 'number' &&
+    Number.isFinite(parsed.claudeOAuthLastRefreshAt)
+  ) {
+    result.claudeOAuthLastRefreshAt = parsed.claudeOAuthLastRefreshAt;
+  }
+  const refreshError = decodeClaudeOAuthRefreshError(
+    parsed.claudeOAuthLastRefreshError,
+  );
+  if (refreshError) result.claudeOAuthLastRefreshError = refreshError;
   return result;
+}
+
+const CLAUDE_OAUTH_ACCOUNT_FIELDS = [
+  'accountUuid',
+  'emailAddress',
+  'organizationUuid',
+  'organizationName',
+  'subscriptionType',
+] as const;
+
+function decodeClaudeOAuthAccount(
+  value: unknown,
+): ClaudeOAuthAccountInfo | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const account: ClaudeOAuthAccountInfo = {};
+  for (const field of CLAUDE_OAUTH_ACCOUNT_FIELDS) {
+    if (typeof raw[field] === 'string' && raw[field]) {
+      account[field] = raw[field] as string;
+    }
+  }
+  return Object.keys(account).length > 0 ? account : null;
+}
+
+const CLAUDE_OAUTH_REFRESH_ERROR_KINDS = new Set<
+  ClaudeOAuthRefreshError['kind']
+>(['invalid_grant', 'rejected', 'account_mismatch']);
+
+function decodeClaudeOAuthRefreshError(
+  value: unknown,
+): ClaudeOAuthRefreshError | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (
+    !CLAUDE_OAUTH_REFRESH_ERROR_KINDS.has(
+      raw.kind as ClaudeOAuthRefreshError['kind'],
+    ) ||
+    typeof raw.message !== 'string' ||
+    typeof raw.at !== 'number'
+  ) {
+    return null;
+  }
+  return {
+    kind: raw.kind as ClaudeOAuthRefreshError['kind'],
+    message: raw.message,
+    at: raw.at,
+  };
 }
 
 function encryptChannelSecret<T>(payload: T): EncryptedSecrets {
@@ -1212,6 +1315,9 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     claudeCodeOauthToken: provider.claudeCodeOauthToken || '',
     claudeOAuthCredentials: provider.claudeOAuthCredentials ?? null,
     codexOAuthCredentials: provider.codexOAuthCredentials ?? null,
+    claudeOAuthAccount: provider.claudeOAuthAccount ?? null,
+    claudeOAuthLastRefreshAt: provider.claudeOAuthLastRefreshAt ?? null,
+    claudeOAuthLastRefreshError: provider.claudeOAuthLastRefreshError ?? null,
   };
   const sanitizedEnv = sanitizeCustomEnvMap(provider.customEnv || {}, {
     skipReservedClaudeKeys: true,
@@ -1247,6 +1353,9 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     claudeCodeOauthToken: secrets.claudeCodeOauthToken || '',
     claudeOAuthCredentials: secrets.claudeOAuthCredentials ?? null,
     codexOAuthCredentials: secrets.codexOAuthCredentials ?? null,
+    claudeOAuthAccount: secrets.claudeOAuthAccount ?? null,
+    claudeOAuthLastRefreshAt: secrets.claudeOAuthLastRefreshAt ?? null,
+    claudeOAuthLastRefreshError: secrets.claudeOAuthLastRefreshError ?? null,
     customEnv: sanitizeCustomEnvMap(stored.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
@@ -1540,6 +1649,68 @@ export function saveBalancingConfig(
   return merged;
 }
 
+type ClaudeAuthKind = 'oauth' | 'setup_token' | 'api_key';
+
+function hasSecretValue(value: string | undefined, fieldName: string): boolean {
+  return typeof value === 'string' && normalizeSecret(value, fieldName) !== '';
+}
+
+/**
+ * The official authentication kind a write selects. Claude Code silently
+ * prefers one credential when several are present, so a provider holds at
+ * most one kind and supplying two in one write is rejected.
+ */
+function selectedClaudeAuthKind(
+  type: UnifiedProvider['type'],
+  input: {
+    claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
+    claudeCodeOauthToken?: string;
+    anthropicApiKey?: string;
+    anthropicAuthToken?: string;
+  },
+): ClaudeAuthKind | null {
+  const kinds: ClaudeAuthKind[] = [];
+  if (input.claudeOAuthCredentials) kinds.push('oauth');
+  if (hasSecretValue(input.claudeCodeOauthToken, 'claudeCodeOauthToken')) {
+    kinds.push('setup_token');
+  }
+  if (
+    type === 'official' &&
+    (hasSecretValue(input.anthropicApiKey, 'anthropicApiKey') ||
+      hasSecretValue(input.anthropicAuthToken, 'anthropicAuthToken'))
+  ) {
+    kinds.push('api_key');
+  }
+  if (kinds.length > 1) {
+    throw new Error(
+      '一次只能设置一种官方认证方式（OAuth 登录凭据、setup-token 或 API Key）',
+    );
+  }
+  return kinds[0] ?? null;
+}
+
+/** Validate a credential write before any runtime is touched. */
+export function assertSingleClaudeAuthKind(
+  type: UnifiedProvider['type'],
+  input: Parameters<typeof selectedClaudeAuthKind>[1],
+): void {
+  selectedClaudeAuthKind(type, input);
+}
+
+/** Drop every credential of the kinds the write did not select. */
+function applyClaudeAuthKind(
+  provider: UnifiedProvider,
+  kind: ClaudeAuthKind | null,
+): void {
+  if (!kind) return;
+  if (kind !== 'oauth') provider.claudeOAuthCredentials = null;
+  if (kind !== 'setup_token') provider.claudeCodeOauthToken = '';
+  if (provider.type === 'official' && kind !== 'api_key') {
+    provider.anthropicApiKey = '';
+    provider.anthropicAuthToken = '';
+  }
+}
+
 export function createProvider(input: {
   name: string;
   type: 'official' | 'third_party';
@@ -1549,11 +1720,13 @@ export function createProvider(input: {
   anthropicApiKey?: string;
   claudeCodeOauthToken?: string;
   claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
+  claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
   codexOAuthCredentials?: CodexOAuthCredentials | null;
   customEnv?: Record<string, string>;
   weight?: number;
   enabled?: boolean;
 }): UnifiedProvider {
+  const authKind = selectedClaudeAuthKind(input.type, input);
   const state = readStoredStateV4() || {
     providers: [],
     balancing: { ...DEFAULT_BALANCING_CONFIG },
@@ -1587,11 +1760,15 @@ export function createProvider(input: {
       : '',
     claudeOAuthCredentials: input.claudeOAuthCredentials ?? null,
     codexOAuthCredentials: input.codexOAuthCredentials ?? null,
+    claudeOAuthAccount: input.claudeOAuthAccount ?? null,
+    claudeOAuthLastRefreshAt: null,
+    claudeOAuthLastRefreshError: null,
     customEnv: sanitizeCustomEnvMap(input.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
     updatedAt: now,
   };
+  applyClaudeAuthKind(provider, authKind);
 
   state.providers.push(provider);
   writeStoredStateV4(state.providers, state.balancing);
@@ -1655,6 +1832,8 @@ export function updateProviderSecrets(
     clearClaudeCodeOauthToken?: boolean;
     claudeOAuthCredentials?: ClaudeOAuthCredentials;
     clearClaudeOAuthCredentials?: boolean;
+    /** Account facts for the credentials set by this write. */
+    claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
     codexOAuthCredentials?: CodexOAuthCredentials;
     clearCodexOAuthCredentials?: boolean;
   },
@@ -1666,6 +1845,7 @@ export function updateProviderSecrets(
   if (idx < 0) throw new Error('未找到指定供应商');
 
   const current = state.providers[idx];
+  const authKind = selectedClaudeAuthKind(current.type, secrets);
   const updated = { ...current, updatedAt: new Date().toISOString() };
 
   if (typeof secrets.anthropicAuthToken === 'string') {
@@ -1697,16 +1877,29 @@ export function updateProviderSecrets(
 
   if (secrets.claudeOAuthCredentials) {
     updated.claudeOAuthCredentials = secrets.claudeOAuthCredentials;
-    // When full OAuth creds set, clear legacy single token
-    updated.claudeCodeOauthToken = '';
   } else if (secrets.clearClaudeOAuthCredentials) {
     updated.claudeOAuthCredentials = null;
   }
+  applyClaudeAuthKind(updated, authKind);
 
   if (secrets.codexOAuthCredentials) {
     updated.codexOAuthCredentials = secrets.codexOAuthCredentials;
   } else if (secrets.clearCodexOAuthCredentials) {
     updated.codexOAuthCredentials = null;
+  }
+
+  // Account facts and refresh state describe one Claude grant. A new or
+  // removed credential starts over, which also lifts a needs-re-login state.
+  const claudeGrantChanged =
+    current.claudeCodeOauthToken !== updated.claudeCodeOauthToken ||
+    !sameOAuthCredentials(
+      current.claudeOAuthCredentials,
+      updated.claudeOAuthCredentials,
+    );
+  if (claudeGrantChanged || secrets.claudeOAuthAccount !== undefined) {
+    updated.claudeOAuthAccount = secrets.claudeOAuthAccount ?? null;
+    updated.claudeOAuthLastRefreshAt = null;
+    updated.claudeOAuthLastRefreshError = null;
   }
 
   state.providers[idx] = updated;
@@ -1727,39 +1920,89 @@ function oauthCredentialsSnapshot(credentials: ClaudeOAuthCredentials): string {
   });
 }
 
-/**
- * Persist an SDK-refreshed OAuth credential only if the provider still holds
- * the exact credential snapshot used to start reconciliation. The synchronous
- * read/modify/write is a compare-and-swap boundary inside the Node process, so
- * an admin update or another session refresh cannot be silently overwritten.
- */
-export function updateProviderOAuthCredentialsIfCurrent(
+function sameOAuthCredentials(
+  left: ClaudeOAuthCredentials | null,
+  right: ClaudeOAuthCredentials | null,
+): boolean {
+  if (!left || !right) return left === right;
+  return oauthCredentialsSnapshot(left) === oauthCredentialsSnapshot(right);
+}
+
+/** Index of the provider still holding exactly `expected`, or -1. */
+function findProviderHoldingOAuth(
+  providers: UnifiedProvider[],
   id: string,
   expected: ClaudeOAuthCredentials,
-  refreshed: ClaudeOAuthCredentials,
-): boolean {
-  const state = readStoredStateV4();
-  if (!state) throw new Error('Claude 配置不存在');
-  const idx = state.providers.findIndex((provider) => provider.id === id);
+): number {
+  const idx = providers.findIndex((provider) => provider.id === id);
   if (idx < 0) throw new Error('未找到指定供应商');
-
-  const current = state.providers[idx];
-  const currentOauth = buildClaudeAiOauthPayload(providerToConfig(current));
+  const currentOauth = buildClaudeAiOauthPayload(
+    providerToConfig(providers[idx]),
+  );
   if (
     !currentOauth ||
     oauthCredentialsSnapshot(currentOauth) !==
       oauthCredentialsSnapshot(expected)
   ) {
-    return false;
+    return -1;
   }
+  return idx;
+}
 
+/**
+ * Persist an SDK-refreshed OAuth credential only if the provider still holds
+ * the exact credential snapshot used to start reconciliation. The synchronous
+ * read/modify/write is a compare-and-swap boundary inside the Node process, so
+ * an admin update or another session refresh cannot be silently overwritten.
+ * A successful rotation proves the grant is alive, so it also clears a
+ * recorded refresh rejection.
+ */
+export function updateProviderOAuthCredentialsIfCurrent(
+  id: string,
+  expected: ClaudeOAuthCredentials,
+  refreshed: ClaudeOAuthCredentials,
+  options?: { account?: ClaudeOAuthAccountInfo | null },
+): boolean {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('Claude 配置不存在');
+  const idx = findProviderHoldingOAuth(state.providers, id, expected);
+  if (idx < 0) return false;
+
+  const current = state.providers[idx];
   state.providers[idx] = {
     ...current,
     claudeOAuthCredentials: {
       ...refreshed,
       scopes: [...new Set(refreshed.scopes)].sort(),
     },
+    claudeOAuthAccount: options?.account
+      ? { ...(current.claudeOAuthAccount ?? {}), ...options.account }
+      : (current.claudeOAuthAccount ?? null),
+    claudeOAuthLastRefreshAt: Date.now(),
+    claudeOAuthLastRefreshError: null,
     updatedAt: new Date().toISOString(),
+  };
+  writeStoredStateV4(state.providers, state.balancing);
+  return true;
+}
+
+/**
+ * Record a terminal refresh rejection, but only while the provider still
+ * holds the credential that was rejected: after a concurrent rotation or an
+ * administrator update the old token is expected to fail.
+ */
+export function markProviderOAuthRefreshFailureIfCurrent(
+  id: string,
+  expected: ClaudeOAuthCredentials,
+  error: ClaudeOAuthRefreshError,
+): boolean {
+  const state = readStoredStateV4();
+  if (!state) throw new Error('Claude 配置不存在');
+  const idx = findProviderHoldingOAuth(state.providers, id, expected);
+  if (idx < 0) return false;
+  state.providers[idx] = {
+    ...state.providers[idx],
+    claudeOAuthLastRefreshError: error,
   };
   writeStoredStateV4(state.providers, state.balancing);
   return true;
@@ -1894,9 +2137,35 @@ export function toPublicProvider(
     codexOAuthCredentialsEmail: provider.codexOAuthCredentials?.email ?? null,
     codexOAuthCredentialsPlanType:
       provider.codexOAuthCredentials?.planType ?? null,
+    claudeAuthKind: claudeAuthKindOf(provider),
+    claudeOAuthAccountEmail: provider.claudeOAuthAccount?.emailAddress ?? null,
+    claudeOAuthOrganizationName:
+      provider.claudeOAuthAccount?.organizationName ?? null,
+    claudeOAuthOrganizationUuid:
+      provider.claudeOAuthAccount?.organizationUuid ?? null,
+    claudeOAuthSubscriptionType:
+      provider.claudeOAuthCredentials?.subscriptionType ??
+      provider.claudeOAuthAccount?.subscriptionType ??
+      null,
+    claudeOAuthScopes: provider.claudeOAuthCredentials
+      ? [...provider.claudeOAuthCredentials.scopes]
+      : [],
+    claudeOAuthLastRefreshAt: provider.claudeOAuthLastRefreshAt ?? null,
+    claudeOAuthNeedsReLogin: !!provider.claudeOAuthLastRefreshError,
+    claudeOAuthLastRefreshError: provider.claudeOAuthLastRefreshError ?? null,
     customEnv: provider.customEnv || {},
     updatedAt: provider.updatedAt,
   };
+}
+
+function claudeAuthKindOf(
+  provider: UnifiedProvider,
+): UnifiedProviderPublic['claudeAuthKind'] {
+  if (provider.type !== 'official') return null;
+  if (provider.claudeOAuthCredentials) return 'oauth';
+  if (provider.claudeCodeOauthToken) return 'setup_token';
+  if (provider.anthropicApiKey || provider.anthropicAuthToken) return 'api_key';
+  return null;
 }
 
 /**
