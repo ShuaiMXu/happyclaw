@@ -321,7 +321,8 @@ Provider：
   OAuth、setup-token、API Key 中的一种
 - `PATCH|DELETE /api/config/claude/providers/:id`，第三方 Provider 的 PATCH
   可同时携带 `anthropicAuthToken` / `clearAnthropicAuthToken`，与其他字段在同一
-  请求内提交
+  请求内提交；删除 ChatGPT 订阅型 Provider 后在后台尽力吊销其 refresh token，
+  吊销结果不影响响应
 - `PUT /api/config/claude/providers/:id/secrets`，同样接受
   `claudeCredentialInput`；凭据变更只排空该 Provider 的 Runner
 - `POST /api/config/claude/providers/:id/toggle`，没有可用凭据的 Provider
@@ -349,11 +350,14 @@ Provider：
   接受 `localhost:1455` / `127.0.0.1:1455` 回调页完整 URL、其 query 或裸授权码）
   换取 token，创建或更新 ChatGPT 订阅型 Provider，成功返回公开 Provider；其
   `anthropicBaseUrl` 落盘为内嵌网关占位值。新建时写入目录默认模型与
-  `CODEX_REASONING_EFFORT`；回调带 `error=` 或 token 交换瞬时失败时返回
-  `{ error, retryable: true }`（400 / 502）并保留挂起流程，授权码被拒返回
-  `{ error, retryable: false }`（400）；目标 Provider 不存在返回 404。换账号或由
-  其他类型转换时会停稳运行器并清除该 Provider 的会话，停稳失败返回 503
-  `{ error, applied, provider? }`
+  `CODEX_REASONING_EFFORT`；回调带 `error=`（400），或 token 请求可证明未到达
+  服务器（DNS、拒绝连接、连接超时、TLS 握手失败，502）时返回
+  `{ error, retryable: true }` 并保留挂起流程；请求可能已到达 token 端点时
+  （响应超时、连接中断、5xx 等，502）或授权码被拒（400）返回
+  `{ error, retryable: false }`，授权码不会再次发送，需重新发起登录；目标
+  Provider 不存在返回 404。换账号或由其他类型转换时会停稳运行器并清除该
+  Provider 的会话，停稳失败返回 503 `{ error, applied, provider? }`；换成另一个
+  ChatGPT 账号时后台尽力吊销旧 refresh token，不影响响应
 - 内嵌网关（不在 `/api` 下）：`POST /gateway/chatgpt/v1/messages` 与
   `POST /gateway/chatgpt/v1/messages/count_tokens`（本地估算），只接受存活 Runner
   的临时 token，并拒绝带反代转发头或非回环/私网来源的请求
