@@ -357,15 +357,23 @@ Provider：
 - 内嵌网关（不在 `/api` 下）：`POST /gateway/chatgpt/v1/messages` 与
   `POST /gateway/chatgpt/v1/messages/count_tokens`（本地估算），只接受存活 Runner
   的临时 token，并拒绝带反代转发头或非回环/私网来源的请求
-- `GET /api/config/codex/model-catalog`，返回 Codex 模型目录
-  `{ models: [{ value, label, efforts, defaultEffort? }], defaultModel,
-defaultEffort, source, fetchedAt }`（条目内 `defaultEffort` 是上游
-  per-model 默认推理档，可能缺省）；目录由
-  `src/codex-gateway/model-catalog-sync.ts`
-  从上游 openai/codex 仓库 `codex-rs/models-manager/models.json` 同步
-  （`source` 为 `upstream`/`disk-cache`/`builtin`），baked-in 目录
-  （`src/codex-gateway/model-catalog.ts`）作离线兜底，供设置页模型/
-  推理力度下拉使用
+- `GET /api/config/codex/model-catalog[?providerId=]`，返回 Codex 模型目录
+  `{ models, defaultModel, defaultEffort, source, fetchedAt, providerId?,
+planType? }`。`models` 条目为 `{ value, label, efforts, defaultEffort?,
+useResponsesLite, supportsVerbosity, defaultVerbosity, contextWindow?,
+minimalClientVersion?, availableInPlans?, serviceTiers }`（字段取自官方
+  `models.json`；`defaultEffort` 是 per-model 默认推理档，可能缺省；
+  `serviceTiers` 含 `priority` 才可用 Fast）。全局目录由
+  `src/codex-gateway/model-catalog-sync.ts` 从上游 openai/codex 仓库
+  `codex-rs/models-manager/models.json` 同步（`source` 为
+  `upstream`/`disk-cache`/`builtin`），baked-in 目录
+  （`src/codex-gateway/model-catalog.ts`）作离线兜底，并剔除
+  `minimal_client_version` 高于网关客户端版本的模型。带 `providerId`
+  （必须是已登录 ChatGPT 的 Provider，否则 404）时改用该账号的实时目录
+  `GET chatgpt.com/backend-api/codex/models?client_version=`（`source` 为
+  `live`，内存缓存 1 小时，首次请求等待一次拉取，失败回落全局目录），
+  并按该账号 `planType` 过滤 `availableInPlans`；`defaultModel` 不在结果中时
+  取第一项。供设置页模型/推理力度下拉使用
 - `PUT /api/config/claude/custom-env`
 
 第三方 Provider 的 `anthropicAuthMode` 为 `bearer`（`Authorization: Bearer`，

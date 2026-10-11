@@ -4,14 +4,28 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { clampCodexEffortWithCatalog } from '../src/codex-gateway/model-catalog.js';
+const resolveCodexAccess = vi.hoisted(() => vi.fn());
+vi.mock('../src/codex-gateway/token-manager.js', () => ({
+  resolveCodexAccess,
+}));
+
 import {
+  clampCodexEffortWithCatalog,
+  getCodexModelTraits,
+} from '../src/codex-gateway/model-catalog.js';
+import {
+  ensureCodexProviderCatalog,
+  getCodexCatalogForProvider,
   getResolvedCodexCatalog,
   initCodexCatalogSync,
   maybeRefreshCodexCatalog,
+  maybeRefreshCodexProviderCatalog,
+  noteCodexModelsEtag,
   parseUpstreamModelCatalog,
   refreshCodexCatalog,
+  refreshCodexProviderCatalog,
   resetCodexCatalogSyncForTests,
+  resolveCodexCatalogForProvider,
   setCodexCatalogDiskCachePathForTests,
 } from '../src/codex-gateway/model-catalog-sync.js';
 
@@ -100,7 +114,7 @@ describe('Codex model catalog upstream sync', () => {
 
   test('keeps curated label for known slugs, derives label for new models', () => {
     const entries = parseUpstreamModelCatalog(UPSTREAM_PAYLOAD);
-    expect(entries[0].label).toBe('gpt-6-sol（主力编码）');
+    expect(entries[0].label).toBe('gpt-6-sol（上一代编码）');
     expect(entries[1].label).toBe('gpt-9-aurora（GPT-9 Aurora）');
   });
 
@@ -388,5 +402,239 @@ describe('Codex model catalog upstream sync', () => {
     vi.advanceTimersByTime(1 * 60 * 60 * 1000); // 累计 6h05m > 6h
     maybeRefreshCodexCatalog();
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('parses official request-shape fields and drops models newer than the client', () => {
+    const entries = parseUpstreamModelCatalog({
+      models: [
+        {
+          slug: 'late',
+          visibility: 'list',
+          priority: 9,
+          supported_reasoning_levels: [{ effort: 'low' }],
+        },
+        {
+          slug: 'shaped',
+          visibility: 'list',
+          priority: 1,
+          use_responses_lite: true,
+          support_verbosity: true,
+          default_verbosity: 'medium',
+          context_window: 272000,
+          minimal_client_version: [0, 153, 0],
+          available_in_plans: ['Plus', 'pro', 'bad plan', 42],
+          service_tiers: [{ id: 'priority', name: 'Fast' }, { name: 'x' }],
+          web_search_tool_type: 'text_and_image',
+          supported_reasoning_levels: [{ effort: 'low' }],
+        },
+        {
+          slug: 'too-new',
+          visibility: 'list',
+          priority: 0,
+          minimal_client_version: '0.999.0',
+          supported_reasoning_levels: [{ effort: 'low' }],
+        },
+      ],
+    });
+    expect(entries.map((entry) => entry.value)).toEqual(['shaped', 'late']);
+    expect(entries[0]).toEqual({
+      value: 'shaped',
+      label: 'shaped',
+      efforts: ['low'],
+      useResponsesLite: true,
+      supportsVerbosity: true,
+      defaultVerbosity: 'medium',
+      contextWindow: 272000,
+      minimalClientVersion: '0.153.0',
+      availableInPlans: ['plus', 'pro'],
+      serviceTiers: ['priority'],
+      webSearchToolType: 'text_and_image',
+    });
+    // Missing fields take the official ModelInfo serde defaults.
+    expect(entries[1]).toMatchObject({
+      useResponsesLite: false,
+      supportsVerbosity: false,
+      defaultVerbosity: null,
+      serviceTiers: [],
+      webSearchToolType: 'text',
+    });
+  });
+
+  test('refresh makes the synced catalog drive request traits', async () => {
+    expect(getCodexModelTraits('gpt-9-aurora').known).toBe(false);
+    await refreshCodexCatalog({ fetchImpl: mockFetchWith(UPSTREAM_PAYLOAD) });
+    expect(getCodexModelTraits('gpt-9-aurora')).toMatchObject({
+      known: true,
+      useResponsesLite: false,
+    });
+    resetCodexCatalogSyncForTests();
+    expect(getCodexModelTraits('gpt-9-aurora').known).toBe(false);
+  });
+
+  test('ignores disk caches written before the request-shape fields', () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'codex-catalog-'));
+    const cachePath = path.join(dir, 'catalog.json');
+    try {
+      writeFileSync(
+        cachePath,
+        JSON.stringify({
+          models: [{ value: 'gpt-6-sol', label: 'sol', efforts: ['low'] }],
+          fetchedAt: '2026-01-01T00:00:00.000Z',
+        }),
+      );
+      setCodexCatalogDiskCachePathForTests(cachePath);
+      initCodexCatalogSync({ fetchImpl: neverSettleFetch });
+      expect(getResolvedCodexCatalog().source).toBe('builtin');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('per-provider live Codex model catalog', () => {
+  const LIVE_PAYLOAD = {
+    models: [
+      {
+        slug: 'gpt-6.1-sol',
+        visibility: 'list',
+        priority: 1,
+        use_responses_lite: true,
+        support_verbosity: true,
+        default_verbosity: 'low',
+        service_tiers: [{ id: 'priority' }],
+        supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }],
+      },
+    ],
+  };
+  const liveFetch = (etag = '"v1"') =>
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify(LIVE_PAYLOAD), {
+          status: 200,
+          headers: { etag },
+        }),
+    );
+
+  afterEach(() => {
+    resetCodexCatalogSyncForTests();
+    setCodexCatalogDiskCachePathForTests(null);
+    resolveCodexAccess.mockReset();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  test('fetches the account catalog with the official client identity', async () => {
+    resolveCodexAccess.mockResolvedValue({
+      providerId: 'p1',
+      accessToken: 'access-token',
+      accountId: 'acct-1',
+    });
+    const fetchImpl = liveFetch();
+    expect(await refreshCodexProviderCatalog('p1', { fetchImpl })).toBe(true);
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    expect(url).toBe(
+      'https://chatgpt.com/backend-api/codex/models?client_version=0.162.1',
+    );
+    const headers = init.headers as Record<string, string>;
+    expect(headers).toMatchObject({
+      Authorization: 'Bearer access-token',
+      'ChatGPT-Account-ID': 'acct-1',
+      originator: 'codex-tui',
+      version: '0.162.1',
+    });
+    expect(headers['User-Agent']).toMatch(/^codex-tui\/0\.162\.1 /);
+    expect(headers).not.toHaveProperty('If-None-Match');
+    const live = resolveCodexCatalogForProvider('p1');
+    expect(live.source).toBe('live');
+    expect(live.models.map((entry) => entry.value)).toEqual(['gpt-6.1-sol']);
+    expect(getCodexCatalogForProvider('p1', 'acct-1')).toBe(live.models);
+    // Another account (re-login) never sees the old account's catalog.
+    expect(getCodexCatalogForProvider('p1', 'acct-2')).toBe(
+      getResolvedCodexCatalog().models,
+    );
+    expect(getCodexCatalogForProvider('p2')).toBe(
+      getResolvedCodexCatalog().models,
+    );
+  });
+
+  test('refreshes after an hour, backs off after failures and keeps the last catalog', async () => {
+    vi.useFakeTimers();
+    resolveCodexAccess.mockResolvedValue({
+      providerId: 'p1',
+      accessToken: 'token',
+      accountId: null,
+    });
+    const fetchMock = liveFetch();
+    vi.stubGlobal('fetch', fetchMock);
+    maybeRefreshCodexProviderCatalog('p1');
+    await vi.waitFor(() =>
+      expect(resolveCodexCatalogForProvider('p1').source).toBe('live'),
+    );
+    maybeRefreshCodexProviderCatalog('p1');
+    vi.advanceTimersByTime(59 * 60 * 1000);
+    maybeRefreshCodexProviderCatalog('p1');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockImplementation(
+      async () => new Response('busy', { status: 503 }),
+    );
+    vi.advanceTimersByTime(60 * 1000);
+    maybeRefreshCodexProviderCatalog('p1');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await Promise.resolve();
+    expect(resolveCodexCatalogForProvider('p1').source).toBe('live');
+    // A different account forces a refresh, still subject to the backoff.
+    maybeRefreshCodexProviderCatalog('p1', { accountId: 'other' });
+    vi.advanceTimersByTime(4 * 60 * 1000);
+    maybeRefreshCodexProviderCatalog('p1');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(60 * 1000);
+    maybeRefreshCodexProviderCatalog('p1');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+  });
+
+  test('refreshes when x-models-etag changes and only then', async () => {
+    resolveCodexAccess.mockResolvedValue({
+      providerId: 'p1',
+      accessToken: 'token',
+      accountId: null,
+    });
+    const fetchMock = liveFetch('"v1"');
+    vi.stubGlobal('fetch', fetchMock);
+    await refreshCodexProviderCatalog('p1');
+    noteCodexModelsEtag('p1', '"v1"');
+    noteCodexModelsEtag('p1', '"v1"');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    noteCodexModelsEtag('p1', '"v2"');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    // The models endpoint still reports v1: the same notice does not loop.
+    noteCodexModelsEtag('p1', '"v2"');
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('waits for the first account fetch only when nothing is cached', async () => {
+    resolveCodexAccess.mockRejectedValueOnce(new Error('login expired'));
+    const failed = await ensureCodexProviderCatalog('p1', {
+      fetchImpl: liveFetch(),
+    });
+    expect(failed.source).toBe('builtin');
+    resolveCodexAccess.mockResolvedValue({
+      providerId: 'p1',
+      accessToken: 'token',
+      accountId: null,
+    });
+    const fetchImpl = liveFetch();
+    // Backoff after the failure: no fetch yet.
+    expect((await ensureCodexProviderCatalog('p1', { fetchImpl })).source).toBe(
+      'builtin',
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+    resetCodexCatalogSyncForTests();
+    const first = await ensureCodexProviderCatalog('p1', { fetchImpl });
+    expect(first.source).toBe('live');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

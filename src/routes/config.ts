@@ -186,10 +186,13 @@ import {
 import {
   CODEX_DEFAULT_MODEL,
   CODEX_DEFAULT_EFFORT,
+  filterCodexCatalogByPlan,
 } from '../codex-gateway/model-catalog.js';
 import {
+  ensureCodexProviderCatalog,
   getResolvedCodexCatalog,
   maybeRefreshCodexCatalog,
+  type ProviderCodexCatalog,
 } from '../codex-gateway/model-catalog-sync.js';
 import {
   hasOAuthUsageSignals,
@@ -2344,7 +2347,9 @@ configRoutes.post(
 
 // ─── GET /codex/model-catalog — Codex 模型目录（UI 下拉数据源）──────────
 // 目录真相源是上游 openai/codex 的 models.json，由 model-catalog-sync
-// 定期同步（baked-in 目录兜底）；前端不再硬编码。
+// 定期同步（baked-in 目录兜底）；前端不再硬编码。带 ?providerId= 时改用该
+// 账号的实时目录（/backend-api/codex/models，首次等待一次拉取），并按其
+// ChatGPT 套餐过滤 available_in_plans。
 configRoutes.get(
   '/codex/model-catalog',
   authMiddleware,
@@ -2352,13 +2357,28 @@ configRoutes.get(
   async (c) => {
     // TTL 过期时触发后台刷新：响应不等待网络，目录在流量中自愈。
     maybeRefreshCodexCatalog();
-    const resolved = getResolvedCodexCatalog();
+    const providerId = c.req.query('providerId')?.trim();
+    let resolved: ProviderCodexCatalog = getResolvedCodexCatalog();
+    let planType: string | null = null;
+    if (providerId) {
+      const provider = getProviders().find(
+        (candidate) =>
+          candidate.id === providerId && !!candidate.codexOAuthCredentials,
+      );
+      if (!provider) return c.json({ error: 'Codex provider not found' }, 404);
+      planType = provider.codexOAuthCredentials?.planType ?? null;
+      resolved = await ensureCodexProviderCatalog(provider.id);
+    }
+    const models = filterCodexCatalogByPlan(resolved.models, planType);
     return c.json({
-      models: resolved.models,
-      defaultModel: CODEX_DEFAULT_MODEL,
+      models,
+      defaultModel: models.some((entry) => entry.value === CODEX_DEFAULT_MODEL)
+        ? CODEX_DEFAULT_MODEL
+        : (models[0]?.value ?? CODEX_DEFAULT_MODEL),
       defaultEffort: CODEX_DEFAULT_EFFORT,
       source: resolved.source,
       fetchedAt: resolved.fetchedAt,
+      ...(providerId ? { providerId, planType } : {}),
     });
   },
 );
