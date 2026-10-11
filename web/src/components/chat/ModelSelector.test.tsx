@@ -127,6 +127,35 @@ describe('ModelSelector', () => {
     expect(trigger().disabled).toBe(true);
   });
 
+  test('a configuration without a credential is shown but not selectable', async () => {
+    mocks.get.mockResolvedValue(
+      selection({
+        options: [
+          ...selection().options,
+          {
+            id: 'copy',
+            name: 'GLM (副本)',
+            kind: 'third_party',
+            enabled: false,
+            model: 'glm-5.3',
+            usable: false,
+          },
+        ],
+      }),
+    );
+    await render(null);
+    await act(async () => {
+      trigger().dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }),
+      );
+    });
+    const copy = [
+      ...document.querySelectorAll<HTMLElement>('[role="menuitemradio"]'),
+    ].find((item) => item.textContent?.includes('GLM (副本)'));
+    expect(copy?.textContent).toContain('缺少凭据');
+    expect(copy?.getAttribute('aria-disabled')).toBe('true');
+  });
+
   test('stays hidden when no model configuration exists', async () => {
     mocks.get.mockResolvedValue(selection({ options: [] }));
     await render(null);

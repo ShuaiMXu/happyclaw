@@ -52,6 +52,7 @@ import {
   getEnabledProviders,
   getBalancingConfig,
   getProviders,
+  providerHasCredentials,
   getSystemSettings,
   getEffectiveExternalDir,
   hasExplicitWorkspaceClaudeAuth,
@@ -1339,7 +1340,7 @@ function resolvePinnedModelConfigId(
  * composer. It outranks the Agent's binding because it is the more specific
  * choice; like the Agent binding it may name a configuration that is not in
  * the automatic pool. A selection whose configuration has since been deleted
- * degrades to the default instead of failing the turn.
+ * or lost its credential degrades to the default instead of failing the turn.
  */
 export function resolveSessionModelSelection(
   groupFolder: string,
@@ -1347,9 +1348,8 @@ export function resolveSessionModelSelection(
 ): string | null {
   const selected = getSessionModelSelection(groupFolder, agentId);
   if (!selected) return null;
-  return getProviders().some((provider) => provider.id === selected)
-    ? selected
-    : null;
+  const provider = getProviders().find((item) => item.id === selected);
+  return provider && providerHasCredentials(provider) ? selected : null;
 }
 
 /** Whether a completed user turn must release its runner for the next pick. */

@@ -95,6 +95,7 @@ import {
   getContainerEnvConfig,
   getProviders,
   getSystemSettings,
+  providerHasCredentials,
   saveContainerEnvConfig,
   toPublicContainerEnvConfig,
 } from '../runtime-config.js';
@@ -2237,6 +2238,9 @@ function buildSessionModelSelectionPayload(
       kind: provider.codexOAuthCredentials ? ('codex' as const) : provider.type,
       enabled: provider.enabled,
       model: provider.anthropicModel,
+      // A configuration without a credential (e.g. an old copy that lost its
+      // key) would fail every turn; the picker shows it but cannot pick it.
+      usable: providerHasCredentials(provider),
     })),
   };
 }
@@ -2266,11 +2270,17 @@ groupRoutes.put('/:jid/model-selection', authMiddleware, async (c) => {
   if ('error' in scope) return scope.error;
   const { group, agentId } = scope;
   const modelConfigId = parsed.data.modelConfigId;
-  if (
-    modelConfigId &&
-    !getProviders().some((provider) => provider.id === modelConfigId)
-  ) {
-    return c.json({ error: '模型配置不存在' }, 404);
+  if (modelConfigId) {
+    const target = getProviders().find(
+      (provider) => provider.id === modelConfigId,
+    );
+    if (!target) return c.json({ error: '模型配置不存在' }, 404);
+    if (!providerHasCredentials(target)) {
+      return c.json(
+        { error: '该模型配置缺少凭据，请先在模型配置中补全密钥或完成授权' },
+        400,
+      );
+    }
   }
 
   const authUser = c.get('user') as AuthUser;

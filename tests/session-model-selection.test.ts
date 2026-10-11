@@ -20,9 +20,11 @@ const tmpRoot = fs.mkdtempSync(
 const mocks = vi.hoisted(() => ({
   providers: [] as Array<{
     id: string;
+    type: 'third_party';
     enabled: boolean;
     weight: number;
     anthropicModel: string;
+    anthropicAuthToken: string;
   }>,
   strategy: 'round-robin' as
     | 'round-robin'
@@ -75,9 +77,11 @@ const { providerPool } = await import('../src/provider-pool.ts');
 function setProviders(...entries: Array<[string, boolean]>) {
   mocks.providers = entries.map(([id, enabled]) => ({
     id,
+    type: 'third_party',
     enabled,
     weight: 1,
     anthropicModel: `${id}-model`,
+    anthropicAuthToken: id === 'nokey' ? '' : `${id}-token`,
   }));
   for (const [id] of entries) providerPool.resetHealth(id);
 }
@@ -132,6 +136,9 @@ describe('session model selection storage', () => {
 describe('session model selection drives provider choice', () => {
   test('a stale selection degrades to the default', () => {
     db.setSessionModelSelection('grp', null, 'deleted');
+    expect(runner.resolveSessionModelSelection('grp', null)).toBeNull();
+    setProviders(['A', true], ['B', true], ['C', false], ['nokey', false]);
+    db.setSessionModelSelection('grp', null, 'nokey');
     expect(runner.resolveSessionModelSelection('grp', null)).toBeNull();
     db.setSessionModelSelection('grp', null, 'C');
     expect(runner.resolveSessionModelSelection('grp', null)).toBe('C');

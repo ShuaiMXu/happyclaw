@@ -23,6 +23,8 @@ export interface SessionModelOption {
   kind: 'official' | 'third_party' | 'codex';
   enabled: boolean;
   model: string;
+  /** False when the configuration holds no credential and would fail. */
+  usable?: boolean;
 }
 
 export interface SessionModelSelection {
@@ -189,13 +191,21 @@ export function ModelSelector({
           </DropdownMenuRadioItem>
           <DropdownMenuSeparator />
           {selection.options.map((option) => (
-            <DropdownMenuRadioItem key={option.id} value={option.id}>
+            <DropdownMenuRadioItem
+              key={option.id}
+              value={option.id}
+              disabled={option.usable === false}
+            >
               <span className="min-w-0">
                 <span className="block truncate">{option.name}</span>
                 <span className="block truncate text-micro text-muted-foreground">
                   {KIND_LABELS[option.kind]}
                   {option.model ? ` · ${option.model}` : ''}
-                  {option.enabled ? '' : ' · 未启用'}
+                  {option.usable === false
+                    ? ' · 缺少凭据'
+                    : option.enabled
+                      ? ''
+                      : ' · 未启用'}
                 </span>
               </span>
             </DropdownMenuRadioItem>

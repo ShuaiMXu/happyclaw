@@ -72,6 +72,7 @@ vi.mock('../src/runtime-config.js', async (importOriginal) => {
         type: 'official',
         enabled: true,
         anthropicModel: 'opus',
+        anthropicApiKey: 'sk-ant-key',
         codexOAuthCredentials: null,
       },
       {
@@ -80,6 +81,7 @@ vi.mock('../src/runtime-config.js', async (importOriginal) => {
         type: 'official',
         enabled: true,
         anthropicModel: 'gpt-6-sol',
+        anthropicAuthToken: 'gateway-id',
         codexOAuthCredentials: { accessToken: 'secret' },
       },
       {
@@ -88,6 +90,16 @@ vi.mock('../src/runtime-config.js', async (importOriginal) => {
         type: 'third_party',
         enabled: false,
         anthropicModel: 'glm-5.3[1m]',
+        anthropicAuthToken: 'glm-token',
+        codexOAuthCredentials: null,
+      },
+      {
+        id: 'copy',
+        name: 'GLM (副本)',
+        type: 'third_party',
+        enabled: false,
+        anthropicModel: 'glm-5.3',
+        anthropicAuthToken: '',
         codexOAuthCredentials: null,
       },
     ],
@@ -187,6 +199,7 @@ describe('GET /:jid/model-selection', () => {
         kind: 'official',
         enabled: true,
         model: 'opus',
+        usable: true,
       },
       {
         id: 'chatgpt',
@@ -194,6 +207,7 @@ describe('GET /:jid/model-selection', () => {
         kind: 'codex',
         enabled: true,
         model: 'gpt-6-sol',
+        usable: true,
       },
       {
         id: 'glm',
@@ -201,6 +215,15 @@ describe('GET /:jid/model-selection', () => {
         kind: 'third_party',
         enabled: false,
         model: 'glm-5.3[1m]',
+        usable: true,
+      },
+      {
+        id: 'copy',
+        name: 'GLM (副本)',
+        kind: 'third_party',
+        enabled: false,
+        model: 'glm-5.3',
+        usable: false,
       },
     ]);
     expect(JSON.stringify(body)).not.toContain('secret');
@@ -250,6 +273,13 @@ describe('PUT /:jid/model-selection', () => {
       jids: [GROUP_JID],
       target: null,
     });
+  });
+
+  test('refuses a configuration without a credential', async () => {
+    const { status, body } = await call('PUT', '', { modelConfigId: 'copy' });
+    expect(status).toBe(400);
+    expect(body.error).toContain('缺少凭据');
+    expect(db.getSessionModelSelection(GROUP_FOLDER, null)).toBeNull();
   });
 
   test('rejects an unknown configuration and non-owners', async () => {
