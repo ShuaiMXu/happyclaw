@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { StreamEventProcessor } from '../container/agent-runner/src/stream-processor.js';
 import type { ContainerOutput } from '../container/agent-runner/src/types.js';
@@ -107,6 +109,14 @@ describe('sub-agent final answer capture', () => {
       isSynthetic: true,
       taskResult: 'All 12 call sites updated.',
     });
+    // The captured answer is released once it has been handed on.
+    expect(
+      (
+        processor as unknown as {
+          subAgentFinalTextByTask: Map<string, unknown>;
+        }
+      ).subAgentFinalTextByTask.has('toolu_fg'),
+    ).toBe(false);
   });
 
   test('a task without any sub-agent text has no captured answer', () => {
@@ -120,5 +130,20 @@ describe('sub-agent final answer capture', () => {
       output_file: '',
     });
     expect(notifications(outputs).at(-1)?.taskResult).toBeUndefined();
+  });
+});
+
+describe('sub-agent answers stay on the host', () => {
+  test('the Web broadcaster strips taskResult before sending', () => {
+    const web = fs.readFileSync(path.join(process.cwd(), 'src/web.ts'), 'utf8');
+    const start = web.indexOf('export function broadcastStreamEvent(');
+    const broadcaster = web.slice(
+      start,
+      web.indexOf('export function broadcastGroupCreated(', start),
+    );
+    expect(broadcaster).toMatch(/delete event\.taskResult/);
+    expect(broadcaster.indexOf('delete event.taskResult')).toBeLessThan(
+      broadcaster.indexOf('safeBroadcast('),
+    );
   });
 });

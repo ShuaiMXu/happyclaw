@@ -3402,6 +3402,12 @@ export function broadcastStreamEvent(
     }
     return;
   }
+  // A finished sub-agent's answer (up to 16k characters) only feeds the
+  // host's replay checkpoint; the Web never reads it.
+  if (event.taskResult !== undefined) {
+    event = { ...event };
+    delete event.taskResult;
+  }
 
   const jid = normalizeHomeJid(chatJid);
   const allowedUserIds = getGroupAllowedUserIds(chatJid);

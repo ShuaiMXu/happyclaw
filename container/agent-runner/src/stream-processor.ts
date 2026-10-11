@@ -981,6 +981,7 @@ export class StreamEventProcessor {
             displayLevel: 'primary',
           },
         });
+        this.subAgentFinalTextByTask.delete(id);
       }
       this.taskToolUseIds.delete(id);
       this.backgroundTaskToolUseIds.delete(id);
