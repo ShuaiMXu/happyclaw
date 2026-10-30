@@ -1,5 +1,12 @@
-import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
-import { Loader2 } from 'lucide-react';
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+import { ChevronDown, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -170,6 +177,7 @@ function AutomationForm({
   const stale = !!serverError?.stale;
   // The revision the form's contents came from; a refresh moves it on.
   const [revision, setRevision] = useState(automation?.revision ?? 0);
+  const advancedRef = useRef<HTMLDetailsElement>(null);
 
   const set = <K extends keyof AutomationFormValues>(
     key: K,
@@ -232,6 +240,15 @@ function AutomationForm({
   const hasErrors = Object.keys(fieldErrors).length > 0;
   const errorOf = (field: AutomationFormField) =>
     submitted ? fieldErrors[field] : undefined;
+
+  useEffect(() => {
+    if (
+      submitted &&
+      (fieldErrors.stopWhen || fieldErrors.endAt || fieldErrors.preRunCheck)
+    ) {
+      advancedRef.current?.setAttribute('open', '');
+    }
+  }, [fieldErrors, submitted]);
 
   const reloadStale = async () => {
     if (!automation) return;
@@ -395,6 +412,35 @@ function AutomationForm({
             )}
           </Field>
         </div>
+
+        {script ? (
+          <Field label="脚本命令" errors={errorOf('script')}>
+            {(id) => (
+              <Input
+                id={id}
+                value={values.scriptCommand}
+                maxLength={AUTOMATION_LIMITS.scriptCommandMax}
+                placeholder="python scripts/report.py"
+                onChange={(event) => set('scriptCommand', event.target.value)}
+                className="font-mono"
+              />
+            )}
+          </Field>
+        ) : (
+          <Field label="提示词" errors={errorOf('prompt')}>
+            {(id) => (
+              <Textarea
+                id={id}
+                value={values.prompt}
+                rows={6}
+                maxLength={AUTOMATION_LIMITS.promptMax}
+                placeholder="例如：检查仓库里新的 issue，总结需要我处理的部分。"
+                onChange={(event) => set('prompt', event.target.value)}
+                className="min-h-32"
+              />
+            )}
+          </Field>
+        )}
 
         <Field label="计划" errors={errorOf('schedule')}>
           {(id) => (
@@ -623,120 +669,117 @@ function AutomationForm({
           )}
         </Field>
 
-        <div className="grid gap-5 sm:grid-cols-2">
-          <Field
-            label="停止条件（可选）"
-            errors={errorOf('stopWhen')}
-            hint="每次运行先核实，满足时智能体会结束这个自动化。"
-          >
-            {(id) => (
-              <Input
-                id={id}
-                value={values.stopWhen}
-                maxLength={AUTOMATION_LIMITS.stopWhenMax}
-                placeholder="例如：第 1–29 集全部下载完"
-                onChange={(event) => set('stopWhen', event.target.value)}
-              />
-            )}
-          </Field>
-          <Field
-            label="结束时间（可选）"
-            errors={errorOf('endAt')}
-            hint="到这个时间后不再触发。"
-          >
-            {(id) => (
-              <Input
-                id={id}
-                type="datetime-local"
-                value={values.endAtLocal}
-                onChange={(event) => set('endAtLocal', event.target.value)}
-              />
-            )}
-          </Field>
-        </div>
-
-        <SwitchRow
-          label="检查没事不说话"
-          description="仅报告变化或问题。提醒和定时发送可关闭此项。"
-          checked={values.silentWhenIdle}
-          onCheckedChange={(value) => set('silentWhenIdle', value)}
-        />
-
-        {!script && (
-          <div className="space-y-3">
-            <SwitchRow
-              label="前置检查"
-              description={
-                allowHostCommands
-                  ? '触发时先在工作目录运行命令：退出码 0 照常运行，2 跳过本次（不消耗用量），其他视为失败。'
-                  : '只在管理员的宿主机工作区可用。'
-              }
-              checked={values.preRunCheckEnabled}
-              disabled={!allowHostCommands && !values.preRunCheckEnabled}
-              onCheckedChange={(value) => set('preRunCheckEnabled', value)}
+        <details
+          ref={advancedRef}
+          className="group rounded-lg ring-1 ring-surface-border"
+        >
+          <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-label font-medium text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none">
+            <span className="min-w-0 flex-1">
+              高级设置
+              <span className="ml-2 text-caption font-normal text-muted-foreground">
+                {[
+                  values.stopWhen && '停止条件',
+                  values.endAtLocal && '结束时间',
+                  values.silentWhenIdle && '静默检查',
+                  values.preRunCheckEnabled && '前置检查',
+                ]
+                  .filter(Boolean)
+                  .join(' · ') || '未设置'}
+              </span>
+            </span>
+            <ChevronDown
+              className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180 motion-reduce:transition-none"
+              aria-hidden="true"
             />
-            {values.preRunCheckEnabled && (
-              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_8rem]">
-                <Field label="检查命令" errors={errorOf('preRunCheck')}>
-                  {(id) => (
-                    <Input
-                      id={id}
-                      value={values.preRunCheckCommand}
-                      placeholder="node scripts/check.mjs"
-                      onChange={(event) =>
-                        set('preRunCheckCommand', event.target.value)
-                      }
-                      className="font-mono"
-                    />
-                  )}
-                </Field>
-                <Field label="超时（秒）">
-                  {(id) => (
-                    <Input
-                      id={id}
-                      type="number"
-                      min={1}
-                      max={AUTOMATION_LIMITS.preRunCheckMaxTimeoutMs / 1000}
-                      value={values.preRunCheckTimeout}
-                      onChange={(event) =>
-                        set('preRunCheckTimeout', event.target.value)
-                      }
-                    />
-                  )}
-                </Field>
+          </summary>
+          <div className="space-y-5 border-t border-surface-border p-3">
+            <div className="grid gap-5 sm:grid-cols-2">
+              <Field
+                label="停止条件（可选）"
+                errors={errorOf('stopWhen')}
+                hint="每次运行先核实，满足时智能体会结束这个自动化。"
+              >
+                {(id) => (
+                  <Input
+                    id={id}
+                    value={values.stopWhen}
+                    maxLength={AUTOMATION_LIMITS.stopWhenMax}
+                    placeholder="例如：第 1–29 集全部下载完"
+                    onChange={(event) => set('stopWhen', event.target.value)}
+                  />
+                )}
+              </Field>
+              <Field
+                label="结束时间（可选）"
+                errors={errorOf('endAt')}
+                hint="到这个时间后不再触发。"
+              >
+                {(id) => (
+                  <Input
+                    id={id}
+                    type="datetime-local"
+                    value={values.endAtLocal}
+                    onChange={(event) => set('endAtLocal', event.target.value)}
+                  />
+                )}
+              </Field>
+            </div>
+
+            <SwitchRow
+              label="检查没事不说话"
+              description="仅报告变化或问题。提醒和定时发送可关闭此项。"
+              checked={values.silentWhenIdle}
+              onCheckedChange={(value) => set('silentWhenIdle', value)}
+            />
+
+            {!script && (
+              <div className="space-y-3">
+                <SwitchRow
+                  label="前置检查"
+                  description={
+                    allowHostCommands
+                      ? '触发时先在工作目录运行命令：退出码 0 照常运行，2 跳过本次（不消耗用量），其他视为失败。'
+                      : '只在管理员的宿主机工作区可用。'
+                  }
+                  checked={values.preRunCheckEnabled}
+                  disabled={!allowHostCommands && !values.preRunCheckEnabled}
+                  onCheckedChange={(value) => set('preRunCheckEnabled', value)}
+                />
+                {values.preRunCheckEnabled && (
+                  <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_8rem]">
+                    <Field label="检查命令" errors={errorOf('preRunCheck')}>
+                      {(id) => (
+                        <Input
+                          id={id}
+                          value={values.preRunCheckCommand}
+                          placeholder="node scripts/check.mjs"
+                          onChange={(event) =>
+                            set('preRunCheckCommand', event.target.value)
+                          }
+                          className="font-mono"
+                        />
+                      )}
+                    </Field>
+                    <Field label="超时（秒）">
+                      {(id) => (
+                        <Input
+                          id={id}
+                          type="number"
+                          min={1}
+                          max={AUTOMATION_LIMITS.preRunCheckMaxTimeoutMs / 1000}
+                          value={values.preRunCheckTimeout}
+                          onChange={(event) =>
+                            set('preRunCheckTimeout', event.target.value)
+                          }
+                        />
+                      )}
+                    </Field>
+                  </div>
+                )}
               </div>
             )}
           </div>
-        )}
-
-        {script ? (
-          <Field label="脚本命令" errors={errorOf('script')}>
-            {(id) => (
-              <Input
-                id={id}
-                value={values.scriptCommand}
-                maxLength={AUTOMATION_LIMITS.scriptCommandMax}
-                placeholder="python scripts/report.py"
-                onChange={(event) => set('scriptCommand', event.target.value)}
-                className="font-mono"
-              />
-            )}
-          </Field>
-        ) : (
-          <Field label="提示词" errors={errorOf('prompt')}>
-            {(id) => (
-              <Textarea
-                id={id}
-                value={values.prompt}
-                rows={6}
-                maxLength={AUTOMATION_LIMITS.promptMax}
-                placeholder="例如：检查仓库里新的 issue，总结需要我处理的部分。"
-                onChange={(event) => set('prompt', event.target.value)}
-                className="min-h-32"
-              />
-            )}
-          </Field>
-        )}
+        </details>
       </div>
 
       <div className="flex shrink-0 flex-col gap-2 border-t border-surface-border px-5 py-3 sm:flex-row sm:items-center phone:pb-[calc(0.75rem+env(safe-area-inset-bottom))]">

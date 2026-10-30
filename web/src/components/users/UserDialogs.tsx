@@ -153,11 +153,17 @@ export function CreateUserDialog({
   const visibleTemplates = templates.filter(
     (item) => isAdmin || item.role !== 'admin',
   );
+  const selectedTemplate = visibleTemplates.find(
+    (item) =>
+      item.role === newRole &&
+      samePermissions(item.permissions, newPermissions),
+  );
+  const roleLabel = newRole === 'admin' ? '管理员' : '成员';
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-xl">
-        <form onSubmit={handleCreate} className="grid gap-4">
+        <form onSubmit={handleCreate} className="grid gap-4 phone:pb-24">
           <DialogHeader>
             <DialogTitle>创建新用户</DialogTitle>
             <DialogDescription>填写账户信息并按需分配权限。</DialogDescription>
@@ -247,6 +253,12 @@ export function CreateUserDialog({
                     type="button"
                     variant="outline"
                     size="xs"
+                    aria-pressed={selectedTemplate?.key === item.key}
+                    className={
+                      selectedTemplate?.key === item.key
+                        ? 'border-foreground bg-surface-selected'
+                        : undefined
+                    }
                     onClick={() => {
                       setNewRole(item.role);
                       setNewPermissions(item.permissions);
@@ -260,7 +272,7 @@ export function CreateUserDialog({
           )}
 
           {assignablePermissions.length > 0 && (
-            <div className="space-y-1.5">
+            <div id="create-user-permissions" className="space-y-1.5">
               <div className="text-label text-foreground">权限明细</div>
               <PermissionChecklist
                 idPrefix="create-user-perm"
@@ -270,6 +282,21 @@ export function CreateUserDialog({
               />
             </div>
           )}
+
+          <div className="flex flex-wrap items-center justify-between gap-2 text-caption text-muted-foreground">
+            <span aria-live="polite">
+              {roleLabel} · 已选择 {newPermissions.length} 项权限
+              {selectedTemplate ? ` · ${selectedTemplate.label}` : ''}
+            </span>
+            {newPermissions.length > 0 && (
+              <a
+                href="#create-user-permissions"
+                className="text-primary-text underline-offset-2 hover:underline"
+              >
+                查看已选权限
+              </a>
+            )}
+          </div>
 
           <DialogFooter>
             <Button

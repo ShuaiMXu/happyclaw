@@ -147,7 +147,19 @@ export function CreateAgentDialog({
             void submit();
           }}
         >
-          <SettingsField label="名称" htmlFor="new-agent-name">
+          <SettingsField
+            label={
+              <>
+                名称
+                {start !== 'ai' && (
+                  <span className="ml-1 text-error" aria-hidden="true">
+                    *
+                  </span>
+                )}
+              </>
+            }
+            htmlFor="new-agent-name"
+          >
             <Input
               id="new-agent-name"
               value={name}
@@ -164,6 +176,7 @@ export function CreateAgentDialog({
                     : '例如：代码评审'
               }
               aria-invalid={!!nameError || undefined}
+              aria-required={start !== 'ai'}
               aria-describedby={nameError ? 'new-agent-name-error' : undefined}
               className="pointer-coarse:min-h-11"
             />
@@ -208,12 +221,16 @@ export function CreateAgentDialog({
                 className="text-label text-foreground"
               >
                 一句话描述它要做什么
+                <span className="ml-1 text-error" aria-hidden="true">
+                  *
+                </span>
               </label>
               <Textarea
                 id="new-agent-description"
                 value={description}
                 onChange={(event) => setDescription(event.target.value)}
                 maxLength={4000}
+                aria-required="true"
                 className="min-h-28 resize-y bg-background text-body leading-6"
                 placeholder="例如：做代码评审，重点关注架构风险、并发问题和测试缺口，先给结论再按严重程度列问题。"
               />
