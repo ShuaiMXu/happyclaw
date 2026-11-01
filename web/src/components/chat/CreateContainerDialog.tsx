@@ -271,15 +271,13 @@ export function CreateContainerDialog({
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && handleClose()}>
-      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col sm:max-w-xl">
-        <DialogHeader className="flex-shrink-0">
-          <DialogTitle>为智能体新建工作区</DialogTitle>
-          <DialogDescription>
-            选择智能体，并确认工作区的回复模式、运行位置和上下文。
-          </DialogDescription>
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-3 p-4 sm:max-w-md">
+        <DialogHeader className="flex-shrink-0 gap-1">
+          <DialogTitle>新建工作区</DialogTitle>
+          <DialogDescription>选择智能体并设置工作区名称。</DialogDescription>
         </DialogHeader>
 
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
           <div>
             <label
               htmlFor="workspace-agent-profile"
@@ -340,7 +338,7 @@ export function CreateContainerDialog({
               </p>
             )}
             {profiles.length > 0 && (
-              <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
+              <p className="mt-1 text-xs text-muted-foreground line-clamp-1">
                 {selectedProfile?.identity_prompt ||
                   '使用默认智能体行为，不追加额外身份提示词。'}
               </p>
@@ -351,6 +349,8 @@ export function CreateContainerDialog({
             value={interactionMode}
             onChange={setInteractionMode}
             name="create-workspace-interaction-mode"
+            compact
+            description="Assistant 统一交付最终回复；主动模式允许处理中多次发消息。"
             disabled={loading}
           />
 
@@ -378,49 +378,31 @@ export function CreateContainerDialog({
           </div>
 
           {selectedProfile && (
-            <div className="rounded-lg border bg-muted/20 p-3">
-              <div className="grid gap-3 sm:grid-cols-3">
-                <div className="min-w-0">
-                  <div className="text-[11px] font-medium text-muted-foreground">
-                    运行位置
-                  </div>
-                  <div className="mt-1 flex items-center gap-1.5 text-sm font-medium text-foreground">
-                    {executionMode === 'host' && canHostExec ? (
-                      <Monitor className="h-3.5 w-3.5 text-muted-foreground" />
-                    ) : (
-                      <Box className="h-3.5 w-3.5 text-muted-foreground" />
-                    )}
-                    {executionMode === 'host' && canHostExec
-                      ? '宿主机'
-                      : 'Docker 容器'}
-                  </div>
-                </div>
-                <div className="min-w-0">
-                  <div className="text-[11px] font-medium text-muted-foreground">
-                    智能体上下文
-                  </div>
-                  <div className="mt-1 text-sm font-medium text-foreground">
-                    {inheritsHostClaude ? '继承 ~/.claude' : 'HappyClaw 管理'}
-                  </div>
-                </div>
-                <div className="min-w-0">
-                  <div className="text-[11px] font-medium text-muted-foreground">
-                    回复模式
-                  </div>
-                  <div className="mt-1 text-sm font-medium text-foreground">
-                    {interactionMode === 'proactive'
-                      ? '主动模式'
-                      : 'Assistant 模式'}
-                  </div>
-                </div>
-              </div>
-              <p className="mt-2 border-t pt-2 text-[11px] leading-5 text-muted-foreground">
-                {canHostExec
-                  ? inheritsHostClaude
-                    ? `运行位置只决定命令在哪里执行。该智能体会将完整 ~/.claude 作为用户配置层叠加，工作区仍是 cwd；宿主机 Skills：${hostSkillsMode === 'inherit' ? '全部使用' : hostSkillsMode === 'custom' ? `选择 ${selectedProfile?.runtime_policy.skills.host?.ids.length ?? 0} 项` : '不使用'}。`
-                    : '运行位置只决定命令在哪里执行。该智能体使用 HappyClaw 管理的上下文与附加能力。'
-                  : '工作区固定在 Docker 容器中运行，并使用 HappyClaw 管理的智能体上下文与附加能力。'}
-              </p>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground">
+              <span className="inline-flex items-center gap-1.5">
+                {executionMode === 'host' && canHostExec ? (
+                  <Monitor className="h-3.5 w-3.5" />
+                ) : (
+                  <Box className="h-3.5 w-3.5" />
+                )}
+                {executionMode === 'host' && canHostExec
+                  ? '宿主机'
+                  : 'Docker 容器'}
+              </span>
+              <span>
+                上下文：
+                {inheritsHostClaude ? '继承 ~/.claude' : 'HappyClaw 管理'}
+              </span>
+              {inheritsHostClaude && (
+                <span>
+                  Skills：
+                  {hostSkillsMode === 'inherit'
+                    ? '全部'
+                    : hostSkillsMode === 'custom'
+                      ? `已选 ${selectedProfile?.runtime_policy.skills.host?.ids.length ?? 0} 项`
+                      : '关闭'}
+                </span>
+              )}
             </div>
           )}
 

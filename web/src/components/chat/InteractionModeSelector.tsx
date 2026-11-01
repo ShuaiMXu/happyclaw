@@ -8,6 +8,7 @@ interface InteractionModeSelectorProps {
   disabled?: boolean;
   name: string;
   description?: string;
+  compact?: boolean;
 }
 
 const OPTIONS: Array<{
@@ -38,13 +39,19 @@ export function InteractionModeSelector({
   disabled = false,
   name,
   description = '选择由框架在任务结束时交付一条主回复，还是由智能体在处理过程中主动发出多条消息。身份、Skills、记忆与渠道响应范围不变。',
+  compact = false,
 }: InteractionModeSelectorProps) {
   return (
     <fieldset disabled={disabled}>
       <legend className="text-sm font-medium text-foreground">
         工作区回复模式
       </legend>
-      <p className="mt-1 text-xs leading-5 text-muted-foreground">
+      <p
+        className={cn(
+          'mt-1 text-xs text-muted-foreground',
+          !compact && 'leading-5',
+        )}
+      >
         {description}
       </p>
       <div className="mt-2 grid gap-2 sm:grid-cols-2">
@@ -54,8 +61,10 @@ export function InteractionModeSelector({
           return (
             <label
               key={option.value}
+              title={compact ? option.description : undefined}
               className={cn(
-                'relative block min-w-0 cursor-pointer rounded-lg border bg-background p-3 transition-colors',
+                'relative block min-w-0 cursor-pointer rounded-lg border bg-background transition-colors',
+                compact ? 'p-2' : 'p-3',
                 'hover:border-foreground/25 hover:bg-muted/30',
                 disabled && 'cursor-not-allowed opacity-60',
                 selected ? 'border-primary bg-primary/5' : 'border-border/80',
@@ -76,21 +85,35 @@ export function InteractionModeSelector({
                   className="pointer-events-none absolute right-3 top-3 h-4 w-4 text-primary"
                 />
               )}
-              <span className="flex items-start gap-2.5">
+              <span
+                className={cn(
+                  'flex items-start',
+                  compact ? 'gap-2' : 'gap-2.5',
+                )}
+              >
                 <Icon
                   aria-hidden="true"
                   className={cn(
-                    'mt-0.5 h-4 w-4 shrink-0',
+                    compact
+                      ? 'mt-0.5 h-3.5 w-3.5 shrink-0'
+                      : 'mt-0.5 h-4 w-4 shrink-0',
                     selected ? 'text-primary' : 'text-muted-foreground',
                   )}
                 />
                 <span className="min-w-0">
-                  <span className="block pr-6 text-sm font-medium text-foreground">
+                  <span
+                    className={cn(
+                      'block pr-6 font-medium text-foreground',
+                      compact ? 'text-xs' : 'text-sm',
+                    )}
+                  >
                     {option.title}
                   </span>
-                  <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                    {option.description}
-                  </span>
+                  {!compact && (
+                    <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                      {option.description}
+                    </span>
+                  )}
                 </span>
               </span>
             </label>
