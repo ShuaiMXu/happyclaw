@@ -54,10 +54,12 @@ const DISPLAY_KEY = 'happyclaw-display-mode:guest';
 const memory = new Map<string, string>();
 
 const JID = 'web:bubble-process';
+const SESSION = 'session-1';
+const SESSION_JID = `${JID}#agent:${SESSION}`;
 
 const reply = (over: Partial<Message> = {}): Message => ({
   id: 'm1',
-  chat_jid: JID,
+  chat_jid: SESSION_JID,
   sender: 'happyclaw-agent',
   sender_name: 'HappyClaw',
   content: '最终答案在这里。',
@@ -154,7 +156,7 @@ const TRACE = [
 function Row({ message: given }: { message: Message }) {
   const message =
     useChatStore((s) =>
-      s.messages[given.chat_jid]?.find((m) => m.id === given.id),
+      s.agentMessages[SESSION]?.find((m) => m.id === given.id),
     ) ?? given;
   const thinking = useChatStore((s) => s.thinkingCache[message.id]);
   const duration = useChatStore((s) => s.thinkingDurationCache[message.id]);
@@ -243,7 +245,7 @@ beforeEach(() => {
     {
       ...initialState,
       groups: { [JID]: group() },
-      messages: { [JID]: [] },
+      agentMessages: { [SESSION]: [] },
       thinkingCache: {},
       thinkingDurationCache: {},
       traceCache: {},
@@ -653,7 +655,7 @@ describe('when the owner changes the level of the process', () => {
     });
   const seedFull = () => {
     at('full');
-    useChatStore.setState({ messages: { [JID]: [reply()] } });
+    useChatStore.setState({ agentMessages: { [SESSION]: [reply()] } });
     seed({
       steps: FULL_STEPS,
       thinking: '**内部推理标题**\n\n不该留下的推理。',
@@ -719,7 +721,7 @@ describe('when the owner changes the level of the process', () => {
     async (from) => {
       at(from);
       useChatStore.setState({
-        messages: { [JID]: [reply()] },
+        agentMessages: { [SESSION]: [reply()] },
         // The ask at the lower level found nothing to show.
         turnTraceStatus: { m1: 'empty' },
       });
@@ -808,7 +810,7 @@ describe('steps this tab rebuilt after joining the run part-way', () => {
     steps,
     steps_dropped: 0,
   });
-  const url = `/api/groups/${encodeURIComponent(JID)}/turn-traces/turn-1`;
+  const url = `/api/groups/${encodeURIComponent(SESSION_JID)}/turn-traces/turn-1`;
 
   it('are shown as they are, and nothing is asked for until the card is opened', async () => {
     seed({ steps: REBUILT, provisional: true });
@@ -984,7 +986,7 @@ describe('what a tool returned, once the workspace is a proactive one', () => {
 
   it('are let go with the process when another tab makes the workspace proactive', async () => {
     mode('assistant');
-    useChatStore.setState({ messages: { [JID]: [reply()] } });
+    useChatStore.setState({ agentMessages: { [SESSION]: [reply()] } });
     seed({
       steps: FAILED,
       thinking: '**确认范围**\n\n先跑测试。',
@@ -1011,7 +1013,7 @@ describe('what a tool returned, once the workspace is a proactive one', () => {
 
   it('are let go when another tab lowers the level to hidden', async () => {
     mode('proactive', 'full');
-    useChatStore.setState({ messages: { [JID]: [reply()] } });
+    useChatStore.setState({ agentMessages: { [SESSION]: [reply()] } });
     seed({ steps: STEPS, thinking: '想', duration: 3000, trace: TRACE });
     await mount(reply());
     expect(card()).toBeTruthy();
@@ -1027,7 +1029,7 @@ describe('what a tool returned, once the workspace is a proactive one', () => {
 
   it('are kept in an Assistant workspace when another tab only renames it', async () => {
     mode('assistant');
-    useChatStore.setState({ messages: { [JID]: [reply()] } });
+    useChatStore.setState({ agentMessages: { [SESSION]: [reply()] } });
     seed({ steps: FAILED });
     await mount(reply());
     await loadGroupsAs({ name: '改了名', interaction_mode: 'assistant' });
@@ -1087,6 +1089,73 @@ describe('a reply on a phone', () => {
     );
     expect(details?.className).toContain('phone:inline-flex');
     expect(details?.className).toContain('hidden');
+  });
+
+  it('shows the cache hit rate and speed in the usage line', async () => {
+    await mount(
+      reply({
+        has_trace: false,
+        token_usage: JSON.stringify({
+          inputTokens: 5830,
+          outputTokens: 6174,
+          cacheReadInputTokens: 2588416,
+          cacheCreationInputTokens: 0,
+          durationMs: 63693,
+          streamOutputTokens: 6174,
+          streamMs: 98_000,
+        }),
+      }),
+    );
+    const inline = [...container.querySelectorAll('span')].find((el) =>
+      /tokens/.test(el.textContent ?? ''),
+    );
+    expect(inline?.textContent).toContain('命中 99.8%');
+    expect(inline?.textContent).toContain('63.0 tok/s');
+    // A phone shows the two at a glance on the button that opens the rest.
+    const phoneButton = container.querySelector(
+      'button[aria-label^="用量详情"]',
+    );
+    expect(phoneButton?.textContent).toBe('命中 99.8% · 63.0 tok/s');
+  });
+
+  const usageDetails = async (usage: Record<string, number>) => {
+    await mount(
+      reply({ has_trace: false, token_usage: JSON.stringify(usage) }),
+    );
+    await click(container.querySelector('button[aria-label^="用量详情"]'));
+    return document.body.textContent ?? '';
+  };
+
+  it('has no hit rate in the details when nothing was cached', async () => {
+    const details = await usageDetails({
+      inputTokens: 1200,
+      outputTokens: 300,
+    });
+    expect(details).toContain('输入');
+    expect(details).not.toContain('缓存命中率');
+  });
+
+  it('explains a 0% hit rate after a cache write', async () => {
+    const details = await usageDetails({
+      inputTokens: 200,
+      outputTokens: 300,
+      cacheCreationInputTokens: 1000,
+    });
+    expect(details).toContain('缓存命中率');
+    expect(details).toContain('首轮或上下文刚重置时没有可读的缓存');
+  });
+
+  it('leaves a 0% hit rate out of the usage line', async () => {
+    await mount(
+      reply({
+        has_trace: false,
+        token_usage: JSON.stringify({ inputTokens: 1200, outputTokens: 300 }),
+      }),
+    );
+    const inline = [...container.querySelectorAll('span')].find((el) =>
+      /tokens/.test(el.textContent ?? ''),
+    );
+    expect(inline?.textContent).not.toContain('命中');
   });
 
   it('gives the user a raised bubble, and 「⋯」 below it', async () => {
@@ -1251,7 +1320,9 @@ describe('the progress a proactive turn sent, folded into its reply', () => {
           process_visibility: level,
         }),
       },
-      messages: { [JID]: [reply({ source_kind: 'sdk_send_message' })] },
+      agentMessages: {
+        [SESSION]: [reply({ source_kind: 'sdk_send_message' })],
+      },
     });
     seed({ steps: PROGRESS_STEPS });
   };
@@ -1303,7 +1374,7 @@ describe("a proactive reply whose turn's trace is on its way", () => {
           process_visibility: 'activity',
         }),
       },
-      traceAwaited: { [JID]: 'm1' },
+      traceAwaited: { [SESSION_JID]: 'm1' },
     });
   const row = () =>
     [...container.querySelectorAll('button')].find((el) =>
@@ -1347,7 +1418,7 @@ describe("a proactive reply whose turn's trace is on its way", () => {
             process_visibility: 'hidden',
           }),
         },
-        traceAwaited: { [JID]: 'm1' },
+        traceAwaited: { [SESSION_JID]: 'm1' },
       });
       await mount(reply({ source_kind: 'sdk_send_message', has_trace: false }));
       const rows = [...container.querySelectorAll('button')].filter((el) =>

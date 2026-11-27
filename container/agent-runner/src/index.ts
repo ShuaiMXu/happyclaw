@@ -72,7 +72,10 @@ import {
   parseTranscript,
   transcriptSinceLastCompaction,
 } from './session-history.js';
-import { StreamEventProcessor } from './stream-processor.js';
+import {
+  isHookToolProgress,
+  StreamEventProcessor,
+} from './stream-processor.js';
 import {
   ActiveTurnStopper,
   consumeInterruptSentinel,
@@ -129,12 +132,25 @@ import {
   type ClaudeRuntimeEnv,
 } from './claude-runtime-env.js';
 import { pinBoundProviderSettings } from './provider-env-pin.js';
+import { webFetchPreflightSettings } from './web-fetch-preflight.js';
+import { defaultToolSearchEnv, pinToolSearch } from './tool-search.js';
+import { pinMaxOutputTokens } from './max-output-pin.js';
+import {
+  pinSubagentConcurrency,
+  sdkSubagentDefinitions,
+  subagentConcurrencyEnv,
+} from './subagent-launch.js';
+import {
+  assistantMessageText,
+  isContextOverflowText,
+  providerErrorText,
+} from './provider-error-text.js';
 import {
   resolveClaudeProviderRuntime,
   resolveClaudeQueryModelRuntime,
   resolveProviderReportedModelTier,
 } from './provider-runtime.js';
-import { resolveRunSdkEffort } from './agent-effort.js';
+import { resolveRunSdkEffort, resolveRunSdkThinking } from './agent-effort.js';
 import {
   resolveAssistantErrorAttemptBoundary,
   decideProviderLimitAction,
@@ -165,13 +181,18 @@ import {
 import {
   AssistantUsageCollector,
   type AssistantUsageBatch,
+  type UsageFlushBoundary,
 } from './assistant-usage.js';
 import { createTranscriptUsageLoader } from './transcript-usage.js';
 import {
   buildHappyClawPromptPlan,
   hasBackgroundTaskTools,
+  SESSION_PROMPTS,
+  type BackgroundTasksPromptId,
   type PromptPlan,
+  type RolePromptId,
 } from './prompt-plan.js';
+import { sessionKind } from './session-kind.js';
 import {
   buildHappyClawSystemPrompt,
   withHappyClawSubagentContract,
@@ -184,7 +205,7 @@ import {
 import { assessContextBudget } from './context-budget.js';
 import {
   findClaudeMdExcludeLeaks,
-  resolveManagedHostClaudeMdExcludes,
+  resolveHostClaudeMdExcludes,
 } from './claude-memory-policy.js';
 import {
   escapeAttribute,
@@ -193,6 +214,8 @@ import {
 } from './agent-turn-contract.js';
 import { prepareMessageStreamText } from './message-stream-text.js';
 import {
+  BackgroundHoldKeepalive,
+  backgroundHoldKeepaliveIntervalMs,
   BackgroundProtocolDebtWatchdog,
   DurableInputTurnCompletion,
   isMergedBackgroundCompletionPlaceholder,
@@ -210,6 +233,11 @@ import {
   MAX_SILENT_STOP_CONTINUES,
 } from './silent-stop.js';
 import { ToolLoopDetector } from './tool-loop-detector.js';
+import {
+  type CliSecretFiles,
+  sweepOrphanCliSecretDirs,
+  writeCliSecretFiles,
+} from './cli-secret-files.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -344,8 +372,12 @@ const INTERACTION_GUIDELINES = loadPrompt('interaction.md');
 const ASSISTANT_OUTPUT_GUIDELINES = loadPrompt('output.assistant.md');
 const PROACTIVE_OUTPUT_GUIDELINES = loadPrompt('output.proactive.md');
 const WEB_FETCH_GUIDELINES = loadPrompt('web-fetch.md');
-const BACKGROUND_TASK_GUIDELINES = loadPrompt('background-tasks.md');
-const TEAM_BACKGROUND_TASK_GUIDELINES = loadPrompt('background-tasks.team.md');
+const BACKGROUND_TASK_GUIDELINES: Record<BackgroundTasksPromptId, string> = {
+  'background-tasks': loadPrompt('background-tasks.md'),
+  'background-tasks.team': loadPrompt('background-tasks.team.md'),
+  'background-tasks.multi': loadPrompt('background-tasks.multi.md'),
+  'background-tasks.delegated': loadPrompt('background-tasks.delegated.md'),
+};
 const ASSISTANT_DELIVERY_CONTRACT = loadPrompt(
   'delivery-contract.assistant.md',
 );
@@ -358,10 +390,11 @@ const HAPPYCLAW_PLATFORM_IDENTITY = loadPrompt('identity.happyclaw.md');
 const HAPPYCLAW_PLATFORM_BOOTSTRAP = loadPrompt('bootstrap.happyclaw.md');
 const RUNTIME_ADAPTATION = loadPrompt('runtime-adaptation.md');
 const RUNTIME_BASELINE = loadPrompt('runtime-baseline.md');
-const TEAM_PROMPTS = {
-  router: { id: 'team-router', text: loadPrompt('team-router.md') },
-  worker: { id: 'team-worker', text: loadPrompt('team-worker.md') },
-} as const;
+const ROLE_PROMPTS: Record<RolePromptId, string> = {
+  'team-router': loadPrompt('team-router.md'),
+  'team-worker': loadPrompt('team-worker.md'),
+  'delegated-worker': loadPrompt('delegated-worker.md'),
+};
 
 // 各渠道共用的格式说明：Web 端始终可看完整渲染，不因来源降级输出。
 // Mermaid 渲染说明已在模式专属 output prompt 中讲过，此处不重复，
@@ -548,9 +581,9 @@ function enrichContextAudit(
     audit.claudeMdExcludes ?? [],
   );
   if (excludedMemoryLeaks.length > 0) {
-    audit.warnings.push(
-      `managed context isolation failed; SDK loaded excluded memory: ${excludedMemoryLeaks.join(', ')}`,
-    );
+    const warning = `context isolation failed; SDK loaded excluded memory: ${excludedMemoryLeaks.join(', ')}`;
+    audit.warnings.push(warning);
+    logWarn(warning);
   }
   const claudeMemory = memoryFiles.find(
     (file) =>
@@ -931,6 +964,9 @@ const SDK_COMPACTION_RESPONSE_TIMEOUT_MS = 10 * 60_000;
 const SDK_PROVIDER_FAILURE_EXIT_GRACE_MS = 250;
 const BACKGROUND_PROTOCOL_DEBT_TIMEOUT_MS = 15_000;
 const BACKGROUND_PROTOCOL_FAILURE_EXIT_GRACE_MS = 1_000;
+// See BackgroundHoldKeepalive. The host's stuck recovery defers a held result
+// for the same bound (BACKGROUND_HOLD_MAX_MS in src/stuck-runner-recovery.ts).
+const BACKGROUND_HOLD_KEEPALIVE_MAX_MS = 2 * 60 * 60_000;
 
 function writeOutput(output: ContainerOutput): void {
   let correlatedOutput: ContainerOutput = activeOutputInputTurnId
@@ -992,41 +1028,32 @@ function generateTurnId(): string {
   return `ipc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/**
- * Normalize isMain/isHome/isAdminHome flags for backward compatibility.
- * If the host sends the old `isMain` field, treat it as isHome=true + isAdminHome=true.
- */
+/** Home capabilities belong to every session of the Home workspace. */
 function normalizeHomeFlags(input: ContainerInput): {
   isHome: boolean;
   isAdminHome: boolean;
 } {
-  if (input.isHome !== undefined) {
-    return { isHome: !!input.isHome, isAdminHome: !!input.isAdminHome };
-  }
-  // Legacy: isMain was the only flag
-  const legacy = !!input.isMain;
-  return { isHome: legacy, isAdminHome: legacy };
+  return { isHome: !!input.isHome, isAdminHome: !!input.isAdminHome };
 }
 
-function resolveAgentBuilderEnabled(
-  input: ContainerInput,
-  isHome: boolean,
-): boolean {
-  return input.agentBuilderEnabled ?? (isHome && !input.agentId);
+/** Agent Builder is a host decision for each session; absent means off. */
+function resolveAgentBuilderEnabled(input: ContainerInput): boolean {
+  return input.agentBuilderEnabled === true;
 }
 
 /**
- * 检测是否为上下文溢出错误
+ * A result that reports a failure rather than answering: the SDK flags it,
+ * or Claude Code wrote its own error text (`API Error: …`, `Prompt is too
+ * long …`). A normal answer may quote an upstream's overflow wording.
  */
-function isContextOverflowError(msg: string): boolean {
-  const patterns: RegExp[] = [
-    /prompt is too long/i,
-    /maximum context length/i,
-    /context.*too large/i,
-    /exceeds.*token limit/i,
-    /context window.*exceeded/i,
-  ];
-  return patterns.some((pattern) => pattern.test(msg));
+function isErrorShapedResult(
+  resultMsg: Record<string, unknown>,
+  textResult: string,
+): boolean {
+  return (
+    resultMsg.is_error === true ||
+    /^\s*(?:API Error\b|Prompt is too long\b)/i.test(textResult)
+  );
 }
 
 /**
@@ -1266,7 +1293,7 @@ const TRANSCRIPT_UUID_RE =
  * 消息重放给 for-await 消费者，且消息上没有 isReplay 标记（实测 string-prompt
  * 模式下干净会话 resume 会重放上一轮 assistant + result；streaming 模式下
  * 带孤儿后台任务的会话 resume 会合成 init/result 对）。收集旧 transcript
- *（主会话 + subagents，含嵌套子目录）里已有消息的 uuid，for-await 中命中即
+ *（主 Agent 与 subagents 的 transcript，含嵌套子目录）里已有消息的 uuid，for-await 中命中即
  * 跳过——否则重放的旧 assistant 文本会混进 assistantTextTracker 造成回复
  * 重复历史内容。
  * 注意：result 不写入 transcript（CLI 重放时现场合成、uuid 全新），无法用
@@ -2080,6 +2107,8 @@ async function runQueryAttempt(
     failureNotice?: string;
     rateLimitScope?: 'account' | 'model';
     livenessTimeout?: boolean;
+    /** What the upstream itself said, when the SDK passed it on. */
+    errorText?: string | null;
   }): void => {
     const {
       error,
@@ -2088,9 +2117,11 @@ async function runQueryAttempt(
       failureNotice,
       rateLimitScope = 'account',
       livenessTimeout = false,
+      errorText,
     } = options;
     if (providerFailurePublished) return;
     providerFailurePublished = true;
+    const upstreamText = providerErrorText(errorText);
     // Produce the exact receipt candidates for a terminal host projection.
     // The host ACKs them only when no healthy provider remains; otherwise its
     // durable IPC recovery rewinds the input for failover replay.
@@ -2106,6 +2137,7 @@ async function runQueryAttempt(
         ? { providerRateLimitResetsAt: rateLimitResetsAt }
         : {}),
       ...(failureNotice ? { providerFailureNotice: failureNotice } : {}),
+      ...(upstreamText ? { providerErrorText: upstreamText } : {}),
       providerRateLimitScope: rateLimitScope,
       providerRateLimitModel: resolveProviderReportedModelTier(
         CLAUDE_PROVIDER_RUNTIME,
@@ -2249,7 +2281,10 @@ async function runQueryAttempt(
       ? readUsageBaseline(resolveTranscriptDir(), sessionId, logWarn)
       : null,
   });
-  const assistantUsageCollector = new AssistantUsageCollector();
+  const usageOptions = {
+    codex: containerInput.usageAccountingMode === 'codex',
+  };
+  const assistantUsageCollector = new AssistantUsageCollector(usageOptions);
   // Live assistant snapshots carry message_start's placeholder output count;
   // the main and sidechain transcripts carry the CLI-merged final usage. The
   // loader reads only appended bytes, so every flushed message consults it.
@@ -2257,26 +2292,44 @@ async function runQueryAttempt(
     const activeSessionId = newSessionId || sessionId;
     if (!activeSessionId) return undefined;
     return path.join(resolveTranscriptDir(), `${activeSessionId}.jsonl`);
-  });
+  }, usageOptions);
   const emitResultUsage = (
     resultMessage: Record<string, unknown>,
     fallbackEventId: string,
+    boundary: UsageFlushBoundary = resultMessage.type === 'result'
+      ? 'result'
+      : 'interrupt',
   ): void => {
     const activeSessionId = newSessionId || sessionId;
+    // The settled usage replaces the live totals; later calls answer the
+    // next input.
+    assistantUsageCollector.resetUsageProgress();
     const assistantBatches: AssistantUsageBatch[] = [];
-    for (;;) {
-      const batch = assistantUsageCollector.drain(
-        activeSessionId,
-        transcriptUsageLoader,
-      );
-      if (!batch) break;
+    const recordBatch = (batch: AssistantUsageBatch) => {
       assistantBatches.push(batch);
       usageReconciler.recordAccounted(batch.tokens.modelUsage, {
         final: batch.final,
         completed: batch.completed,
       });
-    }
+    };
     const isResult = resultMessage.type === 'result';
+    const codexCumulative =
+      usageOptions.codex &&
+      isResult &&
+      Object.keys(resultMessage.modelUsage ?? {}).length > 0;
+    const lateChildren = codexCumulative
+      ? assistantUsageCollector.childrenWithResiduals()
+      : undefined;
+    for (;;) {
+      const batch = assistantUsageCollector.drain(
+        activeSessionId,
+        transcriptUsageLoader,
+        boundary,
+        lateChildren,
+      );
+      if (!batch) break;
+      recordBatch(batch);
+    }
     const reconciled = isResult
       ? usageReconciler.applyResult({
           usage: resultMessage.usage as SdkResultUsage | undefined,
@@ -2287,6 +2340,21 @@ async function runQueryAttempt(
           fallbackModelKey: queryModelRuntime.usageModelKey,
         })
       : { costUSD: 0 };
+    if (codexCumulative) {
+      // A late child may already be in an earlier result. Use this result's
+      // unassigned growth first, then its earlier possible coverage. Only
+      // uncovered tokens enter the reconciler's pending usage for later results.
+      const remaining = reconciled.residual && { ...reconciled.residual };
+      if (lateChildren) {
+        for (const batch of assistantUsageCollector.settleCumulativeChildren(
+          lateChildren,
+          transcriptUsageLoader,
+          remaining,
+        ))
+          recordBatch(batch);
+      }
+      if (remaining) assistantUsageCollector.recordChildResidual(remaining);
+    }
     if (
       activeSessionId &&
       (isResult || assistantBatches.length > 0) &&
@@ -2337,6 +2405,8 @@ async function runQueryAttempt(
         ...reconciled.residual,
       });
     }
+    const lastEvent = events.at(-1);
+    if (lastEvent) assistantUsageCollector.foldCarriedGeneration(lastEvent);
     events.forEach((event, index) => {
       // Result cost/duration/turn count describe the whole SDK result, so
       // attach them only to the final event instead of multiplying them.
@@ -2685,6 +2755,16 @@ async function runQueryAttempt(
     }
   };
 
+  const backgroundHoldKeepalive = new BackgroundHoldKeepalive({
+    intervalMs: backgroundHoldKeepaliveIntervalMs(
+      containerInput.hostIdleCloseMs,
+    ),
+    maxMs: BACKGROUND_HOLD_KEEPALIVE_MAX_MS,
+    pendingCount: () => processor.getBlockingPendingSdkTaskCount(),
+    onTick: () =>
+      emit({ status: 'stream', result: null, backgroundHoldKeepalive: true }),
+  });
+
   const armBackgroundProtocolDebtWatchdog = (
     blockingDebtCount: number,
   ): void => {
@@ -2728,11 +2808,7 @@ async function runQueryAttempt(
     }, backgroundProtocolDebtWatchdog.remainingMs(BACKGROUND_PROTOCOL_DEBT_TIMEOUT_MS));
   };
 
-  const { isHome } = normalizeHomeFlags(containerInput);
-  const agentBuilderEnabled = resolveAgentBuilderEnabled(
-    containerInput,
-    isHome,
-  );
+  const agentBuilderEnabled = resolveAgentBuilderEnabled(containerInput);
   const memoryPromptName = 'memory-system.workspace' as const;
   const hasMemoryTools = allowedTools.some(
     (tool) =>
@@ -2786,6 +2862,9 @@ async function runQueryAttempt(
       inputTurnCompleted,
       ipcDeliveryTracker.hasPendingTurns,
     );
+    // The host books the hold from this same result.
+    if (candidate.pendingBgTasks > 0) backgroundHoldKeepalive.hold();
+    else backgroundHoldKeepalive.release();
     emit({
       status: 'success',
       // Proactive SDK text is control-plane only; user-visible speech must
@@ -2870,8 +2949,9 @@ async function runQueryAttempt(
   const includeClaudePreset =
     !proactiveInteractiveContract &&
     (containerInput.agentProfile?.includeClaudePreset ?? true);
-  const teamPrompt = containerInput.teamRole
-    ? TEAM_PROMPTS[containerInput.teamRole.role]
+  const sessionPrompts = SESSION_PROMPTS[sessionKind(containerInput)];
+  const teamPrompt = sessionPrompts.role
+    ? { id: sessionPrompts.role, text: ROLE_PROMPTS[sessionPrompts.role] }
     : undefined;
   const promptPlan = buildHappyClawPromptPlan({
     engine: includeClaudePreset
@@ -2915,9 +2995,8 @@ async function runQueryAttempt(
     ...(hasWebTools ? { web: WEB_FETCH_GUIDELINES } : {}),
     ...(backgroundTaskToolsAvailable
       ? {
-          backgroundTasks: teamPrompt
-            ? TEAM_BACKGROUND_TASK_GUIDELINES
-            : BACKGROUND_TASK_GUIDELINES,
+          backgroundTasks:
+            BACKGROUND_TASK_GUIDELINES[sessionPrompts.backgroundTasks],
         }
       : {}),
     ...(teamPrompt
@@ -2977,20 +3056,42 @@ async function runQueryAttempt(
   // Auto-compaction is configured through Claude Code's own environment
   // variables: they outrank the `autoCompactWindow` setting and apply to the
   // window Claude Code resolved for the model, 1M-native models included.
-  const claudeRuntimeEnv: ClaudeRuntimeEnv = buildClaudeRuntimeEnv(process.env);
+  const claudeRuntimeEnv: ClaudeRuntimeEnv = {
+    ...buildClaudeRuntimeEnv(process.env),
+    ...defaultToolSearchEnv(
+      process.env,
+      CLAUDE_PROVIDER_RUNTIME.endpointKind,
+      containerInput.toolSearch,
+    ),
+    ...subagentConcurrencyEnv(containerInput.subagents),
+  };
   // The bound connection outranks every settings file the CLI reads (the
   // admin's, the workspace's project and local ones), in host and container
   // mode alike.
-  const flagSettings: Record<string, unknown> = pinBoundProviderSettings({
-    ...process.env,
-    ...claudeRuntimeEnv,
-  });
-  const claudeMdExcludes = resolveManagedHostClaudeMdExcludes({
+  const flagSettings: Record<string, unknown> = {
+    ...pinSubagentConcurrency(
+      pinMaxOutputTokens(
+        pinToolSearch(
+          pinBoundProviderSettings({
+            ...process.env,
+            ...claudeRuntimeEnv,
+          }),
+          containerInput.toolSearch,
+        ),
+        containerInput.maxOutputTokens,
+      ),
+      containerInput.subagents,
+    ),
+    ...webFetchPreflightSettings(containerInput.webFetchPreflightPolicy),
+  };
+  const subagentDefinitions = sdkSubagentDefinitions(containerInput);
+  const claudeMdExcludes = resolveHostClaudeMdExcludes({
     executionMode: contextAuditBase.executionMode,
     runtimePolicy: containerInput.agentProfile?.runtimePolicy,
     externalClaudeDir: contextAuditBase.externalClaudeDir,
     homeDir: process.env.HOME,
     projectRoot: contextAuditBase.projectRoot,
+    cwd: WORKSPACE_GROUP,
   });
   if (claudeMdExcludes.length > 0) {
     flagSettings.claudeMdExcludes = claudeMdExcludes;
@@ -3069,16 +3170,33 @@ async function runQueryAttempt(
   const userMcpServers = activeAgentMcpPolicy.includeUserMcpServers
     ? loadUserMcpServers()
     : {};
+  // HappyClaw's own server wins a name clash, as it did when both shared one
+  // mcpServers object.
+  const { happyclaw: _shadowed, ...externalMcpServers } = userMcpServers;
+  // Flag settings carry the connection token and user MCP servers their
+  // credentials: they go to the CLI as 0600 files, not argv (see
+  // cli-secret-files.ts). Written inside the try so a failed write still
+  // closes the IPC watcher; removed in the finally below.
+  let cliSecretFiles: CliSecretFiles | undefined;
 
   try {
+    cliSecretFiles = writeCliSecretFiles(flagSettings, externalMcpServers);
     const agentEffort = resolveRunSdkEffort(containerInput);
     log(
       agentEffort
         ? `Run effort: ${agentEffort}`
         : containerInput.launchEffort === null
-          ? 'Run effort: none (the model takes no effort)'
+          ? 'Run effort: none passed (nothing picked for a model whose efforts are unknown, or the model takes none)'
           : 'Run effort: inherit Provider/SDK default',
     );
+    const runThinking = resolveRunSdkThinking(containerInput);
+    if (runThinking.type === 'disabled') {
+      log('Run thinking: off (the model does not reason)');
+    }
+    if (containerInput.toolSearch) log('Run tool search: on');
+    if (containerInput.maxOutputTokens) {
+      log(`Run reply limit: ${containerInput.maxOutputTokens} (pinned)`);
+    }
     if (Object.keys(claudeRuntimeEnv).length > 0) {
       log(
         `Claude runtime env: ${Object.entries(claudeRuntimeEnv)
@@ -3100,8 +3218,9 @@ async function runQueryAttempt(
       systemPrompt,
       allowedTools,
       disallowedTools: effectiveDisallowedTools,
-      thinking: { type: 'adaptive' as const, display: 'summarized' as const },
+      thinking: runThinking,
       ...(agentEffort ? { effort: agentEffort } : {}),
+      ...(subagentDefinitions ? { agents: subagentDefinitions } : {}),
       permissionMode: 'bypassPermissions' as const,
       allowDangerouslySkipPermissions: true,
       // Registers AskUserQuestion, which the CLI omits without a handler.
@@ -3120,15 +3239,15 @@ async function runQueryAttempt(
       // stream events: the card's sub-agent transcript advances block by block
       // instead of only filling in when the subagent completes.
       forwardSubagentText: true,
-      settings: flagSettings as any,
+      settings: cliSecretFiles.settingsPath,
+      ...(cliSecretFiles.mcpConfigPath
+        ? { extraArgs: { 'mcp-config': cliSecretFiles.mcpConfigPath } }
+        : {}),
       ...(userPlugins && { plugins: userPlugins }),
       ...(activeAgentMcpPolicy.strictMcpConfig
         ? { strictMcpConfig: true }
         : {}),
-      mcpServers: {
-        ...userMcpServers,
-        happyclaw: mcpServerConfig,
-      },
+      mcpServers: { happyclaw: mcpServerConfig },
       hooks: {
         PreToolUse: [
           {
@@ -3508,6 +3627,16 @@ async function runQueryAttempt(
         assistantUsageCollector.observeStreamEvent(
           message as unknown as Record<string, unknown>,
         );
+        // A call just finished: the live totals for the run status bar.
+        // Display only; the ledger settles at the result.
+        const usageProgress = assistantUsageCollector.takeUsageProgress();
+        if (usageProgress && !suppressOutputAfterInterrupt) {
+          emit({
+            status: 'stream',
+            result: null,
+            streamEvent: { eventType: 'usage_progress', usageProgress },
+          });
+        }
         if (!suppressOutputAfterInterrupt) {
           visibleOutputStarted = true;
         }
@@ -3535,6 +3664,7 @@ async function runQueryAttempt(
       }
 
       if (message.type === 'tool_progress') {
+        if (isHookToolProgress(message)) continue;
         if (!suppressOutputAfterInterrupt) {
           visibleOutputStarted = true;
         }
@@ -3783,6 +3913,7 @@ async function runQueryAttempt(
         const assistantErrorClass = resolveAssistantErrorAttemptBoundary({
           error: assistantError,
           parentToolUseId: msgParentToolUseId,
+          errorText: assistantMessageText(message),
         });
         if (assistantErrorClass) {
           log(
@@ -3795,6 +3926,7 @@ async function runQueryAttempt(
           publishProviderFailure({
             error: assistantError,
             failureClass: assistantErrorClass,
+            errorText: assistantMessageText(message),
           });
           processor.discardPendingTextOutput();
           processor.cleanup();
@@ -3939,6 +4071,7 @@ async function runQueryAttempt(
           publishProviderFailure({
             error: 'rate_limit',
             failureClass: 'account',
+            errorText: textResult,
           });
           emitResultUsage(resultMsg, containerInput.turnId || generateTurnId());
           processor.discardPendingTextOutput();
@@ -4063,7 +4196,11 @@ async function runQueryAttempt(
         }
 
         // SDK 将某些 API 错误包装为 subtype=success 的 result（不抛异常）
-        if (textResult && isContextOverflowError(textResult)) {
+        if (
+          textResult &&
+          isErrorShapedResult(resultMsg, textResult) &&
+          isContextOverflowText(textResult)
+        ) {
           log(
             `Context overflow detected in result: ${textResult.slice(0, 100)}`,
           );
@@ -4414,7 +4551,7 @@ async function runQueryAttempt(
     }
 
     // 检测上下文溢出错误
-    if (isContextOverflowError(errorMessage)) {
+    if (isContextOverflowText(errorMessage)) {
       log(`Context overflow detected: ${errorMessage}`);
       // ── 发射已累积的部分回复，避免用户已看到的流式内容丢失 ──
       const partialText = processor.getFullText();
@@ -4535,6 +4672,7 @@ async function runQueryAttempt(
     if (cacheLine) logInfo(cacheLine);
     firstResponseWatchdog?.clear();
     clearBackgroundProtocolDebtWatchdog();
+    backgroundHoldKeepalive.release();
     backgroundResultGate.dispose();
     pendingBackgroundResult = undefined;
     // IPC watcher 清理：覆盖 try 块内的正常出口、catch 抛出，以及 try 内所有 early-return
@@ -4543,6 +4681,15 @@ async function runQueryAttempt(
     // 定时器，以及旧 watcher 抢先 drain 本应进入新 query 的 IPC 消息。
     ipcPolling = false;
     ipcQueryWatcher.close();
+    // A child's final stream event or sidechain may follow the last result.
+    if (usageOptions.codex) {
+      try {
+        emitResultUsage({}, '', 'query-end');
+      } catch (err) {
+        logWarn(`Failed to flush final Codex child usage: ${String(err)}`);
+      }
+    }
+    cliSecretFiles?.dispose();
   }
 }
 
@@ -4648,6 +4795,13 @@ function forceExitWithSafetyNet(code: number): never {
 }
 
 async function main(): Promise<void> {
+  // SIGKILL gives a Runner no chance to remove its CLI secret files.
+  const sweptCliSecretDirs = sweepOrphanCliSecretDirs();
+  if (sweptCliSecretDirs > 0) {
+    log(
+      `Removed ${sweptCliSecretDirs} CLI secret file director(ies) left by killed Runners`,
+    );
+  }
   let containerInput: ContainerInput;
 
   try {
@@ -4704,10 +4858,7 @@ async function main(): Promise<void> {
   let sessionId = containerInput.sessionId;
   latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
-  const agentBuilderEnabled = resolveAgentBuilderEnabled(
-    containerInput,
-    isHome,
-  );
+  const agentBuilderEnabled = resolveAgentBuilderEnabled(containerInput);
 
   // Create in-process SDK MCP server (replaces the stdio subprocess)
   // NOTE: chatJid and currentInputTurnId are mutated in-place by the main loop
@@ -4738,6 +4889,7 @@ async function main(): Promise<void> {
     ownerProfileEnabled: containerInput.happyClawOwnerProfileEnabled === true,
     interactionMode: containerInput.interactionMode ?? 'assistant',
     teamRole: containerInput.teamRole,
+    workMode: containerInput.workMode,
     currentInputTurnId: containerInput.turnId,
     workspaceMemoryMutationAuth:
       containerInput.workspaceMemoryMutationSigningSecret &&
@@ -4846,7 +4998,9 @@ async function main(): Promise<void> {
   // Query loop: run query -> wait for IPC message -> run new query -> repeat
   let resumeAt: string | undefined;
   let overflowRetryCount = 0;
-  const MAX_OVERFLOW_RETRIES = 3;
+  // Claude Code has compacted and asked again before an overflow gets here,
+  // so one more attempt only covers a passing failure of that compaction.
+  const MAX_OVERFLOW_RETRIES = 2;
   let consecutiveCompactions = 0;
   const MAX_CONSECUTIVE_COMPACTIONS = 3;
   // 暂存的会话历史上下文：当 auto-continue 阶段发生 sessionResumeFailed 时，
@@ -4972,7 +5126,7 @@ async function main(): Promise<void> {
         );
 
         if (overflowRetryCount >= MAX_OVERFLOW_RETRIES) {
-          const errorMsg = `上下文溢出错误：已重试 ${MAX_OVERFLOW_RETRIES} 次仍失败。请联系管理员检查 CLAUDE.md 大小或减少会话历史。`;
+          const errorMsg = `the context still overflows after ${MAX_OVERFLOW_RETRIES} attempts`;
           log(errorMsg);
           writeOutput({
             status: 'error',
@@ -4983,10 +5137,9 @@ async function main(): Promise<void> {
           process.exit(1);
         }
 
-        // 未超过重试次数，等待后继续下一轮循环（会触发自动压缩）
-        log(
-          'Retrying query after context overflow (will trigger auto-compaction)...',
-        );
+        // Claude Code compacts on an overflow by itself and asks again; one
+        // that still reaches here may pass on a later attempt.
+        log('Retrying query after context overflow...');
         await new Promise((r) => setTimeout(r, 3000));
         continue;
       }

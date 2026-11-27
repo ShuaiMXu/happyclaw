@@ -1,4 +1,5 @@
 import type { ResolvedModelCapabilities } from './lib/model-providers';
+import type { WorkMode } from './work-items';
 
 export type InteractionMode = 'assistant' | 'proactive';
 /**
@@ -15,7 +16,9 @@ export interface GroupInfo {
   added_at: string;
   interaction_mode: InteractionMode;
   process_visibility?: ProcessVisibility;
-  kind?: 'home' | 'main' | 'feishu' | 'web';
+  /** Web workspaces: single-task (default) or multi-task (多任务). */
+  work_mode?: WorkMode;
+  kind?: 'home' | 'feishu' | 'web';
   is_home?: boolean;
   is_my_home?: boolean;
   can_modify?: boolean;
@@ -23,7 +26,7 @@ export interface GroupInfo {
   read_only?: boolean;
   editable?: boolean;
   deletable?: boolean;
-  lastMessage?: string;
+  /** Latest activity of any of the workspace's sessions. */
   lastMessageTime?: string;
   execution_mode?: 'container' | 'host';
   custom_cwd?: string;
@@ -46,13 +49,22 @@ export interface GroupInfo {
   agent_profile_avatar_url?: string | null;
 }
 
-export interface AdditionalMountInput {
-  host_path: string;
-  /** Relative suffix mounted below /workspace/extra/. */
-  container_path: string;
-  /** Host directory mounts are read-only in the current product contract. */
-  readonly: true;
-}
+export type AdditionalMountInput =
+  | {
+      host_path: string;
+      /** Relative suffix mounted below /workspace/extra/. */
+      container_path: string;
+      /** Host directory mounts are read-only in the current product contract. */
+      readonly: true;
+    }
+  | {
+      /** A storage source id from the mount allowlist. */
+      source: string;
+      /** Directory inside the export or share; omitted mounts its root. */
+      sub_path?: string;
+      container_path: string;
+      readonly: boolean;
+    };
 
 export interface CreateWorkspaceOptions {
   execution_mode?: 'container' | 'host';
@@ -61,6 +73,7 @@ export interface CreateWorkspaceOptions {
   init_git_url?: string;
   agent_profile_id?: string;
   interaction_mode?: InteractionMode;
+  work_mode?: WorkMode;
   additional_mounts?: AdditionalMountInput[];
 }
 
@@ -99,13 +112,21 @@ export interface AgentProfile {
 /**
  * One model of a connection as the chat picker and the Agent forms get it:
  * its resolved capabilities (efforts low to high, empty when none; window
- * null when unknown) and where the efforts come from.
+ * null when unknown), where the efforts come from, and what its vendor says
+ * about it (absent on older servers). `effortsSource: 'none'` is a model
+ * nothing is known about, which may run at any effort.
  */
 export type ConnectionModel = { id: string } & Pick<
   ResolvedModelCapabilities,
   'efforts' | 'defaultEffort' | 'contextWindow'
 > &
-  Partial<Pick<ResolvedModelCapabilities, 'effortsSource'>>;
+  Partial<Pick<ResolvedModelCapabilities, 'effortsSource'>> & {
+    /** The vendor's name for the model, when its list gives one. */
+    displayName?: string | null;
+    maxOutputTokens?: number | null;
+    vendor?: string | null;
+    upstreamMissingSince?: string | null;
+  };
 
 export interface ModelConfigOption {
   id: string;
@@ -117,6 +138,8 @@ export interface ModelConfigOption {
   usable?: boolean;
   /** Every model an Agent may pin within this connection, its own included. */
   models: ConnectionModel[];
+  /** A ChatGPT subscription: no separate sub-agent model. */
+  chatgpt?: boolean;
 }
 
 /** A binding an Agent can follow: who supplies the connection and model. */
@@ -176,6 +199,27 @@ export interface AgentProfileRuntimePolicy {
     mode: 'inherit' | 'custom' | 'disabled';
     ids: string[];
   };
+  /** Absent when the Agent sets nothing about sub-agents. */
+  subagents?: AgentSubagentPolicy | null;
+}
+
+export type SubagentEffortLevel = Exclude<AgentEffortLevel, 'inherit'>;
+
+/** A user-defined sub-agent; its model is one of the Agent's connection. */
+export interface AgentSubagentDefinition {
+  name: string;
+  description: string;
+  prompt: string;
+  /** null inherits every tool. */
+  tools: string[] | null;
+  model: string | null;
+  effort: SubagentEffortLevel | null;
+}
+
+export interface AgentSubagentPolicy {
+  model: string | null;
+  max_concurrent: number | null;
+  definitions: AgentSubagentDefinition[];
 }
 
 export interface AgentProfileRuntimePolicyPatch {
@@ -187,6 +231,8 @@ export interface AgentProfileRuntimePolicyPatch {
     host?: Partial<NonNullable<AgentProfileRuntimePolicy['skills']['host']>>;
   };
   mcp?: Partial<AgentProfileRuntimePolicy['mcp']>;
+  /** Saved as one unit; null clears it. */
+  subagents?: AgentSubagentPolicy | null;
 }
 
 export type AgentContextSource = NonNullable<
@@ -323,6 +369,20 @@ export interface AgentCapabilityPreview {
     entries: EffectiveCapabilityEntry[];
     conflicts: string[];
   };
+  /** The Agent's sub-agents as a run gets them; null without settings. */
+  subagents?: {
+    maxConcurrent: number | null;
+    /** null when Claude Code or the Workspace's environment decides. */
+    defaultModel: string | null;
+    /** null without a connection. */
+    defaultModelSource: 'agent' | 'connection' | 'turn' | 'claude_code' | null;
+    definitions: Array<{
+      name: string;
+      tools: string[] | null;
+      model: string | null;
+      effort: SubagentEffortLevel | null;
+    }>;
+  } | null;
   notes: string[];
 }
 
@@ -422,6 +482,8 @@ export interface AgentInfo {
     /** Team mode: the session that routes a group, and a work item's worker. */
     | 'team_router'
     | 'work_item'
+    /** A workspace's conversation from before sessions were all alike. */
+    | 'legacy_main'
     | null;
   /** Sessions an automation opened (fresh / persistent runs). */
   automation_id?: string | null;
@@ -437,6 +499,10 @@ export interface AgentInfo {
     | null;
   title_generating?: boolean;
   last_active_at?: string | null;
+  /** When the current user pinned it; null when not pinned. */
+  pinned_at?: string | null;
+  /** A /spawn agent: the session runtime JID that started it. */
+  spawned_from_jid?: string | null;
   latest_message?: { content: string; timestamp: string } | null;
   /** The session's own git worktree (Host workspaces only), if it has one. */
   worktree?: SessionWorktreeInfo | null;
@@ -516,6 +582,5 @@ export interface WorkspaceDeleteImpact {
   has_channel_bindings: boolean;
   channel_binding_count: number;
   bound_sessions: WorkspaceDeleteBindingSession[];
-  bound_main_im_groups: WorkspaceDeleteBindingGroup[];
   bound_thread_contexts: WorkspaceDeleteThreadContext[];
 }

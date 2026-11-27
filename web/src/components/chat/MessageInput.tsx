@@ -112,8 +112,7 @@ interface MessageInputProps {
   groupJid?: string;
   /**
    * Conversation the draft and pending attachments belong to: the session
-   * chat jid (`${groupJid}#agent:${id}`), or the workspace jid for the main
-   * conversation. Defaults to `groupJid`.
+   * chat jid (`${groupJid}#agent:${id}`). Defaults to `groupJid`.
    */
   draftKey?: string;
   disabled?: boolean;
@@ -166,7 +165,7 @@ const FOCUS_HANDOFF_MS = 1000;
 const SOFT_KEYBOARD_MIN_PX = 150;
 // The phone dock sits 8px above the safe area, or above the keyboard.
 const DOCK_LIFT =
-  'max(calc(env(safe-area-inset-bottom, 0px) + 8px), calc(var(--keyboard-height, 0px) + 8px))';
+  'max(calc(var(--safe-bottom, 0px) + 8px), calc(var(--keyboard-height, 0px) + 8px))';
 // Its feathered top edge (pt-6), over which the conversation fades out.
 const DOCK_FEATHER_PX = 24;
 // The docking slide covers half the window; a little longer than a fade.
@@ -882,6 +881,9 @@ export const MessageInput = memo(function MessageInput({
     );
     if (!column || !host || !phoneDock || layout === 'centered') return;
     host.style.setProperty('--composer-dock-lift', DOCK_LIFT);
+    // The list's bottom room already clears the dock; its own end room
+    // would only add a blank band above it.
+    host.style.setProperty('--list-end-room', '0px');
     let published = '';
     const update = () => {
       const height = `${column.offsetHeight + DOCK_FEATHER_PX}px`;
@@ -896,6 +898,7 @@ export const MessageInput = memo(function MessageInput({
       observer.disconnect();
       host.style.removeProperty('--composer-dock-height');
       host.style.removeProperty('--composer-dock-lift');
+      host.style.removeProperty('--list-end-room');
     };
   }, [phoneDock, layout]);
   const committedLayoutRef = useRef(layout);
@@ -1019,7 +1022,7 @@ export const MessageInput = memo(function MessageInput({
           : {
               paddingBottom: dock
                 ? DOCK_LIFT
-                : `max(0.75rem, env(safe-area-inset-bottom, 0px), var(--keyboard-height, 0px))`,
+                : `max(0.75rem, var(--safe-bottom, 0px), var(--keyboard-height, 0px))`,
             }
       }
     >
@@ -1031,11 +1034,16 @@ export const MessageInput = memo(function MessageInput({
         />
       )}
       {/* Same column as the message list (max-w-3xl + px-6) so the
-          composer edges line up with message content. */}
+          composer edges line up with message content. The centred hero is
+          the exception: it belongs to the heading/starter column, so it
+          keeps that width even in compact mode. */}
       <div
         ref={dockColumnRef}
+        data-composer-column
         className={
-          isCompact ? 'mx-auto px-4' : 'mx-auto max-w-3xl px-4 lg:px-6'
+          isCompact && !centered
+            ? 'mx-auto px-4'
+            : 'mx-auto max-w-3xl px-4 lg:px-6'
         }
       >
         <UploadProgress />

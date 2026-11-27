@@ -253,11 +253,14 @@ describe('Agent prompt and capability frontend contract', () => {
       reasoning: { effort: 'max' },
       skills: { mode: 'inherit', ids: [], host: { mode: 'inherit', ids: [] } },
       mcp: { mode: 'custom', ids: ['user:github'] },
+      // No sub-agent settings: sent as null (clear), stored as absent.
+      subagents: null,
     });
     const form = read('web/src/components/agents/AgentCapabilityForm.tsx');
     expect(form).toContain('aria-label={`${labelPrefix}推理等级`}');
-    // Only the efforts the bound model takes are offered.
-    expect(form).toContain('entry.efforts.includes(effort)');
+    // Only the efforts the bound model takes are offered (all of them,
+    // unverified, for a model whose efforts are unknown).
+    expect(form).toContain('selectableEfforts(entry).efforts.includes(effort)');
   });
 
   test('a profile from an older server without host Skills follows its effective context', () => {

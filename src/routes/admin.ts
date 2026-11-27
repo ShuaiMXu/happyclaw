@@ -1,4 +1,10 @@
 import fs from 'fs';
+import { dropMfaChallengesForUser, removeTwoFactor } from '../auth-mfa.js';
+import { dropPasskeyRegistrationChallenges } from '../passkeys.js';
+import {
+  deletePasskeysForUser,
+  loginFactorSummary,
+} from '../auth-factor-store.js';
 import path from 'path';
 import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
@@ -13,12 +19,17 @@ import {
   AdminPatchUserSchema,
   InviteCreateSchema,
 } from '../schemas.js';
-import { isUsernameConflictError, toUserPublic } from './auth.js';
+import {
+  checkCurrentPassword,
+  isUsernameConflictError,
+  toUserPublic,
+} from './auth.js';
 import type {
   AuthUser,
   Permission,
   PermissionTemplateKey,
   AuthEventType,
+  UserSession,
 } from '../types.js';
 import { invalidateUserSessions, getWebDeps } from '../web-context.js';
 import { revokeGuestSessionsForOwner } from '../guest-accounts.js';
@@ -32,8 +43,9 @@ import {
   updateUserFieldsAndForceRuntimesToHost,
   deleteUser,
   restoreUser,
+  deleteUserSession,
   deleteUserSessionsByUserId,
-  createUserSession,
+  replaceUserSessions,
   getActiveAdminCount,
   logAuthEvent,
   getAllRegisteredGroups,
@@ -86,7 +98,14 @@ import {
   getPendingAdminHostOnlyCleanupFolders,
   markAdminHostOnlyCleanupPending,
 } from '../admin-host-only-runtime.js';
-import { getSystemSettings } from '../runtime-config.js';
+import {
+  isAdminHostOnlyEffective,
+  isSingleUserHost,
+} from '../deployment-mode.js';
+import {
+  SingleUserHostConflictError,
+  singleUserHostRefusal,
+} from '../single-user-host-guard.js';
 import { onPasswordHashBusy } from '../password-hash-busy.js';
 
 const adminRoutes = new Hono<{ Variables: Variables }>();
@@ -164,6 +183,8 @@ async function commitActiveAdminHostOnlyGrant(
   userId: string,
   updates: Parameters<typeof updateUserFields>[1],
   reason: string,
+  /** Runs synchronously right before the write; throws to abort it. */
+  beforeWrite: () => void,
 ): Promise<void> {
   const targets = getUserWorkspaceRuntimeTargets(userId);
   const folders = targets.map((target) => target.folder);
@@ -175,6 +196,7 @@ async function commitActiveAdminHostOnlyGrant(
   }
 
   const commit = () => {
+    beforeWrite();
     const migration = updateUserFieldsAndForceRuntimesToHost(userId, updates);
     if (deps) {
       const liveGroups = deps.getRegisteredGroups();
@@ -182,7 +204,6 @@ async function commitActiveAdminHostOnlyGrant(
         const fresh = getRegisteredGroup(jid);
         if (fresh) liveGroups[jid] = fresh;
       }
-      for (const folder of folders) delete deps.sessions[folder];
     }
   };
 
@@ -286,7 +307,14 @@ adminRoutes.get('/users', authMiddleware, usersManageMiddleware, (c) => {
     page: Number.isFinite(page) ? page : 1,
     pageSize: Number.isFinite(pageSize) ? pageSize : 50,
   });
-  return c.json(result);
+  const factors = loginFactorSummary(result.users.map((user) => user.id));
+  return c.json({
+    ...result,
+    users: result.users.map((user) => ({
+      ...user,
+      ...factors.get(user.id),
+    })),
+  });
 });
 
 // GET /api/admin/permission-templates - 获取权限模板
@@ -311,6 +339,7 @@ adminRoutes.get('/permission-templates', authMiddleware, (c) => {
 
 // POST /api/admin/users - 创建用户
 adminRoutes.post('/users', authMiddleware, usersManageMiddleware, async (c) => {
+  if (isSingleUserHost()) return singleUserHostRefusal(c);
   const body = await c.req.json().catch(() => ({}));
   const validation = AdminCreateUserSchema.safeParse(body);
   if (!validation.success) {
@@ -346,6 +375,8 @@ adminRoutes.post('/users', authMiddleware, usersManageMiddleware, async (c) => {
   const now = new Date().toISOString();
   const userId = generateUserId();
   const passwordHash = await hashPassword(password);
+  // The mode may have switched while the password was hashing.
+  if (isSingleUserHost()) return singleUserHostRefusal(c);
 
   const finalRole = role || 'member';
   const finalPermissions = normalizePermissions(
@@ -423,12 +454,35 @@ adminRoutes.patch(
         400,
       );
     }
+    // One's own password takes the current one, as in Settings: a stolen
+    // session must not reset it and then pass the password re-check that
+    // adding a passkey asks for. Counted like a login attempt.
+    if (
+      validation.data.password !== undefined &&
+      id === (c.get('user') as AuthUser).id
+    ) {
+      const denied = await checkCurrentPassword(
+        c,
+        c.get('user') as AuthUser,
+        validation.data.current_password ?? '',
+      );
+      if (denied) return denied;
+    }
 
     return withCapabilityScopeLocks(
       [SYSTEM_CAPABILITY_LOCK_KEY, userCapabilityLockKey(id)],
       async () => {
         const target = getUserById(id);
         if (!target) return c.json({ error: 'User not found' }, 404);
+        // Reactivating or promoting would add a second active user (or
+        // admin); disabling, deleting and editing stay allowed. Checked
+        // again right before each write, after the awaits below.
+        const addsActiveUser =
+          (validation.data.status === 'active' && target.status !== 'active') ||
+          (validation.data.role === 'admin' && target.role !== 'admin');
+        const refusedBySingleUserHost = () =>
+          addsActiveUser && isSingleUserHost();
+        if (refusedBySingleUserHost()) return singleUserHostRefusal(c);
 
         const actor = c.get('user') as AuthUser;
         if (actor.role !== 'admin' && target.role === 'admin') {
@@ -614,6 +668,7 @@ adminRoutes.patch(
             postCommitActions.push(() => {
               invalidateUserSessions(id);
               deleteUserSessionsByUserId(id);
+              dropMfaChallengesForUser(id);
               revokeGuestSessionsForOwner(id);
               if (target.role === 'guest') {
                 deleteGuestWorkspaceGrantsForGuest(id);
@@ -635,6 +690,8 @@ adminRoutes.patch(
             postCommitActions.push(() => {
               invalidateUserSessions(id);
               deleteUserSessionsByUserId(id);
+              // A pending 2FA login must not survive being re-enabled.
+              dropMfaChallengesForUser(id);
               revokeGuestSessionsForOwner(id);
               void imManager
                 .disconnectAllUserChannels(id)
@@ -693,6 +750,20 @@ adminRoutes.patch(
 
         const isSelfPasswordReset =
           validation.data.password !== undefined && id === actor.id;
+        // An admin resetting their own password stays signed in on this
+        // device under a new session, which keeps its Web Push subscription.
+        const issuedAt = new Date().toISOString();
+        const selfSession: UserSession | null = isSelfPasswordReset
+          ? {
+              id: generateSessionToken(),
+              user_id: actor.id,
+              ip_address: getClientIp(c),
+              user_agent: c.req.header('user-agent') || null,
+              created_at: issuedAt,
+              expires_at: sessionExpiresAt(),
+              last_active_at: issuedAt,
+            }
+          : null;
         if (validation.data.password !== undefined) {
           updates.password_hash = await hashPassword(validation.data.password);
           // Only force password change when resetting OTHER user's password
@@ -702,7 +773,11 @@ adminRoutes.patch(
           }
           postCommitActions.push(() => {
             invalidateUserSessions(id);
-            deleteUserSessionsByUserId(id);
+            if (selfSession) {
+              replaceUserSessions(id, c.get('sessionId'), selfSession);
+            } else {
+              deleteUserSessionsByUserId(id);
+            }
             logAuthEvent({
               event_type: 'password_changed',
               username: target.username,
@@ -732,6 +807,7 @@ adminRoutes.patch(
           });
         }
 
+        if (refusedBySingleUserHost()) return singleUserHostRefusal(c);
         let updateAlreadyCommitted = false;
         const revokesHostPrivilege =
           targetIsActiveAdmin && !targetRemainsActiveAdmin;
@@ -744,7 +820,7 @@ adminRoutes.patch(
           );
         const grantsHostOnlyAdminRuntime =
           targetRemainsActiveAdmin &&
-          getSystemSettings().adminHostOnlyMode &&
+          isAdminHostOnlyEffective() &&
           (!targetIsActiveAdmin || hasPendingHostOnlyCleanup);
         if (grantsHostOnlyAdminRuntime) {
           try {
@@ -752,15 +828,25 @@ adminRoutes.patch(
               id,
               updates,
               `Administrator ${id} gained active host-only privileges`,
+              () => {
+                if (refusedBySingleUserHost()) {
+                  throw new SingleUserHostConflictError();
+                }
+              },
             );
             updateAlreadyCommitted = true;
           } catch (err) {
+            if (err instanceof SingleUserHostConflictError) {
+              return singleUserHostRefusal(c);
+            }
             if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
             logger.error(
               { err, userId: id, persisted: err.persisted },
               'Failed to apply active administrator host-only runtime policy',
             );
             if (err.persisted) runPostCommitActions();
+            // No cookie goes out: end the session it would have been.
+            if (selfSession) deleteUserSession(selfSession.id);
             return c.json(
               {
                 error: err.persisted
@@ -787,6 +873,8 @@ adminRoutes.patch(
               'Failed to revoke active administrator host privileges',
             );
             if (err.persisted) runPostCommitActions();
+            // No cookie goes out: end the session it would have been.
+            if (selfSession) deleteUserSession(selfSession.id);
             return c.json(
               {
                 error: err.persisted
@@ -803,26 +891,13 @@ adminRoutes.patch(
         runPostCommitActions();
         const updated = getUserById(id)!;
 
-        // When admin resets their own password, recreate session to avoid logout
-        if (isSelfPasswordReset) {
-          const now = new Date().toISOString();
-          const ip = getClientIp(c);
-          const ua = c.req.header('user-agent') || null;
-          const newToken = generateSessionToken();
-          createUserSession({
-            id: newToken,
-            user_id: actor.id,
-            ip_address: ip,
-            user_agent: ua,
-            created_at: now,
-            expires_at: sessionExpiresAt(),
-            last_active_at: now,
-          });
+        // When admin resets their own password, hand over the new session
+        if (selfSession) {
           return new Response(
             JSON.stringify({ success: true, user: toUserPublic(updated) }),
             {
               status: 200,
-              headers: sessionCookieHeaders(c, newToken, {
+              headers: sessionCookieHeaders(c, selfSession.id, {
                 'Content-Type': 'application/json',
               }),
             },
@@ -901,6 +976,7 @@ adminRoutes.delete(
     // 与 PATCH status='deleted' 路径对齐：清缓存 + 断 IM 连接，否则前端调
     // DELETE 之后 sessionCache 仍是 active 状态、IM bot 持续响应群消息直到重启。
     invalidateUserSessions(id);
+    dropMfaChallengesForUser(id);
     revokeGuestSessionsForOwner(id);
     void imManager.disconnectAllUserChannels(id).catch(() => undefined);
 
@@ -1007,6 +1083,89 @@ adminRoutes.delete(
   },
 );
 
+/**
+ * Who may clear another user's login factors: someone with manage_users, not
+ * for themselves (that is done in Settings, with the password), and an
+ * admin's only by an admin.
+ */
+function loginFactorResetDenial(
+  c: any,
+  actor: AuthUser,
+  target: Parameters<typeof denyEscalationToTarget>[2] & { id: string },
+  what: { own: string; admin: string; action: string },
+): Response | null {
+  if (actor.id === target.id) return c.json({ error: what.own }, 400);
+  if (actor.role !== 'admin' && target.role === 'admin') {
+    return c.json({ error: what.admin }, 403);
+  }
+  return denyEscalationToTarget(c, actor, target, what.action);
+}
+
+// DELETE /api/admin/users/:id/2fa - 清除用户的二次验证（丢失验证器时的恢复路径）
+adminRoutes.delete(
+  '/users/:id/2fa',
+  authMiddleware,
+  usersManageMiddleware,
+  (c) => {
+    const id = c.req.param('id');
+    const target = getUserById(id);
+    if (!target) return c.json({ error: 'User not found' }, 404);
+    const actor = c.get('user') as AuthUser;
+    // One's own factor is turned off in Settings with a password and a code.
+    const denial = loginFactorResetDenial(c, actor, target, {
+      own: 'Turn off your own two-factor authentication in Settings',
+      admin: 'Forbidden: only admin can reset admin two-factor',
+      action: 'reset two-factor for',
+    });
+    if (denial) return denial;
+    const removed = removeTwoFactor(id);
+    if (removed) {
+      logAuthEvent({
+        event_type: 'mfa_reset',
+        username: target.username,
+        actor_username: actor.username,
+        ip_address: getClientIp(c),
+      });
+    }
+    return c.json({ success: true, removed });
+  },
+);
+
+// DELETE /api/admin/users/:id/passkeys - 撤销用户的全部通行密钥
+// A passkey stands in for the password and the second factor, and neither a
+// password change nor a 2FA reset removes it: this is the way to take back
+// passkeys that may be in the wrong hands.
+adminRoutes.delete(
+  '/users/:id/passkeys',
+  authMiddleware,
+  usersManageMiddleware,
+  (c) => {
+    const id = c.req.param('id');
+    const target = getUserById(id);
+    if (!target) return c.json({ error: 'User not found' }, 404);
+    const actor = c.get('user') as AuthUser;
+    const denial = loginFactorResetDenial(c, actor, target, {
+      own: 'Remove your own passkeys in Settings',
+      admin: 'Forbidden: only admin can revoke admin passkeys',
+      action: 'revoke passkeys of',
+    });
+    if (denial) return denial;
+    const removed = deletePasskeysForUser(id);
+    // A registration started before must not add one back.
+    dropPasskeyRegistrationChallenges(id);
+    if (removed > 0) {
+      logAuthEvent({
+        event_type: 'passkeys_revoked',
+        username: target.username,
+        actor_username: actor.username,
+        ip_address: getClientIp(c),
+        details: { removed },
+      });
+    }
+    return c.json({ success: true, removed });
+  },
+);
+
 // --- Invite Codes ---
 
 // GET /api/admin/invites - 获取邀请码列表
@@ -1020,6 +1179,7 @@ adminRoutes.post(
   authMiddleware,
   inviteManageMiddleware,
   async (c) => {
+    if (isSingleUserHost()) return singleUserHostRefusal(c);
     const body = await c.req.json().catch(() => ({}));
     const validation = InviteCreateSchema.safeParse(body);
     if (!validation.success) {

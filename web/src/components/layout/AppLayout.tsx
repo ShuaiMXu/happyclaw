@@ -29,6 +29,7 @@ import { useWorkItemSubscription } from '../../stores/work-items';
 import { AutomationFormHost } from '../automations/AutomationFormHost';
 import { CreateWorkspaceHost } from './CreateWorkspaceHost';
 import { syncAppBadge } from '../../utils/appBadge';
+import { useWebPushLifecycle } from '../../hooks/useWebPushLifecycle';
 
 export function AppLayout() {
   const location = useLocation();
@@ -47,6 +48,8 @@ export function AppLayout() {
   // Read-only guests may only call a small GET allowlist; skip everything
   // else (billing, creating sessions) so they never see 403s.
   const isGuest = useIsGuest();
+  // Web Push: presence for the server, the subscription, tapped notifications.
+  useWebPushLifecycle({ enabled: !isGuest });
 
   // ⌘B / Ctrl+B toggles the desktop sidebar between full width and icon rail.
   const toggleSidebar = useShellStore((s) => s.toggleSidebar);
@@ -92,17 +95,12 @@ export function AppLayout() {
   useEffect(() => {
     const unsubRunner = wsManager.on('runner_state', (data: any) => {
       if (data.chatJid && data.state) {
-        if (!data.chatJid.includes('#agent:')) {
-          useGroupsStore.getState().setRunnerState(data.chatJid, data.state);
-        }
-        useChatStore.getState().handleRunnerState(data.chatJid, data.state);
+        useGroupsStore.getState().setRunnerState(data.chatJid, data.state);
       }
     });
     const unsubStarted = wsManager.on('run_started', (data: any) => {
       if (!data.chatJid) return;
-      if (!data.chatJid.includes('#agent:')) {
-        useGroupsStore.getState().setRunnerState(data.chatJid, 'running');
-      }
+      useGroupsStore.getState().setRunnerState(data.chatJid, 'running');
       useChatStore.getState().handleRunStarted(data.chatJid, data.runId);
     });
     const unsubFinished = wsManager.on('run_finished', (data: any) => {
@@ -116,8 +114,7 @@ export function AppLayout() {
         : [];
       useChatStore.getState().handleActiveRunSnapshot(runs, queuedChatJids);
       for (const run of runs) {
-        if (!run?.chatJid) continue;
-        if (!run.chatJid.includes('#agent:')) {
+        if (run?.chatJid) {
           useGroupsStore.getState().setRunnerState(run.chatJid, 'running');
         }
       }

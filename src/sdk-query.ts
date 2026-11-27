@@ -16,14 +16,14 @@ import {
   applyCodexGatewayNoProxy,
   resolveCodexGatewayLaunchConfig,
 } from './codex-gateway/runner-tokens.js';
-import { resolveGeminiGatewayLaunchConfig } from './gemini-gateway/resolve-gateway-url.js';
 
 /**
  * Send a prompt to Claude and return the plain-text response.
  * Uses the provider configured in the web settings (not a separate CLI install).
  *
  * @param prompt  The user prompt text
- * @param opts.model   Override model (defaults to provider config)
+ * @param opts.model   Override model (defaults to the global connection's
+ *                     background model, else its model)
  * @param opts.timeout Timeout in ms (default 60 000)
  * @returns The assistant's text response, or null on failure
  */
@@ -36,7 +36,14 @@ export async function sdkQuery(
   // 构造隔离的 env 副本传给 SDK（options.env 是子进程 env 的权威来源）。
   // 不再突变全局 process.env、也无需 mutex 串行化，因此多个 sdkQuery（/recall、
   // 自动标题、bug 上报、task 解析等）可并发执行、凭据互不串扰。
-  const storedConfig = getClaudeProviderConfig();
+  // Without a model of the caller's, these short calls run on the global
+  // connection's background model (its small-fast role) when it names one,
+  // the way Claude Code's own background calls do; else on its model.
+  const globalConfig = getClaudeProviderConfig();
+  const smallFast = opts?.model ? undefined : globalConfig.roles?.smallFast;
+  const storedConfig = smallFast
+    ? { ...globalConfig, anthropicModel: smallFast }
+    : globalConfig;
   // A Codex provider gets a gateway token scoped to this one query.
   const codexGatewayLease = new CodexGatewayRunnerLease({
     kind: 'sdk-query',
@@ -45,9 +52,10 @@ export async function sdkQuery(
   const timer = setTimeout(() => abortController.abort(), timeout);
 
   try {
-    const config = resolveGeminiGatewayLaunchConfig(
-      resolveCodexGatewayLaunchConfig(storedConfig, 'host', codexGatewayLease),
+    const config = resolveCodexGatewayLaunchConfig(
+      storedConfig,
       'host',
+      codexGatewayLease,
     );
     const envLines = buildClaudeEnvLines(config);
     const env: Record<string, string | undefined> = { ...process.env };

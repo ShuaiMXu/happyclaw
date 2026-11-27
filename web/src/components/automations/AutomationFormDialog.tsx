@@ -26,6 +26,7 @@ import type { ApiError } from '../../api/client';
 import {
   AUTOMATION_LIMITS,
   AUTOMATION_SESSION_MODE_LABELS,
+  automationTakesModel,
   describeAutomationSchedule,
   validateAutomationDraft,
   type Automation,
@@ -41,6 +42,7 @@ import {
   draftFromForm,
   emptyAutomationForm,
   fieldOfError,
+  modelPatchFromForm,
   type AutomationFormField,
   type AutomationFormValues,
   type ScheduleForm,
@@ -55,6 +57,11 @@ import { useAuthStore } from '../../stores/auth';
 import { useChatStore } from '../../stores/chat';
 import { extractErrorMessage } from '../../utils/error';
 import { sessionJidOf } from '../../lib/session-jid';
+import {
+  listedSessions,
+  sessionDisplayName,
+} from '../../lib/session-presentation';
+import { SessionModelChoiceField } from '../chat/SessionModelChoiceField';
 
 const PRESETS: SchedulePreset[] = [
   'minutes',
@@ -186,25 +193,20 @@ function AutomationForm({
   const allowHostCommands =
     user?.role === 'admin' && workspace?.execution_mode === 'host';
   const script = values.execution === 'script';
+  const takesModel = automationTakesModel(values);
 
   useEffect(() => {
     if (values.workspaceJid) void loadAgents(values.workspaceJid);
   }, [values.workspaceJid, loadAgents]);
 
+  // The workspace's sessions, in the session lists' order.
   const sessionOptions = useMemo(() => {
     if (!values.workspaceJid) return [];
-    const main = {
-      jid: values.workspaceJid,
-      label: workspace?.is_my_home ? '直接对话' : '主会话',
-    };
-    const sessions = (agents[values.workspaceJid] ?? [])
-      .filter((agent) => agent.kind === 'conversation')
-      .map((agent) => ({
-        jid: sessionJidOf(values.workspaceJid, agent.id),
-        label: agent.name || '新会话',
-      }));
-    return [main, ...sessions];
-  }, [agents, values.workspaceJid, workspace?.is_my_home]);
+    return listedSessions(agents[values.workspaceJid] ?? []).map((agent) => ({
+      jid: sessionJidOf(values.workspaceJid, agent.id),
+      label: sessionDisplayName(agent),
+    }));
+  }, [agents, values.workspaceJid]);
 
   const draft = useMemo(() => draftFromForm(values), [values]);
   const fieldErrors = useMemo(() => {
@@ -264,9 +266,13 @@ function AutomationForm({
       let saved: Automation;
       if (automation) {
         // The execution kind is fixed at creation; fresh and persistent
-        // sessions are the server's to pick.
-        const patch: AutomationPatchBody = { ...draft };
-        delete (patch as Partial<typeof draft>).execution;
+        // sessions are the server's to pick. A model goes only when it
+        // changed: an omitted one stays as it is.
+        const { execution: _execution, model: _model, ...kept } = draft;
+        const patch: AutomationPatchBody = {
+          ...kept,
+          ...modelPatchFromForm(values, automation),
+        };
         if (values.sessionMode === 'bound')
           patch.targetSessionJid = targetSessionJid;
         saved = await update(automation.id, revision, patch);
@@ -379,6 +385,8 @@ function AutomationForm({
                     ...current,
                     workspaceJid: event.target.value,
                     targetSessionJid: null,
+                    // It was picked among the other workspace's options.
+                    model: null,
                   }))
                 }
                 className="w-full"
@@ -623,6 +631,26 @@ function AutomationForm({
           )}
         </Field>
 
+        {takesModel && values.workspaceJid && (
+          <Field
+            label="模型"
+            hint={
+              values.sessionMode === 'fresh'
+                ? '每次运行新建的会话使用这个模型。'
+                : '每次运行前把它建的会话换回这个模型；改回跟随智能体时，那个会话也回到默认。'
+            }
+          >
+            {(id) => (
+              <SessionModelChoiceField
+                id={id}
+                workspaceJid={values.workspaceJid}
+                value={values.model}
+                onChange={(model) => set('model', model)}
+              />
+            )}
+          </Field>
+        )}
+
         <div className="grid gap-5 sm:grid-cols-2">
           <Field
             label="停止条件（可选）"
@@ -739,7 +767,7 @@ function AutomationForm({
         )}
       </div>
 
-      <div className="flex shrink-0 flex-col gap-2 border-t border-surface-border px-5 py-3 sm:flex-row sm:items-center phone:pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
+      <div className="flex shrink-0 flex-col gap-2 border-t border-surface-border px-5 py-3 sm:flex-row sm:items-center phone:pb-[calc(0.75rem+var(--safe-bottom))]">
         <div className="min-w-0 flex-1 space-y-1" aria-live="polite">
           {serverError && (
             <p role="alert" className="text-caption text-error">

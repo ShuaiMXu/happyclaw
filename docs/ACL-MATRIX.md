@@ -42,12 +42,16 @@
 | `/api/auth/status`                   | GET  | 无                     |
 | `/api/auth/setup`                    | POST | 仅用户表为空           |
 | `/api/auth/login`                    | POST | 登录限流               |
+| `/api/auth/login/2fa`                | POST | 有效 challenge、限流   |
+| `/api/auth/passkey/login/options`    | POST | 页面来源可用           |
+| `/api/auth/passkey/login`            | POST | 有效 challenge、签名   |
 | `/api/auth/register/status`          | GET  | 无                     |
 | `/api/auth/register`                 | POST | 注册策略、邀请码、限流 |
 | `/api/auth/avatars/:filename`        | GET  | 仅允许受管头像路径     |
 | `/api/config/appearance/public`      | GET  | 只返回公开外观         |
 | `/api/config/brand-assets/:filename` | GET  | 仅允许受管品牌资源名   |
 | `/api/health`                        | GET  | 不返回敏感运行详情     |
+| `/api/build`                         | GET  | 只返回前端构建标识     |
 
 `/ws` 不是 Public。Upgrade 时必须同时通过 Cookie Session 与 Origin 校验。
 
@@ -60,17 +64,20 @@ token（Runner/查询退出即吊销），并拒绝带 `Forwarded`、`X-Forwarde
 
 以下资源以登录用户 ID 为作用域，不接受客户端指定其他 owner：
 
-| 路由族                                              | 权限                                          |
-| --------------------------------------------------- | --------------------------------------------- |
-| `/api/auth/me`、profile、password、sessions、avatar | Login，仅本人                                 |
-| `/api/agent-profiles/*`                             | Login，仅本人 Agent                           |
-| `/api/channel-accounts/*`                           | Login，仅本人渠道账号                         |
-| `/api/skills/*`                                     | Login，仅本人用户 Skills                      |
-| 用户级 `/api/mcp-servers/*`                         | Login，仅本人配置                             |
-| Workspace Memory v2                                 | Login + Workspace owner ACL，见 4.5           |
-| HappyClaw Owner Profile                             | Home actual owner + runtime exact-turn gate   |
-| `/api/usage/*`                                      | Login；普通用户只见本人，管理视图再按角色过滤 |
-| `/api/billing/my/*`                                 | Login，仅本人                                 |
+| 路由族                                              | 权限                                                                              |
+| --------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `/api/auth/me`、profile、password、sessions、avatar | Login，仅本人                                                                     |
+| `/api/auth/2fa/*`                                   | Login，仅本人；访客 403；开启、关闭需当前密码                                     |
+| `/api/auth/passkeys*`                               | Login，仅本人；访客 403；添加需当前密码（开了二次验证还要验证码），删除需当前密码 |
+| `/api/agent-profiles/*`                             | Login，仅本人 Agent                                                               |
+| `/api/channel-accounts/*`                           | Login，仅本人渠道账号                                                             |
+| `/api/skills/*`                                     | Login，仅本人用户 Skills                                                          |
+| 用户级 `/api/mcp-servers/*`                         | Login，仅本人配置                                                                 |
+| Workspace Memory v2                                 | Login + Workspace owner ACL，见 4.5                                               |
+| HappyClaw Owner Profile                             | Home actual owner + runtime exact-turn gate                                       |
+| `/api/usage/*`                                      | Login；普通用户只见本人，管理视图再按角色过滤                                     |
+| `/api/billing/my/*`                                 | Login，仅本人                                                                     |
+| `/api/push/*`                                       | Login，仅本人订阅；访客 403                                                       |
 
 产品级 Agent 删除前必须先迁移其工作区（`migrate-and-delete` 一次性迁移并归档，
 目标也必须是本人的 active Agent）。复制、导入不授予宿主机资源：非 admin 得到的
@@ -95,11 +102,12 @@ Agent 不含宿主机上下文与宿主机 Skills。渠道账号删除、登出�
 - 列表中的工作区投影
 - 读取消息与文件，以及回合的思考摘要与执行轨迹
   （`GET /api/groups/:jid/turn-traces/:turnId`，主动模式工作区另按下述过程可见性过滤）
-- 查看会话当前使用的模型配置与上下文占用（`GET /api/groups/:jid/context-usage`）
+- 查看会话当前使用的模型配置与上下文占用（`GET /api/groups/:jid/context-usage`），
+  以及还没有会话时可选的模型（`GET /api/groups/:jid/model-options`，Host 工作区另需
+  Host 权限）
 - 发送普通消息
 - 查看 Runtime Session、绑定和项目能力
-- 读取代码改动（`GET /api/groups/:jid/git/status|diff`）、worktree 可用性和同目录
-  运行提示（`workdir/peers`，看不到的工作区只计数不具名）
+- 读取代码改动（`GET /api/groups/:jid/git/status|diff`）和 worktree 可用性
 - 打开 Web 终端前的资源检查
 
 Home 的 AgentProfile 归属也是系统不变量：只能绑定同一 owner 的 `is_default`
@@ -108,17 +116,31 @@ backfill 会修复旧数据中的错误 Home 绑定。
 
 Host Workspace 在 Access 之外还要求 admin。
 
+文件读取（`GET /api/groups/:jid/files` 与 `files/{download,preview,office-preview,content}/:path`，
+GET 与 HEAD）使用 View：Host 工作区另需 admin 或访客授权（`canViewHostGroup`），文件根随
+`?agentId=` 解析，访客的隐藏规则见第 11 节。上传、保存、删除和建目录仍要求 Access，
+Host 工作区要求 admin。Office 预览（`files/office-preview/:path`）与其他读取的授权完全
+相同，校验后立即以 `O_NOFOLLOW|O_NONBLOCK` 打开文件，核对仍是校验过的那个普通文件，之后
+只从这个描述符读取，排队期间把路径换成符号链接也读不到文件根以外的内容。它的 PDF 缓存
+按源文件内容寻址、跨用户共享：能拿到相同内容的人可以从响应耗时推测出别人预览过这份
+内容，这是接受的取舍（响应里没有直接标明命中与否的头）。配置了
+`OFFICE_PREVIEW_SOFFICE_BIN` 时，任何能预览的人都能让宿主机上的 LibreOffice 以服务身份
+解析工作区里的文档（Container 工作区也一样），因此该转换器只在运维显式设置时启用，见
+`DEPLOYMENT.md`。
+
 ### 4.2 Modify
 
 `canModifyGroup()` 是 owner-only。需要 Modify 的典型操作：
 
 - 重命名、切换 Agent、修改执行方式
-- 修改回复模式与过程可见性（`PATCH /api/groups/:jid` 的 `interaction_mode`、
-  `process_visibility`，仅 `web:` 工作区；后者不重启运行时）
+- 修改回复模式、过程可见性与工作方式（`PATCH /api/groups/:jid` 的 `interaction_mode`、
+  `process_visibility`、`work_mode`，仅 `web:` 工作区；后两者不重启运行时，`work_mode`
+  让暖 Runner 在本轮结束后退役）
 - stop、interrupt、reset-session、clear-history
 - 切换会话模型与推理档位（`PUT /api/groups/:jid/model-selection`）；其中高于 `max` 的
   推理档位（目前是 `ultra`）另需 `manage_system_config`
-- 创建、修改、删除 Runtime Session
+- 创建、修改、删除 Runtime Session；新会话带模型选择时按 `model-selection` 的规则校验
+  （Host 工作区另需 Host 权限）
 - 为新会话创建独立 worktree（另需 Host 权限）；删除会话、工作区或 clear-history 时
   移除 worktree、保留分支，有未提交改动须带 `force_worktree(s)=true` 确认
 - 写入工作区 Skills/MCP
@@ -200,17 +222,28 @@ admin 没有跨 owner bypass。目标 Workspace/item 不存在或授权失败均
 
 Agent Runtime 的 Workspace Memory MCP 还叠加执行上下文策略：
 
-| 执行上下文                                       | 读取 | 创建、更新、忘记                   |
-| ------------------------------------------------ | ---- | ---------------------------------- |
-| 顶层 Main/Runtime Session，批次全部是 owner 输入 | 允许 | 按 Workspace ACL                   |
-| 顶层 Main/Runtime Session，含非 owner 输入       | 允许 | 只能创建/修改/忘记 `proposed` 条目 |
-| 自动化运行的轮次                                 | 允许 | 只能创建/修改/忘记 `proposed` 条目 |
-| Spawn/Task 会话、SDK Task Sub-Agent              | 允许 | 拒绝                               |
+| 执行上下文                                  | 读取 | 创建、更新、忘记                   |
+| ------------------------------------------- | ---- | ---------------------------------- |
+| 顶层 Runtime Session，批次全部是 owner 输入 | 允许 | 按 Workspace ACL                   |
+| 顶层 Runtime Session，含非 owner 输入       | 允许 | 只能创建/修改/忘记 `proposed` 条目 |
+| 自动化运行的轮次                            | 允许 | 只能创建/修改/忘记 `proposed` 条目 |
+| Spawn/Task 会话、SDK Task Sub-Agent         | 允许 | 拒绝                               |
 
-owner 输入的判定在宿主：Web 输入的 sender 等于 owner 用户 id；IM 输入的发送者 IM id
-必须等于该工作区注册中由宿主记录的 owner（claim source 为 `configured`、
-`trusted_direct` 或 `auto_feishu`）。写入一律要求 Runner 的 HMAC 写能力；proposed
-只有 owner 在 Web 确认后才生效。Sub-Agent 的只读限制由 PreToolUse hook 与主进程
+owner 输入的判定在宿主（`src/workspace-owner-identity.ts`）：Web 输入的 sender 等于
+owner 用户 id；IM 输入的来源聊天必须是工作区主人（`created_by`）自己的注册，发送者 IM id
+必须等于主人**登记在 Home 工作区或当前工作区**的聊天注册中由宿主记录的 owner（claim source 为
+`configured`、`trusted_direct` 或 `auto_feishu`）。也就是「发送者是工作区主人自己的可信 IM
+身份」，与聊天绑定到哪个工作区的会话无关：发现和配对把聊天登记在账号的默认工作区（未设置时为
+Home），绑定只改目标会话，所以主人自己的配对私聊绑到非 Home 工作区的会话时，在那里同样是主人。
+账号默认工作区设为 W 时登记在 W 的身份只在 W 算主人，不在 Home 和其他工作区算。比较按
+provider、跨主人的各个渠道账号进行：sender 由平台给出、不可伪造，飞书 open_id、QQ openid 这类
+按应用区分的 id 跨应用不会撞值；企业微信 userid、钉钉 staffId/senderId 只在一个企业或应用内
+唯一，只在同一渠道账号内比较；不同 provider 的相同值不算同一人；其他用户的注册与身份永远不算；群成员按自己的 sender 判定，不因所在的群而成为主人。自动化运行、
+`work_item_input` 等宿主合成的输入永远不算主人亲自发起。`install_skill`、自动化的 owner 轮次、
+`work_delegate` 与 `session_list` 的主人轮次、HappyClaw Owner Profile 用同一判定。
+
+写入一律要求 Runner 的 HMAC 写能力；proposed 只有 owner 在 Web 确认后才生效。
+Sub-Agent 的只读限制由 PreToolUse hook 与主进程
 IPC broker 共同执行，不能由模型参数扩大权限。
 
 ### 4.6 HappyClaw Owner Profile
@@ -237,7 +270,7 @@ read-only 投影按 host-issued turn ID 精确匹配当前或已接纳的 queued
 `/api/memory/global` 只要求有效登录，但无论角色均返回 410；它们不提供旧文件读取
 或兼容写入能力。
 
-### 4.7 团队模式
+### 4.7 团队模式与多任务模式
 
 `src/routes/work-items.ts` 只服务工作区主人：URL 中的工作区（或工作项所属工作区）
 必须是 `web:*` 并通过 `canModifyGroup()`（`created_by` 等于当前用户）；Host 工作区另需
@@ -252,51 +285,67 @@ admin。admin 没有跨 owner bypass，不存在与无权限都返回 404。
 | `GET /api/work-items/:id`、`POST .../stop`、`POST .../approve` | 允许                         | 404              | 拒绝 |
 
 访客拒绝是 403：guest guard 的放行清单不含这些路由，处理器也再拒绝一次。工作项事件
-`work_item_updated` 只推给工作区主人。
+`work_item_updated` 只推给工作区主人。多任务模式的派发型工作项（`origin='delegated'`）
+走同一组路由和同一张表，访客同样看不到，也不能停止。
+
+派发由 Agent 工具发起，不经过 HTTP，宿主在 IPC 侧把关：`work_delegate` 只接受多任务
+工作区里普通会话（不是团队路由或执行会话，也不是 spawn 或独立 worktree 会话）中由工作区
+主人亲自发起的轮次，判定与 `install_skill` 相同（执行中和已排队的每条输入都必须是主人本人
+的人工输入；处理回报的 `work_item_input` 轮次和自动化轮次都不算），请求还必须用
+`inputTurnId` 指明这一轮，过期的请求不借用当前轮次；另有每会话 3 个、每工作区 5 个
+未结束派发的上限和计费闸门。`work_stop`、`work_followup` 只能作用于本会话派出的工作项，
+并且同样只接受主人亲自发起的轮次；只读的 `work_delegations` 不受此限。工作区切回单任务
+后，有过派发的会话仍可用这三个工具跟进已派出的任务，只是不能再派新的。团队会话调用这四个
+工具一律被拒绝；派发型 Worker 被收走的工具与团队执行会话相同。
 
 ## 5. 工作区与 Session 渠道绑定
 
 写操作统一要求目标工作区 Modify，同时校验 IM Chat 属于同一用户、同一渠道账号，
 并验证会话类型：
 
-| 绑定                  | 允许目标 | 路由                                              |
-| --------------------- | -------- | ------------------------------------------------- |
-| Workspace Mount       | 群聊     | `/api/groups/:jid/im-binding`                     |
-| Runtime Session Mount | 私聊     | `/api/groups/:jid/sessions/:sessionId/im-binding` |
-| `/agents` 兼容 Mount  | 私聊     | `/api/groups/:jid/agents/:agentId/im-binding`     |
+| 绑定                  | 允许目标     | 路由                                              |
+| --------------------- | ------------ | ------------------------------------------------- |
+| Workspace Mount       | 原生话题群   | `/api/groups/:jid/im-binding`                     |
+| Runtime Session Mount | 私聊、普通群 | `/api/groups/:jid/sessions/:sessionId/im-binding` |
+| `/agents` 兼容 Mount  | 私聊、普通群 | `/api/groups/:jid/agents/:agentId/im-binding`     |
 
 附加规则：
 
 - `channel_account_id` 必须属于当前用户。
 - 账号编码在 JID 中时，必须与数据库记录一致。
 - 原生话题容器使用 `thread_map`，不能绑定到一个固定 Session 后吞并所有话题。
-- Unbind 必须原子恢复该 Bot 的默认工作区；无法解析默认目标时保留旧绑定并报错。
+- Unbind 真正移除投递关系，聊天变为未绑定，不恢复默认工作区，也不改投到任何会话。
 
 ## 6. 系统和管理权限
 
-| 路由族/操作                                       | 权限                                               |
-| ------------------------------------------------- | -------------------------------------------------- |
-| Provider、系统容量、Host 集成、注册策略、系统外观 | `manage_system_config`                             |
-| Plugin Catalog 手动扫描                           | admin / `manage_system_config` 路径中的 admin 检查 |
-| 系统 MCP 写入                                     | admin                                              |
-| 用户创建、禁用、恢复、角色与权限                  | `manage_users`                                     |
-| 邀请码                                            | `manage_invites`                                   |
-| 审计日志和导出                                    | `view_audit_log`                                   |
-| `/api/billing/admin/*`                            | `manage_billing`                                   |
-| `/api/docker/pull`、运行监控管理                  | `manage_system_config`                             |
-| `/api/status/channel-outbox/*` 人工裁决           | `manage_system_config`                             |
-| 系统外观读写（`GET/PUT /api/config/appearance`）  | `manage_system_config`                             |
-| 品牌资源上传/删除（图标、横幅头像文件写入）       | admin（`adminRoleMiddleware`）                     |
-| `POST /api/groups/:jid/reset-owner`               | admin break-glass，同时仍验证目标资源              |
+| 路由族/操作                                             | 权限                                                |
+| ------------------------------------------------------- | --------------------------------------------------- |
+| Provider、系统容量、Host 集成、注册策略、系统外观       | `manage_system_config`                              |
+| Plugin Catalog 手动扫描                                 | admin / `manage_system_config` 路径中的 admin 检查  |
+| 系统 MCP 写入                                           | admin                                               |
+| 用户创建、禁用、恢复、角色与权限                        | `manage_users`                                      |
+| 重置他人二次验证 `DELETE /api/admin/users/:id/2fa`      | `manage_users`，不能是自己，admin 只能由 admin 重置 |
+| 撤销他人通行密钥 `DELETE /api/admin/users/:id/passkeys` | `manage_users`，不能是自己，admin 只能由 admin 撤销 |
+| 邀请码                                                  | `manage_invites`                                    |
+| 审计日志和导出                                          | `view_audit_log`                                    |
+| `/api/billing/admin/*`                                  | `manage_billing`                                    |
+| `/api/docker/pull`、运行监控管理                        | `manage_system_config`                              |
+| `/api/status/channel-outbox/*` 人工裁决                 | `manage_system_config`                              |
+| 系统外观读写（`GET/PUT /api/config/appearance`）        | `manage_system_config`                              |
+| 品牌资源上传/删除（图标、横幅头像文件写入）             | admin（`adminRoleMiddleware`）                      |
+| 存储源（`/api/config/storage-sources*`）                | admin（`adminRoleMiddleware`）；密码只写不读        |
+| `POST /api/groups/:jid/reset-owner`                     | admin break-glass，同时仍验证目标资源               |
 
 系统 MCP 默认仅 admin 可用；只有显式设置为 shared 后，普通成员的 Agent 才能进入
 有效能力清单。API 不回传 Secret 明文。
 
 模型连接只由 `manage_system_config` 管理，没有个人连接：增改删、凭据、
-`POST /api/config/claude/providers/test`、`POST /api/config/claude/providers/discover-models`
-和 `GET /api/config/claude/providers/:id/impact` 都在该权限下。测试与获取模型列表共用每个
-用户每分钟 10 次的上游请求限额；草稿里的凭据只用于这一次请求，不落盘，上游错误摘录脱敏后
-返回，日志只记上游 origin。普通成员通过会话模型选择和智能体绑定使用已有连接，看不到凭据。
+`POST /api/config/claude/providers/test`、`POST /api/config/claude/providers/discover-models`、
+`POST /api/config/claude/providers/:id/catalog/sync`、`GET /api/config/claude/providers/:id/usage`
+（magpie 连接读 `/v1/magpie/quotas`）和 `GET /api/config/claude/providers/:id/impact` 都在该
+权限下。测试、获取模型列表与需要请求上游的目录同步共用每个用户每分钟 10 次的上游请求限额；
+草稿里的凭据只用于这一次请求，不落盘，上游错误摘录脱敏后返回，日志只记上游 origin。普通成员通过会话模型选择和智能体绑定使用已有连接，看不到凭据。
+仍被智能体绑定或被任何自动化（含暂停、已完成的）选为模型的连接不能删除，要先改掉这些引用。
 
 ## 7. WebSocket
 
@@ -310,6 +359,7 @@ admin。admin 没有跨 owner bypass，不存在与无权限都返回 404。
 | Runtime Session 消息                   | Access + Session 属于该 Workspace  |
 | `terminal_start`                       | Access；只支持 Container Workspace |
 | `terminal_input` / resize / stop       | 必须是当前 WebSocket 已拥有的终端  |
+| `presence`                             | 仅记在本连接上；访客连接忽略       |
 | Docker Build 流                        | 对应系统管理权限                   |
 
 不能仅依赖 `terminal_start` 的历史授权；终端 owner 映射和连接关闭清理是协议的一部分。
@@ -332,6 +382,10 @@ admin。admin 没有跨 owner bypass，不存在与无权限都返回 404。
 Owner Claim：
 
 - 可信的 1:1 私聊可以从第一条持久化人类消息学习 owner。
+- 配对（`/pair`）或绑定后学习到的私聊发送者在机器人里等同主人本人：IM 命令可以 `/list`
+  主人的全部工作区，`/bind` 到其中任意一个（包括宿主机工作区）。配对登记在 Home，所以配对私聊
+  的发送者在主人任意工作区里都按主人轮次判定（见 4.5）。配对页和渠道引导提示只给主人自己的
+  账号配对。
 - 未认领群聊不会让“第一个发命令的人”自动成为 owner。
 - 群聊用 `/owner_mention` 显式认领。
 - `/release_owner` 清除 owner 与 allowlist，并把 legacy `owner_mentioned` 降级。
@@ -349,6 +403,7 @@ Owner Claim：
 | `/recall`、`/rc`                               | 私聊只读；群聊仅 IM Owner；带节流；只读取本条消息路由到的 Session             |
 | `/allowlist`                                   | 只读                                                                          |
 | `/clear`、`/fresh`、`/bind`、`/unbind`、`/new` | IM Owner                                                                      |
+| `/model`（含不带参数的查看）                   | IM Owner；列出并按工作区主人的权限校验 owner 的连接与模型                     |
 | `/sw`、`/spawn`                                | IM Owner                                                                      |
 | `/release_owner`                               | IM Owner                                                                      |
 | `/owner_mention`                               | 未认领群的 bootstrap，不可被 Owner Gate 锁死                                  |
@@ -357,6 +412,10 @@ Owner Claim：
 | `/steer <消息>`、`/break`（全部 IM 渠道）      | 群聊必须有渠道结构证明的真实 @Bot，并通过当前 audience/激活策略；不要求 owner |
 | 飞书 `/clear`、`/fresh [备注]`（运行时控制）   | 群聊必须结构化真实 @Bot 且为 IM Owner（与斜杠 `/clear`、`/fresh` 同一边界）   |
 | MCP `fresh_window`                             | 当前会话 Agent 可调用；不走斜杠 owner gate                                    |
+
+私聊里 `/list`、`/recall` 不受限、私聊发送者可以通过 owner-required 命令，是因为配对或绑定后
+私聊的对方就是主人本人；把别人的私聊配对或绑定进来，等于把这些权限（包括 `/bind` 到宿主机
+工作区）交给对方。
 
 飞书群聊中由 `handleCommand()` 处理的通用斜杠命令同样必须结构化真实 @Bot，并通过 audience
 检查；它们不受激活闸门（`activation_mode`、`when_mentioned`、`disabled`）约束，
@@ -367,8 +426,9 @@ Owner Claim：
 收到私聊时持久化 `feishu_chat_mode=p2p`；否则按持久化的 `feishu_chat_mode` 判断，
 未知时按群聊处理（fail closed）。私聊中的 owner-required 命令在 owner 未知时认领
 发送者；群聊永不自动认领。运行时控制在群聊路由失败时回复目标不存在，只有私聊才由
-绑定解析目标，绝不回退到 Workspace 主会话。`/recall` 在话题群中只读取当前话题的
-Session，缺少话题元数据时拒绝，不回退到 Workspace 主会话。
+绑定解析目标，绝不回退到工作区的其他会话；未绑定的聊天没有目标，`/clear`、`/fresh`、
+`/recall`、`/model` 回复「本聊天未绑定会话。」且不做任何操作。`/recall` 在话题群中只读取当前话题的
+Session，缺少话题元数据时拒绝，不回退到工作区的其他会话。
 
 不同 Provider 的原生 sender ID namespace 不得混用。例如 QQ C2C 与 Group 使用不同
 ID 空间；owner 比对必须使用渠道适配器传入的规范化 ID。
@@ -389,9 +449,16 @@ Agent MCP 调用没有 Cookie，但必须携带由主进程创建的运行上下
 自动化：
 
 - 每次运行都是真实会话里的一轮：绑定已有会话（默认当前会话）、每次新建或持续会话。
+- 自动化的模型（每次新建、持续会话的 Agent 自动化）只能在 Web 设置，按创建者当前的权限校验
+  （已停用的创建者没有任何权限），与会话选择同一套规则；只写入自动化自己建的会话，不会改动
+  用户已有会话的选择；访客看不到它，Agent 工具不能设置或修改它。
 - 脚本和前置检查仅允许 admin 的 Host Workspace。
 - `adminHostOnlyMode` 仅允许 admin 配置；开启后 active admin 拥有的 Workspace
   强制使用 Host，所有 Container 写入入口都会拒绝。member 始终保留 Container 隔离。
+- `deploymentMode`、`workspaceRoot` 仅允许 admin 配置（`/api/config/host-integration`）。
+  单人宿主机模式等同管理员纯宿主机生效，并由后端拒绝：注册（403）、建用户、建邀请码、
+  重新启用用户或提升为 admin、建访客或重新启用访客、`POST /api/docker/pull`（409
+  `SINGLE_USER_HOST`）。读取、停用、删除不受影响；界面隐藏这些入口只是展示层面。
 
 自动化的 Agent 工具（`automation_*`）不接收任何 JID。主进程从 IPC 目录和正在执行的
 批次推出调用者（`src/automation-runtime.ts` 的 `deriveAutomationActor`），**admin
@@ -402,6 +469,33 @@ Agent MCP 调用没有 Cookie，但必须携带由主进程创建的运行上下
   新建的自动化绑定当前会话和这条输入的来源路由（例如飞书话题）。
 - 其他轮次（群成员、混合批次）只能列出。
 - 旧的 `schedule_task` 等请求一律返回错误，提示改用自动化工具。
+
+会话查询（`session_list`、`session_get`）是只读的 Agent 工具，不经过 HTTP，权限全部由宿主在 IPC
+侧（`src/session-inspect-service.ts`）判定，Runner 的参数裁剪只是少给模型看不该用的参数：
+
+- 调用者只由请求文件所在的 IPC 目录（工作区 folder 加会话 id）确定，请求体里的身份字段一律
+  忽略。团队路由会话、团队执行会话和派发 Worker 不注册这两个工具，宿主也拒绝它们的请求
+  （`TEAM_LANE_POLICY.withheldTools`）。
+- 可见范围永远是调用者所在工作区的主人（`created_by`）自己的工作区，不能查看其他用户的
+  工作区。非 Home 工作区只能查看本工作区；Home 工作区可以查看主人的全部工作区，但必须
+  写明工作区（`workspace` 参数或 `<工作区>/<会话>` 寻址），裸会话 id 不会跨工作区搜索。
+  Host 工作区与 Web 读取（`canViewHostGroup`）一致，只在主人仍是 admin 时可见：主人不是
+  admin 时它不出现在列表里、寻址返回 `not_found`，Host 工作区自己的会话也不能使用这两个
+  工具。工作区不存在、不属于主人、会话不存在或无权查看，一律返回同一条 `not_found`，
+  不泄露存在性。
+- 本轮必须是工作区主人亲自发起的（判定与 `install_skill` 相同，用请求里的 `inputTurnId`
+  指明这一轮，过期的不借用当前轮次），才能跨工作区、读取消息正文、读取执行轨迹和
+  工具入参。群成员轮次、自动化运行、`work_item_input` 回报轮只得到本工作区会话的运行
+  状态字段（不含最新消息预览、消息、轨迹、工具入参和进展文本），跨工作区请求返回
+  `owner_turn_required`，不做任何查找。
+- 已取消的输入（飞书撤回、`/break`，即 `is_from_me=0` 且 `delivery_status='cancelled'`）
+  与 Web 时间线一样不出现在最新消息预览和 `session_get` 的消息里；IM `/recall` 的摘要同样
+  跳过它们。
+- 返回的会话内容经 `untrusted_session_data` 围栏作为不可信数据交给模型，「匹配到多个会话」
+  的候选会话名也放在围栏里，不进错误文本。按 Runner 打印出的字节计，`session_get` 的消息
+  和轨迹合计最多 32 KiB，从最新的往旧的取、遇到第一条放不下的就停，并用 `truncated` 标明
+  省略了多少；`session_list` 的会话条目最多 24 KiB，超出的同样省略并标明。没有新增数据库
+  列，也没有界面开关。
 
 ## 11. 访客（只读）
 
@@ -420,16 +514,16 @@ Agent MCP 调用没有 Cookie，但必须携带由主进程创建的运行上下
   `Guest accounts are read-only`，新路由默认拒绝。每次访客请求都重新读取 owner
   状态，owner 被禁用/删除或 `allowMemberGuests` 关闭（member owner）后立即 403，
   登录也失败；owner 被禁用/删除时同时注销其访客的会话。
-- 放行清单：Public 登录相关接口、`GET /api/auth/me`、`POST /api/auth/logout`、
+- 放行清单：Public 登录相关接口（含 `POST /api/auth/login/2fa`、`POST /api/auth/passkey/login[/options]`）、`GET /api/auth/me`、`POST /api/auth/logout`、
   `PUT /api/auth/password`、`GET/DELETE /api/auth/sessions[/:id]`；
   `GET /api/groups`、`GET /api/groups/:jid/{messages,agents,sessions}`、消息附件原图、
   `GET /api/groups/:jid/turn-traces/:turnId`、`GET /api/follow-ups`、
   `GET /api/workspaces[/:jid]`；`GET /api/groups/:jid/files` 与
-  `files/{download,preview,content}/:path`；Workspace Memory 的列表、搜索、条目和版本；
+  `files/{download,preview,office-preview,content}/:path`；Workspace Memory 的列表、搜索、条目和版本；
   `GET /api/automations[/:id[/runs]]`。放行的处理器仍按 `canViewGroup` 判断，
   未授权返回 404。
 - 有意不放行的读取：`/api/groups/:jid/git/*`（diff 可能包含被隐藏的点文件）、
-  `workdir/peers`（其他工作区的运行）、`model-selection`（owner 的模型连接）、
+  `model-selection` 与 `model-options`（owner 的模型连接）、
   `context-usage`（token 用量，只服务于输入框）、`env`、`mcp`、`im-groups`、
   `delete-impact`、工作区的渠道与运行会话挂载、`/api/automations/for-session`、
   `/api/status*`、用量与计费。
@@ -447,7 +541,7 @@ Agent MCP 调用没有 Cookie，但必须携带由主进程创建的运行上下
   前置检查命令、脚本命令和前置检查输出一律去掉（REST 与 WebSocket 相同）；所有写
   操作（包括标记已读）403。
 - Memory：读取用 `canViewGroup`，写入仍是 Modify。
-- WebSocket：访客连接只接收。除 `ping`（回 `pong`）外，任何入站消息（`send_message`、
+- WebSocket：访客连接只接收。除 `ping`（回 `pong`）和被忽略的 `presence` 外，任何入站消息（`send_message`、
   `terminal_*` 及未来类型）都在分发前以 `ws_error` 拒绝。广播受众
   （`getGroupAllowedUserIds`）包含持有有效授权的访客，包括 Host 工作区事件、流式思考
   与工具调用、重连快照和自动化事件；访客看到的过程信息与 owner 相同。REST 不给访客

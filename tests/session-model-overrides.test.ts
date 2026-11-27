@@ -331,10 +331,17 @@ describe('resolveSessionLaunchOverrides', () => {
       effort: 'high',
     });
     expect(glm()).toEqual({ model: 'glm-5.3', effort: 'high' });
-    // ...and is ignored, with a warning, on one that takes none.
+    // ...goes as picked with one whose efforts nothing knows...
     db.setSessionModelSelection('grp', null, 'glm', 'member-1', {
       model: 'glm-air',
       effort: 'high',
+    });
+    expect(glm()).toEqual({ model: 'glm-air', effort: 'high' });
+    expect(mocks.logger.warn).not.toHaveBeenCalled();
+    // ...and is ignored, with a warning, on one declared to take none.
+    setProviders(chatGpt('gpt'), {
+      ...thirdParty('glm'),
+      models: [{ id: 'glm-model' }, { id: 'glm-air', efforts: [] }],
     });
     expect(glm()).toEqual({ model: 'glm-air' });
     expect(mocks.logger.warn).toHaveBeenCalledWith(
@@ -570,13 +577,37 @@ describe('changing the model starts a new session', () => {
         chatJid: 'web:grp',
       },
       selected,
-      null,
     );
     expect(input.sessionId).toBeUndefined();
     // deleteSession wiped the row; the new session is bound and recorded again.
     expect(db.getSession('grp', null) || undefined).toBeUndefined();
     expect(db.getSessionProviderId('grp', null)).toBe('gpt');
     expect(db.getSessionModel('grp', null)).toBe('gpt-6-astra');
+  });
+
+  test('the reset rebinds the session the launch runs', () => {
+    const session = 'session-1';
+    db.setSession('grp', 'sdk-session-1', session);
+    db.setSessionProviderId('grp', session, 'gpt');
+    db.setSessionModel('grp', session, 'gpt-6.1-sol');
+    db.setSessionModelSelection('grp', session, 'gpt', 'ops-1', {
+      model: 'gpt-6-astra',
+    });
+    const selected = runner.trySelectPoolProvider('grp', session);
+    providerPool.releaseSession('gpt');
+    applyProviderSwitchToInput(
+      {
+        prompt: 'continue',
+        sessionId: 'sdk-session-1',
+        groupFolder: 'grp',
+        chatJid: `web:grp#agent:${session}`,
+        agentId: session,
+      },
+      selected,
+    );
+    expect(db.getSession('grp', session) || undefined).toBeUndefined();
+    expect(db.getSessionProviderId('grp', session)).toBe('gpt');
+    expect(db.getSessionModel('grp', session)).toBe('gpt-6-astra');
   });
 });
 
@@ -641,5 +672,91 @@ describe('buildCodexSelectionView', () => {
     const result = view(provider, { canExceedCeiling: false });
     expect(result.defaultModel).toBe('gpt-6-sol');
     expect(result.needsReauth).toBe(true);
+  });
+});
+
+describe('efforts a model is declared to take none of, or nothing is known of', () => {
+  const connection = {
+    ...thirdParty('glm'),
+    models: [
+      { id: 'mystery' },
+      { id: 'none', efforts: [], thinks: false },
+      { id: 'thinker', efforts: [] },
+      { id: 'glm-5.3' },
+    ],
+  };
+
+  test('a choice on an unknown model takes any effort; one declared none takes none', () => {
+    const chooser = { role: 'member', permissions: [] } as never;
+    expect(
+      overrides.validateSessionChoice(
+        connection as never,
+        { model: 'mystery', effort: 'max' },
+        chooser,
+      ),
+    ).toEqual({ ok: true, model: 'mystery', effort: 'max' });
+    expect(
+      overrides.validateSessionChoice(
+        connection as never,
+        { model: 'none', effort: 'low' },
+        chooser,
+      ),
+    ).toMatchObject({ ok: false, rejection: { code: 'EFFORT_NOT_SUPPORTED' } });
+    // A known model still checks its own efforts.
+    expect(
+      overrides.validateSessionChoice(
+        connection as never,
+        { model: 'glm-5.3', effort: 'medium' },
+        chooser,
+      ),
+    ).toMatchObject({ ok: false, rejection: { code: 'EFFORT_NOT_SUPPORTED' } });
+  });
+
+  test('a launch runs the first pick as is on an unknown model, nothing on a declared one', () => {
+    const run = (model: string, picks: Array<string | undefined>) =>
+      overrides.resolveLaunchReasoning(connection as never, model, picks);
+    expect(run('mystery', [undefined, 'xhigh', 'low'])).toEqual({
+      effort: 'xhigh',
+      thinkingDisabled: false,
+    });
+    expect(run('mystery', [])).toEqual({
+      effort: null,
+      thinkingDisabled: false,
+    });
+    expect(run('none', ['high'])).toEqual({
+      effort: null,
+      thinkingDisabled: true,
+    });
+    expect(run('thinker', ['high'])).toEqual({
+      effort: null,
+      thinkingDisabled: false,
+    });
+    expect(run('glm-5.3', ['medium'])).toEqual({
+      effort: 'high',
+      thinkingDisabled: false,
+    });
+  });
+
+  test('the picker is told what each model is', () => {
+    const listed = overrides.listConnectionModels({
+      ...connection,
+      models: [
+        {
+          id: 'codex/gpt-5.6-sol',
+          displayName: 'GPT-5.6-Sol',
+          maxOutputTokens: 128_000,
+          vendor: 'Codex',
+          upstreamMissingSince: '2026-11-01T00:00:00.000Z',
+        },
+      ],
+      anthropicModel: 'codex/gpt-5.6-sol',
+    } as never);
+    expect(listed[0]).toMatchObject({
+      id: 'codex/gpt-5.6-sol',
+      displayName: 'GPT-5.6-Sol',
+      maxOutputTokens: 128_000,
+      vendor: 'Codex',
+      upstreamMissingSince: '2026-11-01T00:00:00.000Z',
+    });
   });
 });

@@ -45,6 +45,16 @@ export const GUEST_ROUTE_ALLOWLIST: ReadonlyArray<{
   },
   { method: 'POST', pattern: /^\/api\/auth\/login$/, note: 'log in again' },
   {
+    method: 'POST',
+    pattern: /^\/api\/auth\/login\/2fa$/,
+    note: 'log in again (second factor)',
+  },
+  {
+    method: 'POST',
+    pattern: /^\/api\/auth\/passkey\/login(\/options)?$/,
+    note: 'log in again (passkey)',
+  },
+  {
     method: 'GET',
     pattern: new RegExp(`^/api/auth/avatars/${SEG}$`),
     note: 'avatar images',
@@ -60,6 +70,11 @@ export const GUEST_ROUTE_ALLOWLIST: ReadonlyArray<{
     note: 'brand assets',
   },
   { method: 'GET', pattern: /^\/api\/health$/, note: 'health probe' },
+  {
+    method: 'GET',
+    pattern: /^\/api\/build$/,
+    note: 'frontend build id (stale-page prompt)',
+  },
 
   // Own account.
   { method: 'GET', pattern: /^\/api\/auth\/me$/, note: 'current user' },
@@ -113,7 +128,7 @@ export const GUEST_ROUTE_ALLOWLIST: ReadonlyArray<{
   {
     method: 'GET',
     pattern: new RegExp(
-      `^/api/groups/${SEG}/files/(download|preview|content)/${SEG}$`,
+      `^/api/groups/${SEG}/files/(download|preview|office-preview|content)/${SEG}$`,
     ),
     note: 'file read',
   },
@@ -162,10 +177,10 @@ export const GUEST_ROUTE_ALLOWLIST: ReadonlyArray<{
   },
 
   // Deliberately absent reads: git status/diff (a diff can show the dot
-  // files the file routes hide), workdir peers (other workspaces' runs),
-  // model selection (the owner's model connections), context usage (token
-  // usage; only the composer shows it), workspace env/MCP, IM groups,
-  // delete impact, channel and runtime-session mounts, /api/status*.
+  // files the file routes hide), model selection (the owner's model
+  // connections), context usage (token usage; only the composer shows it),
+  // workspace env/MCP, IM groups, delete impact, channel and runtime-session
+  // mounts, /api/status*.
 ];
 
 export function isGuestRouteAllowed(method: string, path: string): boolean {

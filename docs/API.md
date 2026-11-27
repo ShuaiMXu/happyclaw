@@ -27,15 +27,15 @@
 | `/api/agent-profiles`              | `src/routes/agent-profiles.ts`   | 产品级 Agent                  |
 | `/api/channel-accounts`            | `src/routes/channel-accounts.ts` | 多渠道账号                    |
 | `/api/config`                      | `src/routes/config.ts`           | Provider、系统与兼容渠道配置  |
-| `/api/config`                      | `src/routes/gemini.ts`           | Gemini 订阅授权与模型目录     |
 | `/api/config`                      | `src/routes/brand-assets.ts`     | 品牌资源上传、删除与公开读取  |
 | `/api/automations`                 | `src/routes/automations.ts`      | 自动化和运行记录              |
-| `/api`                             | `src/routes/work-items.ts`       | 团队模式：群设置与工作项      |
+| `/api`                             | `src/routes/work-items.ts`       | 团队模式与多任务模式：工作项  |
 | `/api/tasks`                       | `src/routes/tasks.ts`            | 已废弃，一律 410              |
 | `/api/memory`                      | `src/routes/memory.ts`           | Workspace Memory v2           |
 | `/api/skills`                      | `src/routes/skills.ts`           | 用户 Skills                   |
 | `/api/mcp-servers`                 | `src/routes/mcp-servers.ts`      | 用户/系统 MCP                 |
 | `/api/plugins`                     | `src/routes/plugins.ts`          | Plugin Catalog 与用户启用状态 |
+| `/api/push`                        | `src/routes/push.ts`             | Web Push 订阅与测试           |
 | `/api/usage`                       | `src/routes/usage.ts`            | Token 用量                    |
 | `/api/billing`                     | `src/routes/billing.ts`          | 订阅、余额和计费管理          |
 | `/api/admin`                       | `src/routes/admin.ts`            | 用户、邀请和审计              |
@@ -49,24 +49,89 @@
 
 Public：
 
-- `GET /api/auth/status`
-- `POST /api/auth/setup`，仅用户表为空时可用
-- `POST /api/auth/login`
-- `GET /api/auth/register/status`
-- `POST /api/auth/register`
+- `GET /api/auth/status`：`{ initialized, deploymentMode, deploymentModeSource }`，
+  `deploymentModeSource` 为 `settings|env|default`；初始化向导据此预选环境变量给出的方式，
+  不改选就不提交
+- `POST /api/auth/setup`，仅用户表为空时可用；可带
+  `deployment_mode: "multi_user" | "single_user_host"`，在创建管理员的 Home 工作区之前保存。
+  只写入这一项，其他系统设置仍按环境变量生效；不带时什么也不存
+- `POST /api/auth/login`：开启了二次验证的账号密码正确时不下发会话，返回
+  `{ mfa_required: true, challenge }`
+- `POST /api/auth/login/2fa`：`{ challenge, code }`，`code` 为验证器的 6 位验证码或一个恢复码；
+  成功后下发会话。challenge 只在内存中，绑定用户，5 分钟过期，最多试 5 次，用过即作废；
+  失败返回 400（`code: MFA_INVALID`，过期或用尽为 `MFA_EXPIRED`），并与密码失败共用登录限流。
+  密码正确时只退还这一次计数、不清除用户名+IP 桶里已有的失败，第二步成功才清除，所以重新输入
+  密码不会重置验证码的猜测次数。challenge 绑定发出时的密码与二次验证设置：之后改了密码（本人、
+  管理员或 `reset:admin`）、关闭或重置二次验证（即使重新开启）、账号被停用（即使再启用）或删除，
+  都返回 `MFA_EXPIRED`。验证器密钥无法解密（加密密钥被替换）时返回 500
+  `MFA_SECRET_UNREADABLE`，不计失败、challenge 保留，可改用恢复码
+- `POST /api/auth/passkey/login/options`：无用户名登录（可发现凭据）的 WebAuthn 选项。每个客户端
+  （IPv4 地址或 IPv6 /64）最多保留 50 个未用的登录 challenge，超出时丢弃它自己最早的那个；
+  loopback 与未知地址分不出客户端，共用一个同样上限的名额（反向代理后要设 `TRUST_PROXY`）。
+  登录 challenge 与注册 challenge 分开存放，刷登录选项挤不掉进行中的注册
+- `POST /api/auth/passkey/login`：`{ response }`（`navigator.credentials.get` 的 JSON），成功即下发
+  会话，视同已过二次验证。challenge 过期、用过或不存在返回 400 `PASSKEY_EXPIRED`（重新取选项
+  再试）；凭据未登记、属于别的主机、`userHandle` 不是凭据所属用户、签名或用户验证不通过，以及
+  停用账号和访客，返回 400 `PASSKEY_INVALID`
+- `GET /api/auth/register/status`：单人宿主机模式下恒为关闭
+- `POST /api/auth/register`：单人宿主机模式下 403
 - `GET /api/auth/avatars/:filename`
 
 登录后：
 
 - `POST /api/auth/logout`
-- `GET /api/auth/me`
+- `GET /api/auth/me`：顶层带 `deploymentMode`（生效值）
 - `PUT /api/auth/profile`
-- `PUT /api/auth/password`
+- `PUT /api/auth/password`：当前密码错误返回 400 `CURRENT_PASSWORD_INCORRECT`，与登录共用限流
 - `GET /api/auth/sessions`
 - `DELETE /api/auth/sessions/:id`
 - `POST /api/auth/avatar`
+- `GET /api/auth/2fa`：`{ enabled, recovery_codes_remaining }`
+- `POST /api/auth/2fa/setup`：生成待确认的 TOTP 密钥（RFC 6238，SHA-1、6 位、30 秒），返回
+  `{ secret, otpauth_uri, qr_data_url }`；已开启时 409 `MFA_ALREADY_ENABLED`
+- `POST /api/auth/2fa/enable`：`{ password, code }`，当前密码和第一个验证码都对才开启，返回
+  `{ success, recovery_codes, sessions_revoked }`：10 个恢复码只此一次（库里只存逐条加盐的哈希），
+  同时注销该账号除当前会话外的全部会话（写进审计 `mfa_enabled` 的 `details`）
+- `POST /api/auth/2fa/disable`：`{ password, code }`，`code` 可以是恢复码；未开启时 409
+  `MFA_NOT_ENABLED`
+- `POST /api/auth/2fa/recovery-codes`：`{ code }`（只接受验证器验证码），重新生成恢复码
 
-`POST /api/auth/login` 的失败次数按三个桶计数，任一超限返回 429：用户名+IP
+改密码、二次验证和通行密钥的接口重新核对当前密码与验证码时（开启二次验证时的第一个验证码也算），
+先占用一次登录限流计数再校验，错误的密码和验证码与登录失败共用同一组桶（用户名小写 + 客户端 IP）；
+核对通过只退还这一次计数，不清除已有的失败，只有真正登录成功才清除。超限返回 429（带
+`Retry-After` 头）
+`{ code: "TOO_MANY_ATTEMPTS", retry_after_seconds }`。错误一律返回 400 而不是 401（Web 客户端
+把 401 当作登录失效），并带 `code`：请求体无效 `INVALID_REQUEST`、当前密码错误
+`CURRENT_PASSWORD_INCORRECT`、验证码错误 `MFA_INVALID`、需要验证码却没给 `MFA_REQUIRED`、
+验证器密钥无法解密 `MFA_SECRET_UNREADABLE`（500）。同一个 30 秒步长的验证码只接受一次。访客没有
+二次验证，这些接口不在访客放行清单里。
+
+通行密钥（WebAuthn，`src/passkeys.ts`、`src/routes/passkeys.ts`）：
+
+- `GET /api/auth/passkeys`：`{ passkeys: [{ id, name, rp_id, created_at, last_used_at }], rp_id,
+unavailable_reason, two_factor_enabled }`，`unavailable_reason` 说明当前页面地址为什么不能用通行
+  密钥，`two_factor_enabled` 为真时添加还要验证码
+- `POST /api/auth/passkeys/options`：`{ password, code? }`，先重新验证本人：当前密码，开了二次
+  验证时还要验证码（可以是恢复码），失败计入登录限流（见上文的错误码）；通过后返回注册选项
+  （要求可发现凭据与用户验证，attestation `none`，算法 EdDSA、ES256、RS256）。每人最多 20 个，
+  超出 409 `PASSKEY_LIMIT_REACHED`
+- `POST /api/auth/passkeys`：`{ response, name? }`，用上一步的 challenge 验证后保存，写审计
+  `passkey_added`；保存前再查一次上限（409 `PASSKEY_LIMIT_REACHED`）
+- `PATCH /api/auth/passkeys/:id`：`{ name }`，只能改自己的，否则 404
+- `POST /api/auth/passkeys/:id/delete`：`{ password }`，密码错误 400 `CURRENT_PASSWORD_INCORRECT`
+  并计入登录限流，写审计 `passkey_removed`
+
+没有配置的公网地址，仪式的 origin 取请求的 `Origin` 头，只在它与 `Host` 同源、是 localhost
+（`CORS_ALLOW_LOCALHOST=false` 时除外）或列在 `CORS_ALLOWED_ORIGINS`（`*` 不算）时接受，且必须
+是 HTTPS（localhost 可用 HTTP）；否则 400，`code` 为 `PASSKEY_NO_ORIGIN`、`PASSKEY_INSECURE` 或
+`PASSKEY_NOT_ALLOWED`。RP ID 是该 origin 的主机名，必须是域名：IP 地址（含 `127.0.0.1` 与 IPv6
+地址）返回 400 `PASSKEY_IP_HOST`。RP ID 随凭据保存，登录时只接受同一 RP ID 的凭据。challenge
+存在内存里，绑定用途、用户、origin 和 RP ID，5 分钟过期，只能用一次。改密码和管理员重置二次验证
+都不删除通行密钥，撤销用 `DELETE /api/admin/users/:id/passkeys`；删除用户时一并删除。访客没有
+通行密钥：管理接口返回 403，访客的凭据不能登录。
+
+`POST /api/auth/login` 的失败次数按三个桶计数，任一超限返回 429（与 `/login/2fa` 及上面的复核
+接口同形：`{ error, code: "TOO_MANY_ATTEMPTS", retry_after_seconds }`，带 `Retry-After` 头）：用户名+IP
 （`maxLoginAttempts`/`loginLockoutMinutes`）、用户名（4 倍/1 小时）、客户端 IP
 （6 倍/同一窗口，IPv6 按 /64 合并；loopback 与未知地址不计）。客户端 IP 取自
 `getClientIp`，部署在反向代理后需设置 `TRUST_PROXY=true`。用户名超过 64 字符直接按无效凭据返回 401。
@@ -112,22 +177,28 @@ active 的 admin 可以为自己创建只读访客（`role=guest`），并授权
 
 ## 工作区、消息和运行控制
 
-- `GET|POST /api/groups`；`POST` 的响应带 `warnings`，`custom_cwd` 与同一用户的其他
-  宿主机工作区目录相同时为
-  `[{"code": "shared_custom_cwd", "message": "…", "workspaces": [{"jid", "name"}]}]`，
-  不阻止创建
+- `GET|POST /api/groups`；`custom_cwd` 可以与同一用户的其他宿主机工作区相同。`GET` 另带
+  `workspace_root`：没有自定义目录的新宿主机工作区建在它下面的同名子目录；只返回给 admin，
+  其他角色为 `null`。工作区根目录和备用目录都不可用时也为 `null`，新工作区放在
+  `data/groups/{folder}`
 - `PATCH|DELETE /api/groups/:jid`
 - `PATCH /api/groups/:jid/agent-profile`
 - `POST /api/groups/:jid/stop`
 - `POST /api/groups/:jid/interrupt`
 - `POST /api/groups/:jid/reset-session`
 - `GET|PUT /api/groups/:jid/model-selection`，聊天输入框的会话级模型与推理档位选择
+- `GET /api/groups/:jid/model-options`，还没有会话时可选的模型（新建会话、自动化表单）
 - `GET /api/groups/:jid/context-usage`，会话当前的上下文占用（输入框旁的圆环）
 - `POST /api/groups/:jid/clear-history`，重建工作区内容：永久清除聊天、
-  Runtime Session、子对话、`data/groups/{folder}` 工作目录、会话 worktree 目录及
-  Workspace Memory（含版本历史和 Home Owner Profile）；自动化保留，重建期间暂停，
-  排队或运行中的运行记为已终止，绑定已删会话的自动化保持暂停；保留工作区外壳、
+  Runtime Session、工作区目录（工作区根目录下记录的目录，否则 `data/groups/{folder}`）、
+  会话 worktree 目录及 Workspace Memory（含版本历史和 Home Owner Profile）；自动化保留，
+  重建期间暂停，排队或运行中的运行记为已终止，绑定已删会话的自动化保持暂停；保留工作区外壳、
   `data/extra/`、自动化运行历史、worktree 分支和宿主机模式的自定义工作目录
+- `DELETE /api/groups/:jid` 和 `clear-history` 删除或移走有记录的工作区目录之前先做安全检查
+  （目录必须正是记录的根目录下的同名子目录、自身不是链接、不与安装目录重叠、不包含其他工作区
+  的目录或自定义目录；根目录被移走后用链接接回原位、真实位置仍带 `.happyclaw-workspace-root`
+  标记时按真实位置检查）。不通过时返回 409 `{ error, code: "WORKSPACE_DIR_UNSAFE", reason }`，
+  不删除任何文件
 - `POST /api/groups/:jid/reset-owner`，admin break-glass
 - `GET /api/groups/:jid/messages`
 - `GET /api/groups/:jid/turn-traces/:turnId`，已结算回合的思考摘要、执行轨迹与有序步骤
@@ -147,8 +218,9 @@ active 的 admin 可以为自己创建只读访客（`role=guest`），并授权
 工作区或会话取消等待。来源是 IM 的输入在开始等待时收到一条说明（同一输入只发一次）。
 自动化的输入与其他输入一样留在队列里等待，运行保持 `queued`。
 
-`model-selection` 以 `agentId`（GET 查询参数、PUT 请求体）区分 Runtime Session，
-缺省表示主会话。GET 返回当前选择、默认值的解析来源和全部已保存模型配置（不含凭据）；
+`model-selection` 以 `agentId`（GET 查询参数、PUT 请求体）指定 Runtime Session，必填，
+缺失时 400 `{ "code": "session_required" }`；`context-usage`、`messages`、`reset-session`
+同样必须带会话。GET 返回当前选择、默认值的解析来源和全部已保存模型配置（不含凭据）；
 `default.source` 按与运行时相同的函数解析，取值 `agent`（智能体自己的绑定）、
 `workspace_env`（工作区自带 Provider 环境变量）、`owner_main`（工作区所有者的主智能体）、
 `system_main`（系统主 HappyClaw：最早创建的 admin 的主智能体）、`none`；未设置的一步
@@ -160,10 +232,14 @@ PUT 的 `modelConfigId` 为 `null` 时恢复默认。会话选择的（配置, �
 绑定；切换后该会话的暖 Runner 在当前轮次结束后退出，下一条消息使用新选择。
 
 每个配置都可以在配置内选择具体模型。选项带 `usable`（有凭据才可选）；ChatGPT 订阅以外
-的选项带 `models[]`：`id`、`efforts`（可选档位，空数组表示不能选）、`defaultEffort`
+的选项带 `models[]`：`id`、`displayName`（上游列表给的名称，没有为 `null`）、
+`efforts`（已知支持的档位）、`defaultEffort`
 （不选档位时运行的档位：智能体显式档位且该模型支持时用它，否则模型默认档位，没有则
 `null`）、`contextWindow`（未知为 `null`）、`effortsSource`（`declared` 连接里声明、
-`registry` 能力表、`family` 同系列推断、`none`）。全部模型都会列出。直通中转没有默认
+`registry` 能力表、`family` 同系列推断、`none` 未知）、`maxOutputTokens`、`vendor`、
+`upstreamMissingSince`（没有为 `null`）。`efforts` 为空且 `effortsSource` 为 `declared`
+表示声明不支持档位，不能选；`effortsSource` 为 `none` 表示档位未知，五个档位都可以选，
+按所选原样下发（Web 标「未验证」）。全部模型都会列出。直通中转没有默认
 模型时 `model` 为空字符串。
 
 ChatGPT 订阅配置（`kind: "codex"`）不带 `models`，而是带 `codex`，并且还能选择推理
@@ -174,15 +250,6 @@ Agent 显式档位优先，其次是配置档位，按模型目录钳制）、`s
 的实时目录并按套餐过滤，同步读取、后台刷新，不等待网络；`efforts` 按 low 到 ultra
 排序，只含当前用户可以选择的档位。
 
-Gemini 订阅连接（公开字段 `hasGeminiOAuthCredentials`）的 `models` 是登录时保存的
-Antigravity 目录（`id`、`contextWindow`），另带 `geminiOAuthCredentialsExpiresAt`、
-`geminiOAuthCredentialsEmail`、`geminiOAuthProjectId`、`geminiOAuthNeedsReauth`、
-`geminiOAuthLastRefreshError`（`{ kind: 'reauth_required' | 'transient', message, at }`）
-和完整的 `geminiModels`：`id`、`displayName`、`contextWindow`、`maxOutputTokens`、
-`supportsThinking`、`supportsImages`、`thinkingBudget`、`minThinkingBudget`。
-它的 `anthropicBaseUrl` 落盘为内嵌网关占位值，Runner 启动时替换为本机网关地址与
-仅本轮有效的临时 token。
-
 响应顶层另有 `selectedModel` 与 `selectedEffort`（所有类型）：已存的模型若已不在配置
 的模型列表（ChatGPT 为账号目录）中，或档位不被所运行的模型（ChatGPT 为目录或当前用户
 权限）支持，按未选择返回，与 Runner 启动时的处理一致。
@@ -190,12 +257,16 @@ Antigravity 目录（`id`、`contextWindow`），另带 `geminiOAuthCredentialsE
 PUT 可以携带 `model`、`effort`，请求整体替换该会话的选择：只写 `modelConfigId`
 会清掉之前的模型和档位，换配置也不会继承旧配置的模型。`model` 最长 200 个字符，
 必须在所选配置的模型列表内，ChatGPT 订阅则必须在该账号当前目录内；`effort` 必须在
-（所选或配置默认的）模型的 `efforts` 内，否则 ChatGPT 以外返回 `EFFORT_NOT_SUPPORTED`；
+（所选或配置默认的）模型的 `efforts` 内（档位未知的模型接受任何档位，声明不支持档位的
+模型不接受），否则 ChatGPT 以外返回 `EFFORT_NOT_SUPPORTED`；
 两者都要同时给出 `modelConfigId`。否则返回 400 与 `code`：
 `MODEL_NOT_IN_CONNECTION`、`EFFORT_NOT_SUPPORTED`、`MODEL_UNAVAILABLE`、
-`EFFORT_UNSUPPORTED`、`EFFORT_RESTRICTED`、`MODEL_CONFIG_REQUIRED`。推理等级按会话
-档位 → 智能体显式档位 → 模型默认档位解析，只取所运行模型支持的档位，不支持档位的
-模型不写 `CLAUDE_CODE_EFFORT_LEVEL`；没有默认 `max`。会话档位写入
+`EFFORT_UNSUPPORTED`、`EFFORT_RESTRICTED`、`MODEL_CONFIG_REQUIRED`、
+`MODEL_CONFIG_NO_CREDENTIALS`（配置缺少凭据）；配置不存在时 404
+`MODEL_CONFIG_NOT_FOUND`。推理等级按会话
+档位 → 智能体显式档位 → 模型默认档位解析，只取所运行模型支持的档位；档位未知的模型取
+第一个合法的档位原样下发，都没有就不传；声明不支持档位的模型不传档位，同时声明不推理
+（`thinks: false`）时本轮关闭思考；不传时不写 `CLAUDE_CODE_EFFORT_LEVEL`；没有默认 `max`。会话档位写入
 `CLAUDE_CODE_EFFORT_LEVEL`（Claude Code 让它优先于 Runner 为智能体传的 SDK `effort`），
 不改动交给 Runner 的智能体配置。ChatGPT 以外只改档位时退出暖 Runner（下一条消息
 重启），但保留 SDK 会话。高于 `max` 的档位（目前是
@@ -203,6 +274,13 @@ PUT 可以携带 `model`、`effort`，请求整体替换该会话的选择：只
 `EFFORT_RESTRICTED`，Runner 启动时若选择者已失去该权限则回到默认档；放宽只需改
 `CODEX_SESSION_EFFORT_CEILING`。响应附带 `drained`（被退出的暖 Runner 数）与
 `liveUpdated`（被就地改档的存活网关授权数）。
+
+`model-options` 不需要会话，返回 `{ default, options }`，与 `model-selection` 响应里
+的同名字段相同；访问检查同 `model-selection` 的 GET。
+
+由一个会话派生出的会话从它的选择开始：多任务派发的 Worker 复制派出会话当时的选择，
+团队模式的路由会话复制群绑定会话的选择，执行会话复制路由会话的选择。复制的是记录本身
+（含选择者），之后各自独立；启动时照常校验，失效则回到默认。
 
 `context-usage` 以 `agentId` 查询参数区分 Runtime Session，访问检查同
 `model-selection` 的 GET，返回
@@ -221,7 +299,8 @@ Runner 启动时，选中的模型取代配置的默认模型成为 `ANTHROPIC_M
 环境由 `buildConnectionModelEnv` 按本轮模型生成：上下文长度大于 200K 时模型名加 `[1m]`
 （Claude Code 的开关，请求前剥掉，只把上下文上限抬到 1M），小于 1M 且不等于 200K 时
 写 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 压回实际长度，未知时两者都不写；opus/sonnet/haiku
-档与 `CLAUDE_CODE_SUBAGENT_MODEL` 取连接的 `roles`，未设置时跟随本轮模型。官方连接只在
+档与 `CLAUDE_CODE_SUBAGENT_MODEL` 取连接的 `roles`，未设置时跟随本轮模型（智能体设置了
+默认子代理模型时以它为准，见 Agent Profile 的 `runtime_policy.subagents`）。官方连接只在
 模型条目声明了大于 200K 的上下文时加 `[1m]`（可能按长上下文计费）。已选模型被移出列表
 后，按配置默认模型运行并记录告警，不让本轮失败。
 
@@ -257,6 +336,16 @@ Workspace↔AgentProfile 绑定行上，因此：仅 `web:` 前缀工作区可�
 工作区没有 AgentProfile 绑定时返回 409 `WORKSPACE_AGENT_PROFILE_MISSING`。
 它与 `execution_mode` 共享同一道 quiesce 边界，暖 Runner 只能观察到旧契约或新
 契约；停机失败返回 503 并带 `persisted` 标记。
+
+`work_mode`（`single` 或 `multi`）是工作区的工作方式，存放在同一条绑定行上。
+`GET /api/groups` 的每个 `web:` 工作区和 `GET /api/workspaces/:jid` 都带它（没有绑定行
+时为 `single`）；`POST /api/groups` 可在创建时指定，缺省 `single`；`PATCH /api/groups/:jid`
+同样接受它，响应回显当前值。权限与 `interaction_mode` 相同（仅 `web:` 前缀工作区、仅
+owner，没有绑定行时 409 `WORKSPACE_AGENT_PROFILE_MISSING`）。切换不经过 quiesce，不中断
+正在运行的回合，也不重置 SDK 会话：该工作区的每个暖 Runner 在本轮结束后退役，空闲的
+立即关闭，下一轮由新的 Runner 按新值决定工具和提示词。`multi` 下，普通会话可以把大任务
+派给 Worker 会话（见「团队模式与多任务模式」）。切回 `single` 后不再派新任务，已派出的
+任务照常完成并回报，派出它们的会话在还有未结束的任务时保留跟进和停止的工具。
 
 `process_visibility`（`hidden`、`activity` 或 `full`）决定主动模式工作区的 Web
 能看到一个回合的多少过程，存放在同一条绑定行上。`GET /api/groups` 的每个 `web:`
@@ -431,12 +520,126 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 `GET /api/browse/directories?purpose=mount` 浏览服务器目录；未配置有效 allowlist
 时该入口 fail-closed。
 
+位于宿主机 NFS 挂载之下的目录默认仍按普通绑定挂进容器。allowlist 的根目录设置
+`nfsDirectMount: true` 后，该根下位于 NFS 上的目录改由 Docker 直接挂同一个导出
+子目录（`local` 卷驱动）。宿主机重挂 NFS（NAS 重启、断网恢复）因此不会让运行中的
+容器拿到失效的挂载；Docker Desktop 与 OrbStack 的 VM 没有挂载传播，绑定的旧挂载会
+一直报 `EBADF`。授权不变：仍按宿主机路径校验 allowlist，开关取匹配到的最具体的根；
+根下不在 NFS 上的目录照常绑定。
+
+```json
+{
+  "allowedRoots": [
+    { "path": "/Volumes/nas", "allowReadWrite": true, "nfsDirectMount": true }
+  ]
+}
+```
+
+- 协议跟随宿主机挂载：NFSv4 仍用 v4（含次版本）和宿主机挂载的原路径（包括 v4
+  伪根下的路径），NFSv3 仍用 v3，选项为 `proto=tcp,hard`。macOS 的版本取自
+  `nfsstat -m`，Linux 取自挂载表。
+- 只有 NFSv3 且守护进程用不了 NLM 时才加 `nolock`：Docker Desktop 与 OrbStack 的
+  VM 不跑 rpc.statd，v3 加锁会报 `ENOLCK`，加 `nolock` 后锁只在容器内生效；Linux
+  上守护进程与宿主机共用内核的 lockd 和 rpc.statd，跟随宿主机挂载是否 `nolock`。
+  NFSv4 的锁在协议内完成，不加 `nolock`。
+- 无法按宿主机挂载重建时容器启动失败并说明原因，不会悄悄退回绑定：宿主机挂载用了
+  Kerberos（`sec=krb5*`）、版本不是 3 或 4.x、读不到挂载表或版本。把该根的
+  `nfsDirectMount` 去掉即恢复绑定。
+- 挂载由守护进程完成，需要：守护进程能直接连到 NAS（NFS 端口，v3 还需要 rpcbind
+  与 mountd）；rootless Docker 不能挂 NFS，不要开启；导出要求特权源端口（Linux
+  knfsd 默认的 `secure`、群晖默认设置）时，经用户态 NAT 出网的 Docker Desktop 与
+  OrbStack 可能被拒。NAS 看到的 uid 是容器内进程的 uid：Linux 上与服务用户一致，
+  Docker Desktop 与 OrbStack 下是容器内 `node` 的 1000，而不是 Mac 用户的 uid，
+  NAS 没有 `all_squash` 一类映射时请先确认文件权限。
+
+网络存储也可以作为存储源直接挂载。管理员在 allowlist 的 `storageSources` 中声明
+服务器与凭据，工作区只按 `id` 选择来源、来源内的子目录和是否只读：
+
+```json
+{
+  "storageSources": [
+    {
+      "id": "nas-nfs",
+      "type": "nfs",
+      "server": "nas.lan",
+      "exportPath": "/volume1/shared",
+      "nfsVersion": "3",
+      "allowReadWrite": true
+    },
+    {
+      "id": "nas-smb",
+      "type": "cifs",
+      "server": "nas.lan",
+      "share": "team",
+      "username": "happyclaw-agent",
+      "passwordFile": "config/secrets/nas-smb",
+      "smbVersion": "3.0",
+      "allowReadWrite": false
+    }
+  ]
+}
+```
+
+```json
+{
+  "additional_mounts": [
+    {
+      "source": "nas-nfs",
+      "sub_path": "projects/alpha",
+      "container_path": "alpha",
+      "readonly": false
+    }
+  ]
+}
+```
+
+- `type` 为 `nfs` 或 `cifs`（SMB）。挂载由 Docker 守护进程的内核完成，容器不需要
+  额外权限；子目录不存在时容器启动失败。`sub_path` 和宿主机目录一样不能命中
+  `blockedPatterns`（`.ssh`、`credentials` 等）。
+- SMB 密码只放在 `passwordFile`（绝对路径或相对项目根，必须是服务用户所有的 600
+  普通文件，单行、不含逗号；示例里的密码目录已被 `.gitignore` 忽略），不进
+  allowlist、数据库、docker 命令行或日志：
+  启动时经 Docker Engine API 的请求体建一个命名卷
+  （`happyclaw-storage-<id>-<摘要>-<凭据版本>`，标签 `io.happyclaw.storage-source`），
+  容器按名字挂载。凭据版本是用服务端密钥（`WEB_SESSION_SECRET`）对密码做 HMAC 后取
+  的 8 位十六进制：改密码后新启动的容器用新卷，仍在运行的容器继续用旧卷，旧卷不会被
+  删除。Docker 自己会把卷参数（含密码）存在守护进程的数据目录里，
+  `docker volume inspect` 也能看到，所以请给 HappyClaw 用一个只有所需权限的专用
+  SMB 账号。只支持本机 unix socket 的 Docker 上下文；每次启动都按当前 Docker 上下文
+  建卷，与随后的 `docker run` 落在同一个守护进程。同名卷的参数不对（例如卷缺失时
+  `docker run` 自动建出的空本地卷）时，空闲则重建，在用则启动失败，不会把它当成共享
+  挂进容器。
+- 不再使用的 SMB 卷（改密码、改来源或删除工作区之后）目前不会自动回收，参数里仍有
+  旧密码。可以用 `docker volume ls --filter label=io.happyclaw.storage-source`
+  列出，确认没有容器在用后 `docker volume rm` 删除。
+- NFS 使用 AUTH_SYS 认证，NAS 只按来源 IP 和请求里自报的 uid 判断权限。容器出网与
+  守护进程主机共用同一个 IP，容器里的 Agent 可以自己连上导出，绕过 `sub_path` 和
+  只读限制。NAS 上只导出工作区可以看到的内容：按子目录单独导出，只读的就只读导出，
+  并设置 `all_squash`。宿主机目录的 `nfsDirectMount` 同样如此。
+- 没有 Unix 扩展的 SMB 共享没有可映射的属主，挂载按 `file_mode=0777,dir_mode=0777`
+  对容器内所有用户开放，实际权限由 SMB 账号在服务器上的权限决定。
+- 管理员也可以在 Web「设置 → 存储源」里添加存储源（见
+  `/api/config/storage-sources`），新建 Container 工作区时在挂载编辑器里选择。Web 添加的
+  存储源存在 `data/config/storage-sources.json`，密码在 `data/config/secrets/`，都在
+  `data/` 下，不进 Git 工作树、随 `make backup` 备份；服务从不改写
+  `config/mount-allowlist.json`。运行时把两份列表合并：allowlist 文件里的来源排在前面，
+  同一个 `id` 以 allowlist 文件为准，Web 那份被忽略并记一条告警；下次经 Web 保存或
+  删除任意存储源时，这份旧条目从 `storage-sources.json` 删除，连同它在
+  `data/config/secrets/` 下的密码文件（allowlist 文件里的来源正用着这个文件时保留）。
+  没有 allowlist 文件时 Web 添加的存储源照样可用，此时不授权任何宿主机目录，
+  `nonMainReadOnly` 按 `true`。allowlist 文件无法解析时全部挂载 fail-closed；
+  `storage-sources.json` 无法解析时只有其中的来源不能挂载。
+- 读写同时受来源的 `allowReadWrite` 与 `nonMainReadOnly` 约束；每次容器启动前都会
+  按当前 allowlist 重新校验，来源被删除后旧工作区无法启动；关闭 `allowReadWrite` 后，
+  以读写方式挂载它的工作区同样无法启动（不会自动降为只读）。
+
 ## 文件
 
 - `GET|POST /api/groups/:jid/files`
 - `POST /api/groups/:jid/files/open-directory`
 - `GET /api/groups/:jid/files/download/:path`
 - `GET /api/groups/:jid/files/preview/:path`
+- `GET|HEAD /api/groups/:jid/files/office-preview/:path`
 - `GET|PUT /api/groups/:jid/files/content/:path`
 - `DELETE /api/groups/:jid/files/:path`
 - `POST /api/groups/:jid/directories`
@@ -444,16 +647,41 @@ HTTP 状态为 409；请求不会停止现有 Runner，也不会修改绑定。
 路径必须位于目标工作区允许范围内；系统目录、路径穿越和不安全符号链接会被拒绝。
 
 文件根与该会话运行时的工作目录一致：宿主机模式的自定义目录、否则
-`data/groups/{folder}`。以上接口都接受查询参数 `agentId`（Runtime Session ID，`main`
-或缺省为主会话）；会话有独立 worktree 时以 worktree 为根。`agentId` 不属于该工作区时
+`data/groups/{folder}`。以上接口都接受查询参数 `agentId`（Runtime Session ID）；缺省时以
+工作区目录为根，会话有独立 worktree 时以 worktree 为根。`agentId` 不属于该工作区时
 返回 404。
+
+读取接口（列表、`download`、`preview`、`office-preview`、`content`）对 owner 和持有有效
+授权的访客开放，访客看不到隐藏路径（返回 404），见 `docs/ACL-MATRIX.md`；写入接口只对
+owner 开放。`:path` 是工作区相对路径的 base64url。`preview` 带 `ETag` 与
+`Last-Modified`，`Cache-Control: private, no-cache`，`If-None-Match` 命中时回 304。
+
+`office-preview` 把 doc/docx/xls/xlsx/ppt/pptx/odt/ods/odp 转成 PDF 返回
+（`Content-Type: application/pdf`，`Content-Security-Policy: default-src 'none'; sandbox`）。
+转换结果按源文件内容的 sha256 缓存在 `data/cache/office-preview/`；`ETag` 是这个哈希
+（强 ETag），`Cache-Control: private, no-cache`，`If-None-Match` 命中时直接回 304，不做
+转换。`HEAD` 同样执行转换并返回状态与头，不带正文，前端用它预检后再让 iframe 加载同一
+地址。没有配置转换器时直接回 501，不打开文件（缓存里已有的 PDF 也不再提供）。文件在
+校验后立即打开（末级不跟随符号链接、不阻塞），之后的哈希与转换只读这个描述符，同一份
+内容的请求各自拿到由自己的字节转换出的 PDF。同时最多 2 个转换、8 个排队。转换器与上限由
+`OFFICE_PREVIEW_*` 环境变量配置，见 `DEPLOYMENT.md`。错误返回 `{"error", "code"}`：
+
+| 状态 | `code`             | 含义                                                                                                                               |
+| ---- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 400  | `UNSUPPORTED_TYPE` | 不是上面列出的扩展名（目录也是 400，但没有 `code`）                                                                                |
+| 403  | 无                 | 宿主机工作区，调用者既不是 admin 也没有访客授权                                                                                    |
+| 404  | 无                 | 文件不存在、对访客隐藏、工作区不可见或 `agentId` 不属于它；末级是符号链接、不是普通文件（如 FIFO），或打开时已不是校验过的那个文件 |
+| 413  | `FILE_TOO_LARGE`   | 源文件超过 `OFFICE_PREVIEW_MAX_MB`，或转换结果超过它的 4 倍                                                                        |
+| 501  | `NOT_CONFIGURED`   | 没有配置转换器，或 Stirling 的密钥文件读不到                                                                                       |
+| 502  | `CONVERT_FAILED`   | 转换器出错、不可用或没有返回 PDF                                                                                                   |
+| 503  | `BUSY`             | 转换名额与排队都已满，稍后重试                                                                                                     |
+| 504  | `TIMEOUT`          | 超过 `OFFICE_PREVIEW_TIMEOUT_MS`                                                                                                   |
 
 ## 代码改动与会话 worktree
 
 - `GET /api/groups/:jid/git/status?agentId=&scope=working|branch`
 - `GET /api/groups/:jid/git/diff?agentId=&path=&orig_path=&scope=working|branch`
 - `GET /api/groups/:jid/git/worktree-support`
-- `GET /api/groups/:jid/workdir/peers?agentId=`
 
 访问检查与文件接口相同：看不到的工作区返回 404，宿主机工作区需要宿主机执行权限
 （403）。git 只对宿主机模式的工作区执行，命令使用参数数组、有超时与输出上限。宿主机上的
@@ -525,12 +753,6 @@ hook）。HappyClaw 本身不访问网络，但 LFS 或 partial clone 仓库在 
 `{"available": false, "reason": "container_mode" | "directory_missing" |
 "not_git_repo" | "repo_has_no_commits", "message": "…"}`。
 
-`workdir/peers` 列出与该会话共用工作目录、且正在运行一轮的其他会话（同工作区未用
-worktree 的会话、主会话，或自定义目录相同的其他工作区），只提示不限制：
-`{"peers": [{"workspace_jid": "web:…", "workspace_name": "Repo", "kind": "main" |
-"session" | "task", "session_id": null, "session_name": null}], "hidden_count": 0}`；
-调用者看不到的工作区只计入 `hidden_count`。
-
 ## Runtime Session 与渠道绑定
 
 推荐使用 `/sessions` 语义：
@@ -554,10 +776,28 @@ worktree 的会话、主会话，或自定义目录相同的其他工作区）�
 - `PUT /api/groups/:jid/im-binding`
 - `DELETE /api/groups/:jid/im-binding/:imJid`
 
+工作区没有主会话：列表只返回真实会话，每行带当前用户的置顶时间 `pinned_at`（未置顶为
+`null`），按「置顶的在前，再按最近活跃」排序（`shared/session-order.ts`）。
+
+- `PATCH /api/groups/:jid/sessions/:sessionId` 接受 `{ "pinned": true | false }`，返回
+  `{ "success": true, "pinned_at": … }`；置顶按用户记录，访客不能置顶。
+- `DELETE` 可删除任何会话，包括原生话题会话。会话绑定了私聊/普通群、原生话题或自动化时
+  先返回 409 `{ "code": "session_has_bindings", "linked_im_groups": [{jid, name}],
+"thread_bindings": [{jid, name, context_id}], "automations": [{id, name}] }`（三个数组
+  总是存在）；带 `confirm_bindings=true` 重发才删除。可选 `rebind_to=<同工作区另一会话 id>`
+  在同一事务里先把私聊/普通群绑定改到该会话；非法时 400 `invalid_rebind_target`。原生话题
+  绑定随会话删除，该话题下一条消息新建会话；绑定该会话的自动化暂停。有 worktree 时另走
+  worktree 的 409 确认。
+- `GET /api/groups/:jid/agents` 的 spawn 行带 `spawned_from_jid`（发起它的会话地址）。
+
 约束：
 
 - `POST /api/groups/:jid/sessions`（及 `/agents`）只接受工作区 `web:*` JID；IM 聊天
   JID 返回 400，IM 聊天应绑定到 Session 而不是在其下创建 Session。
+- 请求体可带 `modelConfigId`、`model`、`effort`，新会话从这个模型选择开始，规则与
+  `PUT model-selection` 相同（请求者是选择者，Host 工作区要求 Host 权限）。不合法时
+  返回 400 与 `code`（同 `model-selection`，配置不存在也是 400 `MODEL_CONFIG_NOT_FOUND`；
+  字段类型不对为 `INVALID_MODEL_CHOICE`），不创建会话，也不建 worktree；不带时跟随默认。
 - 请求体可带 `worktree: true`：宿主机模式、工作目录是有提交的 git 仓库时，宿主在
   `data/worktrees/{folder}/{sessionId}` 以当前 HEAD 新建分支 `happyclaw/<短 ID>` 的
   worktree，该会话此后每次运行都以它为工作目录（工作区在仓库子目录时进入同一子目录）。
@@ -603,13 +843,12 @@ worktree 的会话、主会话，或自定义目录相同的其他工作区）�
   记录的空目录，有内容的目录不动。
 
 - 工作区绑定只接受原生话题群（飞书话题群或 Telegram Forum）。
-- Runtime Session 绑定接受私聊和普通群，`sessionId=main` 表示该 Workspace 的主会话。
+- Runtime Session 绑定接受私聊和普通群，必须指定具体会话；`sessionId=main` 不再有特殊含义（404）。
 - 话题群使用 `thread_map`，每个原生话题映射独立 Session；普通群的 @ 策略不改变绑定层级。
 - `DELETE` 绑定会真正解除路由，不恢复默认工作区或自动创建会话。
 - 每条输入的回复回到实际来源渠道；Web 输入不会自动镜像到已绑定 IM。
-- 绑定管理 `PUT /api/config/user-im/bindings/:imJid` 使用
-  `{target_session_id: "main", target_main_jid: "web:..."}` 选择主会话；
-  仅指定 `target_main_jid` 表示话题群的 Workspace 绑定。
+- 绑定管理 `PUT /api/config/user-im/bindings/:imJid` 用 `target_session_id` 选择会话；
+  仅指定 `target_main_jid` 表示话题群的 Workspace 绑定（只接受原生话题群）。
 - 请求必须携带或解析出正确的 `channel_account_id`，不能跨机器人账号绑定。
 
 ## Agent Profiles
@@ -631,8 +870,7 @@ worktree 的会话、主会话，或自定义目录相同的其他工作区）�
 （`source`、`model_config_id`、`model_config_name`、`model`、`effort`、`connection_missing`）
 说明运行实际用的连接与模型。请求体可带未保存的 `model_config_id`、`model`，与未保存
 的 `runtime_policy` 一样按它们计算；绑定的连接已删除时 `connection_missing` 为 true。
-`source` 按固定顺序取 `session`（会话手选，仅指定 `workspace_jid` 时看该
-工作区主会话）、`agent`（智能体绑定）、`workspace_env`、`owner_main`（所有者的主智能体）、
+`source` 按固定顺序取 `session`（会话手选；智能体预览不针对具体会话，不取这一步）、`agent`（智能体绑定）、`workspace_env`、`owner_main`（所有者的主智能体）、
 `system_main`（系统主 HappyClaw）或 `none`。`GET /api/agent-profiles` 另返回
 `model_configs[]`（每个连接 `{ id, name, type, model, usable, models }`，`models` 形状同
 `model-selection`）和 `inherited_model`（`owner_main`、`system_main` 各为
@@ -657,6 +895,32 @@ worktree 的会话、主会话，或自定义目录相同的其他工作区）�
 每个 profile 的 `runtime_policy.skills.host` 都是显式值（schema v84 起），宿主机
 Skills 不再随有效上下文来源隐式继承。
 
+`runtime_policy.subagents`（可选，整体保存，`null` 清除）是智能体的子代理设置：
+`model`（默认子代理模型）、`max_concurrent`（1–20，写成
+`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`，未设置时不写，沿用 Claude Code 自己的上限；达到
+上限后 Claude Code 拒绝再派出子代理）、`definitions`（最多 20 个自定义子代理，每个有
+`name`、`description`、`prompt`、`tools`（`null` 为全部）、`model`、`effort`，经 SDK
+`options.agents` 注入）。名称为 2–48 位小写字母、数字或连字符，不能与内置子代理重名。
+`tools` 的每一项是一条工具规则：工具名，可带括号里的参数（如 `Bash(git log:*)`），不能含
+逗号或换行，否则 400；`CronCreate` 等 Runner 默认禁用的会话级工具运行时不提供。去掉这些
+工具后一个不剩（含 `tools: []`）的子代理在创建、导入、复制，以及 PATCH 带
+`runtime_policy.subagents` 时返回 400 与 `code: SUBAGENT_NO_AVAILABLE_TOOLS`、`subagents`
+（这些子代理的名称）；此前已保存的这类子代理运行时不注入并记告警。子代理与
+主 Agent 在同一个 Claude Code 进程里运行，只能用智能体所绑连接里的模型：创建时，以及
+PATCH 带 `runtime_policy.subagents` 或 `model_config_id` 时逐一校验，不在其中、智能体没有
+绑定连接，或连接是 ChatGPT 订阅时返回 400 与 `code: SUBAGENT_MODEL_NOT_IN_CONNECTION`；
+连接后来移除了某个模型时，只改名称、提示词等其他字段不受影响。`duplicate` 清掉连接已不
+提供的模型名；导出带 `definitions`（不含 `model`）与 `max_concurrent`，不带模型名，导入时
+清掉文件里的模型名。运行时，会话手选了别的连接或该模型已被移出列表（记告警），这些模型名
+不生效：默认子代理模型回到连接的 `roles.subagent`（官方连接不写，由 Claude Code 决定），
+定义改为继承。推理等级与主模型规则相同：声明不支持的不传，未知的原样传。自定义子代理和
+默认子代理模型声明的最大输出参与 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 的派生。团队路由会话
+不注入自定义子代理。CLI 里定义的 `model` 优先于 `CLAUDE_CODE_SUBAGENT_MODEL`。改动随
+`runtime_policy` 一起停相关 Runner；只有自定义子代理的改动开新 SDK 会话，只改上限或默认
+子代理模型保留会话。`effective-capabilities` 的 `preview.subagents` 给出一次未手选模型的
+运行实际得到的上限、默认子代理模型及其来源（`agent`、`connection`、`turn`、`claude_code`，
+没有连接时为 `null`）和每个自定义子代理的工具、模型与推理等级；没有子代理设置时为 `null`。
+
 `duplicate` 新建「<名称> 副本」（重名时为「副本 2」「副本 3」…），复制四段 Prompt、
 `prompt_mode`、`runtime_policy`、模型绑定、头像 Emoji/背景色与上传的头像文件（复制为
 新文件），不复制工作区和渠道挂载；内置 HappyClaw 返回 400。校验与创建相同；非
@@ -670,8 +934,9 @@ Runner 停止期间，用一个事务把该智能体的全部工作区迁到目�
 
 `export` 返回 `{format: "happyclaw-agent", version: 1, exported_at, agent}`，`agent`
 含名称、头像 Emoji/背景色、四段 Prompt、`prompt_mode` 与 `runtime_policy`；Skills 用
-目录名、MCP 用 `system:`/`user:` 前缀名引用，不含模型配置、上传头像、宿主机路径或
-凭据。`import` 接受 `{data, name?, drop_missing?, confirm_host_grants?}`：格式或
+目录名、MCP 用 `system:`/`user:` 前缀名引用；有自定义子代理或上限时带
+`runtime_policy.subagents`（`max_concurrent` 与不含 `model` 的 `definitions`）。不含模型
+配置（子代理模型名也不含）、上传头像、宿主机路径或凭据。`import` 接受 `{data, name?, drop_missing?, confirm_host_grants?}`：格式或
 版本不对返回 400
 （`INVALID_AGENT_EXPORT`、`UNSUPPORTED_AGENT_EXPORT_VERSION`）；引用了本账号没有的
 Skills/MCP 时返回 409 `AGENT_IMPORT_MISSING_REFERENCES` 与 `missing`，带
@@ -810,32 +1075,64 @@ Provider（模型连接：一份凭据和一个端点，提供一组模型）：
 - `GET /api/config/claude`
 - `GET|POST /api/config/claude/providers`；设置页只添加和维护连接，没有全局默认、
   启用开关和自动池，选哪个模型属于智能体和会话。公开 Provider 带 `models`
-  （`{ id, contextWindow?, efforts?, defaultEffort? }[]`：`id` 是上游原名，从不带
-  `[1m]`；连接自己的模型 `anthropicModel` 总在其中；ChatGPT 订阅为 `[]`，模型取自
-  其目录）、`roles`（`{ subagent?, smallFast?, opus?, sonnet? }`，各自是本连接的一个
-  模型，未设置时跟随本轮模型）、`presetId`（起步的厂商预设，只在地址仍是该预设的地址
-  时保留，否则为 `null`）和 `lastTest`（最近一次测试
+  （条目字段为 `id`、`displayName?`、`contextWindow?`、`efforts?`、`defaultEffort?`、
+  `thinks?`、`maxOutputTokens?`、`vendor?`、`upstreamMissingSince?`：`id` 是上游原名，从不带
+  `[1m]`，也从不是 magpie 的发现别名 `anthropic/magpie-<数字>`；`efforts` 缺省表示
+  档位未知，`[]` 表示不传档位；`thinks` 是上游声明的是否推理（`true`、`false` 或缺省），
+  只有 `efforts: []` 且 `thinks: false` 时启动关闭思考；
+  `displayName`、`maxOutputTokens`、`vendor` 取自上游模型列表；`upstreamMissingSince`
+  是目录同步发现上游已不提供该模型的时间；连接自己的模型 `anthropicModel` 总在其中；
+  ChatGPT 订阅为 `[]`，模型取自其目录）、`roles`
+  （`{ subagent?, smallFast?, opus?, sonnet? }`，各自是本连接的一个模型，未设置时跟随
+  本轮模型）、`presetId`（起步的厂商
+  预设，只在地址仍是该预设的地址时保留，否则为 `null`；地址可编辑的网关预设（magpie）
+  改地址后保留）、`lastTest`（最近一次测试
   `{ ok, code, status, model, latencyMs, at }`，未测过为 `null`；端点、认证方式、
-  凭据、`ANTHROPIC_CUSTOM_HEADERS` 或轻量后台模型变更后清空）。
-  创建请求可带 `models`、`roles`（指向不在列表里的模型时丢弃）、`presetId`（未知预设
-  400），`models` 不含 `anthropicModel` 时把它加在最前，超过 100 个模型返回 400；模型名
-  不能含空白，带 `[1m]` 的旧写法按 1M 上下文读入。`customEnv` 只注入非空值，新连接由
+  凭据、`ANTHROPIC_CUSTOM_HEADERS` 或轻量后台模型变更后清空）、`gateway`
+  （`'magpie' | null`，见下）、`toolSearch`（`'on' | 'off' | 'default'`）、
+  `toolSearchEnabled`（启动是否开启 Claude Code 的工具搜索：`default` 对 magpie 为开，
+  其余为关）和 `catalog`（只对 magpie 连接非空：
+  `{ autoAdd, syncedAt, error, newModels }`）。
+  创建请求可带 `models`（条目同上，`upstreamMissingSince` 除外）、`roles`（指向不在列表里的模型时丢弃）、`presetId`（未知预设
+  400）、`gateway: 'magpie'`（创建前的模型发现识别出 magpie 时由 Web 带上）、
+  `toolSearch` 和 `catalogAutoAdd`，`models` 不含 `anthropicModel` 时把它加在最前，超过 100 个模型返回 400；模型名
+  不能含空白，带 `[1m]` 的旧写法按 1M 上下文读入，magpie 发现别名丢弃。从 magpie 预设创建且未指定
+  `webFetchPreflightPolicy` 时为 `skip`。magpie 连接没有任何模型时，创建和改动模型列表或
+  默认模型的 PATCH 返回 400 `{ error, code: 'MAGPIE_MODELS_REQUIRED' }`（其他字段的 PATCH
+  照常，检测出 magpie 的无模型直通中转仍能改名等）。`customEnv` 只注入非空值，新连接由
   Web 预填 `API_TIMEOUT_MS`、`CLAUDE_CODE_NO_FLICKER`、`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`；
   含 `CONNECTION_MODEL_ENV_KEYS` 里的键（模型、各档、子代理、压缩窗口、推理等级）返回
-  400 `{ error, code: 'RESERVED_ENV_KEY' }`。旧连接的这些键在读取时一次性迁移为
+  400 `{ error, code: 'RESERVED_ENV_KEY' }`；`CLAUDE_CODE_MAX_OUTPUT_TOKENS` 可以写，
+  必须是正整数，写了就取代按模型声明推导的值。旧连接的这些键在读取时一次性迁移为
   `roles`、上下文长度和默认档位。`enabled`、`weight` 被忽略。
   每种类型创建时都必须带凭据，否则 400 `{ error: '新建模型配置需要凭据' }`。
   可用 `claudeCredentialInput` 提交官方
   凭据原文（`.credentials.json` 内容或 setup-token），由服务端解析，格式无效时
   返回 400；官方 Provider 同一时刻只保留 OAuth、setup-token、API Key 中的一种
+- `webFetchPreflightPolicy: 'check' | 'skip'`（所有连接类型，与其他连接字段一样由
+  `manage_system_config` 在创建和 PATCH 时设置；公开 Provider 总是返回，未设置时为
+  `check`）：WebFetch 抓取前是否向 Anthropic
+  查询域名。`skip` 让使用该连接的会话跳过这次查询；`check` 不做设置，由 Claude Code
+  自己的设置决定（默认查询）。没有选中连接的启动（工作区自带 Provider 环境变量）同
+  `check`。值变化后，使用该连接的 Runner 在本轮结束后退出，下一条消息由新 Runner
+  按新值处理，SDK 会话保留；与端点等字段一起修改时按下述规则停 Runner。
 - `PATCH|DELETE /api/config/claude/providers/:id`，第三方 Provider 的 PATCH
   可同时携带 `anthropicAuthToken` / `clearAnthropicAuthToken`，与其他字段在同一
-  请求内提交；删除 ChatGPT 订阅型 Provider 后在后台尽力吊销其 refresh token，
-  吊销结果不影响响应。PATCH 的 `models` 是完整的新列表（未列出的即移除），
+  请求内提交；连接仍被智能体绑定或被自动化选为模型时 DELETE 返回 400（「仍被 N 个
+  智能体使用，请先重新分配」「仍被 N 个自动化使用，请先修改」，暂停和已完成的自动化也算）；
+  删除 ChatGPT 订阅型 Provider 后在后台尽力吊销其 refresh token，
+  吊销结果不影响响应。PATCH 的 `models` 是完整的新列表（未列出的即移除；条目省略的
+  `displayName`、`maxOutputTokens`、`vendor`、`thinks`、`upstreamMissingSince` 沿用
+  已保存的值；从 `catalog.newModels` 加入的模型随即移出 `newModels`），
   `presetId: null` 清除预设，`anthropicAuthMode: null` 清除认证方式、回到按令牌
-  推断（测试时也重新尝试两种方式）；改名称、预设、模型的上下文长度或档位、`roles`
-  或新增模型时不停 Runner、不清会话，在下次启动 Runner 时生效；端点、凭据、认证方式（含清除）、环境变量、默认模型变更或移除模型时停
-  Runner；改 `anthropicModel` 仍按协议字段处理，未带
+  推断（测试时也重新尝试两种方式），`toolSearch`（`default` 回到按网关的默认）、
+  `catalogAutoAdd` 改工具搜索与新模型自动加入；地址变更后清除检测到的网关标记，下次
+  检测重新识别；改名称、预设、模型的上下文长度或档位、`roles`
+  或新增模型时不停 Runner、不清会话，在下次启动 Runner 时生效；工具搜索的生效值变化时
+  与 `webFetchPreflightPolicy` 一样，使用该连接的 Runner 在本轮结束后退出；端点、凭据、认证方式（含清除）、环境变量、默认模型变更或移除模型时停
+  Runner；只改端点时会话保留各自的 SDK 会话（新端点拒绝旧的 thinking 签名时，Claude Code
+  剥掉 thinking 块重发），凭据、认证方式、环境变量变更时使用该连接的会话下一轮开新的 SDK
+  会话；改 `anthropicModel` 仍按协议字段处理，未带
   `models` 时旧默认模型保留在列表中（列表已满 100 个时返回 400）；只改默认模型时
   只清除跑在旧默认模型上或没有记录模型的会话，选了该连接其他模型的会话保留，只改
   上下文长度不清会话。移除仍被智能体使用的模型返回 409
@@ -868,19 +1165,44 @@ Provider（模型连接：一份凭据和一个端点，提供一组模型）：
   正是已保存的连接（草稿未改端点、凭据、认证方式或环境变量）时，`record` 存为该
   连接的 `lastTest`（审计 `test_provider`，不停 Runner、不清会话）；没有认证方式
   的旧连接同时记下端点接受的方式，与原先推断的不同时只排空该连接的 Runner。
-  与 `discover-models` 共用每用户每分钟 10 次的限额，超出返回 429
+  与 `discover-models` 共用每用户每分钟 10 次的限额，超出返回 429；magpie 连接（预设或已标记）
+  没有模型可测时返回 400 `{ error, code: 'MAGPIE_MODELS_REQUIRED' }`，不向 magpie 发裸 Claude 模型名
 - `POST /api/config/claude/providers/discover-models`，获取连接的模型列表，
   请求体同上（不含 `anthropicModel`；`customEnv` 只用于草稿，其
   `ANTHROPIC_CUSTOM_HEADERS` 随请求发送，已保存的连接用自己的环境变量）。第三方端点读
   `modelsUrlFor(地址, 预设)`（自定义地址恰好匹配一个预设时用该预设的列表地址），
   认证方式回退同测试；官方 API Key 读 `https://api.anthropic.com/v1/models`；
-  Claude 订阅不发请求，返回内置别名；ChatGPT 订阅返回其模型目录。成功为
-  `{ ok: true, models, source, authMode? }`，`models` 为
-  `{ id, name?, contextWindow?, efforts?, defaultEffort? }[]`（档位取自上游声明的
-  `supported_reasoning_levels`、`supported_efforts` 等字段，`minimal`/`ultra` 丢弃），`source` 为 `endpoint`、`builtin` 或
+  Claude 订阅不发请求，返回内置别名；ChatGPT 订阅返回其模型目录。请求带
+  `anthropic-version` 和打包的 Claude Code 版本的 User-Agent
+  （`claude-cli/<版本> (external, sdk-ts)`，测试连接同样）；列表带 `magpie_label` 且出现
+  `anthropic/magpie-<数字>` 别名时，换用 HappyClaw 自己的 User-Agent
+  （`HappyClaw/<版本>`）重取一次，用重取的结果；重取失败或仍带别名时整次失败（第二次请求的
+  错误分类，或 `UNKNOWN`），不返回残缺列表，任何情况下都不返回别名。成功为
+  `{ ok: true, models, source, authMode?, gateway }`，`models` 的条目字段为 `id`、
+  `name?`、`contextWindow?`、`efforts?`、`defaultEffort?`、`thinks?`、
+  `maxOutputTokens?`、`vendor?`、`magpieLabel?`（档位取自上游声明的 `supported_reasoning_levels`、
+  `reasoning_levels`、`supported_efforts` 等字段，`minimal`/`ultra` 丢弃，空数组表示
+  不支持档位；`thinks` 取自布尔值 `reasoning`；最大输出取自 `max_output_tokens`、
+  `max_completion_tokens`、`top_provider.max_completion_tokens` 等；`vendor` 取自
+  magpie 标签里模型名之后的部分，否则 `magpie_by` 或 `owned_by`），`gateway` 在列表带
+  `magpie_label` 时为 `'magpie'`，否则为 `null`；带 `providerId` 且草稿未改连接时，
+  成功的列表把该连接标记为 magpie（如是）并记为已检测。`source` 为 `endpoint`、`builtin` 或
   `catalog`；失败仍为 200
   `{ ok: false, code, status, message }`：列表地址 404 为 `ENDPOINT_NOT_FOUND`，
   返回内容不是模型列表为 `UNKNOWN`
+- `POST /api/config/claude/providers/:id/catalog/sync`，打开连接详情时调用。未检测过的
+  第三方连接读一次模型列表，带 `magpie_label` 就标记为 magpie；magpie 连接同步目录：
+  已有模型的显示名、最大输出、供应商总是更新，上下文长度和档位只在当前值为空或等于上次
+  同步写入的值时更新（从未同步过、档位是添加向导为未知模型填满的全部五档时也更新）；上游不再
+  提供的模型记下时间、不删除，重新出现时清除；第一次同步之后
+  上游新出现的模型在 `catalogAutoAdd` 开启时加入列表（受 100 个上限约束，放不下的留在
+  `newModels`），否则记入 `newModels` 等管理员挑选。只改模型元数据，不停 Runner、不清会话。
+  响应 `{ provider, result }`，`result` 为
+  `{ ok: true, gateway, added, newModels, missing, skipped? }`（`skipped: 'recent'` 表示 60 秒内刚同步过，`'checked'` 表示已
+  检测过且不是 magpie，均未请求上游）或 `{ ok: false, code, message }`；官方与 ChatGPT
+  订阅连接返回 400 `{ code: 'CATALOG_UNSUPPORTED' }`。需要请求上游时与测试共用每分钟限额。
+  宿主另有定时同步：启动 2 分钟后开始，每 15 分钟检查一次，magpie 连接每 6 小时同步，
+  其余第三方连接只检测一次；失败按 15 分钟起翻倍、最长 24 小时退避
 - `GET /api/config/claude/providers/:id/impact`，返回
   `{ activeRunners, stoppedRunners }`：正在使用该连接的 Runner 数，以及修改其
   协议字段（端点、密钥、认证方式、默认模型、环境变量）时实际会停掉的 Runner 数
@@ -894,7 +1216,12 @@ Provider（模型连接：一份凭据和一个端点，提供一组模型）：
   `activeLimit`、`rateLimitReachedType` 与 `limits[]`；每个限额族含
   `limitId`、`limitName`、`primary`/`secondary` 窗口（`usedPercent` 0–100、
   `windowMinutes`、`resetsAt` epoch 秒）和 `credits`（`hasCredits`、
-  `unlimited`、`balance`），服务重启后为空
+  `unlimited`、`balance`），服务重启后为空；magpie 连接读
+  `GET <地址>/v1/magpie/quotas`（连接自己的密钥与认证方式），返回
+  `{ kind: 'magpie_quotas', accounts, fetchedAt, error }`：`accounts` 为
+  `{ provider, name, kind, plan, user, windows, readAt, error }[]`，每个窗口为
+  `{ name, used, remaining, resetsAt, unlimited }`（`remaining` 为剩余百分比），读取失败时 `accounts`
+  为空、`error` 为原因
 - `POST /api/config/claude/apply`
 - `POST /api/config/claude/oauth/start`，可选 `targetProviderId`（必须是已有的
   官方 Provider）与 `profile`（`full` 默认，或 `setup_token`）；流程绑定发起用户
@@ -937,32 +1264,6 @@ minimalClientVersion?, availableInPlans?, serviceTiers }`（字段取自官方
   `live`，内存缓存 1 小时，首次请求等待一次拉取，失败回落全局目录），
   并按该账号 `planType` 过滤 `availableInPlans`；`defaultModel` 不在结果中时
   取第一项。供设置页模型/推理力度下拉使用
-- `POST /api/config/gemini/oauth/start`，启动 Gemini 订阅（Google 账号 /
-  Antigravity）OAuth，返回 `authorizeUrl`、`state` 与 `redirectHint`；可选
-  `targetProviderId` 用于对已有 Provider 重新授权。服务端不内置 OAuth 客户端，
-  需要环境变量 `GEMINI_OAUTH_CLIENT_ID` 与 `GEMINI_OAUTH_CLIENT_SECRET` 成对
-  配置，未配置时返回 503 `code: 'GEMINI_OAUTH_CLIENT_NOT_CONFIGURED'`。回调使用固定地址
-  `http://localhost:51121/oauth-callback`，本机通常没有进程监听，浏览器显示
-  加载失败时把地址栏里的完整 URL 粘贴回来即可；流程绑定发起用户，10 分钟后过期
-- `POST /api/config/gemini/oauth/callback`，用 `{ state, code }`（`code`
-  接受回调页完整 URL、其 query 或裸授权码）换取 Google token，创建或更新
-  Gemini 订阅型 Provider，成功返回公开 Provider；其 `anthropicBaseUrl` 落盘为
-  内嵌网关占位值。新建时按上游目录选默认模型并保存模型列表。Google 拒绝授权
-  （`error=`）或输入无法解析时保留流程；token 请求可证明未到达服务器时返回 502
-  与 `retryable: true`，授权码可能已被使用或已被拒绝时返回 400 与
-  `retryable: false`。换成另一个 Google 账号时会停稳运行器并清除该 Provider
-  的会话（思考签名绑定原账号）；目标 Provider 不存在返回 404
-- `POST /api/config/gemini/models/refresh`，用 `{ providerId }` 重新拉取上游
-  Antigravity 模型目录并同步连接的 `models`，返回公开 Provider；缺少项目 ID
-  返回 400，上游没有可用模型或请求失败返回 502（保留已存目录）
-- `POST /api/config/gemini/disconnect`，用 `{ providerId }` 退出 Google 账号：
-  清除 Google 凭据与网关标识，返回公开 Provider
-- 内嵌网关（不在 `/api` 下）：`POST /gateway/gemini/v1/messages` 与
-  `POST /gateway/gemini/v1/messages/count_tokens`（本地估算），把 Anthropic
-  Messages 请求翻译为 Antigravity `:generateContent` /
-  `:streamGenerateContent?alt=sse`，只接受存活 Runner 的临时 token，并拒绝带
-  反代转发头或非回环/私网来源的请求；Google token 只在服务端刷新，从不下发给
-  Runner
 - `PUT /api/config/claude/custom-env`
 
 第三方 Provider 的 `anthropicAuthMode` 为 `bearer`（`Authorization: Bearer`，
@@ -976,6 +1277,37 @@ minimalClientVersion?, availableInPlans?, serviceTiers }`（字段取自官方
 - `GET|PUT /api/config/host-integration`，仅 admin；包含
   `adminHostOnlyMode`。从 `false` 切到 `true` 时会停稳管理员工作区运行器，并把
   active admin 拥有的工作区持久迁移为 Host；普通成员数据不变
+  - `workspaceRoot`（存储值，`''` 表示未设置）以及只读的 `workspaceRootEffective`、
+    `workspaceRootSource`（`settings|env|default`）、`workspaceRootFallbackReason`、
+    `workspaceRootFallbackWarning`。`workspaceRootEffective` 是新工作区实际使用的根目录；
+    备用目录也不可用（`workspaceRootFallbackWarning` 非空）时为 `null`，新工作区放在
+    `data/groups/{folder}`。保存不合格的值返回 400
+    `{ error, code: "WORKSPACE_ROOT_INVALID", reason }`；目录在第一个工作区需要时才创建
+  - `deploymentMode`（生效值）、`deploymentModeConfigured`（存储值）、`deploymentModeSource`。
+    PUT 的 `deploymentMode` 接受 `'' | multi_user | single_user_host`；还有其他启用中的账号时
+    切到单人宿主机返回 409 `{ code: "SINGLE_USER_HOST_OTHER_USERS", users: [{ id, username, role }] }`，
+    成功时执行与开启 `adminHostOnlyMode` 相同的 Host 迁移（已存的 `adminHostOnlyMode` 为
+    `true` 时没有要迁移的工作区，不停运行器、不清会话）；切回多人只保存这一项，存储的
+    `adminHostOnlyMode`、注册和计费设置原样生效，不迁回 Docker
+- `GET /api/config/storage-sources`、`POST|PUT|DELETE /api/config/storage-sources/:id`，
+  仅 admin；列出合并后的全部存储源，写入只针对 `data/config/storage-sources.json`
+  （POST 新建、PUT 替换），写入前用运行时同一个解析器校验合并后的整份列表，不通过时
+  文件不变。`config/mount-allowlist.json` 声明的来源 `origin` 为 `allowlist`，对它的
+  POST/PUT/DELETE 返回 409（`code: STORAGE_SOURCE_READ_ONLY`），只能在服务器上改该文件；
+  Web 添加的为 `web`。allowlist 文件无法解析时列表为空并带 `allowlistError`，写入返回
+  409；`storage-sources.json` 无法解析时带 `managedError`。返回值还带 `hasPassword`、
+  `usedBy`（挂载它的工作区数）与 `readWriteUsedBy`（其中以读写方式挂载的），从不返回
+  密码或 `passwordFile`。SMB 密码只写：请求里的 `password` 省略表示保留、空串表示清除，
+  写入 `data/config/secrets/storage-<id>`（600，目录 700）；NFS 请求里的 `password`
+  被忽略。PUT 把 `allowReadWrite` 从 `true` 改为 `false` 且有工作区以读写方式挂载它时
+  返回 409（`code: STORAGE_SOURCE_READ_WRITE_IN_USE`、`readWriteUsedBy`），请求体带
+  `force: true` 才执行。DELETE，以及改动服务器、导出路径、共享、版本、凭据或收回读写的
+  PUT，会先停下挂载该来源的工作区的运行器再写入（只改 `description` 或打开读写不停）；
+  停不下来时返回 503，带 `persisted` 与 `retryable`，`persisted: true` 表示改动已经生效、
+  这些工作区暂停接活，重试同一请求（DELETE 也一样）完成清理后恢复。审计记
+  `storage_source_saved` / `storage_source_deleted`，只含 id、类型和是否实际写入或删除了
+  密码，不含服务器与共享。单人宿主机模式不使用 Docker，三个写接口都返回 409
+  `{ code: "SINGLE_USER_HOST" }`，设置页也不显示存储源
 - `GET /api/config/external-resources`
 - `GET /api/config/external-resources/rule`
 - `GET|PUT /api/config/registration`
@@ -1008,9 +1340,23 @@ Legacy 渠道 facade 位于 `/api/config/user-im/*`，涵盖飞书、Telegram、
 由 `src/automation-service.ts` 统一处理，REST 与 Agent 工具返回同样的中文错误。
 状态变化通过 WS `automation_changed` / `automation_run_updated` 只推给所有者。
 
+自动化带 `model`：`{ modelConfigId, model, effort }` 或 `null`（运行会话用自己的默认），
+访客看到的总是 `null`。创建、PATCH 可以设置它（PATCH 不带时不变，`null` 清除），只对
+「每次新建」和「持续会话」的 Agent 自动化有效：绑定已有会话时 400
+`automation_model_bound_session`（改成绑定已有会话也要同时清除它），脚本 400
+`automation_model_script`。选择按 `model-selection` 的规则校验，选择者是自动化的创建者，
+不合法时 400 与同样的 `code`（配置不存在也是 400 `MODEL_CONFIG_NOT_FOUND`）。模型只给
+自动化自己建的会话：持续会话接上的是已有会话（`targetSessionJid` 指向别的会话，或从绑定已有
+会话改过来）时同样 400 `automation_model_bound_session`。每次新建的运行会话创建时就是这个
+选择；持续会话每次运行前，会话的选择与它不同时改成它（暖 Runner 在本轮结束后退出）；所选连接已不存在或没有凭据时
+不写入，这次运行按会话的默认运行并记一条 warn。PATCH
+把模型清除时，自动化自己的持续会话若仍是它给的选择，回到默认。没有设置时不改动任何会话的
+选择。选择者已停用或不存在时按没有任何权限校验。Agent 的 `automation_*` 工具不能设置或
+修改它。
+
 旧的 `/api/tasks*` 全部返回 410，提示改用 `/api/automations`。
 
-## 团队模式
+## 团队模式与多任务模式
 
 - `GET /api/workspaces/:jid/team-mounts` → `{ mounts }`，工作区的群绑定及其团队设置，
   `eligible=false` 时带 `ineligibleReason`
@@ -1026,6 +1372,55 @@ Legacy 渠道 facade 位于 `/api/config/user-im/*`，涵盖飞书、Telegram、
 `docs/ACL-MATRIX.md` §4.7。校验和状态机在 `src/work-item-service.ts`，它的
 `WorkItemError` 按自带状态码返回 `{ error }`。工作项变化通过 WS `work_item_updated`
 只推给主人。
+
+工作项有两种来源（`origin`）：`team` 来自团队模式的群，`delegated` 是多任务工作区里
+某个会话用 `work_delegate` 派出的后台任务。两种工作项共用同一个工作区编号 `#seq`，
+也走同一组路由。`WorkItemView` 带 `origin`、`originAgentId`（派出它的会话）、
+`originInputId`（派出时那一轮回答的输入）和 `originSessionName`（派出它的会话名，会话
+已删除时为 `null`）。派发型工作项的 `channelJid` 是派出会话的 lane，`channelName`
+为 `null`。对派发型工作项调用 `POST /api/work-items/:id/stop` 时，工作项结束为
+`stopped`，Worker 停下，派出它的会话收到一条 `state="stopped"` 的 `work_report` 输入；
+`/approve` 不适用，派发型工作项一开始就可修改，调用返回 409。派出会话的 `/break` 或
+Web 停止不会取消队列里尚未处理的派发回报；Worker 一轮结束却没有交回结果（或运行彻底
+失败、计费被拒）时，工作项结束为 `failed`，派出会话收到 `state="failed"` 的回报。
+
+## Web Push
+
+系统通知：Web 来源的回复完成或运行出错时，如果主人没有正在看该会话的可见页面，服务端
+向其浏览器订阅推送。只服务当前登录用户本人的订阅，访客 403，全部响应
+`Cache-Control: private, no-store`。
+
+- `GET /api/push/vapid-public-key` → `{ publicKey }`；密钥不可用时 503
+- `GET /api/push/status` → `{ available, subscription_count, subscriptions }`，每项
+  `{ id, user_agent, created_at, last_success_at }`，不返回 endpoint 与密钥
+- `POST /api/push/subscribe`，body 为浏览器 `PushSubscription` 的
+  `{ endpoint, keys: { p256dh, auth } }` → `{ success }`；endpoint 必须是 https、不带端口
+  和账号，主机只能是 `fcm.googleapis.com`、`web.push.apple.com`、
+  `*.push.services.mozilla.com`、`*.notify.windows.com`，且只含 `[a-z0-9.-]`，WHATWG URL
+  与 web-push 使用的 `url.parse` 解析出的主机必须相同，否则 400；只保存规范化后的
+  `new URL(endpoint).href`。订阅记在提交它的登录会话上，同一用户重复提交是更新（并改记到
+  当前会话）；endpoint 已属于其他用户时不改归属：删除那条记录并返回
+  409 `{ code: 'push_subscription_conflict' }`，浏览器须退订，本用户重新开启才会得到新订阅。
+  每个用户最多保留最近登记的 20 个（按最后一次登记时间淘汰）
+- `POST /api/push/unsubscribe`，body `{ endpoint }` → `{ success }`，幂等，只能删除本人的
+- `POST /api/push/test` → `{ success, ...summary }`，只向本人的订阅发一条测试通知；每个
+  用户每分钟最多 3 次，超出 429（带 `Retry-After`）
+
+订阅随登记它的登录会话结束而删除：退出登录、吊销会话、改密或管理员重置密码、禁用或删除
+用户、会话过期（`user_sessions` 上的触发器）。本人改密（含管理员重置自己的密码）时，发起的
+这台设备换到新会话并保留订阅，其他设备的订阅随旧会话删除。Web 退出登录前先注销并退订本浏览器的订阅；
+浏览器另记本机由哪个用户开启，换了账号的浏览器不会把旧订阅登记给新用户，而是退订，设置页
+显示未开启。
+
+VAPID 密钥首次使用时生成在 `data/config/web-push-vapid.json`（权限 600），不进入
+数据库；订阅存于 `web_push_subscriptions`。推送服务返回 404/410 的订阅会被删除。联系
+地址可用环境变量 `WEB_PUSH_SUBJECT` 设置。单次投递由 `src/web-push-transport.ts` 发出：
+总时长不超过 10 秒，响应体超过 16 KiB 即断开，走与其他出站请求相同的 `HTTPS_PROXY` /
+`NO_PROXY`。判定与发送在 `src/web-push.ts`，调用点在 `src/index.ts` 的
+`webTurnPushNotice`：只对 Web 来源的输入、最终回复或运行错误推送；IM 来源、自动化运行、
+团队模式会话和 Worker 不推送。会被推送的回复在 WebSocket `new_message` 里带
+`web_push: true`（不入库、不出现在历史接口）；已订阅推送的页面只对这类回复不再弹页面通知，
+其他回复与后台任务完成仍照常弹出。
 
 ## Skills、MCP 和 Plugins
 
@@ -1265,9 +1660,16 @@ Web 和 Runtime 不再把它们当作第二个可写真相源。
 管理：
 
 - `GET|POST /api/admin/users`
-- `PATCH|DELETE /api/admin/users/:id`
+- `PATCH|DELETE /api/admin/users/:id`：改自己的密码（`password` 且目标是自己）要同时给
+  `current_password`，错误或缺失返回 400 `CURRENT_PASSWORD_INCORRECT` 并计入登录限流；停用或删除
+  会作废该用户待用的二次验证登录 challenge
 - `POST /api/admin/users/:id/restore`
 - `DELETE /api/admin/users/:id/sessions`
+- `DELETE /api/admin/users/:id/2fa`：清除他人的二次验证与恢复码（丢失验证器时的恢复路径，不动通行密钥），
+  写审计 `mfa_reset`；不能用于自己。用户列表的每行带 `two_factor_enabled` 和 `passkey_count`
+- `DELETE /api/admin/users/:id/passkeys`：删除他人的全部通行密钥并作废其进行中的注册 challenge，
+  返回 `{ success, removed }`，
+  有删除时写审计 `passkeys_revoked`；权限与重置二次验证相同，不能用于自己（自己的在设置里删）
 - `GET /api/admin/permission-templates`
 - `GET|POST /api/admin/invites`
 - `DELETE /api/admin/invites/:code`
@@ -1277,13 +1679,20 @@ Web 和 Runtime 不再把它们当作第二个可写真相源。
 监控：
 
 - `GET /api/health`，Public
-- `GET /api/status`
+- `GET /api/build`，Public：返回当前部署的前端构建标识 `{ id, builtAt }`（读自
+  前端构建产物中的 build.json，由 `web/vite.config.ts` 写入，每次请求按文件 mtime
+  刷新，无需重启后端）；构建产物缺失或损坏时两个字段为 `null`。`id` 是构建产物
+  的内容哈希，同一份前端源码重新构建时不变，不含版本号或提交。已打开的页面在
+  WS 连接/重连、回到前台和每 30 分钟比较一次，`id` 不同且服务端 `builtAt` 更新
+  时提示刷新
+- `GET /api/status`：带 `deploymentMode`；单人宿主机模式下不做任何 Docker 探测，Docker 相关
+  字段为 `null`
 - `GET /api/status/groups`：只返回队列运行状态，供聊天页恢复运行态；可见范围与
   `/api/status` 相同，不做 Docker 与版本探测
 - `POST /api/status/groups/:folder/switch-provider`
 - `GET /api/status/channel-outbox/uncertain`
 - `POST /api/status/channel-outbox/:id/resolve`
-- `POST /api/docker/pull`
+- `POST /api/docker/pull`：单人宿主机模式下 409 `SINGLE_USER_HOST`
 
 Agent 镜像只由 `main` 分支的 GitHub Actions 构建并发布。该接口仅在运行主机上执行
 `docker pull` 更新已发布镜像，不在用户机器上编译镜像。
@@ -1301,7 +1710,8 @@ Agent 镜像只由 `main` 分支的 GitHub Actions 构建并发布。该接口�
 
 目录浏览：
 
-- `GET|POST /api/browse/directories`
+- `GET|POST /api/browse/directories`；目标在工作区根目录（当前的或有工作区记录的旧根目录）
+  里面时返回 403 `{ error, code: "WORKSPACE_ROOT_FORBIDDEN" }`
 
 ## WebSocket
 
@@ -1314,6 +1724,8 @@ Agent 镜像只由 `main` 分支的 GitHub Actions 构建并发布。该接口�
 - `terminal_input`
 - `terminal_resize`
 - `terminal_stop`
+- `presence`，`{ visible, chatJid, agentId }`：页面是否可见、正在看哪个会话；可见时约每 25 秒
+  重发，服务端 60 秒内未收到即视为不在看。用于决定是否发系统通知，访客连接忽略
 
 服务端主要事件：
 

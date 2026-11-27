@@ -8,6 +8,7 @@ import {
   type FeishuTransportIssue,
 } from './feishu-connection-conflict.js';
 import { createFeishuPermissionNotifier } from './feishu-permission-notice.js';
+import type { ChatReachability } from './im-channel.js';
 import {
   answerQuestionMessage,
   CARD_ACTION_ANSWER_QUESTION,
@@ -42,7 +43,6 @@ import {
   MAX_FILE_SIZE,
   FileTooLargeError,
 } from './im-downloader.js';
-import { notifyNewImMessage } from './message-notifier.js';
 import { detectImageMimeType } from './image-detector.js';
 import { resolveJidByMessageId } from './feishu-streaming-card.js';
 import { buildPostMdFallback } from './feishu-message-format.js';
@@ -77,6 +77,7 @@ import {
   classifyFeishuError,
   feishuErrorCode,
   feishuErrorMessageText,
+  isFeishuChatGoneError,
   isFeishuMissingScopeError,
   neutralizeFeishuMentions,
 } from './feishu-errors.js';
@@ -217,7 +218,7 @@ export interface ConnectOptions {
   ) => Promise<string | null>;
   /** 根据 chatJid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (chatJid: string) => string | undefined;
-  /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
+  /** 将 IM chatJid 解析为绑定的会话（话题群为该话题的会话） */
   resolveEffectiveChatJid?: (
     chatJid: string,
     messageMeta?: FeishuMessageMeta,
@@ -352,6 +353,8 @@ export interface FeishuConnection {
   isConnected(): boolean;
   syncGroups(): Promise<void>;
   getChatInfo(chatId: string): Promise<FeishuChatInfo | null>;
+  /** Whether the bot can still see this chat; see `IMChannel.probeChat`. */
+  probeChat(chatId: string): Promise<ChatReachability>;
   executeCapability(
     context: ChannelTurnContext,
     request: FeishuCapabilityRequest,
@@ -3715,7 +3718,7 @@ export function createFeishuConnection(
                       targetJid,
                       senderImId: senderOpenId,
                       // Lets the host resolve a private chat's own Session
-                      // and never fall back to the main session for groups.
+                      // and never fall back to another session for groups.
                       ...(normalizedChatType
                         ? { chatType: normalizedChatType }
                         : {}),
@@ -3729,7 +3732,7 @@ export function createFeishuConnection(
                       senderImId: senderOpenId,
                       notes: runtimeControl.notes,
                       // Lets the host resolve a private chat's own Session
-                      // and never fall back to the main session for groups.
+                      // and never fall back to another session for groups.
                       ...(normalizedChatType
                         ? { chatType: normalizedChatType }
                         : {}),
@@ -3742,7 +3745,7 @@ export function createFeishuConnection(
                       targetJid,
                       senderImId: senderOpenId,
                       // Lets the host resolve a private chat's own Session
-                      // and never fall back to the main session for groups.
+                      // and never fall back to another session for groups.
                       ...(normalizedChatType
                         ? { chatType: normalizedChatType }
                         : {}),
@@ -4881,8 +4884,6 @@ export function createFeishuConnection(
         completeClaimedInbound(claim, payload);
         return 'done';
       }
-      notifyNewImMessage();
-
       if (agentRouting && agentRouting.agentId) {
         onAgentMessage?.(chatJid, agentRouting.agentId);
         logger.info(
@@ -4895,18 +4896,6 @@ export function createFeishuConnection(
             source,
           },
           'Feishu message routed to conversation agent',
-        );
-      } else if (agentRouting) {
-        // Routed to workspace main conversation (no agentId)
-        logger.info(
-          {
-            chatJid,
-            effectiveJid: targetJid,
-            sender: resolvedSenderName,
-            messageId,
-            source,
-          },
-          'Feishu message routed to workspace main conversation',
         );
       } else {
         logger.info(
@@ -5938,6 +5927,51 @@ export function createFeishuConnection(
     );
   }
 
+  /** One `chat.get`; a failure is reported and handed back with no info. */
+  async function readChatInfo(chatId: string): Promise<{
+    info: FeishuChatInfo | null;
+    error?: unknown;
+    dissolved?: boolean;
+  }> {
+    if (!client) return { info: null };
+    try {
+      const target = parseFeishuRouteTarget(chatId);
+      const res = await client.im.v1.chat.get({
+        path: { chat_id: target.chatId },
+      });
+      // A refusal the SDK resolved instead of throwing carries its code too.
+      if (typeof res.code === 'number' && res.code !== 0) {
+        throw feishuApiFailure('chat.get', res);
+      }
+      if (!res.data) return { info: null };
+      const info = {
+        avatar: res.data.avatar,
+        name: res.data.name,
+        user_count: res.data.user_count,
+        chat_type: res.data.chat_type,
+        chat_mode: res.data.chat_mode,
+        group_message_type: (res.data as { group_message_type?: string })
+          .group_message_type,
+      };
+      chatInfoById.set(target.chatId, {
+        name: info.name,
+        chatType: info.chat_type,
+        chatMode: info.chat_mode,
+        groupMessageType: info.group_message_type,
+      });
+      // Outside the chat the bot still gets its basic info, with its status.
+      const status = (res.data as { chat_status?: string }).chat_status;
+      return {
+        info,
+        dissolved: status === 'dissolved' || status === 'dissolved_save',
+      };
+    } catch (err) {
+      permissionNotices.report('chat_info', err);
+      logger.warn({ err, chatId }, 'Failed to get Feishu chat info');
+      return { info: null, error: err };
+    }
+  }
+
   const connection: FeishuConnection = {
     async connect(opts: ConnectOptions): Promise<boolean> {
       const { onReady } = opts;
@@ -6567,34 +6601,15 @@ export function createFeishuConnection(
     },
 
     async getChatInfo(chatId: string): Promise<FeishuChatInfo | null> {
-      if (!client) return null;
-      try {
-        const target = parseFeishuRouteTarget(chatId);
-        const res = await client.im.v1.chat.get({
-          path: { chat_id: target.chatId },
-        });
-        if (!res.data) return null;
-        const info = {
-          avatar: res.data.avatar,
-          name: res.data.name,
-          user_count: res.data.user_count,
-          chat_type: res.data.chat_type,
-          chat_mode: res.data.chat_mode,
-          group_message_type: (res.data as { group_message_type?: string })
-            .group_message_type,
-        };
-        chatInfoById.set(target.chatId, {
-          name: info.name,
-          chatType: info.chat_type,
-          chatMode: info.chat_mode,
-          groupMessageType: info.group_message_type,
-        });
-        return info;
-      } catch (err) {
-        permissionNotices.report('chat_info', err);
-        logger.warn({ err, chatId }, 'Failed to get Feishu chat info');
-        return null;
-      }
+      return (await readChatInfo(chatId)).info;
+    },
+
+    async probeChat(chatId: string): Promise<ChatReachability> {
+      const { info, error, dissolved } = await readChatInfo(chatId);
+      if (info) return dissolved ? 'gone' : 'reachable';
+      return error !== undefined && isFeishuChatGoneError(error)
+        ? 'gone'
+        : 'unknown';
     },
 
     async executeCapability(context, request) {

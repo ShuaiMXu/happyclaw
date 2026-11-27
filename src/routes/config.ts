@@ -6,7 +6,15 @@ import path from 'node:path';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import QRCode from 'qrcode';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
+import {
+  listStorageSources,
+  listStorageSourceUsers,
+  planStorageSourceDelete,
+  planStorageSourceSave,
+  StorageSourceAdminError,
+  withStorageSourceWriteLock,
+} from '../storage-source-admin.js';
 import { DATA_DIR } from '../config.js';
 import { bindSystemMainIfUnbound } from '../model-binding-backfill.js';
 import {
@@ -32,7 +40,6 @@ import {
   logAuthEvent,
   deleteWorkspaceSessions,
   deleteSessionsByProviderIdAroundCommit,
-  getSession,
   getRouterState,
   getRouterStateByPrefix,
   setRouterState,
@@ -46,6 +53,7 @@ import {
   listAgentProfilesUsingModels,
   listSessionNamespacesForProviderId,
 } from '../db.js';
+import { countAutomationsByModelConfigId } from '../automation-store.js';
 import { parseChannelAddress } from '../channel-address.js';
 import { conversationBindingPolicyError } from '../channel-conversation-kind.js';
 import {
@@ -75,6 +83,7 @@ import {
   AppearanceConfigSchema,
   HostIntegrationSettingsSchema,
   SystemSettingsSchema,
+  StorageSourceSaveSchema,
   UnifiedProviderCreateSchema,
   UnifiedProviderPatchSchema,
   UnifiedProviderSecretsSchema,
@@ -101,6 +110,8 @@ import {
   deleteProvider,
   providerToConfig,
   toPublicProvider,
+  providerToolSearchEnabled,
+  ProviderWriteError,
   getFeishuProviderConfig,
   getFeishuProviderConfigWithSource,
   toPublicFeishuProviderConfig,
@@ -221,6 +232,7 @@ import {
   connectionTestResult,
   discoverAnthropicModels,
   discoverEndpointModels,
+  fetchMagpieQuotas,
   redact,
   testAnthropicApiKey,
   testProviderConnectivity,
@@ -234,24 +246,22 @@ import {
   findPresetsByBaseUrl,
   getModelPreset,
   modelsUrlFor,
-  normalizeProviderBaseUrl,
+  presetAppliesAt,
   presetModelEntry,
   splitOneMillionSuffix,
+  type MagpieQuotasUsage,
   type ModelPreset,
   type ProviderErrorCode,
   type ProviderModelEntry,
 } from '../model-providers.js';
 import { isCodexGatewayBaseUrl } from '../codex-gateway/resolve-gateway-url.js';
 import {
-  GeminiOAuthError,
-  fetchGeminiModels,
-} from '../gemini-gateway/oauth.js';
-import {
-  GeminiGatewayAuthError,
-  GeminiReauthRequiredError,
-  GeminiRefreshUnavailableError,
-  resolveGeminiAccess,
-} from '../gemini-gateway/token-manager.js';
+  catalogSyncSkip,
+  noteConnectionModelList,
+  setCatalogToolSearchChangeListener,
+  storedConnectionAccess,
+  syncProviderCatalog,
+} from '../model-catalog-sync.js';
 import {
   buildSessionMountUpdate,
   buildDetachedWorkspaceUpdate,
@@ -260,7 +270,9 @@ import {
   hasRemainingThreadMapMount,
   hasSessionMountConflict,
   hasWorkspaceMountConflict,
+  isBindableSession,
   isNativeContextContainer,
+  SESSION_NOT_BINDABLE,
   unbindChannelMount,
 } from '../channel-mount-service.js';
 import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
@@ -286,6 +298,25 @@ import {
   markAdminHostOnlyCleanupPending,
   restorePendingAdminHostOnlyRuntimeSafetyBlocks,
 } from '../admin-host-only-runtime.js';
+import {
+  DEPLOYMENT_MODE_ENV,
+  getDeploymentModeResolution,
+  isSingleUserHost,
+  resolveDeploymentMode,
+} from '../deployment-mode.js';
+import {
+  getWorkspaceRootResolution,
+  rootForNewWorkspaces,
+  validateWorkspaceRootSetting,
+  WORKSPACE_ROOT_PROBLEM_MESSAGES,
+} from '../workspace-root.js';
+import {
+  listOtherActiveUsers,
+  SingleUserHostConflictError,
+  singleUserHostRefusal,
+  type OtherActiveUser,
+} from '../single-user-host-guard.js';
+import { getWorkspaceRootOccupancy } from '../workspace-dir.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
 
 configRoutes.use('/user-im/*', async (c, next) => {
@@ -331,6 +362,11 @@ export function injectConfigDeps(d: any) {
   deps = d;
   restorePendingProviderRuntimeSafetyBlocks();
   restorePendingAdminHostOnlyRuntimeSafetyBlocks(d);
+  // A sync that marks a connection magpie flips its default tool search:
+  // its runners retire after their current query, as for an edit.
+  setCatalogToolSearchChangeListener((providerId) => {
+    deps?.queue?.drainProviderRunnersForCredentialRefresh?.(providerId);
+  });
 }
 
 function createTelegramApiAgent(proxyUrl?: string): HttpsAgent | ProxyAgent {
@@ -361,12 +397,18 @@ interface ClaudeApplyResultPayload {
 interface ApplyOptions {
   /**
    * If set, drop only sticky session bindings that point to this provider —
-   * preserves bindings to unrelated providers. Used when a provider's
-   * protocol-level fields (anthropicBaseUrl / anthropicModel) change.
+   * preserves bindings to unrelated providers. Used when what a provider's
+   * sessions run changes: its default model, key, header style or env, or
+   * the account behind it.
    */
   clearSessionsForProviderId?: string;
   sessionInvalidation?: {
     modelChanged: boolean;
+    /**
+     * The account behind the sessions changed (a new key or login). A
+     * workspace's own Base URL shadows it. A new address alone does not set
+     * it.
+     */
     baseUrlChanged: boolean;
     /**
      * Set when the default model's change is the only reason: sessions on
@@ -490,12 +532,11 @@ function restorePendingProviderRuntimeSafetyBlocks(): void {
   for (const providerId of pendingProviderIds) {
     if (providerId && configuredProviderIds.has(providerId)) continue;
     if (providerId) {
-      const cleanup = deleteSessionsByProviderIdAroundCommit(
+      deleteSessionsByProviderIdAroundCommit(
         providerId,
         undefined,
         () => undefined,
       );
-      syncProviderSessionCaches(cleanup.affectedFolders);
     }
     deleteRouterState(providerInvalidationStateKey(providerId));
     volatilePendingProviderSessionInvalidations.delete(providerId);
@@ -517,7 +558,7 @@ function restorePendingProviderRuntimeSafetyBlocks(): void {
   );
 }
 
-export interface ClaudeMutationResult<T> {
+interface ClaudeMutationResult<T> {
   value?: T;
   applied: ClaudeApplyResultPayload;
 }
@@ -548,7 +589,7 @@ function runAfterProviderPersistence<T>(
   }
 }
 
-export function appendClaudeConfigAuditBestEffort(
+function appendClaudeConfigAuditBestEffort(
   actor: string,
   action: string,
   changedFields: string[],
@@ -566,7 +607,7 @@ export function appendClaudeConfigAuditBestEffort(
 
 let claudeConfigMutationTail: Promise<void> = Promise.resolve();
 
-export async function withClaudeConfigMutationLock<T>(
+async function withClaudeConfigMutationLock<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const previous = claudeConfigMutationTail;
@@ -639,18 +680,6 @@ function getProviderSessionCleanupOptions(
   };
 }
 
-function syncProviderSessionCaches(affectedFolders: string[]): void {
-  if (!deps) return;
-  for (const folder of affectedFolders) {
-    const remainingMainSession = getSession(folder);
-    if (remainingMainSession !== undefined) {
-      deps.sessions[folder] = remainingMainSession;
-    } else {
-      delete deps.sessions[folder];
-    }
-  }
-}
-
 /** The models a connection offers once an edit is saved. */
 function providerModelsAfterEdit(
   previous: UnifiedProvider,
@@ -699,7 +728,6 @@ function commitProviderConfigWithSessionInvalidation<T>(
     getProviderSessionCleanupOptions(providerId, invalidation),
     commit,
   );
-  syncProviderSessionCaches(result.affectedFolders);
   return { value: result.value, clearedSessionsCount: result.deletedCount };
 }
 
@@ -724,7 +752,7 @@ function getKnownClaudeRuntimeJids(): string[] {
   return collectWorkspaceRuntimeJids(deps, getClaudeRuntimeTargets());
 }
 
-export async function mutateClaudeConfigForAllGroups<T>(
+async function mutateClaudeConfigForAllGroups<T>(
   actor: string,
   metadata: Record<string, unknown> | undefined,
   commit: () => T,
@@ -1548,6 +1576,9 @@ configRoutes.post(
       bindSystemMainIfUnbound(provider.id);
       return c.json(toPublicProvider(provider), 201);
     } catch (err) {
+      if (err instanceof ProviderWriteError) {
+        return c.json({ error: err.message, code: err.code }, 400);
+      }
       const message =
         err instanceof Error ? err.message : 'Failed to create provider';
       logger.warn({ err }, 'Failed to create provider');
@@ -1660,15 +1691,15 @@ configRoutes.patch(
           );
         }
         const pendingInvalidation = getPendingProviderSessionInvalidation(id);
+        // A new address alone stops the runners but keeps the sessions: the
+        // same key reaches the same account there (a domain change, a relay),
+        // and the session's model is unchanged. Should the backend behind it
+        // reject the old thinking signatures, Claude Code strips the thinking
+        // blocks and sends again.
         const sessionsInvalidated =
-          baseUrlChanged ||
-          modelChanged ||
-          customEnvChanged ||
-          tokenChanged ||
-          authModeChanged;
+          modelChanged || customEnvChanged || tokenChanged || authModeChanged;
         const onlyDefaultModelChanged =
           modelChanged &&
-          !baseUrlChanged &&
           !customEnvChanged &&
           !tokenChanged &&
           !authModeChanged &&
@@ -1677,9 +1708,7 @@ configRoutes.patch(
           modelChanged:
             modelChanged || pendingInvalidation?.modelChanged === true,
           baseUrlChanged:
-            baseUrlChanged ||
-            tokenChanged ||
-            pendingInvalidation?.baseUrlChanged === true,
+            tokenChanged || pendingInvalidation?.baseUrlChanged === true,
           ...(onlyDefaultModelChanged
             ? { previousDefaultModel: previous.anthropicModel }
             : {}),
@@ -1765,6 +1794,17 @@ configRoutes.patch(
                 : {}),
             },
           };
+          // The WebFetch policy and tool search are fixed at launch too, but
+          // need no stop: this connection's runners exit after their current
+          // query.
+          if (
+            updated.webFetchPreflightPolicy !==
+              previous.webFetchPreflightPolicy ||
+            providerToolSearchEnabled(updated) !==
+              providerToolSearchEnabled(previous)
+          ) {
+            deps?.queue?.drainProviderRunnersForCredentialRefresh?.(id);
+          }
         }
 
         if (!mutation.applied.success) {
@@ -1785,6 +1825,9 @@ configRoutes.patch(
         });
       });
     } catch (err) {
+      if (err instanceof ProviderWriteError) {
+        return c.json({ error: err.message, code: err.code }, 400);
+      }
       const message =
         err instanceof Error ? err.message : 'Failed to update provider';
       logger.warn({ err }, 'Failed to update provider');
@@ -1913,6 +1956,14 @@ configRoutes.delete(
             `该模型配置仍被 ${referencedAgentCount} 个智能体使用，请先重新分配`,
           );
         }
+        // An automation's choice would otherwise be written back into its
+        // run session on every run, naming a connection that is gone.
+        const referencedAutomationCount = countAutomationsByModelConfigId(id);
+        if (referencedAutomationCount > 0) {
+          throw new Error(
+            `该模型配置仍被 ${referencedAutomationCount} 个自动化使用，请先修改`,
+          );
+        }
         const sessionInvalidation = pendingInvalidation ?? {
           modelChanged: true,
           baseUrlChanged: true,
@@ -2015,7 +2066,6 @@ function takeConnectivityCheck(userId: string): boolean {
 /** The upstream a test or a model list reaches, and what it sends there. */
 type CheckedConnection =
   | { kind: 'chatgpt'; stored: UnifiedProvider }
-  | { kind: 'gemini'; stored: UnifiedProvider }
   | {
       kind: 'third_party';
       baseUrl: string;
@@ -2061,9 +2111,6 @@ function resolveCheckedConnection(
   if (stored?.codexOAuthCredentials) {
     return { connection: { kind: 'chatgpt', stored }, stored };
   }
-  if (stored?.geminiOAuthCredentials) {
-    return { connection: { kind: 'gemini', stored }, stored };
-  }
   const type = stored?.type ?? draft.type ?? 'third_party';
   const model = draft.anthropicModel ?? stored?.anthropicModel;
 
@@ -2074,13 +2121,7 @@ function resolveCheckedConnection(
       stored?.anthropicBaseUrl ||
       named?.baseUrl ||
       '';
-    // A preset only speaks for its own endpoint.
-    const preset =
-      named &&
-      normalizeProviderBaseUrl(baseUrl) ===
-        normalizeProviderBaseUrl(named.baseUrl)
-        ? named
-        : null;
+    const preset = named && presetAppliesAt(named, baseUrl) ? named : null;
     const draftToken = draft.anthropicAuthToken?.trim();
     const token =
       draftToken || stored?.anthropicAuthToken || stored?.anthropicApiKey || '';
@@ -2213,8 +2254,6 @@ function connectionOrigin(connection: CheckedConnection): string {
       return ANTHROPIC_API_ORIGIN;
     case 'chatgpt':
       return 'chatgpt';
-    case 'gemini':
-      return 'gemini';
   }
 }
 
@@ -2317,82 +2356,6 @@ async function checkChatGptAccount(
   );
 }
 
-/** Gemini subscription: renew the Google token and read the live catalog. */
-async function checkGeminiAccount(
-  provider: UnifiedProvider,
-): Promise<ConnectionTestResult> {
-  const startedAt = Date.now();
-  try {
-    const access = await resolveGeminiAccess(provider.id);
-    const projectId = access.credentials.projectId;
-    if (!projectId) {
-      return unreachedTest(
-        'UNKNOWN',
-        '该连接缺少项目 ID，请重新登录 Google 账号',
-      );
-    }
-    const catalog = await fetchGeminiModels(access.accessToken, projectId);
-    const latencyMs = Date.now() - startedAt;
-    if (catalog.length === 0) {
-      return connectionTestResult(
-        {
-          ok: false,
-          probes: [
-            {
-              model: '',
-              ok: false,
-              status: null,
-              latencyMs,
-              message: '上游没有返回可用模型',
-              code: 'UNKNOWN',
-            },
-          ],
-        },
-        { model: null },
-      );
-    }
-    return connectionTestResult(
-      { ok: true, probes: [{ model: '', ok: true, status: 200, latencyMs }] },
-      { model: null },
-    );
-  } catch (err) {
-    const latencyMs = Date.now() - startedAt;
-    const reauth =
-      err instanceof GeminiReauthRequiredError ||
-      getProviderById(provider.id)?.geminiOAuthLastRefreshError?.kind ===
-        'reauth_required';
-    const code: ProviderErrorCode = reauth
-      ? 'AUTH_INVALID'
-      : err instanceof GeminiRefreshUnavailableError
-        ? 'UPSTREAM_ERROR'
-        : err instanceof GeminiGatewayAuthError
-          ? 'AUTH_INVALID'
-          : err instanceof GeminiOAuthError
-            ? classifyProviderError({
-                status: err.status ?? undefined,
-                bodyText: err.message,
-              }).code
-            : 'UNKNOWN';
-    const message = err instanceof Error ? err.message : 'Gemini 账号检查失败';
-    return connectionTestResult(
-      {
-        ok: false,
-        probes: [
-          {
-            model: '',
-            ok: false,
-            status: null,
-            latencyMs,
-            message: redact(message, []),
-            code,
-          },
-        ],
-      },
-      { model: null },
-    );
-  }
-}
-
 function testConnection(
   connection: CheckedConnection,
 ): Promise<ConnectionTestResult> {
@@ -2416,8 +2379,6 @@ function testConnection(
       return checkSubscriptionAccount(connection);
     case 'chatgpt':
       return checkChatGptAccount(connection.stored);
-    case 'gemini':
-      return checkGeminiAccount(connection.stored);
   }
 }
 
@@ -2456,12 +2417,14 @@ async function discoverModels(
         ok: true,
         models: [...CLAUDE_SUBSCRIPTION_MODELS],
         source: 'builtin',
+        gateway: null,
       };
     case 'chatgpt': {
       await ensureCodexProviderCatalog(connection.stored.id);
       return {
         ok: true,
         source: 'catalog',
+        gateway: null,
         models: listCodexModelsForProvider(connection.stored).models.map(
           (entry) => ({
             id: entry.value,
@@ -2471,53 +2434,6 @@ async function discoverModels(
           }),
         ),
       };
-    }
-    case 'gemini': {
-      try {
-        const access = await resolveGeminiAccess(connection.stored.id);
-        const projectId = access.credentials.projectId;
-        if (!projectId) {
-          return {
-            ok: false,
-            code: 'UNKNOWN',
-            status: null,
-            message: '该连接缺少项目 ID，请重新登录 Google 账号',
-          };
-        }
-        const catalog = await fetchGeminiModels(access.accessToken, projectId);
-        if (catalog.length === 0) {
-          return {
-            ok: false,
-            code: 'UNKNOWN',
-            status: null,
-            message: '上游没有返回可用模型',
-          };
-        }
-        return {
-          ok: true,
-          source: 'catalog',
-          models: catalog.map((entry) => ({
-            id: entry.id,
-            ...(entry.displayName && entry.displayName !== entry.id
-              ? { name: entry.displayName }
-              : {}),
-          })),
-        };
-      } catch (err) {
-        const reauth =
-          err instanceof GeminiReauthRequiredError ||
-          connection.stored.geminiOAuthLastRefreshError?.kind ===
-            'reauth_required';
-        return {
-          ok: false,
-          code: reauth ? 'AUTH_INVALID' : 'UPSTREAM_ERROR',
-          status: err instanceof GeminiOAuthError ? err.status : null,
-          message: redact(
-            err instanceof Error ? err.message : 'Gemini 模型目录获取失败',
-            [],
-          ),
-        };
-      }
     }
   }
 }
@@ -2546,6 +2462,15 @@ configRoutes.post(
       return c.json({ error: resolved.error }, resolved.status);
     }
     const result = await discoverModels(resolved.connection);
+    // A saved connection's own list says what its endpoint is.
+    if (
+      result.ok &&
+      resolved.stored &&
+      resolved.connection.kind === 'third_party' &&
+      !draftChangesConnection(draft, resolved.stored)
+    ) {
+      noteConnectionModelList(resolved.stored, result.gateway);
+    }
     logger.info(
       {
         providerId: validation.data.providerId ?? null,
@@ -2585,6 +2510,21 @@ configRoutes.post(
       return c.json({ error: resolved.error }, resolved.status);
     }
     const { connection, stored } = resolved;
+    // Without a model the probe would ask for a bare Claude name, which magpie
+    // routes by its own machine's Claude Code settings: test a listed model.
+    if (
+      connection.kind === 'third_party' &&
+      !connection.model.trim() &&
+      (connection.preset?.gateway === 'magpie' || stored?.gateway === 'magpie')
+    ) {
+      return c.json(
+        {
+          error: 'Magpie 连接要先选一个模型再测试',
+          code: 'MAGPIE_MODELS_REQUIRED',
+        },
+        400,
+      );
+    }
     const result = await testConnection(connection);
 
     if (stored && !draftChangesConnection(draft, stored)) {
@@ -2665,14 +2605,12 @@ configRoutes.get(
   systemConfigMiddleware,
   async (c) => {
     const { id } = c.req.param();
-    if (
-      getProviders().some(
-        (provider) =>
-          provider.id === id &&
-          provider.anthropicBaseUrl === CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
-      )
-    ) {
+    const stored = getProviderById(id);
+    if (stored?.anthropicBaseUrl === CODEX_GATEWAY_BASE_URL_PLACEHOLDER) {
       return c.json(getCodexProviderRateLimits(id));
+    }
+    if (stored?.gateway === 'magpie') {
+      return c.json(await readMagpieQuotas(stored));
     }
     try {
       const usage = await fetchOAuthUsage(id);
@@ -2684,6 +2622,61 @@ configRoutes.get(
     }
   },
 );
+
+// ─── POST /claude/providers/:id/catalog/sync — 检测网关、同步 magpie 模型目录 ─────
+// 打开连接详情时调用：未检测过的第三方连接检测一次是否 magpie；magpie 连接
+// 刷新模型元数据、标记上游已不提供的模型、记录新模型。只改模型元数据，不停
+// Runner，不清会话。刚同步过（60 秒内）直接返回上次的结果。
+configRoutes.post(
+  '/claude/providers/:id/catalog/sync',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    const provider = getProviderById(id);
+    if (!provider) return c.json({ error: '未找到指定供应商' }, 404);
+    if (!storedConnectionAccess(provider)) {
+      return c.json(
+        {
+          error: '只有第三方地址的连接有模型目录',
+          code: 'CATALOG_UNSUPPORTED',
+        },
+        400,
+      );
+    }
+    const user = c.get('user') as AuthUser;
+    // Only a sync that reads upstream spends the admin's per-minute checks.
+    if (!catalogSyncSkip(provider) && !takeConnectivityCheck(user.id)) {
+      return c.json({ error: '测试过于频繁，请稍后再试' }, 429);
+    }
+    const result = await syncProviderCatalog(id);
+    const current = getProviderById(id);
+    return c.json({
+      provider: toPublicProvider(current ?? provider),
+      result,
+    });
+  },
+);
+
+/**
+ * The usage of a magpie connection's accounts, read from the gateway with
+ * the key the connection runs with. A failed read says why.
+ */
+async function readMagpieQuotas(
+  provider: UnifiedProvider,
+): Promise<MagpieQuotasUsage> {
+  const access = storedConnectionAccess(provider);
+  const fetchedAt = Date.now();
+  const result = access
+    ? await fetchMagpieQuotas(access)
+    : ({ ok: false, message: '连接缺少地址或密钥' } as const);
+  return {
+    kind: 'magpie_quotas',
+    accounts: result.ok ? result.accounts : [],
+    fetchedAt,
+    error: result.ok ? null : result.message,
+  };
+}
 
 // ─── POST /claude/apply — 应用配置到所有容器 ─────
 configRoutes.post(
@@ -3856,16 +3849,51 @@ configRoutes.put(
 
 // ─── Host integration settings (admin role only) ───────────────────
 
-function toHostIntegrationResponse(
+/** The stored host-integration settings, as configured. */
+function toStoredHostIntegration(
   settings: ReturnType<typeof getSystemSettings>,
 ) {
   return {
     externalClaudeDir: settings.externalClaudeDir,
     pluginAutoScan: settings.pluginAutoScan,
     adminHostOnlyMode: settings.adminHostOnlyMode,
+    workspaceRoot: settings.workspaceRoot,
+    deploymentMode: settings.deploymentMode,
     mainAgentContextSource: settings.mainAgentContextSource,
     mainAgentAutoCompactWindow: settings.mainAgentAutoCompactWindow,
     mainAgentAutoCompactPercentage: settings.mainAgentAutoCompactPercentage,
+  };
+}
+
+/** Stored values plus how the workspace root and deployment mode resolve. */
+function otherActiveUsersConflict(c: Context, users: OtherActiveUser[]) {
+  return c.json(
+    {
+      error: '单人宿主机模式只允许一个用户；请先停用其他账号。',
+      code: 'SINGLE_USER_HOST_OTHER_USERS',
+      users,
+    },
+    409,
+  );
+}
+
+function toHostIntegrationResponse(
+  settings: ReturnType<typeof getSystemSettings>,
+) {
+  // The same occupancy the server uses to pick the root (index.ts).
+  const root = getWorkspaceRootResolution(getWorkspaceRootOccupancy());
+  const mode = getDeploymentModeResolution();
+  return {
+    ...toStoredHostIntegration(settings),
+    // Where new Host workspaces go; null when no root is usable and they
+    // stay in data/groups/<folder>.
+    workspaceRootEffective: rootForNewWorkspaces(root),
+    workspaceRootSource: root.source,
+    workspaceRootFallbackReason: root.fallbackReason,
+    workspaceRootFallbackWarning: root.fallbackWarning,
+    deploymentMode: mode.mode,
+    deploymentModeConfigured: settings.deploymentMode,
+    deploymentModeSource: mode.source,
   };
 }
 
@@ -3906,9 +3934,46 @@ configRoutes.put(
         );
       }
     }
+    // The directory itself is created when the first workspace needs it.
+    const rootProblem =
+      validation.data.workspaceRoot !== undefined
+        ? validateWorkspaceRootSetting(
+            validation.data.workspaceRoot,
+            getWorkspaceRootOccupancy(),
+          )
+        : null;
+    if (rootProblem) {
+      return c.json(
+        {
+          error: WORKSPACE_ROOT_PROBLEM_MESSAGES[rootProblem],
+          code: 'WORKSPACE_ROOT_INVALID',
+          reason: rootProblem,
+        },
+        400,
+      );
+    }
 
     return withCapabilityScopeLocks([SYSTEM_CAPABILITY_LOCK_KEY], async () => {
-      const before = toHostIntegrationResponse(getSystemSettings());
+      const before = toStoredHostIntegration(getSystemSettings());
+      const singleUserHostBefore = isSingleUserHost();
+      const singleUserHostAfter =
+        resolveDeploymentMode({
+          configured: validation.data.deploymentMode ?? before.deploymentMode,
+          env: process.env[DEPLOYMENT_MODE_ENV],
+        }).mode === 'single_user_host';
+      const enablingSingleUserHost =
+        !singleUserHostBefore && singleUserHostAfter;
+      const actorId = (c.get('user') as AuthUser).id;
+      if (enablingSingleUserHost) {
+        const others = listOtherActiveUsers(actorId);
+        if (others.length > 0) return otherActiveUsersConflict(c, others);
+      }
+      // Single-user host mode makes admin host-only effective without
+      // touching the stored switch, so it migrates the same way enabling it.
+      const hostOnlyBefore = before.adminHostOnlyMode || singleUserHostBefore;
+      const hostOnlyAfter =
+        (validation.data.adminHostOnlyMode ?? before.adminHostOnlyMode) ||
+        singleUserHostAfter;
       const mainContextSourceChanged =
         validation.data.mainAgentContextSource !== undefined &&
         validation.data.mainAgentContextSource !==
@@ -3918,19 +3983,16 @@ configRoutes.put(
         validation.data.externalClaudeDir !== before.externalClaudeDir;
       const hostContextChanged =
         mainContextSourceChanged || externalClaudeDirChanged;
-      const adminHostOnlyModeChanged =
-        validation.data.adminHostOnlyMode !== undefined &&
-        validation.data.adminHostOnlyMode !== before.adminHostOnlyMode;
-      const enablingAdminHostOnlyMode =
-        adminHostOnlyModeChanged && validation.data.adminHostOnlyMode === true;
+      // Effective host-only turning on: the stored switch, or single-user
+      // host mode. Already on (stored true, then single-user host), there is
+      // nothing to migrate and no runner or session to reset.
+      const enablingAdminHostOnlyMode = !hostOnlyBefore && hostOnlyAfter;
       const pendingRuntimeCleanupFolders =
         getPendingAdminHostOnlyCleanupFolders();
       const repairingRuntimeCleanup = pendingRuntimeCleanupFolders.length > 0;
       const enforcingAdminHostOnlyMode =
         enablingAdminHostOnlyMode ||
-        (repairingRuntimeCleanup &&
-          before.adminHostOnlyMode &&
-          validation.data.adminHostOnlyMode !== false);
+        (repairingRuntimeCleanup && hostOnlyBefore && hostOnlyAfter);
       const defaultCompactChanged =
         (validation.data.mainAgentAutoCompactWindow !== undefined &&
           validation.data.mainAgentAutoCompactWindow !==
@@ -4034,6 +4096,13 @@ configRoutes.put(
         | ReturnType<typeof forceActiveAdminRuntimesToHost>
         | undefined;
       const commit = () => {
+        // An account may have been added while runners were quiescing.
+        // Checked before the first write, so nothing has changed yet when
+        // it fails (the stopped runners restart on demand).
+        if (enablingSingleUserHost) {
+          const others = listOtherActiveUsers(actorId);
+          if (others.length > 0) throw new SingleUserHostConflictError(others);
+        }
         if (enforcingAdminHostOnlyMode) {
           hostOnlyMigration = forceActiveAdminRuntimesToHost();
           if (deps) {
@@ -4046,10 +4115,6 @@ configRoutes.put(
         }
         for (const folder of sessionResetFolders)
           deleteWorkspaceSessions(folder);
-        if (deps?.sessions) {
-          for (const folder of sessionResetFolders)
-            delete deps.sessions[folder];
-        }
         const value = saveSystemSettings(validation.data);
         return value;
       };
@@ -4093,6 +4158,9 @@ configRoutes.put(
             ADMIN_HOST_ONLY_RUNTIME_SAFETY_SOURCE,
           );
         } catch (err) {
+          if (err instanceof SingleUserHostConflictError) {
+            return otherActiveUsersConflict(c, err.users);
+          }
           if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
           return c.json(
             {
@@ -4106,12 +4174,17 @@ configRoutes.put(
           );
         }
       } else {
-        saved = commit();
+        try {
+          saved = commit();
+        } catch (err) {
+          if (!(err instanceof SingleUserHostConflictError)) throw err;
+          return otherActiveUsersConflict(c, err.users);
+        }
       }
       const response = toHostIntegrationResponse(saved);
       const changedFields = changedSettingFields(
         before,
-        response,
+        toStoredHostIntegration(saved),
         validation.data,
       );
       const actor = c.get('user') as AuthUser;
@@ -4138,6 +4211,299 @@ configRoutes.put(
 
       return c.json(response);
     });
+  },
+);
+
+// ─── Storage sources (admin only) ───────────────────────────────────
+// NFS exports and SMB shares workspaces can mount. Sources added here live
+// under data/config/ and are merged with the mount allowlist's own, which
+// stay read-only; an SMB password is write-only and kept in a 0600 file.
+
+const STORAGE_SOURCE_ID_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+/**
+ * Sources whose change persisted while a runner using them could not be
+ * stopped, with the runtimes blocked since. They stay blocked until the same
+ * request is retried.
+ */
+const storageSourceCleanupPending = new Map<string, string[]>();
+
+function storageSourceSafetySource(id: string): string {
+  return `storage_source:${id}`;
+}
+
+class StorageSourceRuntimeError extends Error {
+  constructor(readonly persisted: boolean) {
+    super('storage source runtime cleanup failed');
+  }
+}
+
+/**
+ * Commits a storage source change with every runner that mounts the source
+ * stopped (CLAUDE.md §8): Docker fixes a mount when the container is created,
+ * so a warm runner would keep the old share, credentials or write access.
+ */
+async function commitStorageSourceChange<T>(
+  id: string,
+  quiesce: boolean,
+  reason: string,
+  commit: () => T,
+): Promise<T> {
+  const needsQuiesce = quiesce || storageSourceCleanupPending.has(id);
+  const targets = needsQuiesce
+    ? listStorageSourceUsers(id).map(({ jid, folder }) => ({
+        folder,
+        primaryJid: jid,
+      }))
+    : [];
+  const safetySource = storageSourceSafetySource(id);
+  const releaseBlocked = (runtimeJids: string[]) => {
+    const blocked = storageSourceCleanupPending.get(id) ?? [];
+    storageSourceCleanupPending.delete(id);
+    const jids = [...new Set([...blocked, ...runtimeJids])];
+    if (deps && jids.length > 0) {
+      deps.queue.unblockGroupsForRuntimeSafety?.(jids, safetySource);
+    }
+  };
+  if (!deps || targets.length === 0) {
+    const value = commit();
+    releaseBlocked([]);
+    return value;
+  }
+  try {
+    const result = await quiesceWorkspaceRunnersAroundCommit(
+      deps,
+      targets,
+      {
+        reason,
+        onPostCommitFailure: (runtimeJids) => {
+          storageSourceCleanupPending.set(id, [
+            ...new Set([
+              ...(storageSourceCleanupPending.get(id) ?? []),
+              ...runtimeJids,
+            ]),
+          ]);
+          deps.queue.blockGroupsForRuntimeSafety?.(
+            runtimeJids,
+            `${reason}: runtime cleanup failed after commit`,
+            safetySource,
+          );
+        },
+      },
+      commit,
+    );
+    releaseBlocked(result.runtimeJids);
+    return result.value;
+  } catch (err) {
+    if (err instanceof WorkspaceRuntimeQuiesceError) {
+      throw new StorageSourceRuntimeError(err.persisted);
+    }
+    throw err;
+  }
+}
+
+function storageSourceRuntimeErrorResponse(
+  c: Context<{ Variables: Variables }>,
+  err: StorageSourceRuntimeError,
+) {
+  return c.json(
+    {
+      error: err.persisted
+        ? '改动已生效，但没能停下使用该存储源的工作区；重试同一请求即可完成清理'
+        : '没能停下使用该存储源的工作区，存储源未修改',
+      persisted: err.persisted,
+      retryable: true,
+    },
+    503,
+  );
+}
+
+function storageSourceAdminErrorResponse(
+  c: Context<{ Variables: Variables }>,
+  err: StorageSourceAdminError,
+) {
+  return c.json(
+    {
+      error: err.message,
+      ...(err.code ? { code: err.code } : {}),
+      ...err.details,
+    },
+    err.status,
+  );
+}
+
+function logStorageSourceAudit(
+  c: Context<{ Variables: Variables }>,
+  eventType: 'storage_source_saved' | 'storage_source_deleted',
+  details: Record<string, unknown>,
+): void {
+  const actor = c.get('user') as AuthUser;
+  logAuthEvent({
+    event_type: eventType,
+    username: actor.username,
+    actor_username: actor.username,
+    ip_address: getClientIp(c),
+    user_agent: c.req.header('user-agent') ?? null,
+    // The server and share are deployment details; record only the shape.
+    details,
+  });
+}
+
+configRoutes.get(
+  '/storage-sources',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => {
+    try {
+      return c.json(listStorageSources());
+    } catch (err) {
+      logger.error({ err }, 'Failed to list storage sources');
+      return c.json({ error: 'Failed to list storage sources' }, 500);
+    }
+  },
+);
+
+// Storage sources are Docker volumes, and single-user host mode runs no
+// Docker: a source saved there would never be mounted.
+function storageSourceWriteRefusal(c: Context) {
+  if (!isSingleUserHost()) return null;
+  return singleUserHostRefusal(
+    c,
+    '单人宿主机模式不使用 Docker，存储源不会生效。',
+  );
+}
+
+async function saveStorageSourceRoute(
+  c: Context<{ Variables: Variables }>,
+  creating: boolean,
+) {
+  const refusal = storageSourceWriteRefusal(c);
+  if (refusal) return refusal;
+  const id = c.req.param('id') ?? '';
+  if (!STORAGE_SOURCE_ID_RE.test(id)) {
+    return c.json(
+      { error: '标识只能用小写字母、数字和连字符，最长 63 个字符' },
+      400,
+    );
+  }
+  const body = await c.req.json().catch(() => ({}));
+  const validation = StorageSourceSaveSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json(
+      { error: 'Invalid request body', details: validation.error.format() },
+      400,
+    );
+  }
+  const { force, ...input } = validation.data;
+  let audit: Record<string, unknown> | undefined;
+  try {
+    const source = await withStorageSourceWriteLock(async () => {
+      const plan = planStorageSourceSave(id, input, creating);
+      if (plan.revokedReadWriteUsers > 0 && !force) {
+        throw new StorageSourceAdminError(
+          `有 ${plan.revokedReadWriteUsers} 个工作区以读写方式挂载了 ${id}，关闭读写后它们将无法启动`,
+          409,
+          'STORAGE_SOURCE_READ_WRITE_IN_USE',
+          { readWriteUsedBy: plan.revokedReadWriteUsers },
+        );
+      }
+      return commitStorageSourceChange(
+        id,
+        plan.changesMounts,
+        `Storage source ${id} updated`,
+        () => {
+          const view = plan.commit();
+          audit = {
+            source_id: id,
+            type: view.type,
+            created: creating,
+            password_changed:
+              plan.passwordAction === 'set' ||
+              plan.passwordAction === 'removed',
+          };
+          return view;
+        },
+      );
+    });
+    return c.json({ source }, creating ? 201 : 200);
+  } catch (err) {
+    if (err instanceof StorageSourceRuntimeError) {
+      return storageSourceRuntimeErrorResponse(c, err);
+    }
+    if (err instanceof StorageSourceAdminError) {
+      return storageSourceAdminErrorResponse(c, err);
+    }
+    logger.error({ err, sourceId: id }, 'Failed to save storage source');
+    return c.json({ error: 'Failed to save storage source' }, 500);
+  } finally {
+    // Recorded whenever the change persisted, including a 503 after it.
+    if (audit) logStorageSourceAudit(c, 'storage_source_saved', audit);
+  }
+}
+
+configRoutes.post(
+  '/storage-sources/:id',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => saveStorageSourceRoute(c, true),
+);
+
+configRoutes.put(
+  '/storage-sources/:id',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => saveStorageSourceRoute(c, false),
+);
+
+configRoutes.delete(
+  '/storage-sources/:id',
+  authMiddleware,
+  adminRoleMiddleware,
+  async (c) => {
+    const refusal = storageSourceWriteRefusal(c);
+    if (refusal) return refusal;
+    const id = c.req.param('id');
+    let audit: Record<string, unknown> | undefined;
+    try {
+      await withStorageSourceWriteLock(async () => {
+        let plan: ReturnType<typeof planStorageSourceDelete> | undefined;
+        try {
+          plan = planStorageSourceDelete(id);
+        } catch (err) {
+          // A retry after a 503 finds the source gone: finish stopping the
+          // runners that still use it instead of answering 404.
+          if (
+            !(err instanceof StorageSourceAdminError) ||
+            err.status !== 404 ||
+            !storageSourceCleanupPending.has(id)
+          ) {
+            throw err;
+          }
+        }
+        await commitStorageSourceChange(
+          id,
+          true,
+          `Storage source ${id} deleted`,
+          () => {
+            if (!plan) return;
+            plan.commit();
+            audit = { source_id: id, type: plan.source.type };
+          },
+        );
+      });
+    } catch (err) {
+      if (err instanceof StorageSourceRuntimeError) {
+        return storageSourceRuntimeErrorResponse(c, err);
+      }
+      if (err instanceof StorageSourceAdminError) {
+        return storageSourceAdminErrorResponse(c, err);
+      }
+      logger.error({ err, sourceId: id }, 'Failed to delete storage source');
+      return c.json({ error: 'Failed to delete storage source' }, 500);
+    } finally {
+      if (audit) logStorageSourceAudit(c, 'storage_source_deleted', audit);
+    }
+    return c.json({ success: true });
   },
 );
 
@@ -5880,24 +6246,21 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         ? body.target_agent_id.trim()
         : '';
 
-  // Parse once for named sessions, main/workspace binds, and policy-only updates.
+  // Parse once for session binds, topic workspace binds, and policy-only updates.
   const { activationMode, audienceMode } = parseBindingResponsePolicy(
     imJid,
     body,
   );
 
   // Bind to workspace session. Stored in target_agent_id for backward compatibility.
-  if (targetSessionId && targetSessionId !== 'main') {
+  if (targetSessionId) {
     const sessionId = targetSessionId;
     const agent = getAgent(sessionId);
     if (!agent) {
       return c.json({ error: 'Session not found' }, 404);
     }
-    if (agent.kind !== 'conversation') {
-      return c.json(
-        { error: 'Only workspace sessions can bind IM groups' },
-        400,
-      );
+    if (!isBindableSession(agent)) {
+      return c.json(SESSION_NOT_BINDABLE, 400);
     }
     if (!agent.chat_jid.startsWith('web:')) {
       return c.json(
@@ -5943,6 +6306,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       !freshAgent.chat_jid.startsWith('web:')
     ) {
       return c.json({ error: 'Session not found' }, 404);
+    }
+    if (!isBindableSession(freshAgent)) {
+      return c.json(SESSION_NOT_BINDABLE, 400);
     }
     const freshOwnerGroup = getRegisteredGroup(freshAgent.chat_jid);
     if (
@@ -6016,7 +6382,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       ? body.owner_im_id.trim()
       : undefined;
 
-  // Bind to workspace main conversation
+  // Bind a native topic group to a workspace (each topic its own session)
   if (typeof body.target_main_jid === 'string' && body.target_main_jid.trim()) {
     const targetMainJid = body.target_main_jid.trim();
     if (!targetMainJid.startsWith('web:')) {
@@ -6054,7 +6420,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     }
     const bindingPolicyError = conversationBindingPolicyError(
       getConversationKind(imJid, freshImGroup, chatInfo),
-      targetSessionId === 'main' ? 'session' : 'workspace',
+      'workspace',
     );
     if (bindingPolicyError) {
       return c.json({ error: bindingPolicyError }, 400);
@@ -6068,12 +6434,6 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
     ) {
       return c.json({ error: FEISHU_P2P_MENTION_ACTIVATION_ERROR }, 400);
     }
-    // Compute against freshImGroup, not the pre-await snapshot — see
-    // fetchLiveChatInfo's doc comment.
-    const threadCapable = isNativeContextContainer(imJid, freshImGroup, {
-      ...(chatInfo ?? {}),
-      activation_mode: activationMode ?? freshImGroup.activation_mode,
-    });
     const force = body.force === true;
     const replyPolicy = 'source_only' as const;
     const legacyMainJid = `web:${freshTargetGroup.folder}`;
@@ -6086,17 +6446,12 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
     const updated: RegisteredGroup = {
-      ...buildWorkspaceMountUpdate(
-        freshImGroup,
-        targetMainJid,
-        threadCapable ? 'thread_map' : 'single_session',
-        {
-          replyPolicy,
-          ...(activationMode !== undefined ? { activationMode } : {}),
-          ...(audienceMode !== undefined ? { audienceMode } : {}),
-          ...(ownerImId !== undefined ? { ownerImId } : {}),
-        },
-      ),
+      ...buildWorkspaceMountUpdate(freshImGroup, targetMainJid, 'thread_map', {
+        replyPolicy,
+        ...(activationMode !== undefined ? { activationMode } : {}),
+        ...(audienceMode !== undefined ? { audienceMode } : {}),
+        ...(ownerImId !== undefined ? { ownerImId } : {}),
+      }),
       feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
       feishu_group_message_type:
         chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
@@ -6110,13 +6465,13 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         freshImGroup.target_main_jid,
         imJid,
         targetMainJid,
-        threadCapable ? 'thread_map' : 'single_session',
+        'thread_map',
       );
     }
-    if (threadCapable) markNativeContextWorkspace(targetMainJid);
+    markNativeContextWorkspace(targetMainJid);
     logger.info(
-      { imJid, targetMainJid, threadCapable, userId: user.id },
-      'IM group bound to workspace (bindings page)',
+      { imJid, targetMainJid, userId: user.id },
+      'IM topic group bound to workspace (bindings page)',
     );
     return c.json({ success: true });
   }
@@ -6159,11 +6514,17 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         400,
       );
     }
+    if (candidate.target_main_jid && !threadCapable) {
+      return c.json(
+        { error: 'Workspace bindings only accept native topic groups' },
+        400,
+      );
+    }
     const updated = candidate.target_main_jid
       ? buildWorkspaceMountUpdate(
           candidate,
           candidate.target_main_jid,
-          threadCapable ? 'thread_map' : 'single_session',
+          'thread_map',
           {
             activationMode: candidate.activation_mode,
             audienceMode: candidate.audience_mode,
@@ -6172,10 +6533,7 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
         )
       : candidate;
     commitChannelMountUpdate(imJid, updated);
-    if (imGroup.binding_mode === 'thread_map' && !threadCapable) {
-      detachThreadMapWorkspaceIfLast(imGroup.target_main_jid, imJid);
-    }
-    if (threadCapable && updated.target_main_jid) {
+    if (updated.target_main_jid) {
       markNativeContextWorkspace(updated.target_main_jid);
     }
     logger.info(

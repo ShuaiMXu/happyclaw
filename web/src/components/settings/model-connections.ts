@@ -2,9 +2,11 @@ import {
   PROVIDER_ERROR_COPY,
   getModelPreset,
   splitOneMillionSuffix,
+  type CatalogSyncResult,
   type DiscoveredModel,
   type ModelPreset,
   type ProviderErrorCode,
+  type ProviderGateway,
   type ProviderTestRecord,
 } from '@/lib/model-providers';
 import { api } from '../../api/client';
@@ -24,7 +26,6 @@ export type ConnectionKind =
   | 'claude_subscription'
   | 'anthropic_api'
   | 'chatgpt'
-  | 'gemini'
   | 'preset'
   | 'custom';
 
@@ -32,7 +33,6 @@ export const CONNECTION_KIND_LABELS: Record<ConnectionKind, string> = {
   claude_subscription: 'Claude 订阅',
   anthropic_api: 'Anthropic API Key',
   chatgpt: 'ChatGPT 订阅',
-  gemini: 'Gemini 订阅',
   preset: '厂商预设',
   custom: '自定义地址',
 };
@@ -41,7 +41,6 @@ type KindFields = Pick<
   UnifiedProviderPublic,
   | 'type'
   | 'hasCodexOAuthCredentials'
-  | 'hasGeminiOAuthCredentials'
   | 'claudeAuthKind'
   | 'hasAnthropicApiKey'
   | 'hasClaudeOAuthCredentials'
@@ -51,7 +50,6 @@ type KindFields = Pick<
 
 export function connectionKind(provider: KindFields): ConnectionKind {
   if (provider.hasCodexOAuthCredentials) return 'chatgpt';
-  if (provider.hasGeminiOAuthCredentials) return 'gemini';
   if (provider.type === 'official') {
     const apiKey =
       provider.claudeAuthKind === 'api_key' ||
@@ -67,13 +65,6 @@ export function connectionKind(provider: KindFields): ConnectionKind {
 /** Kinds that talk to an Anthropic-compatible address with a key. */
 export function isThirdPartyKind(kind: ConnectionKind | null): boolean {
   return kind === 'preset' || kind === 'custom';
-}
-
-/** Kinds that are an account login behind an embedded gateway. */
-export function isSubscriptionKind(kind: ConnectionKind | null): boolean {
-  return (
-    kind === 'claude_subscription' || kind === 'chatgpt' || kind === 'gemini'
-  );
 }
 
 /** The label a row shows for its kind: a preset is named by its vendor. */
@@ -104,17 +95,10 @@ export function errorCopy(code: ProviderErrorCode | null | undefined) {
 export function connectionStatus(
   provider: Pick<
     UnifiedProviderPublic,
-    | 'lastTest'
-    | 'claudeOAuthNeedsReLogin'
-    | 'codexOAuthNeedsReauth'
-    | 'geminiOAuthNeedsReauth'
+    'lastTest' | 'claudeOAuthNeedsReLogin' | 'codexOAuthNeedsReauth'
   >,
 ): ConnectionStatus {
-  if (
-    provider.claudeOAuthNeedsReLogin ||
-    provider.codexOAuthNeedsReauth ||
-    provider.geminiOAuthNeedsReauth
-  ) {
+  if (provider.claudeOAuthNeedsReLogin || provider.codexOAuthNeedsReauth) {
     return {
       tone: 'error',
       label: '需重新登录',
@@ -199,6 +183,8 @@ type DiscoverModelsResponse =
       models: DiscoveredModel[];
       source: 'endpoint' | 'builtin' | 'catalog';
       authMode?: ProviderAuthMode;
+      /** What the list says the endpoint is; absent on older servers. */
+      gateway?: ProviderGateway | null;
     }
   | {
       ok: false;
@@ -255,6 +241,22 @@ export function discoverModels(
   );
 }
 
+/**
+ * Reads a third-party connection's model list again: it tells a magpie
+ * gateway from any other endpoint and, for magpie, refreshes what the
+ * vendor says about each model and finds the new and the vanished ones.
+ */
+export function syncConnectionCatalog(id: string): Promise<{
+  provider: UnifiedProviderPublic;
+  result: CatalogSyncResult;
+}> {
+  return api.post(
+    `${PROVIDERS_API}/${encodeURIComponent(id)}/catalog/sync`,
+    undefined,
+    45_000,
+  );
+}
+
 /** A finished test, reduced to what the UI shows. */
 export interface TestOutcome {
   ok: boolean;
@@ -284,13 +286,17 @@ export function testOutcome(result: ProviderTestResponse): TestOutcome {
 /**
  * Asks before an edit that stops runners: an address, a key, a removed
  * model or the environment. Says how many live runners the edit stops (the
- * server counts every one it quiesces, not only this connection's) and that
- * conversations keep their history.
+ * server counts every one it quiesces, not only this connection's) and
+ * whether conversations start a new SDK session. A new address alone keeps
+ * them.
  */
-export async function confirmProtocolChange(provider: {
-  id: string;
-  name: string;
-}): Promise<boolean> {
+export async function confirmProtocolChange(
+  provider: {
+    id: string;
+    name: string;
+  },
+  { keepsSessions = false }: { keepsSessions?: boolean } = {},
+): Promise<boolean> {
   let stoppedRunners: number | null = null;
   try {
     const impact = await api.get<{
@@ -311,7 +317,9 @@ export async function confirmProtocolChange(provider: {
         : '';
   return confirmDialog({
     title: `修改连接「${provider.name}」`,
-    message: `${runners}使用这个连接的对话，下一条消息会开启新的 SDK 会话，聊天记录保留。`,
+    message: keepsSessions
+      ? `${runners}使用这个连接的对话保留各自的 SDK 会话，下一条消息从新地址继续。`
+      : `${runners}使用这个连接的对话，下一条消息会开启新的 SDK 会话，聊天记录保留。`,
     confirmText: '保存修改',
   });
 }
@@ -335,6 +343,13 @@ export function modelInUseAgents(err: unknown): string[] | null {
         : null,
     )
     .filter((name): name is string => typeof name === 'string');
+}
+
+/** Copy for a connection write the server refused for a known reason. */
+export function connectionWriteErrorMessage(err: unknown): string | null {
+  return errorBody(err)?.code === 'MAGPIE_MODELS_REQUIRED'
+    ? 'magpie 连接至少要有一个模型：magpie 没有默认模型。'
+    : null;
 }
 
 /** Copy for a model or effort pick the server refused, else null. */

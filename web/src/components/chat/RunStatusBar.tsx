@@ -12,8 +12,15 @@ import {
 import { useShellStore } from '../../stores/shell';
 import { useConnectionStatus } from '../../hooks/useConnectionStatus';
 import { useReplyRate } from '../../hooks/useReplyRate';
+import {
+  cacheHitRate,
+  formatHitRate,
+  formatTokensPerSecond,
+  generationTokensPerSecond,
+} from '../../lib/usage-metrics';
 import { useRunElapsed } from '../../hooks/useRunElapsed';
 import { useThrottledValue } from '../../hooks/useThrottledValue';
+import { sessionJidOf } from '../../lib/session-jid';
 import { useAfterDelay } from '../../hooks/useTick';
 import {
   latestProgress,
@@ -54,13 +61,11 @@ export const RunStatusBar = memo(function RunStatusBar({
   agentId,
 }: {
   groupJid: string;
-  agentId?: string | null;
+  agentId: string;
 }) {
-  const runtimeJid = agentId ? `${groupJid}#agent:${agentId}` : groupJid;
-  const running = useChatStore((s) =>
-    agentId
-      ? !!s.agentWaiting[agentId] || isLiveStream(s.agentStreaming[agentId])
-      : !!s.waiting[groupJid],
+  const runtimeJid = sessionJidOf(groupJid, agentId);
+  const running = useChatStore(
+    (s) => !!s.agentWaiting[agentId] || isLiveStream(s.agentStreaming[agentId]),
   );
   const stopping = useChatStore((s) => !!s.stopRequests[runtimeJid]);
   const proactive = useChatStore((s) => isProactiveRuntime(s, runtimeJid));
@@ -95,7 +100,17 @@ export const RunStatusBar = memo(function RunStatusBar({
   );
   const stillGoing = useAfterDelay(running && quiet, QUIET_DELAY_MS);
   const elapsed = useRunElapsed(runtimeJid);
-  const rate = useReplyRate(groupJid, agentId ?? undefined);
+  const rate = useReplyRate(agentId);
+  // Measured as each model call ends; primitives, so a call's end renders
+  // the bar once.
+  const hitRate = useChatStore((s) => {
+    const p = s.agentStreaming[agentId]?.usageProgress;
+    return p && p.cacheReadInputTokens > 0 ? cacheHitRate(p) : null;
+  });
+  const measuredRate = useChatStore((s) => {
+    const p = s.agentStreaming[agentId]?.usageProgress;
+    return p ? generationTokensPerSecond(p) : null;
+  });
   const offline = useConnectionStatus() === 'offline';
   const busyOnly = (proactive && hidden) || quiet;
   const label = offline
@@ -133,9 +148,18 @@ export const RunStatusBar = memo(function RunStatusBar({
 
   if (!running || ended || (quiet && !stillGoing)) return null;
 
+  // Once a call has ended, its measured speed replaces the estimate from
+  // the reply's characters.
+  const speed =
+    measuredRate != null
+      ? formatTokensPerSecond(measuredRate)
+      : rate != null
+        ? `${rate} tok/s`
+        : null;
   const meta = [
     elapsed != null && !offline ? formatRunElapsed(elapsed) : null,
-    rate != null && !stopping && !offline ? `${rate} tok/s` : null,
+    hitRate != null && !offline ? `命中 ${formatHitRate(hitRate)}` : null,
+    speed != null && !stopping && !offline ? speed : null,
   ].filter(Boolean);
   return (
     <div

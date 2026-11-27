@@ -6,7 +6,7 @@ import { isAutomationTurnInput } from '../../src/agent-builder-turn-auth.js';
 import * as automationLedger from '../../src/automation-run-ledger.js';
 import { canDeleteAcknowledgedIpcSource } from '../../src/host-ipc-output-router.js';
 import { WORK_IPC_TYPES } from '../../src/work-items.js';
-import { readTeamInput } from '../../src/team-gate.js';
+import { copiesGroupMessage, readTeamInput } from '../../src/team-gate.js';
 
 // Execute whole production functions with explicit dependencies, without
 // importing index.ts (which starts the server). No routing/cursor algorithm is
@@ -111,17 +111,37 @@ function automationDefaults(): Record<string, unknown> {
       (WORK_IPC_TYPES as readonly unknown[]).includes(type),
     resolveTeamRole: () => null,
     teamLaneOf: () => null,
+    // Session inspection: its requests are not part of what these tests send.
+    isSessionInspectIpcType: (type: unknown) =>
+      type === 'session_list' || type === 'session_get',
+    handleSessionInspectIpc: () => ({ ok: false, error: 'not under test' }),
+    sessionInspectDeps: {},
     // processAgentConversation's own: extracted callbacks close over it.
     teamRole: null,
     resolveTeamRoute: () => null,
     afterTeamMessageStored: () => {},
     followupCopyIdsOf: () => [],
     readTeamInput,
+    copiesGroupMessage,
     onTeamMessageStored: () => {},
+    // Multi-task mode: no delegated work item, so nothing to keep or fail.
+    isDelegatedReportInput: () => false,
+    failDelegatedWorkerRun: () => {},
     // utils.ts reads config at import; tests mock config, so not imported.
     agentIdOfJid: (jid: string) =>
       jid.includes('#agent:') ? jid.split('#agent:')[1] || null : null,
     getAgentBuilderInputMessage: () => null,
+    // Session lane bookkeeping a test of another concern runs without:
+    // sub-agent checkpoints, IPC reply acknowledgement, the billing push and
+    // the OOM counter.
+    runningSubagentTasksByLane: new Map(),
+    trackSubagentTaskEvent: () => {},
+    nonSubagentTaskIds: new Set(),
+    subagentTaskInputMessageId: () => '',
+    activeIpcReplyTurnTrackers: new Map(),
+    agentIpcReplyTracker: { inputTurnId: '', delivered: false },
+    broadcastOwnerBillingUsage: () => {},
+    clearSessionOomExits: () => {},
   };
 }
 
@@ -135,7 +155,11 @@ const AUTOMATION_SOURCE_HELPERS = [
   'createReplyStreamingSession',
   // Team mode helpers every connector and /break path reaches.
   'breakLane',
+  'closeRetryWaitTurnsOfInputs',
   'onImMessagePersisted',
+  // Multi-task mode: what /break releases, and the inputs a turn answered.
+  'releaseKeptReports',
+  'ipcReceiptMessageIds',
 ];
 
 const HOST_INDEX = new URL('../../src/index.ts', import.meta.url);
@@ -182,15 +206,6 @@ export function createRuntimeSourceHarness(
         name,
         named(name, source, owner ? named(owner, source) : source),
       );
-    },
-    installMainOutput(): void {
-      const call = unique(
-        named('processGroupMessages', source),
-        (node) =>
-          ts.isCallExpression(node) &&
-          node.expression.getText(source) === 'runAgent',
-      ) as ts.CallExpression;
-      installNode('handleMainOutput', call.arguments[4]);
     },
     /** Install the argument of the unique `callee(...)` call in `owner`. */
     installCallArgument(

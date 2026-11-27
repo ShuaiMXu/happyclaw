@@ -3,6 +3,7 @@ import { resetUserScopedStores } from './user-scope';
 import { api, apiFetch } from '../api/client';
 import { wsManager } from '../api/ws';
 import { clearMessageSnapshotCache } from '../utils/messageSnapshotCache';
+import { releasePushSubscription } from '../utils/webPush';
 
 export type Permission =
   | 'manage_system_config'
@@ -44,6 +45,10 @@ export interface UserPublic {
   guest_owner_id?: string | null;
   /** Owner username, only present in the admin users list. */
   guest_owner_username?: string | null;
+  /** Two-factor authentication is on; only present in the admin users list. */
+  two_factor_enabled?: boolean;
+  /** How many passkeys the user has; only present in the admin users list. */
+  passkey_count?: number;
 }
 
 export interface AppearanceConfig {
@@ -59,6 +64,30 @@ export interface AppearanceConfig {
   brandBannerUrl: string | null;
 }
 
+/**
+ * How the instance is deployed (`src/deployment-mode.ts` on the server).
+ * `single_user_host` runs everything on the host for one user: no Docker,
+ * registration, other users, guests or billing. The server refuses those
+ * itself; the client only hides them (see lib/deployment-mode.ts).
+ */
+export type DeploymentMode = 'multi_user' | 'single_user_host';
+
+/** An absent or unknown value is `multi_user`, so an older server looks as before. */
+export function parseDeploymentMode(value: unknown): DeploymentMode {
+  return value === 'single_user_host' ? 'single_user_host' : 'multi_user';
+}
+
+/** Where the effective mode comes from: the stored setting, the environment or the default. */
+export type DeploymentModeSource = 'settings' | 'env' | 'default';
+
+function parseDeploymentModeSource(
+  value: unknown,
+): DeploymentModeSource | null {
+  return value === 'settings' || value === 'env' || value === 'default'
+    ? value
+    : null;
+}
+
 export interface SetupStatus {
   needsSetup: boolean;
   claudeConfigured: boolean;
@@ -71,8 +100,28 @@ interface AuthState {
   setupStatus: SetupStatus | null;
   appearance: AppearanceConfig | null;
   initialized: boolean | null; // null = not checked yet
+  /** From /api/auth/me and /api/auth/status; kept across sign-out. */
+  deploymentMode: DeploymentMode;
+  /** From /api/auth/status; null until it is read (or on an older server). */
+  deploymentModeSource: DeploymentModeSource | null;
+  /** Applies a deployment mode switched in settings. */
+  setDeploymentMode: (mode: DeploymentMode) => void;
   checking: boolean;
-  login: (username: string, password: string) => Promise<void>;
+  /**
+   * Log in with a password. With two-factor authentication on, nothing is
+   * signed in yet: the returned challenge goes to loginSecondFactor.
+   */
+  login: (
+    username: string,
+    password: string,
+  ) => Promise<{ mfaChallenge: string } | null>;
+  loginSecondFactor: (challenge: string, code: string) => Promise<void>;
+  /**
+   * Log in with a passkey. `autofill` waits on the browser's passkey
+   * suggestions in the username field instead of opening a prompt; it
+   * resolves false when that wait is cancelled.
+   */
+  loginWithPasskey: (options?: { autofill?: boolean }) => Promise<boolean>;
   register: (data: {
     username: string;
     password: string;
@@ -82,7 +131,11 @@ interface AuthState {
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
   checkStatus: () => Promise<void>;
-  setupAdmin: (username: string, password: string) => Promise<void>;
+  setupAdmin: (
+    username: string,
+    password: string,
+    deploymentMode?: DeploymentMode,
+  ) => Promise<void>;
   changePassword: (
     currentPassword: string,
     newPassword: string,
@@ -104,6 +157,13 @@ interface AuthState {
   hasPermission: (permission: Permission) => boolean;
 }
 
+interface MeResponse {
+  user: UserPublic;
+  setupStatus?: SetupStatus;
+  appearance?: AppearanceConfig;
+  deploymentMode?: unknown;
+}
+
 let checkAuthInFlight: Promise<void> | null = null;
 
 /**
@@ -121,43 +181,102 @@ function discardPrewarms(): void {
   holder.__groupsPrewarm = undefined;
 }
 
+/**
+ * Drop everything that belongs to the signed-in user before another one
+ * signs in on this browser, or after this one signs out.
+ */
+async function discardUserScopedState(): Promise<void> {
+  resetUserScopedStores();
+  discardPrewarms();
+  await clearMessageSnapshotCache();
+}
+
+interface LoginResponse {
+  success: boolean;
+  user: UserPublic;
+  setupStatus?: SetupStatus;
+  appearance?: AppearanceConfig;
+}
+
+// Public pages never run checkAuth, so `checking` may still hold its
+// initial true; the signed-in shell must not wait on it.
+function signedInState(data: LoginResponse) {
+  return {
+    authenticated: true,
+    user: data.user,
+    setupStatus: data.setupStatus ?? null,
+    appearance: data.appearance ?? null,
+    initialized: true,
+    checking: false,
+  };
+}
+
 export const useAuthStore = create<AuthState>((set, get) => ({
   authenticated: false,
   user: null,
   setupStatus: null,
   appearance: null,
   initialized: null,
+  deploymentMode: 'multi_user',
+  deploymentModeSource: null,
   checking: true,
+
+  setDeploymentMode: (mode) => set({ deploymentMode: mode }),
 
   login: async (username: string, password: string) => {
     // Message snapshots are user-scoped application data. Clear them before
     // switching users on a shared browser.
-    resetUserScopedStores();
-    discardPrewarms();
-    await clearMessageSnapshotCache();
-    const data = await api.post<{
-      success: boolean;
-      user: UserPublic;
-      setupStatus?: SetupStatus;
-      appearance?: AppearanceConfig;
-    }>('/api/auth/login', { username, password });
-    // Public pages never run checkAuth, so `checking` may still hold its
-    // initial true; the signed-in shell must not wait on it.
-    set({
-      authenticated: true,
-      user: data.user,
-      setupStatus: data.setupStatus ?? null,
-      appearance: data.appearance ?? null,
-      initialized: true,
-      checking: false,
+    await discardUserScopedState();
+    const data = await api.post<
+      | LoginResponse
+      | { mfa_required: true; challenge: string; user?: undefined }
+    >('/api/auth/login', { username, password });
+    if (!data.user) return { mfaChallenge: data.challenge };
+    set(signedInState(data));
+    return null;
+  },
+
+  loginSecondFactor: async (challenge: string, code: string) => {
+    const data = await api.post<LoginResponse>('/api/auth/login/2fa', {
+      challenge,
+      code,
     });
+    set(signedInState(data));
+  },
+
+  loginWithPasskey: async ({ autofill = false } = {}) => {
+    const { startAuthentication } = await import('@simplewebauthn/browser');
+    const optionsJSON = await api.post<
+      Parameters<typeof startAuthentication>[0]['optionsJSON']
+    >('/api/auth/passkey/login/options', {});
+    let response;
+    try {
+      response = await startAuthentication({
+        optionsJSON,
+        useBrowserAutofill: autofill,
+      });
+    } catch (err) {
+      // Cancelled by the user, or by a newer ceremony (the button aborts
+      // the autofill wait).
+      if (
+        err instanceof Error &&
+        /abort|NotAllowed/i.test(err.name + err.message)
+      ) {
+        return false;
+      }
+      throw err;
+    }
+    await discardUserScopedState();
+    const data = await api.post<LoginResponse>('/api/auth/passkey/login', {
+      response,
+    });
+    set(signedInState(data));
+    return true;
   },
 
   register: async (payload) => {
     // Same rationale as login: clear user-scoped message snapshots.
-    resetUserScopedStores();
-    discardPrewarms();
-    await clearMessageSnapshotCache();
+    await discardUserScopedState();
     const data = await api.post<{ success: boolean; user: UserPublic }>(
       '/api/auth/register',
       payload,
@@ -176,6 +295,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   logout: async () => {
+    // While the session still counts: this browser stops receiving this
+    // account's push notifications. Never blocks signing out.
+    await releasePushSubscription();
     await api.post('/api/auth/logout');
     // The socket is bound to the old session; left open, the server closes
     // it with 1008 at its next broadcast and the client then bounces a user
@@ -184,9 +306,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     wsManager.disconnect();
     // Clear AFTER server-side session invalidation so the next user on this
     // device cannot see this user's message snapshots.
-    resetUserScopedStores();
-    discardPrewarms();
-    await clearMessageSnapshotCache();
+    await discardUserScopedState();
     set({
       authenticated: false,
       user: null,
@@ -198,25 +318,37 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   checkStatus: async () => {
     try {
-      const data = await api.get<{ initialized: boolean }>('/api/auth/status');
-      set({ initialized: data.initialized });
+      const data = await api.get<{
+        initialized: boolean;
+        deploymentMode?: unknown;
+        deploymentModeSource?: unknown;
+      }>('/api/auth/status');
+      set({
+        initialized: data.initialized,
+        deploymentMode: parseDeploymentMode(data.deploymentMode),
+        deploymentModeSource: parseDeploymentModeSource(
+          data.deploymentModeSource,
+        ),
+      });
     } catch {
       // If status endpoint fails, assume initialized (safe default)
       set({ initialized: true });
     }
   },
 
-  setupAdmin: async (username: string, password: string) => {
-    const data = await api.post<{
-      success: boolean;
-      user: UserPublic;
-      setupStatus?: SetupStatus;
-      appearance?: AppearanceConfig;
-    }>('/api/auth/setup', { username, password });
+  setupAdmin: async (username, password, deploymentMode) => {
+    const data = await api.post<MeResponse>('/api/auth/setup', {
+      username,
+      password,
+      ...(deploymentMode ? { deployment_mode: deploymentMode } : {}),
+    });
     discardPrewarms();
     set({
       authenticated: true,
       user: data.user,
+      ...(deploymentMode
+        ? { deploymentMode, deploymentModeSource: 'settings' as const }
+        : {}),
       setupStatus: data.setupStatus ?? null,
       appearance: data.appearance ?? null,
       initialized: true,
@@ -239,14 +371,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         try {
           const res = await prewarm;
           if (res?.ok) {
-            const data = (await res.json()) as {
-              user: UserPublic;
-              setupStatus?: SetupStatus;
-              appearance?: AppearanceConfig;
-            };
+            const data = (await res.json()) as MeResponse;
             set({
               authenticated: true,
               user: data.user,
+              deploymentMode: parseDeploymentMode(data.deploymentMode),
               setupStatus: data.setupStatus ?? null,
               appearance: data.appearance ?? null,
               initialized: true,
@@ -270,14 +399,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       }
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const data = await api.get<{
-            user: UserPublic;
-            setupStatus?: SetupStatus;
-            appearance?: AppearanceConfig;
-          }>('/api/auth/me');
+          const data = await api.get<MeResponse>('/api/auth/me');
           set({
             authenticated: true,
             user: data.user,
+            deploymentMode: parseDeploymentMode(data.deploymentMode),
             setupStatus: data.setupStatus ?? null,
             appearance: data.appearance ?? null,
             initialized: true,

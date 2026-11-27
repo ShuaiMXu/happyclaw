@@ -26,9 +26,12 @@ import {
   type AutomationWsEvent,
   type InjectAutomationInputRequest,
 } from './automation-contract.js';
-import type {
-  AutomationIpcRequest,
-  AutomationIpcResult,
+import {
+  automationTakesModel,
+  type Automation,
+  type AutomationIpcRequest,
+  type AutomationIpcResult,
+  type AutomationModelChoice,
 } from './automation.js';
 import {
   isAutomationTurnInput,
@@ -58,13 +61,19 @@ import { resolveInputChannelReplySource } from './channel-reply-source.js';
 import { canExecuteOnHost } from './host-execution-policy.js';
 import { getChannelType } from './im-channel.js';
 import { logger } from './logger.js';
+import { getProviders, providerHasCredentials } from './runtime-config.js';
+import {
+  saveSessionModelChoice,
+  sessionHasModelChoice,
+  setNewSessionModelChoice,
+} from './session-model-service.js';
 import { resolveWorkspaceProjectRoot } from './session-worktree.js';
 import {
   archiveConversationSession,
   createConversationSession,
   deleteConversationSession,
 } from './session-factory.js';
-import type { NewMessage, RegisteredGroup } from './types.js';
+import type { NewMessage, RegisteredGroup, SubAgent } from './types.js';
 import { agentIdOfJid, stripVirtualJidSuffix } from './utils.js';
 
 export * from './automation-run-ledger.js';
@@ -185,9 +194,9 @@ export interface ResolvedAutomationSession {
   /** The `web:*` JID of the workspace. */
   workspaceJid: string;
   group: RegisteredGroup;
-  /** Null for the Main Session. */
-  agentId: string | null;
-  /** Queue/message JID: the workspace JID or `<workspace>#agent:<id>`. */
+  agent: SubAgent;
+  agentId: string;
+  /** Queue/message JID: `<workspace>#agent:<id>`. */
   laneJid: string;
 }
 
@@ -224,7 +233,10 @@ export interface AutomationRuntimeHooks {
   broadcastAutomationEvent(event: AutomationWsEvent): void;
 }
 
-/** `web:<ws>` or `web:<ws>#agent:<id>` → the live session, or null. */
+/**
+ * `web:<ws>#agent:<id>` → the live session, or null. A workspace JID is no
+ * session.
+ */
 export function resolveAutomationSession(
   sessionJid: string,
   getGroup: (jid: string) => RegisteredGroup | undefined,
@@ -235,9 +247,6 @@ export function resolveAutomationSession(
   const group = getGroup(workspaceJid);
   if (!group) return null;
   const agentId = agentIdOfJid(sessionJid);
-  if (agentId === null && sessionJid === workspaceJid) {
-    return { workspaceJid, group, agentId: null, laneJid: workspaceJid };
-  }
   const agent = agentId ? getAgent(agentId) : undefined;
   // An archived (completed) session still resolves: an input revives it, as
   // a new message in an old topic does.
@@ -251,8 +260,9 @@ export function resolveAutomationSession(
   return {
     workspaceJid,
     group,
-    agentId,
-    laneJid: `${workspaceJid}#agent:${agentId}`,
+    agent,
+    agentId: agent.id,
+    laneJid: `${workspaceJid}#agent:${agent.id}`,
   };
 }
 
@@ -270,6 +280,45 @@ function automationRunIdOfInputMessageId(messageId: string): string | null {
     : null;
 }
 
+/**
+ * Whether `session` is one `automation` created for its runs. Only such a
+ * session takes the automation's model: any other session (a conversation
+ * a persistent automation was pointed at, a bound one) keeps the choice its
+ * user made.
+ */
+function isOwnRunSession(
+  session: ResolvedAutomationSession,
+  automation: Pick<Automation, 'id'>,
+): boolean {
+  return (
+    session.agent.source_kind === 'automation' &&
+    session.agent.automation_id === automation.id
+  );
+}
+
+/**
+ * The model choice a run session of `automation` takes, if any: only an
+ * agent automation's own sessions take one, and only while its connection
+ * exists and holds a credential. A connection gone stale is not written
+ * into the session: the run follows the session's default instead of
+ * failing on it.
+ */
+function runSessionModelChoice(
+  automation: Automation,
+): AutomationModelChoice | null {
+  const choice = automationTakesModel(automation) ? automation.model : null;
+  if (!choice) return null;
+  const provider = getProviders().find(
+    (item) => item.id === choice.modelConfigId,
+  );
+  if (provider && providerHasCredentials(provider)) return choice;
+  logger.warn(
+    { automationId: automation.id, modelConfigId: choice.modelConfigId },
+    'Automation model connection is gone or has no credential; its run follows the session default',
+  );
+  return null;
+}
+
 export function createAutomationRuntimeDeps(
   hooks: AutomationRuntimeHooks,
 ): AutomationRuntimeDeps {
@@ -282,6 +331,26 @@ export function createAutomationRuntimeDeps(
   return {
     async injectAutomationInput(req: InjectAutomationInputRequest) {
       const session = requireSession(req.sessionJid);
+      // Every run enters its session here, however it fired. A persistent
+      // session outlives edits of the automation, so it is brought to the
+      // automation's current model before the input goes in, which retires a
+      // warm runner still on the old one. An automation without a model, or
+      // a session it did not create, keeps the session's own choice.
+      const choice = isOwnRunSession(session, req.automation)
+        ? runSessionModelChoice(req.automation)
+        : null;
+      if (
+        choice &&
+        !sessionHasModelChoice(session.group.folder, session.agentId, choice)
+      ) {
+        saveSessionModelChoice({
+          group: session.group,
+          workspaceJid: session.workspaceJid,
+          agentId: session.agentId,
+          choice,
+          updatedBy: req.automation.createdBy,
+        });
+      }
       const messageId = automationInputMessageId(req.run.id);
       const timestamp = new Date().toISOString();
       const sourceJid = req.deliveryRouteJid ?? session.laneJid;
@@ -349,7 +418,36 @@ export function createAutomationRuntimeDeps(
         sourceKind: 'automation',
         automationId: automation.id,
       });
+      // A new run session starts on the automation's model.
+      const choice = runSessionModelChoice(automation);
+      if (choice) {
+        setNewSessionModelChoice(
+          group.folder,
+          session.id,
+          choice,
+          automation.createdBy,
+        );
+      }
       return { sessionJid: `${automation.workspaceJid}#agent:${session.id}` };
+    },
+
+    releaseAutomationSessionModel({ automation, sessionJid, previous }) {
+      const session = resolveAutomationSession(sessionJid, hooks.getGroup);
+      // What the user chose in the session since then stays.
+      if (
+        !session ||
+        !isOwnRunSession(session, automation) ||
+        !sessionHasModelChoice(session.group.folder, session.agentId, previous)
+      ) {
+        return;
+      }
+      saveSessionModelChoice({
+        group: session.group,
+        workspaceJid: session.workspaceJid,
+        agentId: session.agentId,
+        choice: { modelConfigId: null, model: null, effort: null },
+        updatedBy: automation.createdBy,
+      });
     },
 
     isAutomationInputPending({ sessionJid, inputMessageId }) {
@@ -393,19 +491,17 @@ export function createAutomationRuntimeDeps(
 
     async archiveAutomationSession(sessionJid) {
       const session = resolveAutomationSession(sessionJid, hooks.getGroup);
-      const agent = session?.agentId ? getAgent(session.agentId) : undefined;
-      if (!session || !agent) return;
-      archiveConversationSession(session.workspaceJid, agent);
+      if (session)
+        archiveConversationSession(session.workspaceJid, session.agent);
     },
 
     async deleteAutomationSession(sessionJid) {
       const session = resolveAutomationSession(sessionJid, hooks.getGroup);
-      const agent = session?.agentId ? getAgent(session.agentId) : undefined;
-      if (!session || !agent) return;
-      await deleteConversationSession({
+      if (!session) return;
+      deleteConversationSession({
         workspaceJid: session.workspaceJid,
         group: session.group,
-        session: agent,
+        session: session.agent,
       });
     },
 
@@ -416,13 +512,12 @@ export function createAutomationRuntimeDeps(
     },
 
     async sendAutomationNotice({ routeJid, text }) {
-      if (getChannelType(routeJid)) {
-        const accepted = await hooks.sendImText(routeJid, text);
-        if (!accepted) throw new Error('渠道没有确认收到自动化通知');
-        return;
+      // Notices go out over a channel only; none is written into a session.
+      if (!getChannelType(routeJid)) {
+        throw new Error('自动化通知只能发往渠道');
       }
-      requireSession(routeJid);
-      await hooks.postSessionMessage(routeJid, text);
+      const accepted = await hooks.sendImText(routeJid, text);
+      if (!accepted) throw new Error('渠道没有确认收到自动化通知');
     },
 
     async postScriptOutput({ sessionJid, text }) {

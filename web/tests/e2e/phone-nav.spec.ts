@@ -46,11 +46,12 @@ test.describe('phone', () => {
     await expect(sections.nth(1)).toHaveAttribute('aria-label', '主智能体');
     await expect(sections.nth(2)).toHaveAttribute('aria-label', '自定义智能体');
 
-    // Sessions sit directly under their workspace, main conversation first.
+    // Sessions sit directly under their workspace, most recent first, all
+    // alike: none stands for the workspace itself.
     const alpha = workspaceItem(page, 'alpha');
     const rows = alpha.locator('ul > li');
-    await expect(rows.nth(0)).toContainText('当前对话');
-    await expect(rows.nth(1)).toContainText('alpha 会话 1');
+    await expect(rows.nth(0)).toContainText('alpha 会话 1');
+    await expect(rows.nth(1)).toContainText('alpha 会话 2');
     // Five sessions, then the rest behind 显示更多.
     await expect(
       alpha.getByRole('button', { name: '显示更多（2）' }),
@@ -63,24 +64,24 @@ test.describe('phone', () => {
     // Geometry and type after cindy's list: 56px headers, 78px rows.
     const header = workspaceToggle(page, 'alpha').locator('..');
     expect((await header.boundingBox())!.height).toBe(56);
-    const row = rows.nth(1).locator('> div');
+    const row = rows.nth(0).locator('> div');
     expect((await row.boundingBox())!.height).toBe(78);
     const title = rows
-      .nth(1)
+      .nth(0)
       .getByRole('button', { name: 'alpha 会话 1', exact: true });
     const titleStyle = await title.evaluate((element) => {
       const style = getComputedStyle(element);
       return [style.fontSize, style.lineHeight, style.fontWeight];
     });
     expect(titleStyle).toEqual(['18px', '28px', '500']);
-    const preview = rows.nth(1).getByText(/的最后一条消息/);
+    const preview = rows.nth(0).getByText(/的最后一条消息/);
     const previewStyle = await preview.evaluate((element) => {
       const style = getComputedStyle(element);
       return [style.fontSize, style.lineHeight, style.whiteSpace];
     });
     expect(previewStyle).toEqual(['15px', '26px', 'nowrap']);
     // The time sits at the top right, on the title's line.
-    const time = rows.nth(1).getByText('3 分钟前');
+    const time = rows.nth(0).getByText('3 分钟前');
     const timeBox = (await time.boundingBox())!;
     const titleBox = (await title.boundingBox())!;
     const rowBox = (await row.boundingBox())!;
@@ -336,8 +337,9 @@ test.describe('phone', () => {
     // On a phone the menus are bottom action sheets.
     const sheet = (name: string) => page.getByRole('dialog', { name });
     await beta.getByRole('button', { name: 'Beta 工作区的更多操作' }).click();
+    // Exact: 新建会话… (the dialog) sits next to it.
     await sheet('Beta 工作区的更多操作')
-      .getByRole('button', { name: '新建会话' })
+      .getByRole('button', { name: '新建会话', exact: true })
       .click();
     await expect(routeProbe(page)).toHaveText('/chat/beta?agent=beta-new');
     await page.getByRole('button', { name: '返回', exact: true }).click();
@@ -629,5 +631,100 @@ test.describe('desktop', () => {
     expect(
       await bar.evaluate((element) => getComputedStyle(element).paddingBottom),
     ).toBe('90px');
+  });
+
+  test('the tab bar pill slides to the selected tab', async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    await openShell(page, '/chat');
+    const indicator = page.getByTestId('floating-nav-indicator');
+    const tab = (name: string) =>
+      page.locator('.floating-nav').getByRole('link', { name });
+    const box = async (name: string) => {
+      const b = (await tab(name).boundingBox())!;
+      return { x: b.x, y: b.y, width: b.width, height: b.height };
+    };
+
+    await expect(indicator).toBeVisible();
+    expect(await indicator.boundingBox()).toEqual(await box('工作台'));
+
+    await tab('能力库').click();
+    await expect(routeProbe(page)).toHaveText('/capabilities');
+    await expect(indicator).toHaveClass(/\bslide\b/);
+    await expect
+      .poll(async () => indicator.boundingBox())
+      .toEqual(await box('能力库'));
+    expect(
+      await indicator.evaluate((el) => getComputedStyle(el).transitionProperty),
+    ).toContain('transform');
+
+    // A page outside the tabs has no pill.
+    await openShell(page, '/save-bar');
+    await expect(page.locator('.floating-nav')).toBeVisible();
+    await expect(indicator).toHaveCount(0);
+  });
+
+  test('reduced motion moves the pill without sliding', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.setViewportSize({ width: 800, height: 900 });
+    await openShell(page, '/chat');
+    await page
+      .locator('.floating-nav')
+      .getByRole('link', { name: '设置' })
+      .click();
+    const indicator = page.getByTestId('floating-nav-indicator');
+    await expect(indicator).toHaveClass(/\bslide\b/);
+    expect(
+      await indicator.evaluate((el) => getComputedStyle(el).transitionProperty),
+    ).toBe('none');
+  });
+
+  test('the tab bar compacts and reveals with hysteresis, not on jitter', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 800, height: 600 });
+    await openShell(page, '/save-bar');
+    const container = page.locator('.floating-nav-container');
+    const main = page.locator('main[data-app-scroll-root]');
+    const scrollTo = async (top: number) => {
+      await main.evaluate((el, y) => {
+        el.scrollTop = y;
+      }, top);
+      // One animation frame for the hook, one for React to commit.
+      await page.evaluate(
+        () =>
+          new Promise((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(resolve)),
+          ),
+      );
+    };
+
+    await scrollTo(50);
+    await expect(container).not.toHaveClass(/compact/);
+    await scrollTo(100);
+    await expect(container).toHaveClass(/compact/);
+    // Small back-and-forth under 4px keeps it compact.
+    for (const y of [98, 100, 97, 99]) {
+      await scrollTo(y);
+      await expect(container).toHaveClass(/compact/);
+    }
+    // A real reversal reveals it, even well away from the top.
+    await scrollTo(80);
+    await expect(container).not.toHaveClass(/compact/);
+    await scrollTo(120);
+    await expect(container).toHaveClass(/compact/);
+  });
+
+  test('page content ends above the floating tab bar', async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 600 });
+    await openShell(page, '/save-bar');
+    const main = page.locator('main[data-app-scroll-root]');
+    await main.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+    });
+    const nav = (await page.locator('.floating-nav').boundingBox())!;
+    const lastRow = (await page
+      .getByText('设置项 40', { exact: true })
+      .boundingBox())!;
+    expect(lastRow.y + lastRow.height).toBeLessThanOrEqual(nav.y);
   });
 });
