@@ -39,6 +39,10 @@ import {
   resolveCodexGatewayLaunchConfig,
 } from './codex-gateway/runner-tokens.js';
 import {
+  isGeminiGatewayBaseUrl,
+  resolveGeminiGatewayLaunchConfig,
+} from './gemini-gateway/resolve-gateway-url.js';
+import {
   buildEffectiveMcpManifest,
   loadPluginMcpDefinitions,
 } from './effective-mcp-manifest.js';
@@ -2013,8 +2017,8 @@ interface PreparedVolumeMounts {
   runtimeMcpServers: Record<string, Record<string, unknown>>;
   hostPlugins: SdkPluginConfig[];
   dockerOauthLaunch: OAuthLaunchSnapshot | null;
-  /** Selected provider routes through the ChatGPT/Codex 订阅网关; docker run needs host.docker.internal. */
-  usesCodexGateway: boolean;
+  /** Selected provider routes through an embedded 订阅网关 (ChatGPT/Codex or Gemini); docker run needs host.docker.internal. */
+  usesEmbeddedGateway: boolean;
   /** Selected provider endpoint was rewritten from host loopback to host.docker.internal. */
   providerNeedsHostGateway: boolean;
 }
@@ -2335,26 +2339,29 @@ function prepareVolumeMounts(
   );
   fs.mkdirSync(envDir, { recursive: true });
   const rawGlobalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
-  const codexLaunchConfig = resolveCodexGatewayLaunchConfig(
-    rawGlobalConfig,
+  const gatewayLaunchConfig = resolveGeminiGatewayLaunchConfig(
+    resolveCodexGatewayLaunchConfig(
+      rawGlobalConfig,
+      'container',
+      codexGatewayLease,
+    ),
     'container',
-    codexGatewayLease,
   );
-  // The gateway already resolves to host.docker.internal; this only rewrites
+  // The gateways already resolve to host.docker.internal; this only rewrites
   // a third-party relay configured on the host's loopback.
   const containerBaseUrl = resolveContainerProviderBaseUrl(
-    codexLaunchConfig.anthropicBaseUrl,
+    gatewayLaunchConfig.anthropicBaseUrl,
   );
   const globalConfig = {
-    ...codexLaunchConfig,
+    ...gatewayLaunchConfig,
     anthropicBaseUrl: containerBaseUrl.baseUrl,
   };
-  const usesCodexGateway = isCodexGatewayBaseUrl(
-    rawGlobalConfig.anthropicBaseUrl,
-  );
+  const usesEmbeddedGateway =
+    isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl) ||
+    isGeminiGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl);
   const providerNeedsHostGateway = containerBaseUrl.addHostGateway;
   const providerRoutedToHost =
-    containerBaseUrl.baseUrl !== codexLaunchConfig.anthropicBaseUrl;
+    containerBaseUrl.baseUrl !== gatewayLaunchConfig.anthropicBaseUrl;
   const containerOverride = getContainerEnvConfig(group.folder);
   const effectiveContainerOverride = resolvedProvider
     ? { customEnv: containerOverride.customEnv }
@@ -2400,7 +2407,7 @@ function prepareVolumeMounts(
   applyContainerProxyEnvLines(envLines, containerProxy.envLines);
   // Both the gateway and a rewritten loopback relay live on
   // host.docker.internal, which a forwarded host proxy cannot resolve.
-  if (usesCodexGateway || providerRoutedToHost) {
+  if (usesEmbeddedGateway || providerRoutedToHost) {
     applyCodexGatewayNoProxyToEnvLines(envLines);
   }
   if (envLines.length > 0) {
@@ -2527,7 +2534,7 @@ function prepareVolumeMounts(
     runtimeMcpServers,
     hostPlugins: pluginSkills,
     dockerOauthLaunch,
-    usesCodexGateway,
+    usesEmbeddedGateway,
     providerNeedsHostGateway,
   };
 }
@@ -3121,7 +3128,7 @@ export async function runContainerAgent(
       {
         addHostGateway:
           containerProxy.addHostGateway ||
-          preparedLaunch.usesCodexGateway ||
+          preparedLaunch.usesEmbeddedGateway ||
           preparedLaunch.providerNeedsHostGateway,
       },
       containerImage,
@@ -4168,10 +4175,13 @@ export async function runHostAgent(
   });
   try {
     // Minted inside try so the finally below always revokes the token.
-    const globalConfig = resolveCodexGatewayLaunchConfig(
-      rawGlobalConfig,
+    const globalConfig = resolveGeminiGatewayLaunchConfig(
+      resolveCodexGatewayLaunchConfig(
+        rawGlobalConfig,
+        'host',
+        codexGatewayLease,
+      ),
       'host',
-      codexGatewayLease,
     );
     // 配置层环境变量
     const envLines = buildContainerEnvLines(
@@ -4205,7 +4215,10 @@ export async function runHostAgent(
     } else {
       delete hostEnv['HAPPYCLAW_FALLBACK_MODEL'];
     }
-    if (isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl)) {
+    if (
+      isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl) ||
+      isGeminiGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl)
+    ) {
       applyCodexGatewayNoProxy(hostEnv, 'host');
     }
 

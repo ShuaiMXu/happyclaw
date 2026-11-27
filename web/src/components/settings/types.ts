@@ -6,6 +6,18 @@ import type {
 
 // ─── 统一供应商类型 (V4) ─────────────────────────────────────
 
+/** One entry of the Gemini subscription's upstream model catalog. */
+export interface GeminiModelCatalogEntry {
+  id: string;
+  displayName: string;
+  contextWindow: number | null;
+  maxOutputTokens: number | null;
+  supportsThinking: boolean;
+  supportsImages: boolean;
+  thinkingBudget: number | null;
+  minThinkingBudget: number | null;
+}
+
 export interface UnifiedProviderPublic {
   id: string;
   name: string;
@@ -47,6 +59,19 @@ export interface UnifiedProviderPublic {
     message: string;
     at: string;
   } | null;
+  hasGeminiOAuthCredentials?: boolean;
+  geminiOAuthCredentialsExpiresAt?: number | null;
+  geminiOAuthCredentialsEmail?: string | null;
+  geminiOAuthProjectId?: string | null;
+  /** Google login was refused on refresh; the user must log in again. */
+  geminiOAuthNeedsReauth?: boolean;
+  geminiOAuthLastRefreshError?: {
+    kind: 'reauth_required' | 'transient';
+    message: string;
+    at: string;
+  } | null;
+  /** Live Antigravity catalog saved at login and on manual refresh. */
+  geminiModels?: GeminiModelCatalogEntry[];
   /** Effort the gateway applies when the Agent does not choose one. */
   codexDefaultEffort?: string | null;
   customEnv: Record<string, string>;

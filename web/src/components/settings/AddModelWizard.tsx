@@ -26,6 +26,7 @@ import {
   normalizeProviderBaseUrl,
   type ConnectionModelRoles,
   type ModelPreset,
+  type ProviderModelEntry,
 } from '@/lib/model-providers';
 import { cn } from '@/lib/utils';
 import { api } from '../../api/client';
@@ -93,6 +94,25 @@ const CLAUDE_MODEL_ALIASES = ['opus', 'sonnet', 'haiku', 'fable'];
 function sourceKey(source: WizardSource | null): string {
   if (!source) return '';
   return source.kind === 'preset' ? `preset:${source.presetId}` : source.kind;
+}
+
+/**
+ * A Gemini login saved the upstream catalog with the connection. Those models
+ * are what it runs, so they start checked and keep the window the vendor
+ * reported; discovery only appends models added upstream since.
+ */
+function seededCandidates(
+  current: readonly ModelCandidate[],
+  stored: readonly ProviderModelEntry[],
+): ModelCandidate[] {
+  const seen = new Set(current.map((candidate) => candidate.id));
+  const seeded: ModelCandidate[] = [];
+  for (const model of stored) {
+    if (!model.id || seen.has(model.id)) continue;
+    seen.add(model.id);
+    seeded.push({ ...model, picked: true, origin: 'discovered' });
+  }
+  return seeded.length > 0 ? [...current, ...seeded] : [...current];
 }
 
 interface AddModelWizardProps {
@@ -191,7 +211,13 @@ export function AddModelWizard({
   // The first checked model is the connection's own; nothing names it a
   // default, since Agents and chats pick their model.
   const connectionModel =
-    kind === 'chatgpt' ? codexModel : (picked[0]?.id ?? '');
+    kind === 'chatgpt'
+      ? codexModel
+      : kind === 'gemini' &&
+          created &&
+          picked.some((candidate) => candidate.id === created.anthropicModel)
+        ? created.anthropicModel
+        : (picked[0]?.id ?? '');
 
   // A third-party address may need its own environment, such as the custom
   // headers its key travels in; they go with every request for the draft.
@@ -388,7 +414,11 @@ export function AddModelWizard({
   };
 
   const leaveConnect = async () => {
-    if (kind === 'chatgpt' || discoveredFor.current === connectionSignature) {
+    if (
+      kind === 'chatgpt' ||
+      kind === 'gemini' ||
+      discoveredFor.current === connectionSignature
+    ) {
       setStep('models');
       return;
     }
@@ -511,6 +541,7 @@ export function AddModelWizard({
       case 'claude_subscription':
         return !!created || !!credentialInput.trim();
       case 'chatgpt':
+      case 'gemini':
         return !!created;
       case 'custom':
         return (
@@ -542,6 +573,11 @@ export function AddModelWizard({
     }
     setCreated(provider);
     setName((current) => current || provider.name);
+    // Gemini's login already fetched and stored the catalog; Gemini ids are
+    // not in the registry, so discovery alone would leave every one unchecked.
+    if (provider.hasGeminiOAuthCredentials && provider.models.length > 0) {
+      setCandidates((current) => seededCandidates(current, provider.models));
+    }
     onConnectionCreated?.(provider);
     setStep('models');
   };
@@ -646,6 +682,16 @@ export function AddModelWizard({
             <LoggedIn provider={created} />
           ) : (
             <OAuthLoginPanel service="chatgpt" onSuccess={handleLoggedIn} />
+          )}
+        </div>
+      )}
+
+      {step === 'connect' && kind === 'gemini' && (
+        <div className="space-y-4">
+          {created ? (
+            <LoggedIn provider={created} />
+          ) : (
+            <OAuthLoginPanel service="gemini" onSuccess={handleLoggedIn} />
           )}
         </div>
       )}
@@ -997,7 +1043,9 @@ function KeyError({ message }: { message: string | null }) {
 
 function LoggedIn({ provider }: { provider: UnifiedProviderPublic }) {
   const account =
-    provider.claudeOAuthAccountEmail ?? provider.codexOAuthCredentialsEmail;
+    provider.claudeOAuthAccountEmail ??
+    provider.codexOAuthCredentialsEmail ??
+    provider.geminiOAuthCredentialsEmail;
   return (
     <div
       role="status"
