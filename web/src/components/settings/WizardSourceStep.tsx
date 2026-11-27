@@ -6,7 +6,6 @@ import {
   MessageSquareText,
   Server,
   ShieldCheck,
-  Sparkles,
 } from 'lucide-react';
 
 import { SearchInput } from '@/components/common/SearchInput';
@@ -23,7 +22,7 @@ export type WizardSource =
   | { kind: 'preset'; presetId: string };
 
 const RECOMMENDED: ReadonlyArray<{
-  kind: 'claude_subscription' | 'chatgpt' | 'gemini' | 'anthropic_api';
+  kind: 'claude_subscription' | 'chatgpt' | 'anthropic_api';
   description: string;
   icon: typeof ShieldCheck;
 }> = [
@@ -36,11 +35,6 @@ const RECOMMENDED: ReadonlyArray<{
     kind: 'chatgpt',
     description: '用 ChatGPT Plus / Pro 账号登录，经内嵌网关运行',
     icon: MessageSquareText,
-  },
-  {
-    kind: 'gemini',
-    description: '用 Google 账号登录，经内嵌网关运行 Gemini',
-    icon: Sparkles,
   },
   {
     kind: 'anthropic_api',
@@ -83,7 +77,7 @@ export function WizardSourceStep({
         >
           推荐
         </h3>
-        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-2 sm:grid-cols-3">
           {RECOMMENDED.map((item) => {
             const Icon = item.icon;
             return (

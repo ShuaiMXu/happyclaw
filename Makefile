@@ -1,7 +1,7 @@
-.PHONY: dev dev-backend dev-web build build-backend build-web start \
+.PHONY: dev dev-backend dev-web build build-backend build-web start check \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
        format format-check install install-host-tools clean reset-init update-sdk ensure-latest-sdk sync-types \
-       backup restore leftover-direct-mounts help _ensure-docker-image docker-pull logs status stop \
+       backup restore help _ensure-docker-image docker-pull logs status stop \
        _check-sync _ensure-builtin-skills _build-web-if-stale _build-ar-if-stale _build-backend-if-stale
 
 # ─── Runtime ────────────────────────────────────────────────
@@ -26,7 +26,7 @@ export CONTAINER_IMAGE
 # ─── Development ─────────────────────────────────────────────
 
 dev: ## 启动前后端（首次自动安装依赖并拉取容器镜像）
-	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ] || [ ! -f container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json ]; then echo "📦 依赖有更新或缺失，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-builtin-skills
 	@$(MAKE) _ensure-docker-image
 	@$(PKG) --prefix container/agent-runner run build --silent 2>/dev/null || $(PKG) --prefix container/agent-runner run build
@@ -62,7 +62,7 @@ start: ## 一键启动生产环境（前台阻塞运行）
 	  lsof -ti:$(PORT) -sTCP:LISTEN | xargs ps -fp 2>/dev/null | tail -1; \
 	  exit 1; \
 	fi
-	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ] || [ ! -f container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json ]; then echo "📦 依赖有更新或缺失，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-builtin-skills
 	@$(MAKE) _ensure-docker-image
 	@$(MAKE) _check-sync
@@ -165,6 +165,9 @@ typecheck-web:
 typecheck-agent-runner:
 	cd container/agent-runner && $(RUN) tsc --noEmit
 
+check: ## 合并前的全部检查（格式、审计、类型、测试、构建、冒烟、浏览器 e2e、Runner 自检）
+	@./scripts/check-all.sh
+
 test: ## 运行单元测试
 	$(RUN) vitest run
 
@@ -176,9 +179,12 @@ format-check: ## 检查代码格式
 
 # ─── Docker Image ─────────────────────────────────────────────
 
-_ensure-docker-image: ## (内部) 从镜像仓库拉取 GitHub Actions 发布的容器镜像
-	@if command -v docker >/dev/null 2>&1; then \
-	  $(MAKE) --no-print-directory docker-pull; \
+_ensure-docker-image: ## (内部) 拉取容器镜像；单人宿主机模式跳过，拉取失败不中断启动
+	@if [ "$$(node scripts/deployment-mode.mjs 2>/dev/null)" = "single_user_host" ]; then \
+	  echo "🏠 单人宿主机模式：不使用 Docker，跳过镜像拉取"; \
+	elif command -v docker >/dev/null 2>&1; then \
+	  $(MAKE) --no-print-directory docker-pull || \
+	    echo "⚠️  Docker 镜像拉取失败（Docker 未运行或网络不通）：Docker 模式的工作区需要它，宿主机模式不受影响"; \
 	fi
 
 docker-pull: ## 拉取 GitHub Actions 发布的 Agent 镜像
@@ -295,9 +301,6 @@ backup: ## 备份运行时数据到 happyclaw-backup-{date}.tar.gz
 	mv "$$TMP_FILE" "$$FILE"; \
 	chmod 600 "$$FILE"; \
 	echo "✅ 备份完成：$$FILE ($$(du -sh "$$FILE" | cut -f1))"
-
-leftover-direct-mounts: ## 诊断仍挂在 workspace main 上的可判定私聊（默认 dry-run；APPLY=1 才修复并重置隔离代）
-	$(RUN) tsx scripts/repair-leftover-direct-mounts.ts $(if $(filter 1 yes true,$(APPLY)),--apply,)
 
 restore: ## 从 happyclaw-backup-*.tar.gz 恢复数据（用法：make restore 或 make restore FILE=xxx.tar.gz）
 	@set -eu; \

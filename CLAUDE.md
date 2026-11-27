@@ -29,12 +29,12 @@ Telegram、QQ、钉钉、微信、企业微信、Discord、WhatsApp。
 
 ```text
 Agent Profile（身份、四段 Prompt、能力策略）
-└── Workspace（文件目录、执行模式、环境变量、话题群绑定）
-    ├── Main Session（可绑定私聊或普通群）
+└── Workspace（文件目录、执行模式、工作方式、环境变量、话题群绑定）
     ├── Runtime Session（独立 Claude 上下文，可绑定私聊或普通群；Host 工作区可选独立 git worktree）
     ├── Native Context Session（飞书话题等原生线程）
     ├── Automation（自动化：按计划把提示词作为真实的一轮发进会话）
-    └── Work Item（团队模式的工作项：一件被授权的工作，由自己的执行会话完成）
+    └── Work Item（工作项：一件被授权的工作，由自己的执行会话完成；来自团队模式的群，
+                   或多任务工作区里派出它的会话）
 ```
 
 重要命名边界：
@@ -43,22 +43,50 @@ Agent Profile（身份、四段 Prompt、能力策略）
 - `registered_groups` 是当前兼容层中的工作区和渠道路由记录。
 - `agents` 表及 `/api/groups/:jid/agents` 是历史命名，实际表示工作区内的运行会话，
   不是产品级 Agent Profile。
+- 工作区没有主会话，会话之间一视同仁：工作区 JID 不是任何会话的聊天地址，每个会话都是
+  `agents` 行（`kind='conversation'`），地址为 `<工作区JID>#agent:<id>`；工作区可以一个
+  会话都没有。会话列表的顺序（用户置顶的在前，然后按最近活跃）由 `shared/session-order.ts`
+  给出，Web 与 IM `/list` 共用；置顶按用户记在 `user_pinned_sessions`。旧库里每个工作区的
+  隐式主会话由 v88 迁移成普通会话（`source_kind='legacy_main'`），历史、Claude 上下文、
+  模型选择、渠道绑定和自动化随之迁移。
 - 同一个 Workspace 内的会话共享工作区文件目录，但拥有独立 Claude Session；
   工作区文件隔离与对话上下文隔离是两件事。
 - 自动化（Automation）属于 Workspace，每次运行都是某个真实会话里的一轮：绑定已有会话
   （Agent 在聊天里创建时默认绑定当前会话）、每次新建或持续会话。运行会话是普通
-  `agents` 行（`source_kind='automation'`、`automation_id`），不是 `kind='task'`。
+  `agents` 行（`source_kind='automation'`、`automation_id`），不是 `kind='task'`。每次新建
+  和持续会话的 Agent 自动化可以带模型选择（`automations.model_config_id` 等，只能在 Web 设置），
+  它的运行会话以此为会话选择；绑定已有会话的沿用那个会话自己的选择。
 - 例外是独立 worktree 的 Runtime Session：Host 工作区的工作目录是 git 仓库时，新建会话
   可选它，宿主在 `data/worktrees/{folder}/{sessionId}` 建分支 `happyclaw/<短 id>`，该会话
   每轮以它为 cwd，文件面板、项目 Skills 和 Review 面板也以它为根。worktree 缺失或损坏时
   运行失败，不回退到主仓库；删除会话时移除 worktree、保留分支，有未提交改动或已初始化的
-  子模块时须确认。同一目录上同时有别的会话在跑时，对话页提示但不阻塞。
-- 团队模式（Team mode）按群开启（v1 只支持绑定在工作区主会话上的飞书普通群），关闭时
-  任何行为不变。开启后，宿主为该群建一个路由会话（`source_kind='team_router'`，不是主会话），
+  子模块时须确认。同一目录上的会话可以同时运行，界面不做提示。
+- 团队模式（Team mode）按群开启（v1 只支持绑定到工作区某个会话的飞书普通群），关闭时
+  任何行为不变，群回到它绑定的会话。开启后，宿主为该群建一个路由会话
+  （`source_kind='team_router'`，不是群绑定的那个会话），
   每个被接下的请求成为一个工作项（`work_items`），由它自己的执行会话
   （`source_kind='work_item'`；Host 工作区的 git 仓库用 worktree 会话）完成。只有路由会话在群里
   说话；执行会话只能发一次确认，结果经 `work_report` 回流给路由会话。工作项的阶段
-  （等你回答、等你批准、受阻、失败、工作中、等待新消息）由记录派生，不存储。
+  （等你回答、等你批准、受阻、失败、工作中、等待新消息）由记录派生，不存储。路由会话创建时
+  复制群绑定会话的模型选择，执行会话复制路由会话的。
+- 工作区有工作方式 `work_mode`（存于 `workspace_agent_profiles`）：`single`（单任务，默认）
+  一条输入处理完再处理下一条，长任务在会话内完成，行为与没有这个设置时一致；`multi`（多任务）
+  下，普通会话可以用 `work_delegate` 把较大的任务派给 Worker，这一轮随即结束，会话继续接下一条
+  输入。派出的任务是派发型工作项（`work_items.origin='delegated'`），由它自己的执行会话
+  （`source_kind='work_item'`，不建 worktree，与派出它的会话共用工作目录，复制派出会话当时的
+  模型选择）完成；Worker 只用
+  `work_report`（progress、ready、blocked、failed）。ready、blocked、failed，以及并非派出会话自己
+  `work_stop` 造成的停止（`state="stopped"`），以 `work_item_input` 注入派出它的会话，排在当前轮次
+  之后、不 steer，回复沿用派出那一轮所回答输入的来源路由；派出的会话转述给用户，用
+  `work_followup` 把用户的回答转给 Worker。派发、停止和跟进都只接受工作区主人亲自发起的轮次
+  （与 `install_skill` 同一闸门；派发请求不带 `inputTurnId` 时按非主人拒绝），每个会话最多 3 个、
+  每个工作区最多 5 个未结束，并受计费闸门约束；处理回报的那一轮不算主人亲自发起。独立 worktree
+  会话与自动化运行会话不能派发。Worker 的 summary 不超过 4000 字，更长的结果写进文件。Worker
+  一轮结束却没交回 ready、failed 或 blocked，或运行失败、被计费拒绝时，任务记为失败并告知派出的
+  会话；`/break` 与停止不会取消排队中的派发回报（会话没有在跑的查询时立即交出处理），`/clear`、
+  `/fresh` 把它们排到重置之后照常处理。删除派出的会话会停止它未结束的任务。切回
+  `single` 后，还有未结束派发项的会话仍按多任务运行到它们结束（只是不能再派），切换不中断运行，
+  暖 Runner 在本轮结束后退役。团队模式的代码路径只处理 `origin='team'` 的工作项。
 
 ## 3. 主要模块
 
@@ -83,9 +111,15 @@ Agent Profile（身份、四段 Prompt、能力策略）
 | `src/automation-scheduler.ts`      | 自动化的到期触发、前置检查、错过与重启恢复             |
 | `src/automation-service.ts`        | 自动化的校验、权限，REST 与 Agent 工具共用             |
 | `src/memory-service.ts`            | Workspace Memory 召回、目录、提议与审计                |
+| `src/workspace-owner-identity.ts`  | 工作区主人本人的判定：Web 用户 id、IM 可信身份         |
 | `src/team-gate.ts`                 | 团队模式入站：订阅键、名单与 @ 判定、准入表            |
 | `src/work-item-service.ts`         | 工作项的路由、生命周期、回复门控，REST 与 IPC 共用     |
 | `src/work-item-runtime.ts`         | 团队输入注入各 lane、团队回复经 Outbox 投递            |
+| `src/workspace-root.ts`            | 工作区根目录的解析、回退与候选校验                     |
+| `src/workspace-dir.ts`             | 工作区目录记录、`workspaceDirOf` 与删除前的安全检查    |
+| `src/deployment-mode.ts`           | 部署方式（多人 / 单人宿主机）的解析与生效开关          |
+| `src/single-user-host-guard.ts`    | 单人宿主机模式只留一个启用账号的路由守卫               |
+| `src/web-push.ts`                  | Web Push：端点校验、推送判定与投递（VAPID、限时请求）  |
 
 渠道实现位于：
 
@@ -148,11 +182,23 @@ Web UI 约定：
   `autoFocusOnPhone`），`Sheet`/`Dialog` 和导航抽屉经 `useBackDismiss` 让系统返回先关
   浮层；行和页面的操作菜单用 `ResponsiveMenu`（手机为 ActionSheet），只在 Tooltip 里的
   信息用 `InfoTip`；按钮在手机上自带 44px 命中区，输入框不小于 16px（`variant="code"`
-  关闭自动大写与纠错）。键盘遮挡只读 `--keyboard-inset` / `--vvh`（`useVisualViewport`）。
+  关闭自动大写与纠错）。键盘遮挡只读 `--keyboard-inset` / `--vvh`（`useVisualViewport`）；
+  贴着键盘的底部浮层（输入框、`Dialog`、`Sheet`、toast、表单 footer）的安全区留白用
+  `--safe-bottom`，键盘打开时 `<html data-keyboard="open">` 把它置 0。
+- 安装成 PWA 后 body 关闭了 `-webkit-touch-callout`，iOS 长按图片的系统菜单（存储图像）
+  按图片开启：灯箱大图只在 1× 时开启，文件面板预览图用 `touch-callout-default`，Markdown
+  图片带 `data-native-image-menu`（同时开启 callout），消息附件缩略图不开（低清 data URL，
+  保存交给灯箱）。`useLongPress` 只把带 `data-native-image-menu` 的图片和从 portal 冒泡上来
+  的按压让给系统，其他图片照常触发长按。灯箱的保存在 iOS 上于图片加载后预取文件，并在点击
+  里同步调用 `navigator.share`（被拒时改为下载）；其他平台直接下载。
 - 快捷键在 `lib/shortcuts.ts` 注册并用 `Shortcut` 渲染键帽；动画用 `motion` 的 `m.*`，
   经 `MotionProvider` 懒加载并遵循减少动态效果设置。流式回复的贴底跟随（每批一次的
   WAAPI 位移补偿）和逐词淡入（CSS keyframes）是逐帧、逐词的热路径，不走 `m.*`，
   同样在减少动态效果时关闭。
+- 多任务工作区的对话页在消息列表末尾、输入框上方列出本会话派出的任务：未结束的一直显示，
+  已结束的显示到本会话下一条由人发出的消息为止；「查看」打开 Worker 会话，「停止」需确认，访客
+  不能停止。单任务工作区不挂载、不取数。工作方式在新建工作区弹窗和「工作区设置」里选择；
+  「工作项」页有派出的任务时分「团队工作项 / 派出的任务」两个视图。
 - 聊天输入框是 Tiptap 编辑器（`@tiptap/*` 全部精确锁同一版本）。编辑器内核（结构化列表、
   中文标点与选区修补、长粘贴折叠块、序列化）取自 cindy，位于
   `components/chat/composer/cindy/`，按 Apache-2.0 保留来源与修改声明；外层
@@ -182,8 +228,27 @@ Web UI 约定：
 | Host      | Runner 作为宿主机 Node 进程运行，`customCwd` 直接作为工作目录 | 同一 Session 串行；不同 Session 不设置应用层并发上限 |
 | Container | Runner 在非 root Docker 容器运行，通过只读/读写挂载访问资源   | 受 `maxConcurrentContainers` 和用户计费配额限制      |
 
+部署方式（`deploymentMode`，`src/deployment-mode.ts`）：`multi_user`（默认，即上表）或
+`single_user_host`。单人宿主机下 `isAdminHostOnlyEffective()` 为真、`isBillingEnabled()`
+为假，所有工作区都是 Host，启动、监控和镜像拉取都不调用 Docker；存储的
+`adminHostOnlyMode`、注册配置和 `billingEnabled` 不被改写，切回多人即恢复。还有其他启用中的
+账号（含访客）时拒绝切到单人宿主机；切换时走与开启 `adminHostOnlyMode` 相同的 Host 迁移。
+
 共同约束：
 
+- 每个会话一条执行通道，序列化键为 `folder#<会话id>`；工作区本身没有执行通道，Web 发送、
+  `/clear`、`/fresh`、`/sw` 和终端不带会话时被拒（`session_required`），什么也不存。会话一律
+  受计费闸门约束，用户级容器并发上限按每个活跃会话的 Runner 计。没有回复的运行错误按退避
+  重试，最后一次失败发 `agent_error`；同一会话连续两次 OOM（137）后自动重置它的上下文；Container 模式配置了
+  `CONTAINER_MEMORY_LIMIT` 时改为停止重试并提示超出内存上限，不清上下文。
+  重启后会话续用 SDK 会话并收到「服务已重启」提示。终端按会话打开（`terminal_*` 的
+  `chatJid` 是会话地址）。
+- 模型服务失败按类别处理（`provider-fallback.ts` 分类，`provider-failure.ts` 定处置与提示）：
+  额度、认证等账号类按用量上限等待或结束；529/5xx、无输出等暂时类用同一连接重放一次；请求本身被拒
+  （`invalid_request`、`model_not_found`，或 Claude Code 标为 `unknown`、上游为 400/404/413/422）
+  直接结束，不重放。结束提示附上清洗过的上游原话（`upstreamErrorExcerpt`：只取 message，脱敏邮箱与
+  密钥形状的串，截断），账号类只在没有 Runner 自带的限额文案时附上；Claude Code 自动压缩后仍溢出时
+  提示缩短输入或 `/fresh`。
 - 同一序列化键内的消息保持顺序。
 - 不同飞书话题、不同 Runtime Session 使用不同序列化键，可以并发。
 - Agent loop 运行期间到达的普通消息（Web 与全部 IM 渠道）逐条进入可见、可编辑和可排序的 durable 队列；
@@ -216,6 +281,10 @@ Web UI 约定：
   回复按这条输入的 `source_jid`（创建时冻结的来源路由，例如飞书话题）投递。Agent 看到的
   运行上下文（自动化 id、计划、停止条件、无人值守、安静模式）作为附件里的隐藏条目存在
   这条输入上，追加在用户消息之后，不进 system prompt；Web 只显示提示词本身。
+  自动化带模型时，写入输入之前若会话的选择与它不同就改成它（经 `session-model-service`，
+  暖 Runner 在本轮结束后退出）；每次新建的会话创建时就写好。只改自动化自己建的会话
+  （`source_kind='automation'` 且 `automation_id` 是它），持续会话接上已有会话时不能带模型。
+  没带模型时不改动会话的选择；模型被清除时，自己的持续会话若仍是它给的选择则回到默认。
 - 同一自动化同时最多一个运行；到期时上一次还在排队或运行，本次记为 `skipped`。服务停机
   期间到期的周期运行不补跑，记一条 `missed` 并从现在起算下次；一次性的仍会补跑。
   `endAt` 到达或 Agent 调用 `automation_complete` 后状态为 `completed`。
@@ -229,6 +298,39 @@ Web UI 约定：
   的启动、终态和最终答复按发起它的输入写入 `subagent_checkpoints`；重跑同一输入时
   这些断点作为上下文回注给主 Agent：已完成的直接汇总，未完成的标明中断，部署、迁移、
   推送等非幂等操作要求先核实实际状态。宿主不会自动重跑任何子任务。
+- 卡死检测（`src/stuck-runner-recovery.ts`）每 30 秒查一次欠账的 Runner：query 还欠着经
+  IPC 注入的输入（IPC 债务，query 结束才还清），或 Runner 不在 query 中、同一会话却排着任务。
+  欠账且静默满 3 分钟时，Host 若 CPU 空闲就重启，CPU 忙或 Container（看不到 CPU）等静默满
+  `STUCK_RUNNER_FORCE_RESTART_MINUTES` 再重启。IPC 债务另有同样长、不看输出和 CPU 的绝对
+  上限：经 IPC 开场一轮 query 的输入从注入起算，到模型为这一 query 产出内容为止（带它
+  `queryRunId` 的正文、思考、工具调用、子代理等事件；Runner 读到输入就发出的记忆召回、
+  上下文审计，以及状态、hook 等系统事件和带上一个 query `queryRunId` 的迟到输出都不算。
+  上一轮结果后 SDK 流还开着的几秒里 pipe 进来的输入一被激活就按新 query 计，此后的事件都带
+  新 id）；之后追加进同一 query 的输入从最早一次追加起算，到 query 结束。暖 Runner 上持续
+  输出的一轮因此不会撞上限，模型开工后又静默下去的一轮仍按空闲规则重启。CLI 在主 Agent 的
+  工具调用期间每 30 秒发一次心跳（宿主收到 `tool_progress`），既刷新静默计时也算模型产出，
+  所以模型开工后卡住的工具调用与冷启动 query 一样，只受工具自身的超时约束。Runner 自行续写
+  （压缩后续写、截断续写）结束时，这一 query 若还有未确认回执或仍在磁盘上的 IPC 输入就留在
+  进行中：剩下的输入由此时空闲的 Runner 作为下一轮接手，等于这一 query 重新经 IPC 开场，IPC
+  债务从模型还没答复的最早一条输入起算（已回显的开场输入不算，追加的输入算，都没有时从续写结束
+  起算），模型为它产出内容后同样免除绝对上限，空闲规则照旧；续写结果的回执确认后宿主再判一次，
+  没有剩下的 IPC 输入就结束这一 query。重启后，已为该会话启动或排队
+  的会话任务（例如未确认投递的回放）就是下一轮，宿主不再另起一个。
+- 后台工作（除已转后台的 Bash 外的所有 SDK 后台任务，含子代理、监视器、MCP 任务）结清前，
+  CLI 照常接收输入，但 Runner 扣住结果、不发完成回执，这一 query 结束前 IPC 债务一直还不上。
+  Runner 发布的每个 result 都带 `pendingBgTasks`（结清后为 0），宿主只看 result 上的这个
+  值：大于 0 时把这一 query 记为扣住，卡死检测不做 CPU 探测，IPC 债务上限和空闲规则一律
+  defer（`background_tasks`），每个 query 只记一条 info 日志。中断、provider 失败、模型
+  回退重试、上下文溢出等结束 SDK query 的输出也解除扣住；解除时仍欠的 IPC 债务从解除时刻
+  重新计时。扣住期间子代理等网络或跑长命令时可能完全没有输出，Runner 于是按宿主经
+  `ContainerInput.hostIdleCloseMs` 传入的空闲关闭时长（min(`CONTAINER_TIMEOUT`,
+  `IDLE_TIMEOUT`)，看门狗不会更短）的三分之一、最长 5 分钟发一次保活控制帧
+  `backgroundHoldKeepalive`，没有存活的后台任务时暂停。宿主收到它只重置空闲关闭计时（帧本身
+  已重置进程看门狗），不算 Runner 活动，不进回合轨迹、Web、卡片或任何渠道。扣住从它的第一条
+  result 算起最多 2 小时（`BACKGROUND_HOLD_MAX_MS`，保活同一上限；不再扣住的 result 结束
+  这次扣住，之后再扣住重新计时）：超过后卡死检测按原规则和原有计时判定，扣住期间注入且仍欠着
+  的输入立即撞 IPC 债务上限；保活也停了，静默的 Runner 照常被空闲关闭和看门狗收掉。旧宿主
+  不传空闲关闭时长，Runner 就不发保活。
 - 一轮成功结束、最后一次模型响应只有思考而没有正文（静默停止）时，Claude Code 会先在
   轮内自行补问一次；仍无正文时 Runner 在同一 SDK 流里再要一次答复，每条输入最多一次。
   主动模式、已有后续输入排队、后台任务未结清时不续写。
@@ -266,8 +368,13 @@ preset 的身份和默认风格，只低于平台的安全、权限、工具和�
 
 规则：
 
-- Agent 工具权限保持开放；不要虚构只读或受限工具模式。团队模式的路由与执行会话按角色收紧
-  工具（见 §6.3），这是渠道发言规则，不是通用的受限模式。另一例外是 Claude Code
+- Agent 工具权限保持开放；不要虚构只读或受限工具模式。团队模式的路由与执行会话、多任务
+  工作区的 Worker 按角色收紧工具（见 §6.3 与 §2），这是发言规则，不是通用的受限模式：Worker
+  只通过 `work_report` 交回结果，不能直接对人说话。会话类型由 Runner 的 `sessionKind()`
+  统一判定，团队角色优先于工作方式；多任务工作区的普通会话由宿主设置
+  `ContainerInput.workMode='multi'`，Runner 据此注册 `work_delegate`、`work_delegations`、
+  `work_stop`、`work_followup` 并换用 `background-tasks.multi.md`，Worker 用
+  `delegated-worker.md` 与 `background-tasks.delegated.md`。另一例外是 Claude Code
   内置、依赖 CLI 进程常驻或交互审批的会话级工具（`CronCreate`/`CronDelete`/`CronList`、
   `ScheduleWakeup`、`EnterWorktree`/`ExitWorktree`、`EnterPlanMode`/`ExitPlanMode`）：
   Runner 每轮结束会关闭 CLI，这些承诺会静默丢失，计划模式也等不到审批，因此默认禁用，
@@ -288,10 +395,15 @@ preset 的身份和默认风格，只低于平台的安全、权限、工具和�
   的绑定一旦设置就是权威，连接已删除或没有凭据时本轮失败并提示，不改用别的连接；
   一步都没有时同样失败，不落到任意连接。没有全局默认、自动池和启用开关；Web 的选择器
   与这一顺序共用同一个函数。
-- 推理等级按会话手选 → 智能体显式档位 → 模型默认档位解析，只取该模型支持的档位，
-  不支持档位的模型不下发；不存在默认 `max`。模型支持哪些档位见
+- 推理等级按会话手选 → 智能体显式档位 → 模型默认档位解析，只取该模型支持的档位；
+  不存在默认 `max`。模型支持哪些档位见
   `resolveModelCapabilities`（`shared/model-providers.ts`）：连接上声明的 → 能力表 →
-  同系列推断（如 `gpt-6.1-terra` 取 `gpt-6.1-sol`）→ 无。ChatGPT 订阅连接仍用账号目录。
+  同系列推断（如 `gpt-6.1-terra` 取 `gpt-6.1-sol`）→ 未知。声明为空（`efforts: []`，如
+  magpie 的 `reasoning_levels: []`，或管理员取消了全部档位）表示不传档位；只有同时声明
+  `thinks: false`（上游 `reasoning: false`）时才以 SDK `thinking: {type: 'disabled'}`
+  （`ContainerInput.thinking`）关闭本轮思考，`thinks` 为 `true` 或缺省时思考照常。档位未知时按上面的顺序取第一个
+  合法档位原样下发，都没有就不传，会话选择接受任何档位，Web 标「未验证」。HappyClaw
+  不传档位时 Claude Code 对第三方模型仍会自带 `effort: high`。ChatGPT 订阅连接仍用账号目录。
 - HappyClaw 拥有的 Claude 环境（后端开关、端点、凭据、模型层级、会话的 effort/压缩/
   上下文，清单在 `shared/claude-provider-env.ts`）不取自宿主进程继承的环境，也从管理员
   的 settings 层剔除（连同 `apiKeyHelper` 等取凭据的命令），不会写进挂载给 Agent 的会话
@@ -300,6 +412,20 @@ preset 的身份和默认风格，只低于平台的安全、权限、工具和�
   未被 HappyClaw 设置的键（例如官方连接的 `ANTHROPIC_BASE_URL`）仍可由工作区 cwd 下的
   项目/local settings 文件设置：Host 模式下那是管理员自己的仓库，Container 模式下所有者
   本就能读到该连接的凭据。
+- 连接的工具搜索（`toolSearch`：开、关、默认；默认对 magpie 连接为开，其余为关）：生效为开
+  时 Runner 在 flag settings 的 env 里钉 `ENABLE_TOOL_SEARCH=true`，为关时不写进 settings。
+  Claude Code 2.1.304 起在自定义 `ANTHROPIC_BASE_URL` 后面会自行打开它，所以自定义地址
+  （第三方连接、ChatGPT 网关、工作区自带的地址）上没开、进程环境也没设它时，Runner 在 CLI 的
+  进程环境里写 `ENABLE_TOOL_SEARCH=false`（`defaultToolSearchEnv`）；进程环境是最低一层，连接或
+  工作区的环境变量与各层 settings 仍照旧决定。生效值变化后与 WebFetch 域名检查一样，使用该连接的
+  Runner 在本轮结束后退出，SDK 会话保留。上游以提到 `defer_loading` 的 400 拒绝延迟加载的工具时
+  （magpie 对不能原地加载的路由如此），Claude Code 自己改为完整声明全部工具重发
+  （`tests/e2e/provider-failure-upstream.mjs` 的 `refuse-deferred`）。
+- 连接的 WebFetch 域名检查（`webFetchPreflightPolicy`）：Claude Code 的 WebFetch 会先把
+  域名发到 `api.anthropic.com` 预检，连不上 Anthropic 时第三方连接的 WebFetch 必然失败；它只从
+  settings 读 `skipWebFetchPreflight`，没有环境变量。连接选 `skip` 时 Runner 在 flag
+  settings 把它固定为 `true`；`check`、未设置或没有选中连接时不写这个键，由其他 settings
+  决定。值变化后，使用该连接的 Runner 在本轮结束后退出，SDK 会话保留。
 - 渠道格式说明随每轮的 `<channel_context>` 发送，不进 system prompt；换渠道或每十轮
   重发一次，在被替换或撤回前一直有效。
 - 一个模型配置（连接）是一份凭据、一个地址和一组模型；设置页只添加和维护连接，选哪个
@@ -308,25 +434,85 @@ preset 的身份和默认风格，只低于平台的安全、权限、工具和�
   会话并注入近期历史。模型条目存上游原名、上下文长度和声明的档位，新写入的模型名里不带
   `[1m]`（旧数据里的 `[1m]` 仍表示 1M）：`[1m]` 是 Claude Code 的开关（请求前剥掉，只把上下文上限抬到 1M；不认识的
   模型上限 200K，`CLAUDE_CODE_AUTO_COMPACT_WINDOW` 只能往下压），运行时按上下文长度
-  推导，大于 200K 才加，再用压缩窗口压回实际长度（`buildConnectionModelEnv`）；只用
+  推导，大于 200K 才加，再用压缩窗口压回实际长度（`buildConnectionModelEnv`）。Claude Code
+  2.1.323 起把不认识的模型当作 1M，而 1M 窗口不按阈值压缩、只等上游的「prompt is too long」，
+  别家上游的措辞不同，会话满了就每轮失败；所以没有 `[1m]`、且声明了长度或名字不是 Claude 模型的
+  启动写 `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` 保住 200K 上限（`keepsTwoHundredKWindow`），ChatGPT
+  网关的启动也写；它作用于整个启动，带 `[1m]` 的角色模型此时同样按 200K；连接环境变量（及工作区
+  环境变量覆盖）里自己写的同名键优先。只用
   条目上声明的长度，能力表里的长度只作为添加时的预填值，不会自行打开 `[1m]`。只改
   上下文长度不算换模型。子代理、后台轻量调用和 opus/sonnet 档由连接的 `roles` 从同一
-  连接的模型里选，未设置时跟随本轮模型。连接环境变量只注入用户保存的非空值，新连接预填
+  连接的模型里选，未设置时跟随本轮模型；宿主侧短调用（`sdkQuery`：标题、`/recall`、Bug
+  上报、智能体草稿）在调用方没指定模型时用全局连接的 `roles.smallFast`，`RECALL_MODEL`
+  仍优先。连接环境变量只注入用户保存的非空值，新连接预填
   `API_TIMEOUT_MS`、`CLAUDE_CODE_NO_FLICKER`、`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`；
-  模型相关的键（`CONNECTION_MODEL_ENV_KEYS`）不接受自由填写。这些都存在 V5 配置文件的
-  可选字段里，不升文件版本。测试连接和获取模型列表只有在上游确实接受了凭据时才记录
-  认证头方式。
+  模型相关的键（`CONNECTION_MODEL_ENV_KEYS`）不接受自由填写。模型条目还存上游给的显示名、
+  最大输出和供应商：第三方端点上，本轮模型、各角色模型和本次注入的同轮备用模型都声明了
+  最大输出时，取其中最小值、再与 128000 取小，大于 32000 才写 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`；
+  连接环境变量（及工作区环境变量覆盖）里自己写的同名键优先。派生出值时宿主经
+  `ContainerInput.maxOutputTokens` 交给 Runner，Runner 把它钉进 flag settings 的 env，压过
+  管理员、项目和 local 的 settings；没派生时这个键不属于 HappyClaw 拥有的环境，既不剥也不钉，
+  管理员 settings 或宿主环境里的值照常生效。这些都存在 V5 配置文件的可选字段里，不升文件版本。测试连接和获取模型列表只有在上游确实接受了凭据时才记录
+  认证头方式；两者都带打包 Claude Code 版本的 User-Agent（从 SDK 的 package.json 读）。
+- magpie 网关（连接的 `gateway: 'magpie'`）：模型列表带 `magpie_label` 即识别，任何
+  一次成功的模型发现或目录同步都会标记，从 magpie 预设（默认 `http://127.0.0.1:3425`，地址
+  可改、改后保留预设，WebFetch 域名检查默认 `skip`）创建的直接标记；地址变更清除检测到的
+  标记。magpie 对带 `anthropic-version` 和 `claude-cli/`、`claude-code/` User-Agent 的列表
+  请求把大多数 id 改写成 `anthropic/magpie-<数字>`，发现到别名时用 `HappyClaw/<版本>` 重取，
+  重取失败或仍是别名时本次发现或同步失败（不合并残缺列表），任何情况下别名都不写进模型列表。
+  magpie 连接至少要有一个模型（`MAGPIE_MODELS_REQUIRED`，在创建和修改模型列表或默认模型时校验）；
+  全局 `fallbackModel` 只在它在该连接的模型列表里时才注入。目录同步
+  （`src/model-catalog-sync.ts`，由 `startWebServer` 启动，每 6 小时一次加打开连接详情时）：
+  显示名、最大输出、供应商总是更新，上下文长度和档位只在当前值为空或等于上次同步写入的值时
+  更新；上游不再提供的模型只标记；第一次同步后新出现的模型按「新模型自动加入」开关加入或
+  记下待挑选；只改元数据，不停 Runner、不清会话。其余第三方连接由同一定时任务检测一次（失败
+  退避）。用量面板读 `/v1/magpie/quotas`；一轮以 magpie 的 429「usage limit reached」结束时
+  （Runner 把上游原话放在 `providerErrorText`），宿主读额度，按模型 id 的 `provider/` 前缀
+  找该 provider 已用尽窗口中最早的 `resetsAt`，交给用量上限等待；路由组、`auto/`、读不到额度
+  或没有已用尽窗口时按原逻辑失败（`src/magpie-usage-limit.ts`）。
+- 子代理设置在 `runtime_policy.subagents`（`src/agent-subagents.ts`）：默认子代理模型、
+  同时运行上限（`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`）和自定义子代理（SDK `options.agents`）。
+  一个 Claude Code 进程只连一个端点，子代理不能跨连接，模型只能取智能体所绑连接里的，
+  创建、改动子代理或换连接时校验；运行时会话手选了别的连接或模型已移出列表，这些名字不生效
+  （后者记告警），默认回到连接的 `roles.subagent`（官方连接不写，由 Claude Code 决定），定义
+  改为继承。宿主解析（`resolveConnectionSubagents`）后经 `ContainerInput.subagents` 交给 Runner；
+  推理等级按主模型的规则下发（声明不支持的不传，未知的原样传），工具里去掉 Runner 默认禁用的
+  会话级工具；去掉后一个不剩（或列表本就为空）的定义保存时拒绝，运行时跳过并记告警，绝不以零
+  工具或全部工具运行；自定义子代理与默认子代理模型都计入最大输出的派生。Runner 把上限同时钉进 flag
+  settings（`subagent-launch.ts`），团队路由会话不注入自定义子代理。只有自定义子代理进身份 hash：
+  只改上限或默认子代理模型只换 Runner、保留 SDK 会话。导出带自定义子代理与上限、不带模型名，
+  导入清掉模型名，复制时清掉连接已不提供的模型名。
 - 宿主机 Skills 由 `runtime_policy.skills.host` 独立选择，不能通过
   `host_claude` 开关隐式获得；每个智能体都存显式值，新建、复制、导入一律写显式值。
 - 工作区 `CLAUDE.md`、项目 `.claude/skills` 和项目 MCP 属于项目上下文层。项目根按 CLI
   的规则从工作目录向上找到 git 根（Host 自定义目录与会话 worktree 同样适用），运行时、
   能力预览和工作区设置共用这个根；Host 自定义目录的 `.mcp.json` 因此会被加载。
+- CLI 找 `CLAUDE.md` 时一直走到 `/`。Host 运行的工作目录位于安装目录的 `data/` 下时
+  （旧工作区 `data/groups/<folder>`、`data/worktrees/...`），Runner 用 `claudeMdExcludes`
+  排除安装目录自己的 `CLAUDE.md`、`CLAUDE.local.md`、`.claude/CLAUDE.md` 和
+  `.claude/rules/**`，与上下文来源无关（`container/agent-runner/src/claude-memory-policy.ts`）；
+  自定义目录指向 HappyClaw 仓库本身时保留它。`host_claude` 只决定是否继承宿主用户的
+  `~/.claude` 记忆。
+- 普通会话（含多任务工作区的普通会话）有只读的 `session_list`、`session_get`，按需加载：
+  宿主在主进程里合成会话的 `runtime_state`（running、queued_slot、rate_limited、
+  waiting_human、warm_idle、idle、error；`active` 不等于在跑），来源是 SQLite 加
+  GroupQueue 与流式快照。`error` 指上一轮失败：普通会话失败后回到 `idle`，错误留在
+  `result_summary`（可能为空串），下一轮开始时清空。非 Home 工作区只能看本工作区，Home
+  可以看主人的全部工作区（必须写明工作区；Host 工作区只在主人是 admin 时可见），永远不能
+  看其他用户的；不是主人亲自发起的轮次只得到本工作区的状态字段。团队会话与派发 Worker
+  不注册。实现和权限见 `src/session-inspect-service.ts`、`docs/ACL-MATRIX.md` §10。
 - Skill、MCP、Plugin 变更会停相关 Runner 并开新 SDK 会话，下一轮自动补注近期历史；
   运行中的 Agent 自己调用 `install_skill` 时，本轮结果送达后才重置。安装、卸载 Skill
   只接受工作区主人亲自发起的轮次。
 - Workspace Memory 只有整批输入都来自工作区主人的互动轮次才直接写入；群成员轮次与自动化
   运行的写入存为 `proposed`，在记忆页确认后才参与召回。每轮按用户本人正文的词项召回
   相关条目（`workspace_memory_recall_fts`），全部条目的标题目录随每轮笔记增量注入。
+- 「工作区主人亲自发起」按每条输入的发送者判定（`src/workspace-owner-identity.ts`），记忆直写、
+  `install_skill`、自动化、派发、`session_list` 与 Owner Profile 共用：Web 输入是主人的用户 id；
+  IM 输入的来源聊天是主人自己的注册，发送者是主人登记在 Home 或当前工作区的聊天上由宿主记录的
+  可信身份（`configured`、`trusted_direct`、`auto_feishu`），与聊天绑定到哪个工作区无关。按
+  provider 跨主人的各个渠道账号比较（企业微信、钉钉的 id 只在企业内唯一，按同一渠道账号比较），
+  别的 provider 下相同的值不算。
 - 禁用、删除或缺失的精确选择能力必须让配置失败，不得静默替换。
 - Prompt 或能力身份变化后必须失效旧的暖 Runner。
 
@@ -353,7 +539,9 @@ preset 的身份和默认风格，只低于平台的安全、权限、工具和�
 为准，业务含义见 `docs/BUSINESS-MODEL.md`：
 
 - 工作区绑定只接受原生话题群（飞书话题群、Telegram Forum），路由为 `thread_map`。
-- Runtime Session 绑定接受私聊和普通群，可以绑定 Main Session。
+- 私聊和普通群只绑定到一个具体会话（`registered_groups.target_agent_id`，挂载表
+  `session_id`）；`target_main_jid` 只表示话题群的工作区绑定。IM 里 `/bind <工作区>`
+  在该工作区新建一个会话并绑定，`/bind <工作区>/<会话>` 绑定到已有会话。
 - 会话类型无法确定时拒绝绑定，不猜测。
 - Session 只能在工作区（`web:*` JID）下创建；`POST /api/groups/:jid/sessions`
   （及兼容别名 `/agents`）拒绝 IM 聊天 JID。`#agent:` 是逻辑会话地址，不是发送目标，
@@ -388,7 +576,7 @@ preset 的身份和默认风格，只低于平台的安全、权限、工具和�
 
 普通飞书群：
 
-- 整个群共享已绑定的那一个 Session（可以是 Main Session）。
+- 整个群共享已绑定的那一个 Session。
 - `always` 与 `when_mentioned` 只决定消息是否需要 @ 才激活；提及或激活策略
   不会为普通群新建话题 Session，也不会把它变成工作区绑定。
 - 引用回复（带 root_id 但没有 thread_id，私聊同样）在主聊天作答，不在被引用消息下
@@ -438,7 +626,7 @@ Telegram 默认流式：回复期间约每 1.5 秒编辑一条进度消息，结
 当前命令由 `src/index.ts` 的 `handleCommand()` 分发：
 
 - 只读：`/list`、`/ls`、`/status`、`/where`、`/recall`、`/rc`、`/allowlist`
-- 变更：`/clear`、`/fresh`、`/bind`、`/unbind`、`/new`、`/sw`、`/spawn`
+- 变更：`/clear`、`/fresh`、`/bind`、`/unbind`、`/new`、`/sw`、`/spawn`、`/model`
 - Owner：`/owner_mention`、`/release_owner`、`/allow`、`/disallow`
 - 激活：`/require_mention`
 
@@ -461,8 +649,18 @@ Telegram 默认流式：回复期间约每 1.5 秒编辑一条进度消息，结
   `feishu_chat_mode=p2p`；仍未知时按群聊处理。
 - `/status`、`/where` 只描述本聊天自己的绑定，群成员可用。
 - `/recall` 读取本条消息实际路由到的 Session：普通群/私聊为其绑定的 Session；
-  话题群为当前话题的 Session，缺少话题元数据时拒绝，永远不回退到 Workspace
-  主会话，也不会为此新建话题 Session。
+  话题群为当前话题的 Session，缺少话题元数据时拒绝，永远不回退到工作区的其他
+  会话，也不会为此新建话题 Session。
+- 未绑定的聊天没有目标会话：`/clear`、`/fresh`、`/recall`、`/rc`、`/sw`、`/spawn`、
+  `/model` 回复「本聊天未绑定会话。」且不做任何操作，`/status`、`/where` 显示「未绑定」。
+
+`/model`（`src/im-model-command.ts`）查看和切换本条消息路由到的会话（解析同 `/clear`）的
+模型：不带参数显示当前模型及其来源（本会话选择或跟随的默认）和编号的连接；`/model <n> [页]`
+列出连接 n 的模型（每页 20 个）；`/model <n>.<m> [档位]` 或 `/model <唯一的模型 id 或名称>
+[档位]` 切换，多个连接都有同名模型时列出编号让用户选；`/model default` 恢复默认。它与
+`/clear` 同一 owner 边界，不带参数也是（会列出 owner 的连接）：群聊仅 owner，未认领 owner
+的群拒绝，私聊首次使用时认领；选择者是工作区主人，校验与保存走 Web 选择器同一个服务
+（`src/session-model-service.ts`），换模型让该会话的暖 Runner 在本轮结束后退出。
 
 另有精确的 Session 运行时控制命令，由渠道连接器在通用斜杠命令之前解析。
 群聊必须由渠道结构证明真实 `@Bot`，命令大小写敏感；私聊可直接使用。
@@ -479,8 +677,10 @@ WhatsApp、企微、微信支持 `/steer` 和 `/break`，其 `/clear` 与 `/fres
   不进入 Agent Prompt，也不额外发送框架确认。可携带图片。目标只查已有路由，不为
   `/steer`、`/break` 新建话题会话；目标不存在时回复目标不存在，消息不入库。
 - `/break`：必须无附件且正文精确匹配；以到达时为截止点取消此前 pending 并中断 active
-  Loop，保留 transcript，之后到达的消息继续运行；固定回复 `Current task stopped.` 或
-  `No active task to stop.`。只受响应对象/激活策略约束，不要求 owner。
+  Loop，保留 transcript，之后到达的消息继续运行；排队中的派发回报（多任务模式）不取消，
+  照常交给会话处理（会话没有在跑的查询时，例如在等用量上限，立即交出），要取消只能在 Web
+  队列里撤回。固定回复 `Current task stopped.` 或 `No active task to stop.`。
+  只受响应对象/激活策略约束，不要求 owner。
 - `/clear`：必须无附件且正文精确匹配；重置当前逻辑 Session 并固定回复
   `Session context cleared.`。
 - `/fresh [备注]`：必须无附件；停 runner、清 session 文件、写入
@@ -491,7 +691,7 @@ WhatsApp、企微、微信支持 `/steer` 和 `/break`，其 `/clear` 与 `/fres
   同一破坏性边界：群聊中 `@Bot /clear`、`@Bot /fresh` 只允许 owner，未认领 owner 的
   群直接拒绝；私聊首次使用时认领发送者。
 - 运行时控制的目标：群聊由连接器按本条消息的路由（含原生话题）解析；路由失败时
-  回复目标不存在，绝不回退到绑定的 Workspace 主会话（话题群尤其如此）。只有私聊
+  回复目标不存在，绝不回退到工作区的其他会话（话题群尤其如此）。只有私聊
   在连接器未给出目标时由绑定解析，`/break`、`/clear`、`/fresh` 相同。
 
 飞书撤回（`im.message.recalled_v1`）经 `onMessageRecalled` 进入宿主：仍在 durable
@@ -522,21 +722,32 @@ cancelled 结束且游标前进。批次含其他输入时不中断。回复锚�
 
 ## 7. 数据与目录
 
-运行时数据默认位于 `data/`，不进入 Git：
+运行时数据默认位于 `data/`，不进入 Git。新建的 Host 工作区（未指定自定义目录）在工作区
+根目录下：`<workspaceRoot>/<folder>`，默认 `~/happyclaw`（`src/workspace-root.ts`：系统
+设置 > `HAPPYCLAW_WORKSPACE_ROOT` > 默认；位于安装目录内、上层有 `CLAUDE.md`、位于别的 git
+仓库内或不可写时回退到 `~/happyclaw-workspaces`，它也不能用时新工作区留在
+`data/groups/{folder}`，接口和设置页报告的就是这个实际位置（`rootForNewWorkspaces`）；设置
+接口直接拒绝这样的值）。每个工作区的
+目录记在 `workspace_workdirs`（按 folder），一律经 `workspaceDirOf(folder)`（`src/workspace-dir.ts`）
+读取，不要再拼 `GROUPS_DIR` 与 folder；没有记录的（已有工作区、Container 工作区）就是
+`data/groups/{folder}`。修改根目录只影响之后新建的工作区。这些工作区的运行日志写在
+`data/logs/{folder}`；删除和重建前校验目录名等于 folder、位于已知根目录下且没有经符号链接
+逃逸，任何一项不满足就拒绝（根目录被移走后用链接接回原位、真实位置仍带
+`.happyclaw-workspace-root` 标记时按真实位置校验）；工作区根目录不在 `make backup` 范围内。
 
 ```text
 data/
 ├── db/messages.db
 ├── config/
 ├── groups/{folder}/
+├── logs/{folder}/
 ├── worktrees/{folder}/{sessionId}/
-├── sessions/{folder}/.claude/
 ├── sessions/{folder}/agents/{sessionId}/.claude/
-├── ipc/{folder}/
 ├── ipc/{folder}/agents/{sessionId}/
 ├── memory/
 ├── skills/{userId}/
 ├── builtin-skills/
+├── cache/office-preview/
 ├── mcp-servers/{userId}/
 ├── plugins/
 ├── agent-profile-runtime/
@@ -544,8 +755,17 @@ data/
 └── extra/
 ```
 
+`data/cache/office-preview/` 是 Office 预览的 PDF 缓存：按源文件内容的 sha256 命名、跨用户
+共享，总量受 `OFFICE_PREVIEW_CACHE_MAX_MB` 限制，可随时删除。
+
+`data/config/web-push-vapid.json` 是 Web Push 的 VAPID 密钥（权限 600，首次使用时生成）；
+删除或更换后所有设备都要重新开启推送。
+
 主要数据库当前 Schema 版本以 `src/db.ts` 的 `CURRENT_SCHEMA_VERSION` 为准。
-不要在文档中复制版本号；迁移必须同时具备备份、前向升级和拒绝降级保护。只新增索引
+不要在文档中复制版本号；迁移必须同时具备备份、前向升级和拒绝降级保护。
+v88 把每个工作区的旧主会话迁成普通会话，映射记在 router_state
+`legacy_main_session:<工作区JID>`（只用于迁移自身的幂等与审计）；
+`npx tsx scripts/legacy-main-session-report.ts --check` 以只读方式核对线上库的不变量。只新增索引
 不需要升级版本：在每次启动都会执行的建表函数里用 `CREATE INDEX IF NOT EXISTS`。
 
 核心表族：
@@ -554,7 +774,7 @@ data/
   `guest_workspace_grants`
 - 工作区与会话：`registered_groups`、`sessions`、`workspaces`、
   `workspace_runtime_sessions`、`session_model_selections`、`session_worktrees`、
-  `session_history_reinjections`
+  `session_history_reinjections`、`user_pinned_sessions`
 - Agent：`agent_profiles`、`agent_builder_drafts`、`workspace_agent_profiles`、
   `agents`
 - 渠道：`channel_accounts`、`channel_mounts`、`agent_channel_mounts`、
@@ -566,23 +786,50 @@ data/
 - 团队模式：`team_mounts`、`work_items`、`work_item_subscriptions`、`work_item_events`、
   `work_decisions`
 - 记忆：`workspace_memory_*`（含召回索引 `workspace_memory_recall_fts`）
+- Web Push：`web_push_subscriptions`（每行记着登记它的登录会话，会话结束即删除）
+- 登录因子：`user_totp`、`user_recovery_codes`、`webauthn_credentials`（删除用户时一并删除）
 - 用量与计费：`usage_records`、`usage_events`、`usage_daily_summary`、
   `usage_event_connections` 及 `billing_*`、订阅、余额和兑换码相关表
 
 Channel Reliability 的 Inbox/Turn/Outbox/Card 表由
 `src/channel-reliability-store.ts` 在同一数据库连接上创建；同样，`session_worktrees` 由
-`src/session-worktree-store.ts`，自动化表由 `src/automation-store.ts`，团队模式表由 `src/work-item-store.ts`，等待、补注、用量连接
+`src/session-worktree-store.ts`，自动化表由 `src/automation-store.ts`，团队模式表由 `src/work-item-store.ts`，
+`web_push_subscriptions` 由 `src/web-push-store.ts`，登录因子表由 `src/auth-factor-store.ts`，等待、补注、用量连接
 和 Web 发送去重表由 `src/runtime-state-store.ts` 创建。
 
 ## 8. 认证与权限
 
 - Cookie 会话使用 HMAC 签名，密钥来自环境变量、持久文件或首次自动生成。
+- 二次验证（TOTP，`src/totp.ts`、`src/auth-mfa.ts`）：开启后密码正确只换来一个内存中的
+  challenge（5 分钟、5 次、单次使用），`POST /api/auth/login/2fa` 交验证码或恢复码后才下发会话，
+  失败与密码失败共用登录限流；发 challenge 时不清除已有的失败计数，第二步成功才清除。challenge
+  绑定发出时的密码与二次验证设置，改密码、关闭或重置二次验证、停用或删除账号后即失效。同一步长的
+  验证码只收一次。密钥用 `claude-provider.key` 加密存放，打不开时返回 `MFA_SECRET_UNREADABLE`；
+  恢复码只存逐条加盐的哈希，不依赖密钥（`src/auth-factor-store.ts`）。开启需要当前密码，开启后
+  注销其他会话。丢失验证器由有 `manage_users` 的人在用户管理里重置；唯一管理员的应急办法见
+  `DEPLOYMENT.md`。
+- 登录后重新核对身份（改密码、开关二次验证、添加和删除通行密钥）用 `routes/auth.ts` 的
+  `checkCurrentPassword`、`checkAccountCode`、`reauthenticate`：先占一次登录限流计数再校验，
+  错误返回 400 并带 `code`（不是 401）；核对通过只退还计数，不清除已有的失败。管理员在用户管理里
+  改自己的密码同样要当前密码。
+- 通行密钥（`src/passkeys.ts`）：无用户名登录，成功即下发会话、视同已过二次验证；访客不能用。
+  添加需要当前密码，开了二次验证还要验证码。origin 取请求的 `Origin` 头，只接受与 `Host` 同源、
+  localhost 或 `CORS_ALLOWED_ORIGINS` 列出的 HTTPS 地址，IP 地址不能作 RP ID；RP ID 随凭据保存，
+  换了主机名的凭据不被接受。登录与注册 challenge 分开存放，登录 challenge 每个客户端最多 50 个
+  （分不出客户端的共用一个名额）。改密码和管理员重置二次验证都不删除通行密钥，管理员用
+  `DELETE /api/admin/users/:id/passkeys` 撤销（连同进行中的注册）；本人删除需要当前密码。
 - `canAccessGroup`、`canModifyGroup` 和 `canDeleteGroup` 不提供 admin 全局旁路；
   工作区和渠道资源按 `created_by` 隔离。
 - Host 工作区额外要求 admin 角色。
+- 配对（或绑定后学习到）的私聊发送者在机器人里等同账号主人本人：可以 `/list`、`/bind` 到主人的
+  全部工作区（包括 Host 工作区）；配对登记在 Home，配对私聊的发送者在任意工作区按主人轮次判定。
+  配对页与渠道引导提示只给自己的账号配对；没有「受委托的他人」这一角色。
 - 系统配置、用户、邀请、审计和计费使用独立 Permission Middleware。
 - 敏感写操作必须先停止或暂停相关 Runner，并在提交失败时恢复队列。
 - API 返回资源不存在时通常使用 404 隐藏其他用户资源是否存在。
+- 单人宿主机模式下后端自己拒绝多用户入口，不只靠界面隐藏：注册（403）、建用户、建邀请码、
+  重新启用或提升为 admin、建访客或重新启用访客、`POST /api/docker/pull`（409
+  `SINGLE_USER_HOST`）。读取、停用和删除仍然允许。
 - 只读访客（`role=guest`）由 admin 通过 `/api/guests` 创建并授权查看自己的部分
   工作区；member 只有在系统设置 `allowMemberGuests` 开启时可以（默认关闭，关闭时
   member 的访客一并失效），每个 owner 最多 20 个。不要放宽 `canAccessGroup`：读取
@@ -607,19 +854,27 @@ Web 持久设置 > 环境变量 > 代码默认值
 
 常用环境变量：
 
-| 变量                                 | 默认值                            | 说明                               |
-| ------------------------------------ | --------------------------------- | ---------------------------------- |
-| `WEB_PORT`                           | `3000`                            | HTTP、WebSocket 端口               |
-| `WEB_SESSION_SECRET`                 | 自动生成并持久化                  | Cookie 签名                        |
-| `CONTAINER_IMAGE`                    | `riba2534/happyclaw-agent:latest` | GitHub Actions 发布的 Runner 镜像  |
-| `CONTAINER_TIMEOUT`                  | `1800000`                         | Runner 无输出看门狗                |
-| `IDLE_TIMEOUT`                       | `1800000`                         | 暖 Runner 空闲时间                 |
-| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                              | IPC 债务强制恢复上限（4–120 分钟） |
-| `MAX_CONCURRENT_CONTAINERS`          | `20`                              | Docker 并发                        |
-| `MAX_FILE_SIZE_MB`                   | `50`                              | Web/IM 入站文件上限                |
-| `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | WebSocket Origin 白名单            |
-| `TRUST_PROXY`                        | `false`                           | 是否信任反向代理来源头             |
-| `TZ`                                 | 系统时区                          | 调度时区；无效值回退并告警         |
+| 变量                                 | 默认值                            | 说明                                                                  |
+| ------------------------------------ | --------------------------------- | --------------------------------------------------------------------- |
+| `WEB_PORT`                           | `3000`                            | HTTP、WebSocket 端口                                                  |
+| `WEB_SESSION_SECRET`                 | 自动生成并持久化                  | Cookie 签名                                                           |
+| `CONTAINER_IMAGE`                    | `riba2534/happyclaw-agent:latest` | GitHub Actions 发布的 Runner 镜像                                     |
+| `CONTAINER_TIMEOUT`                  | `1800000`                         | Runner 无输出看门狗                                                   |
+| `IDLE_TIMEOUT`                       | `1800000`                         | 暖 Runner 空闲时间                                                    |
+| `STUCK_RUNNER_FORCE_RESTART_MINUTES` | `10`                              | IPC 债务强制恢复上限（4–120 分钟）；后台工作扣住结果的前 2 小时不适用 |
+| `MAX_CONCURRENT_CONTAINERS`          | `20`                              | Docker 并发                                                           |
+| `CONTAINER_MEMORY_LIMIT`             | 不限制                            | 单个容器内存上限，须带单位，同设 swap                                 |
+| `MAX_FILE_SIZE_MB`                   | `50`                              | Web/IM 入站文件上限                                                   |
+| `CORS_ALLOWED_ORIGINS`               | 仅 localhost                      | WebSocket Origin 白名单                                               |
+| `TRUST_PROXY`                        | `false`                           | 是否信任反向代理来源头                                                |
+| `TZ`                                 | 系统时区                          | 调度时区；无效值回退并告警                                            |
+| `HAPPYCLAW_DEPLOYMENT_MODE`          | `multi_user`                      | 部署方式；Web 设置保存过的值优先（逐键）                              |
+| `HAPPYCLAW_WORKSPACE_ROOT`           | `~/happyclaw`                     | 新建 Host 工作区的根目录；Web 设置保存过的值优先（逐键）              |
+| `OFFICE_PREVIEW_STIRLING_URL`        | 未设置                            | Office 预览转换服务（Stirling-PDF 兼容），设置后优先使用              |
+| `OFFICE_PREVIEW_SOFFICE_BIN`         | 未设置                            | 本机 soffice 绝对路径；只有显式设置才启用，在宿主机以服务身份解析文档 |
+| `WEB_PUSH_SUBJECT`                   | 本项目 GitHub 地址                | Web Push 的 VAPID 联系地址（`mailto:` 或 `https://`）                 |
+
+其余 `OFFICE_PREVIEW_*`（密钥文件、大小、超时、缓存上限）见 `DEPLOYMENT.md`。
 
 Provider 和渠道账号应优先通过 Web 配置。Legacy `/api/config/user-im/*` 只用于兼容，
 新功能统一使用 `/api/channel-accounts`。
@@ -648,6 +903,9 @@ npm run self-test
   测试、模型发现用同一套预设和错误分类。
 - 修改 Prompt 后确保 `scripts/check-agent-runner-prompts.sh` 通过。
 - 修改文档后运行 `npm run docs:check`。
+- 视觉基线（`web/tests/e2e/visual-baseline.spec.ts`）只提交了 macOS 的 `*-darwin.png`，只在 macOS 上
+  设置 `PLAYWRIGHT_VISUAL=1` 时运行，`make check` 跳过它；有意改动外观后在 macOS 上对该 spec 加
+  `--update-snapshots` 重录（完整命令见 spec 头部注释），逐张查看改动的 PNG 再提交。
 - SDK/CLI 升级必须显式执行 `make update-sdk`，验证后提交 package.json 与 lockfile；
   升级后重跑 `node tests/e2e/turn-context-dedup.mjs`，它固定 SessionStart(compact)
   补发的位置。preset 变了时 `tests/agent-runner-claude-preset.integration.test.ts`
@@ -671,14 +929,15 @@ npm run self-test
 
 ### 提交前门槛
 
+仓库没有 GitHub Actions CI，合并门槛就是本地的完整检查（`scripts/check-all.sh`）：
+
 ```bash
-npm run format:changed
-npm run docs:check
-make typecheck
-make test
-make build
-git diff --check
+npm run format:changed   # 先格式化改动文件
+make check               # 格式、审计、共享副本、类型、测试、构建、冒烟、浏览器 e2e、Runner 自检
 ```
+
+PR 的「验证」一节写明 `make check` 在哪个提交上通过；没跑的步骤（如 `CHECK_SKIP_E2E=1`）写明原因。
+合并前必须在最终提交上跑过。
 
 改动 Runner Prompt、`systemPrompt`、工具或 MCP 的 PR 须附改动前后的
 `cache_read_input_tokens` 占比（真实或脚本化运行，见 PR 模板）。

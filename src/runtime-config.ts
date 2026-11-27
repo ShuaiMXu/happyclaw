@@ -26,38 +26,41 @@ import { getResolvedCodexCatalog } from './codex-gateway/model-catalog-sync.js';
 import { normalizeLegacyCodexModel } from './codex-gateway/convert-request.js';
 import { retiredCodexReauthReason } from './codex-gateway/oauth.js';
 import {
-  GEMINI_GATEWAY_BASE_URL_PLACEHOLDER,
-  type GeminiModelInfo,
-  type GeminiOAuthCredentials,
-  type GeminiOAuthRefreshErrorState,
-} from './gemini-gateway/types.js';
-import {
   buildConnectionModelEnv,
+  carrySyncedModelFields,
   CONNECTION_ENV_PREFILL,
   CONNECTION_MODEL_ENV_KEYS,
   effectiveProviderModels,
   findModelEntry,
   getModelPreset,
+  isMagpieAliasModelId,
   isModelEffort,
   isValidModelId,
   launchModelName,
+  maxOutputTokensFor,
   MAX_PROVIDER_MODEL_ID_LENGTH,
   MAX_PROVIDER_MODELS,
   MODEL_EFFORTS,
   normalizeConnectionModelRoles,
   normalizeContextWindow,
-  normalizeProviderBaseUrl,
+  normalizeIsoTime,
   normalizeProviderModels,
   ONE_MILLION_CONTEXT,
+  presetAppliesAt,
   PROVIDER_ERROR_CODES,
   resolveModelCapabilities,
   splitOneMillionSuffix,
+  toolSearchEnabled,
   windowOf,
   type ConnectionModelRoles,
   type ModelEffort,
+  type ProviderCatalogError,
+  type ProviderCatalogPublic,
   type ProviderErrorCode,
+  type ProviderGateway,
   type ProviderModelEntry,
   type ProviderTestRecord,
+  type ToolSearchSetting,
 } from './model-providers.js';
 
 const MAX_FIELD_LENGTH = 2000;
@@ -72,7 +75,7 @@ const OFFICIAL_CLAUDE_PROFILE_ID = '__official__';
  * 的 ciphertext，配合 key 文件泄漏即可解密）。统一走该 helper：tmp 文件以
  * 0o600 创建，rename 后再次 chmod 防御 APFS 上 mode 不跟随 inode 的边角情况。
  */
-function writeSecretFile(targetPath: string, data: string): void {
+export function writeSecretFile(targetPath: string, data: string): void {
   const tmp = `${targetPath}.tmp`;
   // 先 unlink stale tmp，避免 fs.writeFileSync 在文件已存在时复用旧 mode
   // (Node 文档：mode 仅在 on-create 时应用)。残留 0o644 会让我们这次写入
@@ -183,6 +186,15 @@ const THIRD_PARTY_CONFIGURABLE_ENV_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Model environment the launch derives that a connection's own env may
+ * still set: the value the admin wrote replaces the derived one.
+ */
+const USER_TUNABLE_MODEL_ENV: ReadonlySet<string> = new Set([
+  'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
+  'CLAUDE_CODE_DISABLE_1M_CONTEXT',
+]);
+
+/**
  * Haiku tier behind the ChatGPT subscription gateway: Claude Code's own
  * small-fast model id (2.1.x first-party default). The gateway maps every
  * claude-* model to the provider's Codex model and recognizes haiku-tier
@@ -208,6 +220,7 @@ function isCodexGatewayEndpoint(baseUrl: string): boolean {
 /** Provider env values that Claude Code parses as positive integers. */
 const POSITIVE_INTEGER_PROVIDER_ENV_KEYS = new Set([
   'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+  'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
   'API_TIMEOUT_MS',
 ]);
 
@@ -218,6 +231,8 @@ const POSITIVE_INTEGER_PROVIDER_ENV_KEYS = new Set([
  * existed have no mode and keep the legacy inference in buildClaudeEnvLines.
  */
 export type ProviderAuthMode = 'bearer' | 'x-api-key';
+
+export type WebFetchPreflightPolicy = 'check' | 'skip';
 
 /**
  * Reject provider env the runtime would otherwise drop or misread, so the
@@ -441,6 +456,22 @@ export interface ClaudeProviderConfig {
    */
   models?: ProviderModelEntry[];
   roles?: ConnectionModelRoles;
+  /**
+   * The same-turn fallback model a launch is handed, whose declared reply
+   * limit counts toward CLAUDE_CODE_MAX_OUTPUT_TOKENS like the roles'.
+   */
+  fallbackModel?: string;
+  /**
+   * The Agent's default sub-agent model for this launch (agent-subagents.ts):
+   * it takes the place of `roles.subagent`, and is the only sub-agent model
+   * the official endpoint is given.
+   */
+  subagentModel?: string;
+  /**
+   * The models the launch's custom sub-agents name, whose declared reply
+   * limits count toward CLAUDE_CODE_MAX_OUTPUT_TOKENS like the roles'.
+   */
+  subagentModels?: string[];
   updatedAt: string | null;
 }
 
@@ -511,7 +542,6 @@ interface SecretPayload {
   claudeCodeOauthToken: string;
   claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
   codexOAuthCredentials?: CodexOAuthCredentials | null;
-  geminiOAuthCredentials?: GeminiOAuthCredentials | null;
   claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
   claudeOAuthLastRefreshAt?: number | null;
   claudeOAuthLastRefreshError?: ClaudeOAuthRefreshError | null;
@@ -624,17 +654,12 @@ interface StoredProviderV4 {
   anthropicBaseUrl: string;
   anthropicModel: string;
   anthropicAuthMode?: ProviderAuthMode;
+  /** Stored only for skip; absent follows Claude Code's own settings. */
+  webFetchPreflightPolicy?: 'skip';
   secrets: EncryptedSecrets;
   customEnv?: Record<string, string>;
   /** ChatGPT/Codex 订阅：最近一次 token 刷新失败（非机密运行态，凭据写入时清除）。 */
   codexOAuthLastRefreshError?: CodexOAuthRefreshErrorState;
-  /** Gemini 订阅：最近一次 token 刷新失败（非机密运行态，凭据写入时清除）。 */
-  geminiOAuthLastRefreshError?: GeminiOAuthRefreshErrorState;
-  /**
-   * Gemini 订阅：登录时拿到的模型目录（显示名、上下文长度、thinking 支持）。
-   * 只用于展示和请求侧钳制；请求本身可以带目录外的模型名。
-   */
-  geminiModels?: GeminiModelInfo[];
   /**
    * The models the connection offers. Absent: just `anthropicModel`. Not kept
    * for ChatGPT subscriptions, whose live catalog is their list. Optional
@@ -648,6 +673,12 @@ interface StoredProviderV4 {
   lastTest?: ProviderTestRecord;
   /** Which of the connection's models Claude Code uses besides the turn's. */
   roles?: ConnectionModelRoles;
+  /** The gateway the connection is (detected from its model list). */
+  gateway?: ProviderGateway;
+  /** Tool search, when the admin chose; absent follows the gateway. */
+  toolSearch?: 'on' | 'off';
+  /** Catalog sync and gateway detection state; runtime, not a setting. */
+  catalog?: ProviderCatalogState;
   /**
    * Set once CONNECTION_ENV_PREFILL has been given to the connection (by the
    * add wizard, or by the read-time migration for older connections), so a
@@ -693,16 +724,13 @@ export interface UnifiedProvider {
   anthropicBaseUrl: string;
   anthropicAuthToken: string;
   anthropicAuthMode?: ProviderAuthMode;
+  /** Set only when the connection skips WebFetch's domain check. */
+  webFetchPreflightPolicy?: 'skip';
   anthropicModel: string;
   anthropicApiKey: string;
   claudeCodeOauthToken: string;
   claudeOAuthCredentials: ClaudeOAuthCredentials | null;
   codexOAuthCredentials: CodexOAuthCredentials | null;
-  geminiOAuthCredentials: GeminiOAuthCredentials | null;
-  /** See StoredProviderV4.geminiModels. */
-  geminiModels?: GeminiModelInfo[];
-  /** 缺省视为无刷新失败；存量配置没有这个字段。 */
-  geminiOAuthLastRefreshError?: GeminiOAuthRefreshErrorState | null;
   /** Reset whenever the Claude credentials change; kept across refreshes. */
   claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
   claudeOAuthLastRefreshAt?: number | null;
@@ -713,6 +741,9 @@ export interface UnifiedProvider {
   models?: ProviderModelEntry[];
   /** Only roles naming one of `models`; absent when none is set. */
   roles?: ConnectionModelRoles;
+  gateway?: ProviderGateway;
+  toolSearch?: 'on' | 'off';
+  catalog?: ProviderCatalogState;
   envPrefill?: 1;
   presetId?: string;
   lastTest?: ProviderTestRecord | null;
@@ -730,6 +761,7 @@ export interface UnifiedProviderPublic {
   anthropicModel: string;
   /** null for providers saved before the explicit choice existed. */
   anthropicAuthMode: ProviderAuthMode | null;
+  webFetchPreflightPolicy: WebFetchPreflightPolicy;
   hasAnthropicAuthToken: boolean;
   anthropicAuthTokenMasked: string | null;
   hasAnthropicApiKey: boolean;
@@ -743,19 +775,6 @@ export interface UnifiedProviderPublic {
   codexOAuthCredentialsExpiresAt: number | null;
   codexOAuthCredentialsEmail: string | null;
   codexOAuthCredentialsPlanType: string | null;
-  hasGeminiOAuthCredentials: boolean;
-  geminiOAuthCredentialsExpiresAt: number | null;
-  geminiOAuthCredentialsEmail: string | null;
-  geminiOAuthProjectId: string | null;
-  /** Gemini 订阅登录已失效，需要在模型配置里重新登录 Google 账号。 */
-  geminiOAuthNeedsReauth: boolean;
-  geminiOAuthLastRefreshError: {
-    kind: GeminiOAuthRefreshErrorState['kind'];
-    message: string;
-    at: string;
-  } | null;
-  /** 登录时拉到的上游模型目录；未登录时为空。 */
-  geminiModels: GeminiModelInfo[];
   /** Official providers only; null for third-party or no credential. */
   claudeAuthKind: 'oauth' | 'setup_token' | 'api_key' | null;
   claudeOAuthAccountEmail: string | null;
@@ -789,9 +808,55 @@ export interface UnifiedProviderPublic {
   roles: ConnectionModelRoles;
   presetId: string | null;
   lastTest: ProviderTestRecord | null;
+  /** The gateway the connection is; null for any other endpoint. */
+  gateway: ProviderGateway | null;
+  /** The admin's tool search choice; `default` follows the gateway. */
+  toolSearch: ToolSearchSetting;
+  /** Whether launches turn Claude Code's tool search on. */
+  toolSearchEnabled: boolean;
+  /** magpie only: the catalog sync's state and the models it found. */
+  catalog: ProviderCatalogPublic | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
+
+/**
+ * A third-party connection's catalog state. Every such connection is checked
+ * once for a gateway (its model list says magpie); a magpie connection's
+ * list is then kept in step with the gateway's (model-catalog-sync.ts).
+ */
+export interface ProviderCatalogState {
+  /** magpie: new upstream models join the list by themselves. */
+  autoAdd?: true;
+  /** When a model list was last read successfully, by a check or a sync. */
+  checkedAt?: string;
+  /** When a magpie catalog sync last succeeded. */
+  syncedAt?: string;
+  /** The last failed check or sync; cleared by a successful one. */
+  error?: ProviderCatalogError;
+  /** Failed attempts in a row, for the backoff. */
+  failures?: number;
+  /** No scheduled attempt before this time. */
+  retryAt?: string;
+  /** Upstream models the list does not have (auto-add off, or no room). */
+  newModels?: ProviderModelEntry[];
+  /** Every id the last sync saw upstream, to tell a new model from a known one. */
+  knownIds?: string[];
+}
+
+/** A connection write refused for a reason the client can name. */
+export class ProviderWriteError extends Error {
+  constructor(
+    message: string,
+    readonly code: 'MAGPIE_MODELS_REQUIRED',
+  ) {
+    super(message);
+    this.name = 'ProviderWriteError';
+  }
+}
+
+/** Upstream models a catalog remembers past the list; magpie lists ~60. */
+const MAX_CATALOG_NEW_MODELS = 500;
 
 const MAX_PROVIDERS = 20;
 const POOL_CONFIG_FILE = path.join(CLAUDE_CONFIG_DIR, 'provider-pool.json');
@@ -1149,9 +1214,6 @@ function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
       };
     }
   }
-  // Restore Gemini 订阅 (Google Antigravity) OAuth credentials if present
-  const gemini = decodeGeminiOAuthCredentials(parsed.geminiOAuthCredentials);
-  if (gemini) result.geminiOAuthCredentials = gemini;
   const account = decodeClaudeOAuthAccount(parsed.claudeOAuthAccount);
   if (account) result.claudeOAuthAccount = account;
   if (
@@ -1165,54 +1227,6 @@ function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
   );
   if (refreshError) result.claudeOAuthLastRefreshError = refreshError;
   return result;
-}
-
-function decodeGeminiOAuthCredentials(
-  value: unknown,
-): GeminiOAuthCredentials | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
-  if (typeof raw.accessToken !== 'string' || !raw.accessToken) return null;
-  const optionalString = (entry: unknown): string | null =>
-    typeof entry === 'string' && entry ? entry : null;
-  return {
-    accessToken: raw.accessToken,
-    refreshToken: typeof raw.refreshToken === 'string' ? raw.refreshToken : '',
-    expiresAt: typeof raw.expiresAt === 'number' ? raw.expiresAt : 0,
-    email: optionalString(raw.email),
-    accountId: optionalString(raw.accountId),
-    projectId: optionalString(raw.projectId),
-    ...(Array.isArray(raw.scopes)
-      ? {
-          scopes: raw.scopes.filter(
-            (scope): scope is string => typeof scope === 'string',
-          ),
-        }
-      : {}),
-    updatedAt:
-      typeof raw.updatedAt === 'string'
-        ? raw.updatedAt
-        : new Date(0).toISOString(),
-  };
-}
-
-function normalizeGeminiRefreshErrorState(
-  value: unknown,
-): GeminiOAuthRefreshErrorState | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
-  if (
-    (raw.kind !== 'reauth_required' && raw.kind !== 'transient') ||
-    typeof raw.message !== 'string' ||
-    typeof raw.at !== 'string'
-  ) {
-    return null;
-  }
-  return {
-    kind: raw.kind,
-    message: raw.message.slice(0, MAX_FIELD_LENGTH),
-    at: raw.at,
-  };
 }
 
 const CLAUDE_OAUTH_ACCOUNT_FIELDS = [
@@ -1585,7 +1599,6 @@ function toStoredProviderV4(
     claudeCodeOauthToken: provider.claudeCodeOauthToken || '',
     claudeOAuthCredentials: provider.claudeOAuthCredentials ?? null,
     codexOAuthCredentials: provider.codexOAuthCredentials ?? null,
-    geminiOAuthCredentials: provider.geminiOAuthCredentials ?? null,
     claudeOAuthAccount: provider.claudeOAuthAccount ?? null,
     claudeOAuthLastRefreshAt: provider.claudeOAuthLastRefreshAt ?? null,
     claudeOAuthLastRefreshError: provider.claudeOAuthLastRefreshError ?? null,
@@ -1606,6 +1619,9 @@ function toStoredProviderV4(
     ...(provider.anthropicAuthMode
       ? { anthropicAuthMode: provider.anthropicAuthMode }
       : {}),
+    ...(provider.webFetchPreflightPolicy
+      ? { webFetchPreflightPolicy: provider.webFetchPreflightPolicy }
+      : {}),
     secrets: encryptSecrets(secrets),
     ...(Object.keys(sanitizedEnv).length > 0
       ? { customEnv: sanitizedEnv }
@@ -1613,13 +1629,8 @@ function toStoredProviderV4(
     ...(provider.codexOAuthLastRefreshError
       ? { codexOAuthLastRefreshError: provider.codexOAuthLastRefreshError }
       : {}),
-    ...(provider.geminiOAuthLastRefreshError
-      ? { geminiOAuthLastRefreshError: provider.geminiOAuthLastRefreshError }
-      : {}),
-    ...(provider.geminiModels && provider.geminiModels.length > 0
-      ? { geminiModels: provider.geminiModels }
-      : {}),
     ...connectionListFields(provider),
+    ...gatewayFields(provider),
     ...(provider.envPrefill === 1 ? { envPrefill: 1 as const } : {}),
     ...(provider.claudeOAuthCredentials && provider.claudeOAuthGrantId
       ? { claudeOAuthGrantId: provider.claudeOAuthGrantId }
@@ -1663,9 +1674,7 @@ function connectionListFields(provider: {
       ? getModelPreset(provider.presetId)
       : null;
   const presetId =
-    preset &&
-    normalizeProviderBaseUrl(provider.anthropicBaseUrl) ===
-      normalizeProviderBaseUrl(preset.baseUrl)
+    preset && presetAppliesAt(preset, provider.anthropicBaseUrl)
       ? preset.id
       : null;
   // Absent fields stay undefined, which JSON leaves out of the file.
@@ -1675,6 +1684,95 @@ function connectionListFields(provider: {
     presetId: presetId ?? undefined,
     lastTest: normalizeProviderTestRecord(provider.lastTest) ?? undefined,
   };
+}
+
+/**
+ * The gateway fields of a provider as they are stored and read: the gateway
+ * (always magpie for a connection made from the magpie preset), the tool
+ * search choice and a well-formed catalog state, none of them for an
+ * official endpoint or a ChatGPT subscription. Malformed parts are dropped.
+ */
+function gatewayFields(provider: {
+  type?: unknown;
+  anthropicBaseUrl: string;
+  presetId?: unknown;
+  gateway?: unknown;
+  toolSearch?: unknown;
+  catalog?: unknown;
+}): Pick<StoredProviderV4, 'gateway' | 'toolSearch' | 'catalog'> {
+  if (provider.type !== 'third_party' || isCodexGatewayProvider(provider)) {
+    return { gateway: undefined, toolSearch: undefined, catalog: undefined };
+  }
+  const preset =
+    typeof provider.presetId === 'string'
+      ? getModelPreset(provider.presetId)
+      : null;
+  const gateway: ProviderGateway | undefined =
+    preset?.gateway ?? (provider.gateway === 'magpie' ? 'magpie' : undefined);
+  const toolSearch =
+    provider.toolSearch === 'on' || provider.toolSearch === 'off'
+      ? provider.toolSearch
+      : undefined;
+  return {
+    gateway,
+    toolSearch,
+    catalog: normalizeCatalogState(provider.catalog),
+  };
+}
+
+/** A stored error code; one from a newer release reads as UNKNOWN. */
+function storedErrorCode(value: unknown): ProviderErrorCode {
+  return (PROVIDER_ERROR_CODES as readonly unknown[]).includes(value)
+    ? (value as ProviderErrorCode)
+    : 'UNKNOWN';
+}
+
+function normalizeCatalogState(raw: unknown): ProviderCatalogState | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  const state: ProviderCatalogState = {};
+  if (record.autoAdd === true) state.autoAdd = true;
+  const checkedAt = normalizeIsoTime(record.checkedAt);
+  if (checkedAt) state.checkedAt = checkedAt;
+  const syncedAt = normalizeIsoTime(record.syncedAt);
+  if (syncedAt) state.syncedAt = syncedAt;
+  const error =
+    record.error && typeof record.error === 'object'
+      ? (record.error as Record<string, unknown>)
+      : null;
+  const errorAt = normalizeIsoTime(error?.at);
+  if (error && errorAt && typeof error.message === 'string') {
+    state.error = {
+      code: storedErrorCode(error.code),
+      message: error.message.slice(0, 300),
+      at: errorAt,
+    };
+  }
+  if (
+    typeof record.failures === 'number' &&
+    Number.isSafeInteger(record.failures) &&
+    record.failures > 0
+  ) {
+    state.failures = record.failures;
+  }
+  const retryAt = normalizeIsoTime(record.retryAt);
+  if (retryAt) state.retryAt = retryAt;
+  const newModels = Array.isArray(record.newModels)
+    ? (normalizeProviderModels(
+        record.newModels.slice(0, MAX_CATALOG_NEW_MODELS),
+        { max: MAX_CATALOG_NEW_MODELS },
+      ) ?? [])
+    : [];
+  if (newModels.length > 0) state.newModels = newModels;
+  if (Array.isArray(record.knownIds)) {
+    state.knownIds = record.knownIds
+      .filter(
+        (id): id is string =>
+          typeof id === 'string' && id.length <= MAX_PROVIDER_MODEL_ID_LENGTH,
+      )
+      .slice(0, MAX_CATALOG_NEW_MODELS);
+  }
+  return Object.keys(state).length > 0 ? state : undefined;
 }
 
 function nullableNumber(value: unknown): number | null | undefined {
@@ -1703,11 +1801,7 @@ export function normalizeProviderTestRecord(
     return null;
   }
   // A code from a newer release reads as UNKNOWN rather than dropping the test.
-  const code: ProviderErrorCode | null = record.ok
-    ? null
-    : (PROVIDER_ERROR_CODES as readonly unknown[]).includes(record.code)
-      ? (record.code as ProviderErrorCode)
-      : 'UNKNOWN';
+  const code = record.ok ? null : storedErrorCode(record.code);
   return {
     ok: record.ok,
     code,
@@ -1757,6 +1851,9 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     type: stored.type,
     anthropicBaseUrl: stored.anthropicBaseUrl || '',
     anthropicAuthToken: secrets.anthropicAuthToken || '',
+    ...(stored.webFetchPreflightPolicy === 'skip'
+      ? { webFetchPreflightPolicy: 'skip' as const }
+      : {}),
     ...(normalizeProviderAuthMode(stored.anthropicAuthMode)
       ? {
           anthropicAuthMode: normalizeProviderAuthMode(
@@ -1769,13 +1866,6 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     claudeCodeOauthToken: secrets.claudeCodeOauthToken || '',
     claudeOAuthCredentials: secrets.claudeOAuthCredentials ?? null,
     codexOAuthCredentials: secrets.codexOAuthCredentials ?? null,
-    geminiOAuthCredentials: secrets.geminiOAuthCredentials ?? null,
-    geminiOAuthLastRefreshError: normalizeGeminiRefreshErrorState(
-      stored.geminiOAuthLastRefreshError,
-    ),
-    ...(Array.isArray(stored.geminiModels) && stored.geminiModels.length > 0
-      ? { geminiModels: stored.geminiModels }
-      : {}),
     claudeOAuthAccount: secrets.claudeOAuthAccount ?? null,
     claudeOAuthLastRefreshAt: secrets.claudeOAuthLastRefreshAt ?? null,
     claudeOAuthLastRefreshError: secrets.claudeOAuthLastRefreshError ?? null,
@@ -1789,6 +1879,10 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
       ...stored,
       anthropicBaseUrl: stored.anthropicBaseUrl || '',
       anthropicModel: stored.anthropicModel || '',
+    }),
+    ...gatewayFields({
+      ...stored,
+      anthropicBaseUrl: stored.anthropicBaseUrl || '',
     }),
     ...(stored.envPrefill === 1 ? { envPrefill: 1 as const } : {}),
     ...(typeof stored.claudeOAuthGrantId === 'string'
@@ -2033,7 +2127,6 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): StoredStateV5 {
       claudeCodeOauthToken: v3.officialSecrets.claudeCodeOauthToken,
       claudeOAuthCredentials: v3.officialSecrets.claudeOAuthCredentials ?? null,
       codexOAuthCredentials: null,
-      geminiOAuthCredentials: null,
       customEnv: v3.officialCustomEnv || {},
       updatedAt: v3.officialUpdatedAt || now,
     });
@@ -2056,7 +2149,6 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): StoredStateV5 {
       claudeCodeOauthToken: '',
       claudeOAuthCredentials: null,
       codexOAuthCredentials: null,
-      geminiOAuthCredentials: null,
       customEnv: profile.customEnv || {},
       updatedAt: profile.updatedAt || now,
     });
@@ -2504,9 +2596,18 @@ export function nextProviderModelList(
   next: { anthropicModel: string; models?: readonly ProviderModelEntry[] },
 ): ProviderModelEntry[] | undefined {
   const { model, oneMillion } = splitOneMillionSuffix(next.anthropicModel);
-  const list =
+  // A submitted list keeps what the vendor and the catalog sync said about
+  // each model it still has, and never a magpie discovery alias.
+  const submitted =
     next.models !== undefined
-      ? next.models
+      ? carrySyncedModelFields(
+          next.models.filter((entry) => !isMagpieAliasModelId(entry.id)),
+          current ? effectiveProviderModels(current) : [],
+        )
+      : undefined;
+  const list =
+    submitted !== undefined
+      ? submitted
       : current && splitOneMillionSuffix(current.anthropicModel).model !== model
         ? effectiveProviderModels(current)
         : current?.models;
@@ -2604,27 +2705,101 @@ export function recordProviderTest(
   return state.providers[idx];
 }
 
+/** A magpie connection must offer a model: the gateway has no default. */
+function assertGatewayModels(provider: UnifiedProvider): void {
+  if (
+    provider.gateway === 'magpie' &&
+    effectiveProviderModels(provider).length === 0
+  ) {
+    throw new ProviderWriteError(
+      'Magpie 连接至少需要一个模型，请先获取模型列表并选择',
+      'MAGPIE_MODELS_REQUIRED',
+    );
+  }
+}
+
+export interface ProviderCatalogUpdate {
+  gateway?: ProviderGateway;
+  models?: ProviderModelEntry[];
+  catalog: ProviderCatalogState;
+}
+
+/**
+ * Keep what a catalog sync or a gateway check learned about a connection:
+ * the gateway, the synced model list, the catalog state. `build` derives
+ * them from the connection as it is stored at the moment of writing, in the
+ * same synchronous read and write, so an edit an admin saved while the list
+ * was being read (a model removed, auto-add switched) is merged into rather
+ * than overwritten. Nothing is written when the endpoint or the credential
+ * changed meanwhile, since the list describes the old ones, or when `build`
+ * returns null. Runtime state like a test record: `updatedAt` stays.
+ * Returns the stored connection, or null when nothing was written.
+ */
+export function recordProviderCatalog(
+  id: string,
+  checked: UnifiedProvider,
+  build: (current: UnifiedProvider) => ProviderCatalogUpdate | null,
+): UnifiedProvider | null {
+  const state = readStoredStateV4();
+  if (!state) return null;
+  const idx = state.providers.findIndex((provider) => provider.id === id);
+  if (idx < 0) return null;
+  const current = state.providers[idx];
+  if (testedConnectionIdentity(current) !== testedConnectionIdentity(checked)) {
+    return null;
+  }
+  const update = build(current);
+  if (!update) return null;
+  const next: UnifiedProvider = { ...current };
+  if (update.models) {
+    Object.assign(
+      next,
+      connectionListFields({ ...next, models: update.models }),
+    );
+  }
+  Object.assign(
+    next,
+    gatewayFields({
+      ...next,
+      gateway: update.gateway ?? next.gateway,
+      catalog: update.catalog,
+    }),
+  );
+  state.providers[idx] = next;
+  writeStoredStateV4(state);
+  return next;
+}
+
 export function createProvider(input: {
   name: string;
   type: 'official' | 'third_party';
   anthropicBaseUrl?: string;
   anthropicAuthToken?: string;
   anthropicAuthMode?: ProviderAuthMode;
+  webFetchPreflightPolicy?: WebFetchPreflightPolicy;
   anthropicModel?: string;
   anthropicApiKey?: string;
   claudeCodeOauthToken?: string;
   claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
   claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
   codexOAuthCredentials?: CodexOAuthCredentials | null;
-  geminiOAuthCredentials?: GeminiOAuthCredentials | null;
-  geminiModels?: GeminiModelInfo[];
   customEnv?: Record<string, string>;
   models?: ProviderModelEntry[];
   /** Raw roles; those not naming one of the connection's models are dropped. */
   roles?: unknown;
   presetId?: string;
+  /** What a model list read before saving found the endpoint to be. */
+  gateway?: ProviderGateway;
+  toolSearch?: ToolSearchSetting;
+  /** magpie: new upstream models join the list by themselves. */
+  catalogAutoAdd?: boolean;
 }): UnifiedProvider {
   const authKind = selectedClaudeAuthKind(input.type, input);
+  // magpie answers WebFetch's domain check itself only on its own address,
+  // so a connection made from its preset skips the check unless told not to.
+  const webFetchPreflightPolicy =
+    input.webFetchPreflightPolicy ??
+    (getModelPreset(input.presetId)?.gateway === 'magpie' ? 'skip' : undefined);
   const requestedModel = normalizeDefaultModel(input.anthropicModel ?? '');
   const anthropicModel = splitOneMillionSuffix(requestedModel).model;
   const state: StoredStateV5 = readStoredStateV4() || {
@@ -2645,6 +2820,9 @@ export function createProvider(input: {
     id: crypto.randomBytes(8).toString('hex'),
     name: normalizeProfileName(input.name),
     type: input.type,
+    ...(webFetchPreflightPolicy === 'skip'
+      ? { webFetchPreflightPolicy: 'skip' as const }
+      : {}),
     anthropicBaseUrl: input.anthropicBaseUrl
       ? normalizeBaseUrl(input.anthropicBaseUrl)
       : '',
@@ -2663,10 +2841,6 @@ export function createProvider(input: {
       : '',
     claudeOAuthCredentials: input.claudeOAuthCredentials ?? null,
     codexOAuthCredentials: input.codexOAuthCredentials ?? null,
-    geminiOAuthCredentials: input.geminiOAuthCredentials ?? null,
-    ...(input.geminiModels && input.geminiModels.length > 0
-      ? { geminiModels: input.geminiModels }
-      : {}),
     claudeOAuthAccount: input.claudeOAuthAccount ?? null,
     claudeOAuthLastRefreshAt: null,
     claudeOAuthLastRefreshError: null,
@@ -2691,6 +2865,16 @@ export function createProvider(input: {
       presetId: input.presetId,
     }),
   );
+  Object.assign(
+    provider,
+    gatewayFields({
+      ...provider,
+      gateway: input.gateway,
+      toolSearch: input.toolSearch,
+      catalog: input.catalogAutoAdd ? { autoAdd: true } : undefined,
+    }),
+  );
+  assertGatewayModels(provider);
   applyClaudeAuthKind(provider, authKind);
   if (provider.claudeOAuthCredentials) {
     provider.claudeOAuthGrantId = crypto.randomBytes(8).toString('hex');
@@ -2708,6 +2892,7 @@ export function updateProvider(
     anthropicBaseUrl?: string;
     /** Null forgets the style, so it is inferred from the token again. */
     anthropicAuthMode?: ProviderAuthMode | null;
+    webFetchPreflightPolicy?: WebFetchPreflightPolicy;
     anthropicModel?: string;
     customEnv?: Record<string, string>;
     models?: ProviderModelEntry[];
@@ -2715,6 +2900,8 @@ export function updateProvider(
     roles?: unknown;
     /** Null forgets the preset (the endpoint no longer is the vendor's). */
     presetId?: string | null;
+    toolSearch?: ToolSearchSetting;
+    catalogAutoAdd?: boolean;
   },
 ): UnifiedProvider {
   const state = readStoredStateV4();
@@ -2739,6 +2926,15 @@ export function updateProvider(
       : {}),
     ...(patch.anthropicAuthMode !== undefined
       ? { anthropicAuthMode: patch.anthropicAuthMode ?? undefined }
+      : {}),
+    // check is the default, kept as an absent field like a stored one.
+    ...(patch.webFetchPreflightPolicy !== undefined
+      ? {
+          webFetchPreflightPolicy:
+            patch.webFetchPreflightPolicy === 'skip'
+              ? ('skip' as const)
+              : undefined,
+        }
       : {}),
     anthropicModel,
     ...(patch.customEnv !== undefined
@@ -2766,6 +2962,44 @@ export function updateProvider(
         patch.presetId === undefined ? current.presetId : patch.presetId,
     }),
   );
+  // What was detected about the endpoint describes the old address; the
+  // next check looks again. The admin's own choices stay.
+  const moved = updated.anthropicBaseUrl !== current.anthropicBaseUrl;
+  // An empty state is stored as none (normalizeCatalogState).
+  const nextCatalog: ProviderCatalogState = moved ? {} : { ...current.catalog };
+  if (patch.catalogAutoAdd ?? current.catalog?.autoAdd) {
+    nextCatalog.autoAdd = true;
+  } else {
+    delete nextCatalog.autoAdd;
+  }
+  // A new model the admin added is no longer new.
+  if (nextCatalog.newModels) {
+    const listed = effectiveProviderModels(updated);
+    const kept = nextCatalog.newModels.filter(
+      (entry) => !findModelEntry(listed, entry.id),
+    );
+    if (kept.length > 0) nextCatalog.newModels = kept;
+    else delete nextCatalog.newModels;
+  }
+  Object.assign(
+    updated,
+    gatewayFields({
+      ...updated,
+      gateway: moved ? undefined : current.gateway,
+      toolSearch:
+        patch.toolSearch === undefined
+          ? current.toolSearch
+          : patch.toolSearch === 'default'
+            ? undefined
+            : patch.toolSearch,
+      catalog: nextCatalog,
+    }),
+  );
+  // Only an edit of the models can leave a magpie connection without one; a
+  // pass-through relay detected as magpie later keeps taking other edits.
+  if (patch.models !== undefined || patch.anthropicModel !== undefined) {
+    assertGatewayModels(updated);
+  }
   // A test describes the endpoint, header, env and probe it ran against.
   updated.lastTest =
     updated.anthropicBaseUrl === current.anthropicBaseUrl &&
@@ -2795,9 +3029,6 @@ export function updateProviderSecrets(
     claudeOAuthAccount?: ClaudeOAuthAccountInfo | null;
     codexOAuthCredentials?: CodexOAuthCredentials;
     clearCodexOAuthCredentials?: boolean;
-    geminiOAuthCredentials?: GeminiOAuthCredentials;
-    clearGeminiOAuthCredentials?: boolean;
-    /** 登录时拉到的模型目录；不清空，独立于凭据写入（见 setProviderGeminiModels）。 */
   },
 ): UnifiedProvider {
   const state = readStoredStateV4();
@@ -2853,15 +3084,6 @@ export function updateProviderSecrets(
     updated.codexOAuthLastRefreshError = null;
   }
 
-  if (secrets.geminiOAuthCredentials) {
-    updated.geminiOAuthCredentials = secrets.geminiOAuthCredentials;
-    updated.geminiOAuthLastRefreshError = null;
-  } else if (secrets.clearGeminiOAuthCredentials) {
-    updated.geminiOAuthCredentials = null;
-    updated.geminiOAuthLastRefreshError = null;
-    updated.geminiModels = [];
-  }
-
   // Account facts and refresh state describe one Claude grant. A new or
   // removed credential starts over, which also lifts a needs-re-login state.
   const claudeGrantChanged =
@@ -2886,9 +3108,7 @@ export function updateProviderSecrets(
     current.anthropicAuthToken !== updated.anthropicAuthToken ||
     current.anthropicApiKey !== updated.anthropicApiKey ||
     !!secrets.codexOAuthCredentials ||
-    !!secrets.clearCodexOAuthCredentials ||
-    !!secrets.geminiOAuthCredentials ||
-    !!secrets.clearGeminiOAuthCredentials
+    !!secrets.clearCodexOAuthCredentials
   ) {
     delete updated.lastTest;
   }
@@ -3085,116 +3305,6 @@ export function setProviderCodexOAuthRefreshErrorIfCurrent(
   return true;
 }
 
-function geminiOAuthCredentialsSnapshot(
-  credentials: GeminiOAuthCredentials,
-): string {
-  return JSON.stringify({
-    accessToken: credentials.accessToken,
-    refreshToken: credentials.refreshToken,
-    expiresAt: credentials.expiresAt,
-    projectId: credentials.projectId,
-    accountId: credentials.accountId,
-  });
-}
-
-/**
- * Persist a gateway-refreshed Gemini (Google 订阅) credential only if the
- * provider still holds the exact credential snapshot used to start the
- * refresh. Same compare-and-swap boundary as the Codex variant above.
- */
-export function updateProviderGeminiOAuthCredentialsIfCurrent(
-  id: string,
-  expected: GeminiOAuthCredentials,
-  refreshed: GeminiOAuthCredentials,
-): boolean {
-  const state = readStoredStateV4();
-  if (!state) throw new Error('Claude 配置不存在');
-  const idx = state.providers.findIndex((provider) => provider.id === id);
-  if (idx < 0) throw new Error('未找到指定供应商');
-
-  const current = state.providers[idx];
-  const currentGemini = current.geminiOAuthCredentials;
-  if (
-    !currentGemini ||
-    geminiOAuthCredentialsSnapshot(currentGemini) !==
-      geminiOAuthCredentialsSnapshot(expected)
-  ) {
-    return false;
-  }
-
-  state.providers[idx] = {
-    ...current,
-    geminiOAuthCredentials: refreshed,
-    geminiOAuthLastRefreshError: null,
-    updatedAt: new Date().toISOString(),
-  };
-  writeStoredStateV4(state);
-  return true;
-}
-
-/**
- * Record (or clear, with null) the gateway's last Gemini token refresh
- * failure, guarded by the credential snapshot: a failure observed for
- * credentials an admin has since replaced must not mark the new login as
- * needing re-authorization.
- */
-export function setProviderGeminiOAuthRefreshErrorIfCurrent(
-  id: string,
-  expected: GeminiOAuthCredentials,
-  error: GeminiOAuthRefreshErrorState | null,
-): boolean {
-  const state = readStoredStateV4();
-  if (!state) return false;
-  const idx = state.providers.findIndex((provider) => provider.id === id);
-  if (idx < 0) return false;
-  const current = state.providers[idx];
-  if (
-    !current.geminiOAuthCredentials ||
-    geminiOAuthCredentialsSnapshot(current.geminiOAuthCredentials) !==
-      geminiOAuthCredentialsSnapshot(expected)
-  ) {
-    return false;
-  }
-  const normalized = error ? normalizeGeminiRefreshErrorState(error) : null;
-  if (
-    JSON.stringify(current.geminiOAuthLastRefreshError ?? null) ===
-    JSON.stringify(normalized)
-  ) {
-    return true;
-  }
-  state.providers[idx] = {
-    ...current,
-    geminiOAuthLastRefreshError: normalized,
-  };
-  writeStoredStateV4(state);
-  return true;
-}
-
-/** Replace the stored Gemini model catalog (login and manual refresh). */
-export function setProviderGeminiModels(
-  id: string,
-  models: GeminiModelInfo[],
-): UnifiedProvider {
-  const state = readStoredStateV4();
-  if (!state) throw new Error('Claude 配置不存在');
-  const idx = state.providers.findIndex((provider) => provider.id === id);
-  if (idx < 0) throw new Error('未找到指定供应商');
-  const updated: UnifiedProvider = {
-    ...state.providers[idx],
-    geminiModels: models,
-  };
-  state.providers[idx] = updated;
-  writeStoredStateV4(state);
-  return updated;
-}
-
-/** Whether a stored provider routes through the embedded Gemini gateway. */
-export function isGeminiGatewayProvider(
-  provider: Pick<UnifiedProvider, 'anthropicBaseUrl'>,
-): boolean {
-  return provider.anthropicBaseUrl === GEMINI_GATEWAY_BASE_URL_PLACEHOLDER;
-}
-
 /** Whether a stored provider routes through the embedded ChatGPT/Codex gateway. */
 export function isCodexGatewayProvider(
   provider: Pick<UnifiedProvider, 'anthropicBaseUrl'>,
@@ -3223,7 +3333,6 @@ export function getProviderById(id: string): UnifiedProvider | null {
 /** Whether a provider holds a credential its runtime can authenticate with. */
 export function providerHasCredentials(provider: UnifiedProvider): boolean {
   if (provider.codexOAuthCredentials) return true;
-  if (provider.geminiOAuthCredentials) return true;
   if (provider.type === 'third_party') {
     return !!(provider.anthropicAuthToken || provider.anthropicApiKey);
   }
@@ -3251,11 +3360,7 @@ export function duplicateProvider(id: string): UnifiedProvider {
   }
 
   const source = state.providers[idx];
-  if (
-    source.codexOAuthCredentials ||
-    source.claudeOAuthCredentials ||
-    source.geminiOAuthCredentials
-  ) {
+  if (source.codexOAuthCredentials || source.claudeOAuthCredentials) {
     throw new Error(
       'OAuth 授权的模型配置不能复制：两份配置轮换同一个刷新令牌会互相失效，请新建后重新授权',
     );
@@ -3315,6 +3420,7 @@ export function toPublicProvider(
     anthropicBaseUrl: provider.anthropicBaseUrl,
     anthropicModel: provider.anthropicModel,
     anthropicAuthMode: provider.anthropicAuthMode ?? null,
+    webFetchPreflightPolicy: provider.webFetchPreflightPolicy ?? 'check',
     hasAnthropicAuthToken: !!provider.anthropicAuthToken,
     anthropicAuthTokenMasked: maskSecret(provider.anthropicAuthToken),
     hasAnthropicApiKey: !!provider.anthropicApiKey,
@@ -3333,21 +3439,6 @@ export function toPublicProvider(
     codexOAuthCredentialsEmail: provider.codexOAuthCredentials?.email ?? null,
     codexOAuthCredentialsPlanType:
       provider.codexOAuthCredentials?.planType ?? null,
-    hasGeminiOAuthCredentials: !!provider.geminiOAuthCredentials,
-    geminiOAuthCredentialsExpiresAt:
-      provider.geminiOAuthCredentials?.expiresAt ?? null,
-    geminiOAuthCredentialsEmail: provider.geminiOAuthCredentials?.email ?? null,
-    geminiOAuthProjectId: provider.geminiOAuthCredentials?.projectId ?? null,
-    geminiOAuthNeedsReauth:
-      provider.geminiOAuthLastRefreshError?.kind === 'reauth_required',
-    geminiOAuthLastRefreshError: provider.geminiOAuthLastRefreshError
-      ? {
-          kind: provider.geminiOAuthLastRefreshError.kind,
-          message: provider.geminiOAuthLastRefreshError.message,
-          at: provider.geminiOAuthLastRefreshError.at,
-        }
-      : null,
-    geminiModels: provider.geminiModels ?? [],
     claudeAuthKind: claudeAuthKindOf(provider),
     claudeOAuthAccountEmail: provider.claudeOAuthAccount?.emailAddress ?? null,
     claudeOAuthOrganizationName:
@@ -3376,16 +3467,43 @@ export function toPublicProvider(
     codexDefaultEffort: isCodexGatewayProvider(provider)
       ? resolveCodexProviderDefaultEffort(provider)
       : null,
-    models: providerModels(provider),
+    models: providerModels(provider).map(publicModelEntry),
     roles: provider.roles ?? {},
     presetId: provider.presetId ?? null,
     lastTest: provider.lastTest ?? null,
+    gateway: provider.gateway ?? null,
+    toolSearch: provider.toolSearch ?? 'default',
+    toolSearchEnabled: providerToolSearchEnabled(provider),
+    catalog:
+      provider.gateway === 'magpie'
+        ? {
+            autoAdd: provider.catalog?.autoAdd === true,
+            syncedAt: provider.catalog?.syncedAt ?? null,
+            error: provider.catalog?.error ?? null,
+            newModels: (provider.catalog?.newModels ?? []).map(
+              publicModelEntry,
+            ),
+          }
+        : null,
     customEnv: sanitizeCustomEnvMap(
       provider.customEnv || {},
       CONNECTION_ENV_WRITE,
     ),
     updatedAt: provider.updatedAt,
   };
+}
+
+/** A model as the API shows it: the sync's bookkeeping stays inside. */
+function publicModelEntry(entry: ProviderModelEntry): ProviderModelEntry {
+  const { synced: _synced, ...rest } = entry;
+  return rest;
+}
+
+/** Whether launches on this connection turn Claude Code's tool search on. */
+export function providerToolSearchEnabled(
+  provider: Pick<UnifiedProvider, 'toolSearch' | 'gateway'>,
+): boolean {
+  return toolSearchEnabled(provider.toolSearch, provider.gateway);
 }
 
 /**
@@ -3805,6 +3923,15 @@ export function shellQuoteEnvLines(lines: string[]): string[] {
   });
 }
 
+/** The connection's roles with the Agent's default sub-agent model in place. */
+function launchRoles(
+  config: Pick<ClaudeProviderConfig, 'roles' | 'subagentModel'>,
+): ConnectionModelRoles | undefined {
+  return config.subagentModel
+    ? { ...config.roles, subagent: config.subagentModel }
+    : config.roles;
+}
+
 /**
  * The Claude environment of one launch on `config`. `config.anthropicModel`
  * is the model this launch runs on (callers replace it with a conversation's
@@ -3862,6 +3989,8 @@ export function buildClaudeEnvLines(
     anthropicModel: config.anthropicModel,
     models: config.models,
   });
+  // The selected connection's env when given, else the global connection's.
+  const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
   if (isCodexGatewayEndpoint(config.anthropicBaseUrl)) {
     // A ChatGPT subscription keeps no model list: every tier runs the turn's
     // Codex model as named, except a Claude haiku id that lets the gateway
@@ -3876,36 +4005,92 @@ export function buildClaudeEnvLines(
       );
     }
     lines.push(`ANTHROPIC_DEFAULT_HAIKU_MODEL=${CODEX_GATEWAY_HAIKU_MODEL}`);
+    // Codex model names are not Claude Code's (keepsTwoHundredKWindow).
+    if (!customEnv.CLAUDE_CODE_DISABLE_1M_CONTEXT?.trim()) {
+      lines.push('CLAUDE_CODE_DISABLE_1M_CONTEXT=1');
+    }
   } else if (config.anthropicBaseUrl) {
     const modelEnv = buildConnectionModelEnv({
       model: config.anthropicModel,
       models,
-      roles: config.roles,
+      roles: launchRoles(config),
+      fallbackModel: config.fallbackModel,
+      subagentModels: config.subagentModels,
     });
     for (const [key, value] of Object.entries(modelEnv)) {
+      // The admin's own reply limit for the connection wins.
+      if (USER_TUNABLE_MODEL_ENV.has(key) && customEnv[key]?.trim()) continue;
       lines.push(`${key}=${sanitizeEnvValue(value)}`);
     }
-  } else if (config.anthropicModel) {
+  } else {
     // Declared or `[1m]`-named windows only: on the official endpoint `[1m]`
     // is the billed 1M opt-in, which a registry window must not turn on.
-    lines.push(
-      `ANTHROPIC_MODEL=${sanitizeEnvValue(
-        launchModelName(
-          config.anthropicModel,
-          windowOf(models, config.anthropicModel),
-        ),
-      )}`,
-    );
+    if (config.anthropicModel) {
+      lines.push(
+        `ANTHROPIC_MODEL=${sanitizeEnvValue(
+          launchModelName(
+            config.anthropicModel,
+            windowOf(models, config.anthropicModel),
+          ),
+        )}`,
+      );
+    }
+    // Only an Agent's own sub-agent model; otherwise Claude Code picks its
+    // own, as before (the connection's roles do not apply here).
+    if (config.subagentModel) {
+      lines.push(
+        `CLAUDE_CODE_SUBAGENT_MODEL=${sanitizeEnvValue(
+          launchModelName(
+            config.subagentModel,
+            windowOf(models, config.subagentModel),
+          ),
+        )}`,
+      );
+    }
   }
 
-  // The selected connection's env when given, else the global connection's.
-  const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
   for (const [key, value] of Object.entries(customEnv)) {
     if (!value.trim() || isSkippedConnectionEnvKey(key)) continue;
     lines.push(`${key}=${sanitizeCustomEnvValue(key, value)}`);
   }
 
   return lines;
+}
+
+/**
+ * The CLAUDE_CODE_MAX_OUTPUT_TOKENS a launch on `config` derives from its
+ * models (as buildClaudeEnvLines writes it), or null when it derives none:
+ * not a third-party endpoint, a model of the launch that declares no reply
+ * limit, or an env that names the key itself (the connection's own, the
+ * Workspace's override). The Runner pins a derived value above every
+ * settings file, since a launch whose models cap their replies must not be
+ * raised by an admin's or a workspace's settings; a value HappyClaw did not
+ * derive stays theirs to set.
+ */
+export function derivedMaxOutputTokens(
+  config: ClaudeProviderConfig,
+  connectionEnv: Record<string, string> | undefined,
+  workspaceEnv?: Record<string, string>,
+): number | null {
+  if (
+    !config.anthropicBaseUrl ||
+    isCodexGatewayEndpoint(config.anthropicBaseUrl)
+  ) {
+    return null;
+  }
+  for (const env of [connectionEnv, workspaceEnv]) {
+    if (env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS?.trim()) return null;
+  }
+  return maxOutputTokensFor(
+    effectiveProviderModels({
+      anthropicModel: config.anthropicModel,
+      models: config.models,
+    }),
+    config.anthropicModel,
+    launchRoles(config),
+    config.fallbackModel,
+    config.subagentModels,
+  );
 }
 
 export function getActiveProfileCustomEnv(): Record<string, string> {
@@ -4151,6 +4336,16 @@ export function mergeClaudeEnvConfig(
       : {}),
     ...(!override.anthropicBaseUrl && global.roles
       ? { roles: global.roles }
+      : {}),
+    ...(!override.anthropicBaseUrl && global.fallbackModel
+      ? { fallbackModel: global.fallbackModel }
+      : {}),
+    // So are the Agent's sub-agent models, which name models of the list.
+    ...(!override.anthropicBaseUrl && global.subagentModel
+      ? { subagentModel: global.subagentModel }
+      : {}),
+    ...(!override.anthropicBaseUrl && global.subagentModels
+      ? { subagentModels: global.subagentModels }
       : {}),
     updatedAt: global.updatedAt,
   };
@@ -5047,7 +5242,19 @@ export interface SystemSettings {
   // 普通成员能否创建只读访客账号。默认关闭：访客由所有者直接建号，不经过邀请码，
   // 开放给成员等于绕过邀请制注册。关闭时成员已有的访客也一并失效；admin 不受限。
   allowMemberGuests: boolean;
+  // Where new Host workspaces without a custom directory are created. '' =
+  // unset: HAPPYCLAW_WORKSPACE_ROOT, then ~/happyclaw (src/workspace-root.ts).
+  workspaceRoot: string;
+  // '' = unset: HAPPYCLAW_DEPLOYMENT_MODE, then 'multi_user'
+  // (src/deployment-mode.ts). Stored as configured, never as resolved.
+  deploymentMode: '' | DeploymentMode;
 }
+
+export type DeploymentMode = 'multi_user' | 'single_user_host';
+export const DEPLOYMENT_MODES: readonly DeploymentMode[] = [
+  'multi_user',
+  'single_user_host',
+];
 
 // Upper bound for the login lockout window. auth.ts reclaims login-attempt
 // records on a fixed 24h TTL (its authoritative window check assumes the
@@ -5077,6 +5284,8 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   fallbackModel: '',
   pluginAutoScan: true,
   allowMemberGuests: false,
+  workspaceRoot: '',
+  deploymentMode: '',
 };
 
 type SystemSettingsSource = 'file' | 'env' | 'api';
@@ -5207,6 +5416,28 @@ function normalizeSystemSettings(
     }
   }
 
+  // Stored as configured; src/workspace-root.ts validates and resolves it.
+  let workspaceRoot = DEFAULT_SYSTEM_SETTINGS.workspaceRoot;
+  if (raw.workspaceRoot !== undefined) {
+    if (typeof raw.workspaceRoot === 'string') {
+      workspaceRoot = raw.workspaceRoot.trim();
+    } else {
+      invalidFields.add('workspaceRoot');
+    }
+  }
+
+  let deploymentMode = DEFAULT_SYSTEM_SETTINGS.deploymentMode;
+  if (raw.deploymentMode !== undefined && raw.deploymentMode !== '') {
+    if (
+      typeof raw.deploymentMode === 'string' &&
+      (DEPLOYMENT_MODES as readonly string[]).includes(raw.deploymentMode)
+    ) {
+      deploymentMode = raw.deploymentMode as DeploymentMode;
+    } else {
+      invalidFields.add('deploymentMode');
+    }
+  }
+
   let mainAgentContextSource = DEFAULT_SYSTEM_SETTINGS.mainAgentContextSource;
   if (raw.mainAgentContextSource !== undefined) {
     if (
@@ -5294,6 +5525,8 @@ function normalizeSystemSettings(
       'allowMemberGuests',
       DEFAULT_SYSTEM_SETTINGS.allowMemberGuests,
     ),
+    workspaceRoot,
+    deploymentMode,
   };
 
   if (invalidFields.size > 0) {
@@ -5309,11 +5542,30 @@ function normalizeSystemSettings(
 let _settingsCache: SystemSettings | null = null;
 let _settingsMtimeMs = 0;
 
+const SYSTEM_SETTING_KEYS = Object.keys(DEFAULT_SYSTEM_SETTINGS) as Array<
+  keyof SystemSettings
+>;
+
 function readSystemSettingsFromFile(): SystemSettings | null {
   if (!fs.existsSync(SYSTEM_SETTINGS_FILE)) return null;
   const raw = JSON.parse(
     fs.readFileSync(SYSTEM_SETTINGS_FILE, 'utf-8'),
   ) as Record<string, unknown>;
+  // Per key: a key the file does not have (the setup wizard stores only the
+  // deployment mode) follows its environment variable, then the default.
+  const missing = SYSTEM_SETTING_KEYS.filter(
+    (key) =>
+      raw[key] === undefined &&
+      // The former name of the main Agent compact window still counts.
+      !(
+        key === 'mainAgentAutoCompactWindow' &&
+        raw.autoCompactWindow !== undefined
+      ),
+  );
+  if (missing.length > 0) {
+    const fromEnv = buildEnvFallbackSettings();
+    for (const key of missing) raw[key] = fromEnv[key];
+  }
   return normalizeSystemSettings(raw, 'file');
 }
 
@@ -5418,16 +5670,21 @@ export function getEffectiveExternalDir(): string {
   return settings.externalClaudeDir || path.join(os.homedir(), '.claude');
 }
 
+function writeSystemSettingsFile(content: Record<string, unknown>): void {
+  fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
+  const tmp = `${SYSTEM_SETTINGS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(content, null, 2) + '\n', 'utf-8');
+  fs.renameSync(tmp, SYSTEM_SETTINGS_FILE);
+}
+
+/** Store every setting: the current values with `partial` applied. */
 export function saveSystemSettings(
   partial: Partial<SystemSettings>,
 ): SystemSettings {
   const existing = getSystemSettings();
   const merged = normalizeSystemSettings({ ...existing, ...partial }, 'api');
 
-  fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  const tmp = `${SYSTEM_SETTINGS_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, SYSTEM_SETTINGS_FILE);
+  writeSystemSettingsFile(merged as unknown as Record<string, unknown>);
 
   // Update in-memory cache immediately
   _settingsCache = merged;
@@ -5438,6 +5695,41 @@ export function saveSystemSettings(
   }
 
   return merged;
+}
+
+/**
+ * Store only `partial`'s keys: what the file already has stays, and every
+ * key it does not have keeps following its environment variable. The setup
+ * wizard stores the deployment mode this way, so a new install does not
+ * freeze the environment's values of every other setting into the file.
+ */
+export function saveSystemSettingKeys(
+  partial: Partial<SystemSettings>,
+): SystemSettings {
+  let stored: Record<string, unknown> = {};
+  try {
+    if (fs.existsSync(SYSTEM_SETTINGS_FILE)) {
+      const parsed: unknown = JSON.parse(
+        fs.readFileSync(SYSTEM_SETTINGS_FILE, 'utf-8'),
+      );
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        stored = parsed as Record<string, unknown>;
+      }
+    }
+  } catch {
+    /* unreadable: replaced, as saveSystemSettings would */
+  }
+  const normalized = normalizeSystemSettings(
+    { ...getSystemSettings(), ...partial },
+    'api',
+  );
+  for (const key of SYSTEM_SETTING_KEYS) {
+    if (partial[key] !== undefined) stored[key] = normalized[key];
+  }
+  writeSystemSettingsFile(stored);
+  _settingsCache = null;
+  _settingsMtimeMs = 0;
+  return getSystemSettings();
 }
 
 // ─── OAuth Usage Types ─────────────────────────────────────────────────────

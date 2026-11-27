@@ -13,6 +13,7 @@ import { useShellStore } from '../src/stores/shell';
 
 const JID = 'web:reply-rate';
 const AGENT = 'session-1';
+const SESSION_JID = `${JID}#agent:${AGENT}`;
 
 let root: Root;
 let container: HTMLDivElement;
@@ -31,9 +32,7 @@ afterEach(async () => {
   useChatStore.setState({
     groups: {},
     agents: {},
-    waiting: {},
     agentWaiting: {},
-    streaming: {},
     agentStreaming: {},
     stopRequests: {},
     activeRuns: {},
@@ -53,21 +52,14 @@ const base: StreamingState = {
 };
 
 /** The run's state, read and replaced where the bar looks for it. */
-let target: { agentId?: string } = {};
-const current = (): StreamingState => {
-  const s = useChatStore.getState();
-  return (
-    (target.agentId ? s.agentStreaming[target.agentId] : s.streaming[JID]) ??
-    base
-  );
-};
+let target = { agentId: AGENT };
+const current = (): StreamingState =>
+  useChatStore.getState().agentStreaming[target.agentId] ?? base;
 const update = (over: Partial<StreamingState>) => {
   const next = { ...current(), ...over };
-  useChatStore.setState((s) =>
-    target.agentId
-      ? { agentStreaming: { ...s.agentStreaming, [target.agentId!]: next } }
-      : { streaming: { ...s.streaming, [JID]: next } },
-  );
+  useChatStore.setState((s) => ({
+    agentStreaming: { ...s.agentStreaming, [target.agentId]: next },
+  }));
 };
 
 const proactive = (visibility: 'hidden' | 'activity' | 'full', owner = true) =>
@@ -86,10 +78,10 @@ const proactive = (visibility: 'hidden' | 'activity' | 'full', owner = true) =>
 
 const mount = async (
   over: Partial<StreamingState> = { partialText: '开头' },
-  agentId?: string,
+  agentId: string = AGENT,
 ) => {
   target = { agentId };
-  const runtimeJid = agentId ? `${JID}#agent:${agentId}` : JID;
+  const runtimeJid = `${JID}#agent:${agentId}`;
   useChatStore.setState({
     activeRuns: {
       [runtimeJid]: {
@@ -99,9 +91,7 @@ const mount = async (
         phase: 'running',
       },
     },
-    ...(agentId
-      ? { agentWaiting: { [agentId]: true } }
-      : { waiting: { [JID]: true } }),
+    agentWaiting: { [agentId]: true },
   });
   update(over);
   await act(async () => {
@@ -147,7 +137,7 @@ const rate = () => meta()?.match(/(\d+) tok\/s/)?.[1];
 describe('the run status bar', () => {
   it('says nothing without a run', async () => {
     await act(async () => {
-      root.render(<RunStatusBar groupJid={JID} />);
+      root.render(<RunStatusBar groupJid={JID} agentId={AGENT} />);
     });
     expect(bar()).toBeNull();
   });
@@ -167,7 +157,7 @@ describe('the run status bar', () => {
 
   it('waits before the run has said anything', async () => {
     await mount({});
-    useChatStore.setState({ streaming: {} });
+    useChatStore.setState({ agentStreaming: {} });
     await wait(0);
     expect(phase()).toBe('等待中');
   });
@@ -175,7 +165,7 @@ describe('the run status bar', () => {
   it('stops counting and leaves the accent once a stop is requested', async () => {
     await mount();
     await act(async () => {
-      useChatStore.setState({ stopRequests: { [JID]: Date.now() } });
+      useChatStore.setState({ stopRequests: { [SESSION_JID]: Date.now() } });
     });
     expect(phase()).toBe('正在停止…');
     expect(bar()?.firstElementChild?.className).not.toContain(
@@ -191,9 +181,9 @@ describe('the run status bar', () => {
     expect(bar()).not.toBeNull();
     await act(async () => {
       useChatStore.setState((s) => ({
-        streaming: {},
+        agentStreaming: {},
         activeRuns: {
-          [JID]: { ...s.activeRuns[JID], answered: 'input-1' },
+          [SESSION_JID]: { ...s.activeRuns[SESSION_JID], answered: 'input-1' },
         },
       }));
     });
@@ -244,7 +234,7 @@ describe('a proactive workspace', () => {
     await act(async () => {
       useChatStore.setState((s) => ({
         activeRuns: {
-          [JID]: { ...s.activeRuns[JID], answered: 'input-1' },
+          [SESSION_JID]: { ...s.activeRuns[SESSION_JID], answered: 'input-1' },
         },
       }));
     });
@@ -314,7 +304,7 @@ describe('the progress the Agent sent, in a proactive workspace', () => {
     await act(async () => {
       useChatStore.setState((s) => ({
         activeRuns: {
-          [JID]: { ...s.activeRuns[JID], answered: 'input-1' },
+          [SESSION_JID]: { ...s.activeRuns[SESSION_JID], answered: 'input-1' },
         },
       }));
     });
@@ -326,6 +316,55 @@ describe('the progress the Agent sent, in a proactive workspace', () => {
   it('is never shown in an Assistant workspace', async () => {
     await mount({ partialText: '答', steps: [progress('p1', '在查', 1)] });
     expect(shown()).toBeUndefined();
+  });
+});
+
+describe('measured usage, refreshed as each model call ends', () => {
+  const progress = (
+    over: Partial<NonNullable<StreamingState['usageProgress']>> = {},
+  ) => ({
+    calls: 3,
+    inputTokens: 1_000,
+    cacheReadInputTokens: 99_000,
+    cacheCreationInputTokens: 0,
+    outputTokens: 1_780,
+    streamOutputTokens: 1_780,
+    streamMs: 10_000,
+    ...over,
+  });
+
+  it('shows the hit rate and the measured speed once a call has ended', async () => {
+    await mount({ partialText: '开头', usageProgress: progress() });
+    expect(meta()).toBe('12s · 命中 99.0% · 178 tok/s');
+  });
+
+  it('follows each call', async () => {
+    await mount({ partialText: '开头', usageProgress: progress() });
+    await set({
+      usageProgress: progress({
+        calls: 4,
+        cacheReadInputTokens: 49_000,
+        streamOutputTokens: 2_000,
+        streamMs: 20_000,
+      }),
+    });
+    expect(meta()).toBe('12s · 命中 98.0% · 100 tok/s');
+  });
+
+  it('leaves out a hit rate with nothing read from the cache', async () => {
+    await mount({
+      partialText: '开头',
+      usageProgress: progress({ cacheReadInputTokens: 0 }),
+    });
+    expect(meta()).toBe('12s · 178 tok/s');
+  });
+
+  it('measured speed replaces the estimate from the text', async () => {
+    await mount();
+    await write(3000);
+    expect(meta()).toBe('15s · 100 tok/s');
+    await set({ usageProgress: progress() });
+    expect(meta()).toBe('15s · 命中 99.0% · 178 tok/s');
   });
 });
 
@@ -405,17 +444,20 @@ describe('the speed beside the timer, while the reply streams', () => {
     await mount();
     await write(3000);
     await act(async () => {
-      useChatStore.setState({ stopRequests: { [JID]: Date.now() } });
+      useChatStore.setState({ stopRequests: { [SESSION_JID]: Date.now() } });
     });
     expect(rate()).toBeUndefined();
   });
 
   it("reads a session's own reply", async () => {
     await mount({ partialText: '开头' }, AGENT);
-    // The main conversation's reply does not count.
-    useChatStore.setState({
-      streaming: { [JID]: { ...base, partialText: '主会话' } },
-    });
+    // Another session's reply does not count.
+    useChatStore.setState((s) => ({
+      agentStreaming: {
+        ...s.agentStreaming,
+        'session-2': { ...base, partialText: '另一个会话' },
+      },
+    }));
     await write(3000);
     expect(rate()).toBe('100');
   });

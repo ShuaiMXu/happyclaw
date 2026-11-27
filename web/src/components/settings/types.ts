@@ -1,22 +1,16 @@
 import type {
   ConnectionModelRoles,
+  ProviderCatalogPublic,
+  ProviderGateway,
   ProviderModelEntry,
   ProviderTestRecord,
+  ToolSearchSetting,
 } from '@/lib/model-providers';
+import type { DeploymentMode } from '../../stores/auth';
 
 // ─── 统一供应商类型 (V4) ─────────────────────────────────────
 
-/** One entry of the Gemini subscription's upstream model catalog. */
-export interface GeminiModelCatalogEntry {
-  id: string;
-  displayName: string;
-  contextWindow: number | null;
-  maxOutputTokens: number | null;
-  supportsThinking: boolean;
-  supportsImages: boolean;
-  thinkingBudget: number | null;
-  minThinkingBudget: number | null;
-}
+export type WebFetchPreflightPolicy = 'check' | 'skip';
 
 export interface UnifiedProviderPublic {
   id: string;
@@ -26,6 +20,8 @@ export interface UnifiedProviderPublic {
   anthropicModel: string;
   /** null for third-party providers saved before the explicit choice. */
   anthropicAuthMode: 'bearer' | 'x-api-key' | null;
+  /** `skip` skips WebFetch's domain check; `check` follows Claude Code's settings. */
+  webFetchPreflightPolicy?: WebFetchPreflightPolicy;
   hasAnthropicAuthToken: boolean;
   anthropicAuthTokenMasked: string | null;
   hasAnthropicApiKey: boolean;
@@ -59,19 +55,6 @@ export interface UnifiedProviderPublic {
     message: string;
     at: string;
   } | null;
-  hasGeminiOAuthCredentials?: boolean;
-  geminiOAuthCredentialsExpiresAt?: number | null;
-  geminiOAuthCredentialsEmail?: string | null;
-  geminiOAuthProjectId?: string | null;
-  /** Google login was refused on refresh; the user must log in again. */
-  geminiOAuthNeedsReauth?: boolean;
-  geminiOAuthLastRefreshError?: {
-    kind: 'reauth_required' | 'transient';
-    message: string;
-    at: string;
-  } | null;
-  /** Live Antigravity catalog saved at login and on manual refresh. */
-  geminiModels?: GeminiModelCatalogEntry[];
   /** Effort the gateway applies when the Agent does not choose one. */
   codexDefaultEffort?: string | null;
   customEnv: Record<string, string>;
@@ -83,6 +66,15 @@ export interface UnifiedProviderPublic {
   presetId: string | null;
   /** The outcome of the last connection test. */
   lastTest: ProviderTestRecord | null;
+  // The rest are absent on servers older than gateway detection.
+  /** The gateway the connection is, from its preset or its model list. */
+  gateway?: ProviderGateway | null;
+  /** The admin's tool search choice; `default` follows the gateway. */
+  toolSearch?: ToolSearchSetting;
+  /** Whether launches turn Claude Code's tool search on. */
+  toolSearchEnabled?: boolean;
+  /** magpie connections only. */
+  catalog?: ProviderCatalogPublic | null;
   updatedAt: string;
 }
 
@@ -124,6 +116,29 @@ export interface HostIntegrationSettings {
   mainAgentAutoCompactPercentage: number;
   externalClaudeDir: string;
   pluginAutoScan: boolean;
+  // The rest are absent on servers older than the workspace root setting.
+  /** Stored root of new Host workspaces; '' = unset. */
+  workspaceRoot?: string;
+  /** Where new Host workspaces go; null: no usable root, so data/groups/<folder>. */
+  workspaceRootEffective?: string | null;
+  workspaceRootSource?: SettingSource;
+  /** Why the requested root is not used (a problem code), or null. */
+  workspaceRootFallbackReason?: string | null;
+  workspaceRootFallbackWarning?: string | null;
+  /** Effective mode. */
+  deploymentMode?: DeploymentMode;
+  /** Stored mode; '' = unset. */
+  deploymentModeConfigured?: '' | DeploymentMode;
+  deploymentModeSource?: SettingSource;
+}
+
+export type SettingSource = 'settings' | 'env' | 'default';
+
+/** The user list of a 409 `SINGLE_USER_HOST_OTHER_USERS`. */
+export interface OtherActiveUser {
+  id: string;
+  username: string;
+  role: string;
 }
 
 // ─── OAuth Usage ────────────────────────────────────────────
@@ -216,6 +231,7 @@ export type SettingsTab =
   | 'system'
   | 'main-agent'
   | 'host-integration'
+  | 'storage-sources'
   | 'billing'
   | 'profile'
   | 'preferences'

@@ -1,10 +1,50 @@
 import type { StreamEvent, WorkflowRunSnapshot } from './stream-event.types.js';
 
-export interface AdditionalMount {
+/** A host directory, bound into the container (or mounted from its NFS export). */
+export interface HostDirectoryMount {
   hostPath: string; // Absolute canonical path on host
   containerPath: string; // Relative suffix mounted below /workspace/extra
   readonly?: boolean; // Default: true for safety
 }
+
+/** A directory of an allowlisted storage source, mounted by Docker itself. */
+export interface StorageSourceMount {
+  source: string; // StorageSource.id in the mount allowlist
+  subPath?: string; // Relative directory inside the source; empty = its root
+  containerPath: string; // Relative suffix mounted below /workspace/extra
+  readonly?: boolean; // Default: true for safety
+}
+
+export type AdditionalMount = HostDirectoryMount | StorageSourceMount;
+
+interface StorageSourceBase {
+  // Stable identifier referenced by StorageSourceMount.source
+  id: string;
+  // Whether read-write mounts of this source are allowed
+  allowReadWrite: boolean;
+  description?: string;
+}
+
+/** An NFS export, mounted by the Docker daemon's kernel (no credentials). */
+export interface NfsStorageSource extends StorageSourceBase {
+  type: 'nfs';
+  server: string;
+  exportPath: string;
+  nfsVersion?: '3' | '4' | '4.1' | '4.2'; // Default: 3
+}
+
+/** An SMB share. The password lives in a 0600 file, never in this config. */
+export interface CifsStorageSource extends StorageSourceBase {
+  type: 'cifs';
+  server: string;
+  share: string;
+  username?: string; // Omitted = guest
+  domain?: string;
+  passwordFile?: string; // Absolute, or relative to the project root
+  smbVersion?: '2.1' | '3.0' | '3.1.1'; // Default: 3.0
+}
+
+export type StorageSource = NfsStorageSource | CifsStorageSource;
 
 /**
  * Mount Allowlist - Security configuration for additional mounts
@@ -17,6 +57,8 @@ export interface MountAllowlist {
   blockedPatterns: string[];
   // If true, non-main groups can only mount read-only regardless of config
   nonMainReadOnly: boolean;
+  // Network storage that workspaces may mount by id (optional; default none)
+  storageSources: StorageSource[];
 }
 
 export interface AllowedRoot {
@@ -26,6 +68,9 @@ export interface AllowedRoot {
   allowReadWrite: boolean;
   // Optional description for documentation
   description?: string;
+  // Host directories under this root that sit on an NFS mount are mounted by
+  // Docker straight from the export instead of bound (default false)
+  nfsDirectMount?: boolean;
 }
 
 export interface ContainerConfig {
@@ -212,13 +257,12 @@ export interface RegisteredGroup {
   /** Channel account that owns this external chat. Null means legacy/default. */
   channel_account_id?: string;
   is_home?: boolean; // 用户主容器标记
-  /** Direct-chat binding target: a specific workspace conversation session. */
+  /** Direct chat or ordinary group binding: one workspace session. */
   target_agent_id?: string;
   /**
-   * Binding target stored as the canonical workspace JID.
-   * Group chats own the workspace main context. Direct chats must not use
-   * this slot — they bind through `target_agent_id` so they do not share
-   * the workspace main channel-owner key with a group.
+   * Topic container binding (`binding_mode = 'thread_map'`): the canonical
+   * workspace JID whose native topics each get their own session. Direct
+   * chats and ordinary groups never use this slot.
    */
   target_main_jid?: string;
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
@@ -378,6 +422,8 @@ export interface WorkspaceAgentProfileBinding {
   interaction_mode: InteractionMode;
   /** Presentation only: no runtime restart when it changes. */
   process_visibility: ProcessVisibility;
+  /** Multi-task mode: sessions may delegate work to worker sessions. */
+  work_mode: import('./work-items.js').WorkMode;
   created_at: string;
   updated_at: string;
 }
@@ -409,6 +455,35 @@ export interface AgentProfileRuntimePolicy {
     mode: 'inherit' | 'custom' | 'disabled';
     ids: string[];
   };
+  /** Sub-agents (Agent tool). Absent when none of it is set. */
+  subagents?: AgentSubagentPolicy;
+}
+
+/** A sub-agent's own effort; it has no 'inherit' (null follows the CLI). */
+export type SubagentEffortLevel = Exclude<AgentEffortLevel, 'inherit'>;
+
+/**
+ * A user-defined sub-agent, passed to the SDK as an AgentDefinition. Its
+ * model names a model of the Agent's own connection: one Claude Code process
+ * talks to one endpoint, so a sub-agent cannot run on another connection.
+ */
+export interface AgentSubagentDefinition {
+  name: string;
+  description: string;
+  prompt: string;
+  /** Allowed tools; null inherits every tool of the main Agent. */
+  tools: string[] | null;
+  /** A model of the Agent's connection; null inherits. */
+  model: string | null;
+  effort: SubagentEffortLevel | null;
+}
+
+export interface AgentSubagentPolicy {
+  /** Default sub-agent model, of the Agent's connection; null follows the connection's role. */
+  model: string | null;
+  /** CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS (1–20); null keeps the CLI default. */
+  max_concurrent: number | null;
+  definitions: AgentSubagentDefinition[];
 }
 
 export interface AgentBuilderDefinition extends AgentProfilePrompts {
@@ -458,6 +533,12 @@ export interface NewMessage {
    * Derived when a message is listed or announced; never persisted.
    */
   has_trace?: boolean;
+  /**
+   * Set when an agent reply is announced that the server also sends as a Web
+   * Push (src/web-push.ts): a page on a subscribed device leaves the
+   * background notification to the push. Never persisted or listed.
+   */
+  web_push?: boolean;
   turn_id?: string | null;
   session_id?: string | null;
   sdk_message_uuid?: string | null;
@@ -739,7 +820,16 @@ export type AuthEventType =
   | 'recovery_reset'
   | 'register_success'
   | 'system_settings_updated'
-  | 'host_integration_updated';
+  | 'host_integration_updated'
+  | 'storage_source_saved'
+  | 'storage_source_deleted'
+  | 'mfa_enabled'
+  | 'mfa_disabled'
+  | 'mfa_reset'
+  | 'mfa_recovery_codes_regenerated'
+  | 'passkey_added'
+  | 'passkey_removed'
+  | 'passkeys_revoked';
 
 export interface AuthAuditLog {
   id: number;
@@ -784,6 +874,8 @@ export interface SubAgent {
     | 'team_router'
     /** Team mode: the session that does one work item. */
     | 'work_item'
+    /** The former implicit main session of a workspace, made a session by the v88 migration. */
+    | 'legacy_main'
     | null;
   /** automations.id when source_kind='automation'. */
   automation_id?: string | null;
@@ -1035,7 +1127,13 @@ export type WsMessageOut =
       userId: string;
       usage: BillingAccessResult;
     }
-  | { type: 'ws_error'; error: string; chatJid?: string }
+  | {
+      type: 'ws_error';
+      error: string;
+      chatJid?: string;
+      /** `session_required`: a workspace JID was sent without a session. */
+      code?: 'session_required';
+    }
   | { type: 'pong' }
   | {
       type: 'stream_snapshot';
@@ -1130,6 +1228,17 @@ export type WsMessageIn =
   | { type: 'terminal_input'; chatJid: string; data: string }
   | { type: 'terminal_resize'; chatJid: string; cols: number; rows: number }
   | { type: 'terminal_stop'; chatJid: string }
+  /**
+   * A page saying whether it is visible and which conversation it shows. Sent
+   * on every change and periodically while visible; Web Push uses it to stay
+   * quiet for a conversation the user is looking at.
+   */
+  | {
+      type: 'presence';
+      visible: boolean;
+      chatJid: string | null;
+      agentId: string | null;
+    }
   /** A page checking that its socket still reaches the server. */
   | { type: 'ping' };
 

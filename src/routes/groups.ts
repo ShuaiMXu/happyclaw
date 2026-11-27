@@ -21,8 +21,9 @@ import type {
   NewMessage,
   ProcessVisibility,
 } from '../types.js';
+import { DEFAULT_WORK_MODE, type WorkMode } from '../work-items.js';
 import { checkGroupLimit } from '../billing.js';
-import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
+import { DATA_DIR, isDockerAvailable } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
@@ -36,7 +37,7 @@ import {
   canDeleteGroup,
 } from '../group-acl.js';
 import { MAX_GROUP_NAME_LEN } from '../group-constants.js';
-import { realpathBestEffort } from '../utils.js';
+import { sessionActivityAt } from '../session-order.js';
 import {
   dirtyWorktreesConflict,
   findDirtySessionWorktrees,
@@ -70,8 +71,7 @@ import {
   getMessagesPage,
   getMessagesAfter,
   getLatestMessagePreviewPerChat,
-  getMessagesPageMulti,
-  getMessagesAfterMulti,
+  listConversationAgentsByJids,
   getAgent,
   listAgentsByJid,
   getGroupsByTargetAgent,
@@ -94,11 +94,11 @@ import {
   setWorkspaceInteractionMode,
   getWorkspaceProcessVisibility,
   setWorkspaceProcessVisibility,
+  getWorkspaceModes,
+  getWorkspaceWorkMode,
+  setWorkspaceWorkMode,
   getUserById,
-  getSessionModelSelectionDetail,
-  setSessionModelSelection,
   listActiveGuestGrantJids,
-  type SessionModelSelectionDetail,
 } from '../db.js';
 import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
@@ -108,32 +108,18 @@ import {
   withAgentProfileLocks,
   WorkspaceRuntimeQuiesceError,
 } from '../agent-profile-runtime.js';
+import { isAdminHostOnlyEffective } from '../deployment-mode.js';
 import {
   getContainerEnvConfig,
-  getProviders,
-  getSystemSettings,
-  providerHasCredentials,
   saveContainerEnvConfig,
   toPublicContainerEnvConfig,
 } from '../runtime-config.js';
-import { resolveAgentSdkEffort } from '../agent-effort.js';
-import { updateLiveSessionEffort } from '../codex-gateway/runner-tokens.js';
-import { maybeRefreshCodexProviderCatalog } from '../codex-gateway/model-catalog-sync.js';
-import { hasPermission } from '../permissions.js';
 import {
-  buildCodexSelectionView,
-  chatGptDefaultModel,
-  listConnectionModels,
-  readStoredChoice,
-  readStoredConnectionChoice,
-  resolveAgentLaunchModel,
-  validateSessionChoice,
-  type CodexSelectionView,
-} from '../session-model-overrides.js';
-import {
-  resolveModelBinding,
-  summarizeModelBinding,
-} from '../container-runner.js';
+  buildSessionModelOptions,
+  buildSessionModelSelectionView,
+  checkSessionModelChoice,
+  saveSessionModelChoice,
+} from '../session-model-service.js';
 import { clearTargetAgentBindingsForDeletedAgents } from '../im-context-isolation.js';
 import { notifyConversationContextCleared } from '../context-usage-events.js';
 import { readSessionContextUsage } from '../session-context-usage.js';
@@ -181,6 +167,23 @@ const execFileAsync = promisify(execFile);
  * persisted — a client-correctable conflict, never a server fault.
  */
 class WorkspaceAgentProfileMissingError extends Error {}
+
+/**
+ * 409 for a setting stored on the Workspace↔AgentProfile binding the
+ * workspace does not have.
+ */
+function agentProfileMissing(
+  c: Context,
+  setting: '回复模式' | '过程可见性' | '工作方式',
+) {
+  return c.json(
+    {
+      error: `该工作区未绑定智能体配置，因此无法修改${setting}。`,
+      code: 'WORKSPACE_AGENT_PROFILE_MISSING',
+    },
+    409,
+  );
+}
 class AdminHostOnlyModeConflictError extends Error {}
 
 /**
@@ -204,11 +207,10 @@ type RegisteredGroupWithJid = RegisteredGroup & { jid: string };
 /**
  * Resolve the workspace that owns execution for a physical message JID.
  *
- * Home's merged history keeps each message's physical IM chat_jid. Those IM
- * rows commonly retain container defaults even when the Home workspace is
- * host-mode, so authorization must follow the same binding/folder attribution
- * as message display and broadcasts. A declared but stale binding fails
- * closed: we cannot safely infer which workspace's execution policy applies.
+ * An IM chat row commonly retains container defaults even when the workspace
+ * it is bound to is host-mode, so authorization follows the same binding
+ * attribution as broadcasts. A declared but stale binding fails closed: we
+ * cannot safely infer which workspace's execution policy applies.
  */
 export function resolveMessageExecutionGroup(
   physicalJid: string,
@@ -226,61 +228,9 @@ export function resolveMessageExecutionGroup(
   if (boundJid) return getRegisteredGroup(boundJid) ?? null;
   if (hasBoundWorkspaceReference(physicalJid, attributionDeps)) return null;
 
-  for (const siblingJid of getJidsByFolder(physicalGroup.folder)) {
-    if (!siblingJid.startsWith('web:')) continue;
-    const sibling = getRegisteredGroup(siblingJid);
-    if (!sibling?.is_home) continue;
-    if (
-      physicalGroup.created_by &&
-      sibling.created_by !== physicalGroup.created_by
-    ) {
-      continue;
-    }
-    return sibling;
-  }
-
-  // Standalone legacy IM rows have no workspace projection. Preserve their
+  // Unbound legacy IM rows have no workspace projection. Preserve their
   // own access/execution contract rather than making historical data undeletable.
   return physicalGroup;
-}
-
-/**
- * The chat JIDs whose messages a workspace's history shows: the workspace
- * itself plus, for a home group, the IM chats of the same owner and folder.
- * An IM chat bound to another workspace must stay out: its folder/created_by
- * still point at the channel account's owner, so merging by folder + owner
- * alone would surface another workspace's conversation in the owner's Home
- * history.
- */
-export function resolveMessageQueryJids(
-  jid: string,
-  group: RegisteredGroupWithJid,
-): string[] {
-  const queryJids = [jid];
-  if (!group.is_home) return queryJids;
-  for (const siblingJid of getJidsByFolder(group.folder)) {
-    if (siblingJid === jid) continue;
-    const siblingGroup = getRegisteredGroup(siblingJid);
-    if (!siblingGroup) continue;
-    const ownerMatch =
-      group.created_by && siblingGroup.created_by === group.created_by;
-    if (!ownerMatch) continue;
-    const attributionDeps = {
-      getRegisteredGroup,
-      getAgent,
-      getJidsByFolder,
-      getChannelMount,
-    };
-    const boundJid = resolveBoundWorkspaceJid(siblingJid, attributionDeps);
-    if (
-      (boundJid && boundJid !== jid) ||
-      (!boundJid && hasBoundWorkspaceReference(siblingJid, attributionDeps))
-    ) {
-      continue;
-    }
-    queryJids.push(siblingJid);
-  }
-  return queryJids;
 }
 
 function normalizeGroupName(name: unknown): string {
@@ -294,7 +244,7 @@ interface WorkspaceDeleteBindingSummary {
     sessionName: string;
     imGroups: Array<{ jid: string; name: string }>;
   }>;
-  mainImGroups: Array<{ jid: string; name: string }>;
+  workspaceImGroups: Array<{ jid: string; name: string }>;
   threadContextBindings: Array<{
     jid: string;
     name: string;
@@ -320,7 +270,7 @@ function collectWorkspaceDeleteBindings(
     string,
     Map<string, { jid: string; name: string }>
   >();
-  const mainBindings = new Map<string, { jid: string; name: string }>();
+  const workspaceBindings = new Map<string, { jid: string; name: string }>();
 
   for (const mount of listChannelMountsByWorkspace(jid)) {
     const imGroup = getRegisteredGroup(mount.channel_jid);
@@ -333,7 +283,7 @@ function collectWorkspaceDeleteBindings(
       items.set(item.jid, item);
       sessionBindings.set(mount.session_id, items);
     } else {
-      mainBindings.set(item.jid, item);
+      workspaceBindings.set(item.jid, item);
     }
   }
 
@@ -346,12 +296,14 @@ function collectWorkspaceDeleteBindings(
     if (items.size > 0) sessionBindings.set(agent.id, items);
   }
 
-  const legacyMainJid = `web:${existing.folder}`;
-  const mainBoundByJid = getGroupsByTargetMainJid(jid);
-  const mainBoundByFolder =
-    legacyMainJid !== jid ? getGroupsByTargetMainJid(legacyMainJid) : [];
-  for (const linked of [...mainBoundByJid, ...mainBoundByFolder]) {
-    mainBindings.set(linked.jid, {
+  const legacyWorkspaceJid = `web:${existing.folder}`;
+  const workspaceBoundByJid = getGroupsByTargetMainJid(jid);
+  const workspaceBoundByFolder =
+    legacyWorkspaceJid !== jid
+      ? getGroupsByTargetMainJid(legacyWorkspaceJid)
+      : [];
+  for (const linked of [...workspaceBoundByJid, ...workspaceBoundByFolder]) {
+    workspaceBindings.set(linked.jid, {
       jid: linked.jid,
       name: linked.group.name,
     });
@@ -364,7 +316,7 @@ function collectWorkspaceDeleteBindings(
       imGroups: Array.from(imGroups.values()),
     }),
   );
-  const mainImGroups = Array.from(mainBindings.values());
+  const workspaceImGroups = Array.from(workspaceBindings.values());
   const threadContextBindings = listImContextBindingsByWorkspace(jid).map(
     (binding) => {
       const imGroup = getRegisteredGroup(binding.source_jid);
@@ -377,7 +329,7 @@ function collectWorkspaceDeleteBindings(
   );
   const mountedChannelJids = Array.from(
     new Set([
-      ...mainImGroups.map((item) => item.jid),
+      ...workspaceImGroups.map((item) => item.jid),
       ...boundSessions.flatMap((session) =>
         session.imGroups.map((item) => item.jid),
       ),
@@ -390,7 +342,7 @@ function collectWorkspaceDeleteBindings(
 
   return {
     boundSessions,
-    mainImGroups,
+    workspaceImGroups,
     threadContextBindings,
     mountedChannelJids,
     channelBindingCount: allChannelJids.size,
@@ -411,7 +363,7 @@ function workspaceDeleteImpactPayload(
       agentName: session.sessionName,
       imGroups: session.imGroups,
     })),
-    bound_main_im_groups: summary.mainImGroups,
+    bound_main_im_groups: summary.workspaceImGroups,
     bound_thread_contexts: summary.threadContextBindings,
   };
 }
@@ -428,6 +380,7 @@ interface GroupPayloadItem {
   execution_mode: 'container' | 'host';
   interaction_mode?: InteractionMode;
   process_visibility?: ProcessVisibility;
+  work_mode?: WorkMode;
   custom_cwd?: string;
   is_home?: boolean;
   is_my_home?: boolean;
@@ -472,8 +425,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
   for (const [jid, group] of Object.entries(groups)) {
     if (guestGrants) {
       // Guests see exactly the owner's workspaces they were granted
-      // (including a host-mode Home). IM rows are merged into their
-      // workspace's message view, so they are not listed separately.
+      // (including a host-mode Home), never IM rows.
       if (guestGrants.has(jid)) visibleEntries.push([jid, group]);
       continue;
     }
@@ -481,8 +433,8 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     const isWeb = jid.startsWith('web:');
     const isHost = isHostExecutionGroup(group);
 
-    // Hide IM channels that belong to a home folder.
-    // These are merged into the home conversation in UI and message APIs.
+    // Hide IM channels that belong to a home folder: a chat is not a
+    // workspace, it reaches one through its binding.
     if (!isWeb && !isHome && homeFolders.has(group.folder)) continue;
 
     // Hide other users' home groups from the chat sidebar.
@@ -501,9 +453,47 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     visibleEntries.push([jid, group]);
   }
 
+  // A workspace is as recent as its most recent session: the latest message
+  // over its sessions and their own activity. An IM row has its own chat.
+  const sessionsByWorkspace = listConversationAgentsByJids(
+    visibleEntries.map(([jid]) => jid).filter((jid) => jid.startsWith('web:')),
+  );
+  const sessionsOf = (jid: string) => sessionsByWorkspace.get(jid) ?? [];
+  const previewJids = visibleEntries.flatMap(([jid]) =>
+    jid.startsWith('web:')
+      ? sessionsOf(jid).map((s) => `${jid}#agent:${s.id}`)
+      : [jid],
+  );
   // 每个 jid 各取最新一条（分区窗口，不再被高频群吃光全局窗口）
-  const visibleJids = visibleEntries.map(([jid]) => jid);
-  const latestByJid = getLatestMessagePreviewPerChat(visibleJids);
+  const previewByJid = getLatestMessagePreviewPerChat(previewJids);
+  const later = (a: string | undefined, b: string | undefined) =>
+    !b || (!!a && Date.parse(a) > Date.parse(b)) ? a : b;
+  const latestOf = (jid: string): { content?: string; timestamp?: string } => {
+    if (!jid.startsWith('web:')) {
+      return (
+        previewByJid.get(jid) ?? {
+          timestamp: chats.get(jid)?.last_message_time,
+        }
+      );
+    }
+    let message: { content: string; timestamp: string } | undefined;
+    let activity: string | undefined;
+    for (const session of sessionsOf(jid)) {
+      const preview = previewByJid.get(`${jid}#agent:${session.id}`);
+      if (
+        preview &&
+        (!message ||
+          Date.parse(preview.timestamp) > Date.parse(message.timestamp))
+      ) {
+        message = preview;
+      }
+      activity = later(sessionActivityAt(session), activity);
+    }
+    return {
+      content: message?.content,
+      timestamp: later(message?.timestamp, activity),
+    };
+  };
 
   // Fetch user's pinned groups
   const pins = getUserPinnedGroups(user.id);
@@ -512,7 +502,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     const isHome = !!group.is_home;
     const isWeb = jid.startsWith('web:');
 
-    const latest = latestByJid.get(jid);
+    const latest = latestOf(jid);
     // 只读投影：列表 GET 不允许因为某个工作区绑定缺失而顺手开写事务修复
     // （那属于启动 backfill 和运行时解析的职责）。
     const agentProfile = isWeb
@@ -526,18 +516,11 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       kind: isHome ? 'home' : isWeb ? 'web' : 'feishu',
       editable: isWeb && !isGuest,
       deletable: isWeb && !isHome && !isGuest,
-      lastMessage: latest?.content,
-      lastMessageTime:
-        latest?.timestamp ||
-        chats.get(jid)?.last_message_time ||
-        group.added_at,
+      lastMessage: latest.content,
+      // A workspace without a session yet is as recent as its creation.
+      lastMessageTime: latest.timestamp || group.added_at,
       execution_mode: group.executionMode || 'container',
-      interaction_mode: isWeb
-        ? getWorkspaceInteractionMode(group.folder)
-        : undefined,
-      process_visibility: isWeb
-        ? getWorkspaceProcessVisibility(group.folder)
-        : undefined,
+      ...(isWeb ? getWorkspaceModes(group.folder) : {}),
       custom_cwd: isAdmin ? group.customCwd : undefined,
       is_home: isHome || undefined,
       is_my_home: (isHome && group.created_by === user.id) || undefined,
@@ -560,6 +543,18 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
 }
 
 import { removeFlowArtifacts } from '../file-manager.js';
+import {
+  assertRecordedWorkdirRemovable,
+  assignWorkspaceRootDirIfNew,
+  getRecordedWorkdirRecord,
+  releaseUnusedWorkdir,
+  UnsafeWorkdirError,
+  recordedWorkdirLogsDir,
+  getWorkspaceRootOccupancy,
+  workspaceDirOf,
+  workspacePathConflict,
+} from '../workspace-dir.js';
+import { getRootForNewWorkspaces } from '../workspace-root.js';
 import {
   getAutomationService,
   presentAutomationMessage,
@@ -590,32 +585,71 @@ class WorkspaceFilesystemRollbackError extends AggregateError {
 }
 
 /**
+ * Remove `dir` if it holds nothing but empty directories (what a rebuild
+ * creates); anything with a file in it is left alone.
+ */
+function removeEmptyTree(dir: string): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) return;
+    removeEmptyTree(path.join(dir, entry.name));
+  }
+  try {
+    fs.rmdirSync(dir);
+  } catch {
+    /* something appeared in it: leave it */
+  }
+}
+
+/**
  * Move destructive filesystem targets aside before touching SQLite. A handled
  * database failure can then restore the exact original directories instead of
  * returning 500 after files have already been permanently deleted.
  */
 function stageWorkspaceResetForGroup(folder: string): StagedWorkspaceReset {
   const suffix = `.rebuild-backup-${crypto.randomUUID()}`;
-  const groupDir = path.join(GROUPS_DIR, folder);
+  // A recorded directory is moved aside next to itself, in the workspace
+  // root, only after it passes the same check as a delete; its logs live in
+  // data/logs/<folder> instead of inside it.
+  const recordedWorkdir = getRecordedWorkdirRecord(folder);
+  if (recordedWorkdir) assertRecordedWorkdirRemovable(recordedWorkdir);
+  const groupDir = workspaceDirOf(folder);
   const sessionDir = path.join(DATA_DIR, 'sessions', folder);
   const ipcDir = path.join(DATA_DIR, 'ipc', folder);
   const legacyMemoryDir = path.join(DATA_DIR, 'memory', folder);
-  const targets = [groupDir, sessionDir, ipcDir, legacyMemoryDir].map(
-    (targetPath) => ({
-      targetPath,
-      backupPath: `${targetPath}${suffix}`,
-      moved: false,
-    }),
-  );
+  const logsDir = recordedWorkdir ? [recordedWorkdirLogsDir(folder)] : [];
+  const targets = [
+    groupDir,
+    sessionDir,
+    ipcDir,
+    legacyMemoryDir,
+    ...logsDir,
+  ].map((targetPath) => ({
+    targetPath,
+    backupPath: `${targetPath}${suffix}`,
+    existed: fs.existsSync(targetPath),
+    moved: false,
+  }));
 
+  // Only what this rebuild made goes: the fresh directory standing in for a
+  // moved original, or one it created where nothing was. An original that
+  // could not be moved (EACCES, EBUSY) is still in place and is never
+  // touched.
   const rollback = () => {
     const errors: unknown[] = [];
     for (const target of [...targets].reverse()) {
       try {
-        fs.rmSync(target.targetPath, { recursive: true, force: true });
         if (target.moved) {
+          fs.rmSync(target.targetPath, { recursive: true, force: true });
           fs.renameSync(target.backupPath, target.targetPath);
           target.moved = false;
+        } else if (!target.existed) {
+          removeEmptyTree(target.targetPath);
         }
       } catch (error) {
         errors.push(error);
@@ -696,6 +730,14 @@ async function discardFamilyWork(
   await Promise.all(jids.map((j) => queue.stopGroup(j, { force: true })));
 }
 
+function unsafeWorkdirConflict(err: UnsafeWorkdirError) {
+  return {
+    error: err.message,
+    code: 'WORKSPACE_DIR_UNSAFE',
+    reason: err.reason,
+  };
+}
+
 class DirtyWorktreesError extends Error {
   constructor(readonly dirty: DirtyWorktree[]) {
     super('Session worktrees have uncommitted changes');
@@ -764,43 +806,6 @@ async function releaseWorkspaceWorktrees(folder: string): Promise<void> {
   }
 }
 
-/**
- * Other Host workspaces of the same owner that already work in this exact
- * directory. Creation is not blocked: concurrent sessions are allowed, the
- * owner is only told their edits may collide.
- */
-function sharedCustomCwdWarnings(
-  ownerId: string,
-  customCwd: string | undefined,
-  excludeJid: string,
-): Array<{
-  code: 'shared_custom_cwd';
-  message: string;
-  workspaces: Array<{ jid: string; name: string }>;
-}> {
-  if (!customCwd) return [];
-  const target = realpathBestEffort(customCwd);
-  const workspaces = Object.entries(getAllRegisteredGroups())
-    .filter(
-      ([jid, group]) =>
-        jid !== excludeJid &&
-        jid.startsWith('web:') &&
-        group.created_by === ownerId &&
-        isHostExecutionGroup(group) &&
-        !!group.customCwd &&
-        realpathBestEffort(group.customCwd) === target,
-    )
-    .map(([jid, group]) => ({ jid, name: group.name }));
-  if (workspaces.length === 0) return [];
-  return [
-    {
-      code: 'shared_custom_cwd',
-      message: `工作区「${workspaces.map((w) => w.name).join('」「')}」已在使用这个目录。多个会话同时运行时改动可能互相覆盖；需要并行开发时，可以为会话开启独立 worktree。`,
-      workspaces,
-    },
-  ];
-}
-
 function toPublicContainerEnvForUser(
   config: ReturnType<typeof getContainerEnvConfig>,
   user: AuthUser,
@@ -826,8 +831,13 @@ groupRoutes.get('/', authMiddleware, (c) => {
   const groups = buildGroupsPayload(user);
   return c.json({
     groups,
-    admin_host_only_mode:
-      user.role === 'admin' && getSystemSettings().adminHostOnlyMode,
+    admin_host_only_mode: user.role === 'admin' && isAdminHostOnlyEffective(),
+    // Where a new Host workspace without a custom directory is created;
+    // null also when no root is usable (it goes to data/groups/<folder>).
+    workspace_root:
+      user.role === 'admin'
+        ? getRootForNewWorkspaces(getWorkspaceRootOccupancy())
+        : null,
   });
 });
 
@@ -868,7 +878,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   const adminHostOnlyMode =
     authUser.role === 'admin' &&
     authUser.status === 'active' &&
-    getSystemSettings().adminHostOnlyMode;
+    isAdminHostOnlyEffective();
   if (adminHostOnlyMode && validation.data.execution_mode === 'container') {
     return c.json(
       {
@@ -891,6 +901,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   // New workspaces show the activity of a proactive turn by default; existing
   // ones stay hidden until their owner opts in.
   const processVisibility = validation.data.process_visibility ?? 'activity';
+  const workMode = validation.data.work_mode ?? DEFAULT_WORK_MODE;
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
@@ -916,7 +927,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       return c.json(
         {
           error:
-            'Only an active administrator can mount host directories into a workspace',
+            'Only an active administrator can add additional mounts (host directories or storage sources) to a workspace',
           code: 'HOST_MOUNT_ADMIN_REQUIRED',
         },
         403,
@@ -925,7 +936,8 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     if (executionMode !== 'container') {
       return c.json(
         {
-          error: 'Host directory mounts are only valid for container mode',
+          error:
+            'Additional mounts (host directories and storage sources) are only valid for container mode',
           code: 'HOST_MOUNT_CONTAINER_ONLY',
         },
         400,
@@ -939,11 +951,20 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   if (requestedAdditionalMounts.length > 0) {
     try {
       validatedAdditionalMounts = validateAdditionalMountsStrict(
-        requestedAdditionalMounts.map((mount) => ({
-          hostPath: mount.host_path,
-          containerPath: mount.container_path,
-          readonly: mount.readonly,
-        })),
+        requestedAdditionalMounts.map((mount) =>
+          'source' in mount
+            ? {
+                source: mount.source,
+                ...(mount.sub_path ? { subPath: mount.sub_path } : {}),
+                containerPath: mount.container_path,
+                readonly: mount.readonly,
+              }
+            : {
+                hostPath: mount.host_path,
+                containerPath: mount.container_path,
+                readonly: mount.readonly,
+              },
+        ),
         name,
         false,
       );
@@ -1012,6 +1033,17 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       } catch {
         return c.json({ error: 'custom_cwd directory does not exist' }, 400);
       }
+      // Workspace roots hold other workspaces' directories: a custom
+      // directory inside one, or around one (like ~), would expose them.
+      const conflict = workspacePathConflict(realPath);
+      if (conflict) {
+        return c.json(
+          {
+            error: `custom_cwd 不能与工作区根目录或其他工作区的目录 ${conflict} 重叠。`,
+          },
+          400,
+        );
+      }
 
       // 白名单校验：检查路径是否在允许的根目录下，并过滤敏感路径
       // （与 init_source_path 对齐：之前缺少 matchesBlockedPattern，可把
@@ -1079,6 +1111,17 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     } catch {
       return c.json(
         { error: 'init_source_path directory does not exist' },
+        400,
+      );
+    }
+    // Copying from inside or around a workspace root copies other
+    // workspaces' files.
+    const sourceConflict = workspacePathConflict(realPath);
+    if (sourceConflict) {
+      return c.json(
+        {
+          error: `init_source_path 不能与工作区根目录或其他工作区的目录 ${sourceConflict} 重叠。`,
+        },
         400,
       );
     }
@@ -1205,7 +1248,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   // registered workspace or its Agent membership. This removes the rollback
   // race entirely: while clone/copy awaits, migration/delete routes cannot see
   // the workspace, and a failure has no DB membership to undo.
-  const groupDir = path.join(GROUPS_DIR, folder);
+  const groupDir = workspaceDirOf(folder);
   try {
     if (initSourcePath) {
       await fsp.mkdir(groupDir, { recursive: true });
@@ -1292,7 +1335,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
             group.executionMode !== 'host' &&
             currentOwner?.role === 'admin' &&
             currentOwner.status === 'active' &&
-            getSystemSettings().adminHostOnlyMode
+            isAdminHostOnlyEffective()
           ) {
             hostOnlyPolicyChangedDuringCreate = true;
             return undefined;
@@ -1308,7 +1351,11 @@ groupRoutes.post('/', authMiddleware, async (c) => {
               interactionMode,
               processVisibility,
             );
+            if (workMode !== DEFAULT_WORK_MODE) {
+              setWorkspaceWorkMode(folder, workMode);
+            }
             setRegisteredGroup(jid, group);
+            assignWorkspaceRootDirIfNew(jid, group);
             updateChatName(jid, name);
             deps.getRegisteredGroups()[jid] = group;
             return lockedProfile;
@@ -1323,24 +1370,12 @@ groupRoutes.post('/', authMiddleware, async (c) => {
             }
             deleteWorkspaceAgentProfile(folder);
             deleteChatHistory(jid);
+            releaseUnusedWorkdir(folder);
             delete deps.getRegisteredGroups()[jid];
             throw err;
           }
         });
-        // Hold the system policy lock through container prewarm. If host-only
-        // mode is enabled concurrently, its snapshot can only run after this
-        // workspace is fully published and will therefore quiesce the new
-        // container before committing the policy.
-        if (profile && executionMode === 'container') {
-          try {
-            deps.ensureTerminalContainerStarted(jid);
-          } catch (err) {
-            logger.warn(
-              { err, jid },
-              'Workspace created but container prewarm could not be started',
-            );
-          }
-        }
+        // A workspace has no runner of its own: its sessions start theirs.
         return profile;
       },
     );
@@ -1379,6 +1414,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     execution_mode: group.executionMode || 'container',
     interaction_mode: interactionMode,
     process_visibility: processVisibility,
+    work_mode: workMode,
     custom_cwd: isAdmin ? group.customCwd : undefined,
     is_my_home: undefined,
     can_modify: canModifyGroup(authUser, groupWithJid),
@@ -1397,7 +1433,6 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     success: true,
     jid,
     group: responseGroup,
-    warnings: sharedCustomCwdWarnings(authUser.id, group.customCwd, jid),
   });
 });
 
@@ -1425,6 +1460,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     execution_mode,
     interaction_mode,
     process_visibility,
+    work_mode,
   } = validation.data;
   const name = rawName ? normalizeGroupName(rawName) : undefined;
 
@@ -1435,7 +1471,8 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     activation_mode === undefined &&
     execution_mode === undefined &&
     interaction_mode === undefined &&
-    process_visibility === undefined
+    process_visibility === undefined &&
+    work_mode === undefined
   ) {
     return c.json({ error: 'No fields to update' }, 400);
   }
@@ -1459,7 +1496,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     execution_mode === 'container' &&
     authUser.role === 'admin' &&
     authUser.status === 'active' &&
-    getSystemSettings().adminHostOnlyMode
+    isAdminHostOnlyEffective()
   ) {
     return c.json(
       {
@@ -1477,7 +1514,8 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     activation_mode === undefined &&
     execution_mode === undefined &&
     interaction_mode === undefined &&
-    process_visibility === undefined;
+    process_visibility === undefined &&
+    work_mode === undefined;
   if (isPinOnly) {
     if (
       !canAccessGroup(
@@ -1521,6 +1559,9 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         403,
       );
     }
+    if (work_mode !== undefined && !jid.startsWith('web:')) {
+      return c.json({ error: 'Only web workspaces can change work mode' }, 403);
+    }
     // Session worktrees are host checkouts; a container run would put those
     // sessions back in the shared workspace directory.
     if (
@@ -1553,18 +1594,18 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   // unbound. Refuse up front: throwing inside commitUpdate would surface as a
   // 500 and, on the quiesce path, only after the runtime was already stopped.
   if (
-    (interaction_mode !== undefined || process_visibility !== undefined) &&
+    (interaction_mode !== undefined ||
+      process_visibility !== undefined ||
+      work_mode !== undefined) &&
     !getWorkspaceAgentProfileId(existing.folder)
   ) {
-    return c.json(
-      {
-        error:
-          interaction_mode !== undefined
-            ? '该工作区未绑定智能体配置，因此无法修改回复模式。'
-            : '该工作区未绑定智能体配置，因此无法修改过程可见性。',
-        code: 'WORKSPACE_AGENT_PROFILE_MISSING',
-      },
-      409,
+    return agentProfileMissing(
+      c,
+      interaction_mode !== undefined
+        ? '回复模式'
+        : process_visibility !== undefined
+          ? '过程可见性'
+          : '工作方式',
     );
   }
 
@@ -1595,7 +1636,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         execution_mode === 'container' &&
         authUser.role === 'admin' &&
         authUser.status === 'active' &&
-        getSystemSettings().adminHostOnlyMode
+        isAdminHostOnlyEffective()
       ) {
         throw new AdminHostOnlyModeConflictError();
       }
@@ -1636,7 +1677,6 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         // into a container, or an assistant/proactive transcript across output
         // authorities, after the old runner is stopped.
         deleteWorkspaceSessions(existing.folder);
-        delete deps.sessions[existing.folder];
       }
     };
 
@@ -1684,13 +1724,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         }
         if (err instanceof WorkspaceAgentProfileMissingError) {
           deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
-          return c.json(
-            {
-              error: '该工作区未绑定智能体配置，因此无法修改回复模式。',
-              code: 'WORKSPACE_AGENT_PROFILE_MISSING',
-            },
-            409,
-          );
+          return agentProfileMissing(c, '回复模式');
         }
         if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
         if (err.persisted) {
@@ -1724,13 +1758,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
           );
         }
         if (!(err instanceof WorkspaceAgentProfileMissingError)) throw err;
-        return c.json(
-          {
-            error: '该工作区未绑定智能体配置，因此无法修改回复模式。',
-            code: 'WORKSPACE_AGENT_PROFILE_MISSING',
-          },
-          409,
-        );
+        return agentProfileMissing(c, '回复模式');
       }
     }
   }
@@ -1743,13 +1771,26 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     process_visibility !== undefined &&
     !setWorkspaceProcessVisibility(existing.folder, process_visibility)
   ) {
-    return c.json(
-      {
-        error: '该工作区未绑定智能体配置，因此无法修改过程可见性。',
-        code: 'WORKSPACE_AGENT_PROFILE_MISSING',
-      },
-      409,
-    );
+    return agentProfileMissing(c, '过程可见性');
+  }
+
+  // The work mode decides the tools and prompt a session's runner starts
+  // with. Nothing running is interrupted: each warm runner of the workspace
+  // finishes its turn and retires, so the next turn starts under the new mode.
+  if (work_mode !== undefined) {
+    const changed = work_mode !== getWorkspaceWorkMode(existing.folder);
+    if (!setWorkspaceWorkMode(existing.folder, work_mode)) {
+      return agentProfileMissing(c, '工作方式');
+    }
+    if (changed) {
+      for (const runtimeJid of getWorkspaceRuntimeJids(
+        deps,
+        existing.folder,
+        jid,
+      )) {
+        deps.queue.retireRunnerAfterQuery(runtimeJid);
+      }
+    }
   }
 
   return c.json({
@@ -1757,6 +1798,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     pinned_at,
     interaction_mode: getWorkspaceInteractionMode(existing.folder),
     process_visibility: getWorkspaceProcessVisibility(existing.folder),
+    work_mode: getWorkspaceWorkMode(existing.folder),
   });
 });
 
@@ -2138,6 +2180,19 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
       confirmedWorktrees,
     );
     if (freshWorktreeBlock) return freshWorktreeBlock;
+    // A recorded directory is deleted only when it is exactly the one
+    // HappyClaw made; otherwise nothing at all is deleted.
+    const recordedWorkdir = getRecordedWorkdirRecord(freshExisting.folder);
+    if (recordedWorkdir) {
+      try {
+        assertRecordedWorkdirRemovable(recordedWorkdir);
+      } catch (err) {
+        if (err instanceof UnsafeWorkdirError) {
+          return c.json(unsafeWorkdirConflict(err), 409);
+        }
+        throw err;
+      }
+    }
 
     const channelUpdates: Array<{ jid: string; group: RegisteredGroup }> = [];
     deleteGroupData(jid, freshExisting.folder, {
@@ -2173,10 +2228,9 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     }
 
     delete registeredGroups[jid];
-    delete deps.getSessions()[freshExisting.folder];
     deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
 
-    removeFlowArtifacts(freshExisting.folder);
+    removeFlowArtifacts(freshExisting.folder, recordedWorkdir);
     await releaseWorkspaceWorktrees(freshExisting.folder);
 
     logger.info(
@@ -2299,7 +2353,7 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
 });
 
 // POST /api/groups/:jid/reset-session - 重置会话上下文
-// Optional body: { agentId?: string } — when provided, only reset that agent's session
+// Body: { agentId: string } — the session to reset
 groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   const deps = getWebDeps();
   if (!deps) return c.json({ error: 'Server not initialized' }, 500);
@@ -2320,38 +2374,20 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     );
   }
 
-  // Read optional agentId from request body
-  let agentId: string | undefined;
-  try {
-    const body = await c.req.json().catch(() => ({}));
-    if (body && typeof body.agentId === 'string' && body.agentId) {
-      agentId = body.agentId;
-    }
-  } catch {
-    /* no body or invalid JSON — treat as main session reset */
+  const body = (await c.req.json().catch(() => ({}))) as { agentId?: unknown };
+  const agentId =
+    typeof body?.agentId === 'string' && body.agentId ? body.agentId : null;
+  if (!agentId) {
+    return c.json({ error: 'Session required', code: 'session_required' }, 400);
+  }
+  const agent = getAgent(agentId);
+  if (!agent || agent.chat_jid !== jid) {
+    return c.json({ error: 'Agent not found' }, 404);
   }
 
-  // Validate agentId belongs to this group
-  if (agentId) {
-    const agent = getAgent(agentId);
-    if (!agent || agent.chat_jid !== jid) {
-      return c.json({ error: 'Agent not found' }, 404);
-    }
-  }
-
-  // 1. Stop running processes
+  // 1. Stop the session's runner
   try {
-    if (agentId) {
-      // Agent-specific: only stop the agent's virtual JID process
-      const virtualJid = `${jid}#agent:${agentId}`;
-      await deps.queue.stopGroup(virtualJid, { force: true });
-    } else {
-      // Main session: stop ALL processes for this folder
-      const siblingJids = getJidsByFolder(group.folder);
-      await Promise.all(
-        siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })),
-      );
-    }
+    await deps.queue.stopGroup(`${jid}#agent:${agentId}`, { force: true });
   } catch (err) {
     logger.error(
       { jid, agentId, err },
@@ -2381,10 +2417,7 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   try {
     deleteSession(group.folder, agentId);
     clearSessionChannelOwner(group.folder, agentId);
-    if (!agentId) {
-      delete deps.getSessions()[group.folder];
-    }
-    notifyConversationContextCleared(group.folder, agentId ?? null);
+    notifyConversationContextCleared(group.folder, agentId);
   } catch (err) {
     logger.error(
       { jid, folder: group.folder, agentId, err },
@@ -2397,7 +2430,7 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   }
 
   // 4. Insert system divider message into the correct JID (best-effort).
-  const targetJid = agentId ? `${jid}#agent:${agentId}` : jid;
+  const targetJid = `${jid}#agent:${agentId}`;
   const dividerMessageId = crypto.randomUUID();
   const timestamp = new Date().toISOString();
   try {
@@ -2458,15 +2491,19 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
 // Agent's model configuration (and model), else the global default, else the
 // automatic pool of enabled configurations.
 
+type ModelChoiceWorkspaceScope =
+  | { error: Response }
+  | { group: RegisteredGroup };
+
 type SessionModelSelectionScope =
   | { error: Response }
-  | { group: RegisteredGroup; agentId: string | null };
+  | { group: RegisteredGroup; agentId: string };
 
-function resolveSessionModelSelectionScope(
+/** The workspace a model choice is read or made in, and the caller's right to. */
+function resolveModelChoiceWorkspace(
   c: Context<{ Variables: Variables }>,
-  agentIdInput: string | null | undefined,
   requireModify: boolean,
-): SessionModelSelectionScope {
+): ModelChoiceWorkspaceScope {
   const jid = c.req.param('jid');
   const group = jid ? getRegisteredGroup(jid) : undefined;
   if (!jid || !group) {
@@ -2493,218 +2530,40 @@ function resolveSessionModelSelectionScope(
       ),
     };
   }
-  const agentId = agentIdInput || null;
-  if (agentId) {
-    const agent = getAgent(agentId);
-    if (!agent || agent.chat_jid !== jid) {
-      return { error: c.json({ error: 'Agent not found' }, 404) };
-    }
-  }
-  return { group, agentId };
+  return { group };
 }
 
-/**
- * The model a pick without a model runs on `provider`: the Agent's, when the
- * pick is on the Agent's own connection and it still offers that model.
- */
-function agentModelOn(
-  provider: ReturnType<typeof getProviders>[number],
-  profile: { model_config_id: string | null; model: string | null } | undefined,
-  groupFolder: string,
-): string | undefined {
-  if (profile?.model_config_id !== provider.id) return undefined;
-  return resolveAgentLaunchModel(provider, profile.model, {
-    groupFolder,
-    warn: false,
-  });
-}
-
-function buildSessionModelSelectionPayload(
-  group: RegisteredGroup,
-  agentId: string | null,
-  chooser: AuthUser,
-) {
-  const providers = getProviders();
-  const exists = (id: string | null | undefined): id is string =>
-    !!id && providers.some((provider) => provider.id === id);
-  const stored = getSessionModelSelectionDetail(group.folder, agentId);
-  const profile = peekAgentProfileForWorkspace(group.folder, group.created_by);
-  const canExceedCeiling = hasPermission(chooser, 'manage_system_config');
-  const agentEffort = resolveAgentSdkEffort(profile?.runtime_policy);
-
-  // What a conversation that picked nothing runs on, resolved exactly as a
-  // launch resolves it.
-  const binding = resolveModelBinding(
-    { modelConfigId: profile?.model_config_id, model: profile?.model },
-    { groupFolder: group.folder, agentId },
-    { includeSession: false },
-  );
-  const summary = summarizeModelBinding(
-    binding,
-    group.folder,
-    agentId,
-    agentEffort,
-  );
-
-  const codexViews = new Map<string, CodexSelectionView>();
-  const options = providers.map((provider) => {
-    const option = {
-      id: provider.id,
-      name: provider.name,
-      kind: provider.codexOAuthCredentials ? ('codex' as const) : provider.type,
-      model: provider.anthropicModel,
-      // A configuration without a credential (e.g. an old copy that lost its
-      // key) would fail every turn; the picker shows it but cannot pick it.
-      usable: providerHasCredentials(provider),
+function resolveSessionModelSelectionScope(
+  c: Context<{ Variables: Variables }>,
+  agentIdInput: string | null | undefined,
+  requireModify: boolean,
+): SessionModelSelectionScope {
+  const workspace = resolveModelChoiceWorkspace(c, requireModify);
+  if ('error' in workspace) return workspace;
+  // A model pick belongs to a session; a workspace has none.
+  if (!agentIdInput) {
+    return {
+      error: c.json(
+        { error: 'Session required', code: 'session_required' },
+        400,
+      ),
     };
-    if (!provider.codexOAuthCredentials) {
-      return { ...option, models: listConnectionModels(provider) };
-    }
-    // The list is the account's own once its catalog has been fetched; ask for
-    // a fresher one without making the picker wait for it.
-    maybeRefreshCodexProviderCatalog(provider.id, {
-      accountId: provider.codexOAuthCredentials.accountId,
-    });
-    const codex = buildCodexSelectionView(provider, {
-      canExceedCeiling,
-      agentEffort,
-    });
-    codexViews.set(provider.id, codex);
-    return { ...option, codex };
-  });
+  }
+  const agent = getAgent(agentIdInput);
+  if (!agent || agent.chat_jid !== c.req.param('jid')) {
+    return { error: c.json({ error: 'Agent not found' }, 404) };
+  }
+  return { group: workspace.group, agentId: agentIdInput };
+}
 
-  const selectedModelConfigId = exists(stored?.modelConfigId)
-    ? stored.modelConfigId
-    : null;
-  const view = selectedModelConfigId
-    ? codexViews.get(selectedModelConfigId)
-    : undefined;
-  const selectedProvider = providers.find(
-    (provider) => provider.id === selectedModelConfigId,
+// GET /api/groups/:jid/model-options - 会话可选的模型（还没有会话时，例如新建会话）
+groupRoutes.get('/:jid/model-options', authMiddleware, (c) => {
+  const workspace = resolveModelChoiceWorkspace(c, false);
+  if ('error' in workspace) return workspace.error;
+  return c.json(
+    buildSessionModelOptions(workspace.group, c.get('user') as AuthUser),
   );
-  // A stored model or effort the list, the catalog or the chooser's permission
-  // no longer backs reads as unset, exactly as a runner launch would treat it.
-  const selected =
-    stored && view
-      ? readStoredChoice(view, stored, canExceedCeiling)
-      : stored && selectedProvider
-        ? readStoredConnectionChoice(
-            selectedProvider,
-            stored,
-            agentModelOn(selectedProvider, profile, group.folder),
-          )
-        : { model: null, effort: null };
-
-  // A ChatGPT default runs at the effort its gateway resolves: the Agent's,
-  // else the one inherited with the connection.
-  const defaultCodexView = summary.provider?.codexOAuthCredentials
-    ? !agentEffort && binding.inheritedEffort
-      ? buildCodexSelectionView(summary.provider, {
-          canExceedCeiling,
-          agentEffort: binding.inheritedEffort,
-        })
-      : codexViews.get(summary.provider.id)
-    : undefined;
-
-  return {
-    selectedModelConfigId,
-    selectedModel: selected.model,
-    selectedEffort: selected.effort,
-    default: {
-      source: summary.source,
-      modelConfigId: summary.modelConfigId,
-      // A set binding whose connection is gone: runs fail until it is fixed.
-      connectionMissing: summary.connectionMissing,
-      model: summary.model,
-      effort: defaultCodexView
-        ? (defaultCodexView.models.find(
-            (entry) => entry.value === summary.model,
-          )?.defaultEffort ?? defaultCodexView.defaultEffort)
-        : summary.effort,
-    },
-    options,
-  };
-}
-
-/**
- * What the runners of a conversation must do about a change of its choice.
- *
- * A different configuration or model starts a new SDK session on the next
- * message, so the warm runner is retired (one already on the chosen
- * configuration is spared only when no model is involved: neither choice
- * names one, and a conversation that had picked nothing did not run the
- * Agent's). A different effort on a ChatGPT subscription needs no restart at
- * all: the gateway reads it per request, so the live runners of the chosen
- * configuration are pointed at it and keep running. Elsewhere Claude Code
- * takes its effort at start, so the runner is retired but the SDK session
- * kept. Choosing nothing new does nothing.
- */
-function applySessionChoiceChange(
-  deps: NonNullable<ReturnType<typeof getWebDeps>>,
-  group: RegisteredGroup,
-  agentId: string | null,
-  jid: string,
-  previous: SessionModelSelectionDetail | null,
-  next: {
-    modelConfigId: string | null;
-    model: string | null;
-    effort: string | null;
-  },
-): { drained: number; liveUpdated: number } {
-  const providers = getProviders();
-  const profile = peekAgentProfileForWorkspace(group.folder, group.created_by);
-  // The model a configuration actually runs: its pick, else the Agent's on
-  // the Agent's own connection, else the connection's own.
-  const launchKey = (
-    choice: { modelConfigId: string | null; model: string | null } | null,
-  ): string => {
-    if (!choice?.modelConfigId) return '';
-    const provider = providers.find((item) => item.id === choice.modelConfigId);
-    const agentModel = provider
-      ? agentModelOn(provider, profile, group.folder)
-      : undefined;
-    const model = !provider
-      ? ''
-      : provider.codexOAuthCredentials
-        ? (choice.model ?? agentModel ?? chatGptDefaultModel(provider))
-        : (choice.model ?? agentModel ?? provider.anthropicModel);
-    return `${choice.modelConfigId}\u0000${model}`;
-  };
-  const jids = agentId
-    ? [`${jid}#agent:${agentId}`]
-    : getJidsByFolder(group.folder);
-  const effortChanged = (previous?.effort ?? null) !== next.effort;
-  let drained = 0;
-  if (launchKey(previous) !== launchKey(next)) {
-    const ranAgentModel =
-      !previous && !!profile?.model_config_id && !!profile.model;
-    const target =
-      previous?.model || next.model || ranAgentModel
-        ? null
-        : next.modelConfigId;
-    drained = deps.queue.drainRunnersForModelSelection(jids, target);
-  } else if (
-    effortChanged &&
-    !providers.find((item) => item.id === next.modelConfigId)
-      ?.codexOAuthCredentials
-  ) {
-    // Claude Code reads its effort when the runner starts: a new one takes
-    // a new runner, on the same SDK session (the model did not change).
-    drained = deps.queue.drainRunnersForModelSelection(jids, null);
-  }
-  let liveUpdated = 0;
-  if (effortChanged) {
-    liveUpdated = updateLiveSessionEffort(
-      {
-        groupFolder: group.folder,
-        sessionAgentId: agentId,
-        providerId: next.modelConfigId ?? undefined,
-      },
-      next.effort ?? undefined,
-    );
-  }
-  return { drained, liveUpdated };
-}
+});
 
 // GET /api/groups/:jid/model-selection?agentId= - 读取会话模型选择
 groupRoutes.get('/:jid/model-selection', authMiddleware, (c) => {
@@ -2715,7 +2574,7 @@ groupRoutes.get('/:jid/model-selection', authMiddleware, (c) => {
   );
   if ('error' in scope) return scope.error;
   return c.json(
-    buildSessionModelSelectionPayload(
+    buildSessionModelSelectionView(
       scope.group,
       scope.agentId,
       c.get('user') as AuthUser,
@@ -2750,63 +2609,26 @@ groupRoutes.put('/:jid/model-selection', authMiddleware, async (c) => {
   if ('error' in scope) return scope.error;
   const { group, agentId } = scope;
   const authUser = c.get('user') as AuthUser;
-  const modelConfigId = parsed.data.modelConfigId;
-  const requestedModel = parsed.data.model || null;
-  const requestedEffort = parsed.data.effort || null;
-  let model: string | null = null;
-  let effort: string | null = null;
-  if (modelConfigId) {
-    const target = getProviders().find(
-      (provider) => provider.id === modelConfigId,
-    );
-    if (!target) return c.json({ error: '模型配置不存在' }, 404);
-    if (!providerHasCredentials(target)) {
-      return c.json(
-        { error: '该模型配置缺少凭据，请先在模型配置中补全密钥或完成授权' },
-        400,
-      );
-    }
-    if (requestedModel || requestedEffort) {
-      const checked = validateSessionChoice(
-        target,
-        { model: requestedModel, effort: requestedEffort },
-        authUser,
-        agentModelOn(
-          target,
-          peekAgentProfileForWorkspace(group.folder, group.created_by),
-          group.folder,
-        ),
-      );
-      if (!checked.ok) return c.json(checked.rejection, 400);
-      ({ model, effort } = checked);
-    }
-  } else if (requestedModel || requestedEffort) {
+  const checked = checkSessionModelChoice(group, parsed.data, authUser);
+  if (!checked.ok) {
     return c.json(
-      {
-        error: '选择模型或推理档位时需要同时指定模型配置',
-        code: 'MODEL_CONFIG_REQUIRED',
-      },
-      400,
+      checked.rejection,
+      checked.rejection.code === 'MODEL_CONFIG_NOT_FOUND' ? 404 : 400,
     );
   }
+  const { modelConfigId, model, effort } = checked.choice;
 
   const jid = c.req.param('jid');
-  const previous = getSessionModelSelectionDetail(group.folder, agentId);
-  setSessionModelSelection(group.folder, agentId, modelConfigId, authUser.id, {
-    model,
-    effort,
-  });
-
   // A warm runner keeps the provider environment it was spawned with; retire
   // it so the next message of this conversation starts on the new selection.
-  const { drained, liveUpdated } = applySessionChoiceChange(
-    deps,
+  const { previous, drained, liveUpdated } = saveSessionModelChoice({
     group,
+    workspaceJid: jid,
     agentId,
-    jid,
-    previous,
-    { modelConfigId, model, effort },
-  );
+    choice: checked.choice,
+    updatedBy: authUser.id,
+    runners: deps.queue,
+  });
   logger.info(
     {
       jid,
@@ -2822,7 +2644,7 @@ groupRoutes.put('/:jid/model-selection', authMiddleware, async (c) => {
     'Session model selection updated',
   );
   return c.json({
-    ...buildSessionModelSelectionPayload(group, agentId, authUser),
+    ...buildSessionModelSelectionView(group, agentId, authUser),
     drained,
     liveUpdated,
   });
@@ -2896,6 +2718,9 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
       confirmedWorktrees,
     );
     if (dirty.length > 0) throw new DirtyWorktreesError(dirty);
+    // Refuse before any queued work is dropped; staging checks again.
+    const recordedWorkdir = getRecordedWorkdirRecord(group.folder);
+    if (recordedWorkdir) assertRecordedWorkdirRemovable(recordedWorkdir);
     // The rebuild goes ahead: work queued before it is dropped; work that
     // arrives during it stays parked and runs against the fresh workspace.
     await discardFamilyWork(deps.queue, stopJids);
@@ -2930,7 +2755,6 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
     // refresh failure must not turn a successfully committed rebuild into a
     // misleading 500 response: the authoritative state is already in SQLite.
     try {
-      delete deps.getSessions()[group.folder];
       for (const siblingJid of siblingJids) {
         deps.setLastAgentTimestamp(siblingJid, { timestamp: '', id: '' });
       }
@@ -2980,6 +2804,9 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
     }
     if (err instanceof DirtyWorktreesError && !rollbackError) {
       return c.json(dirtyWorktreesConflict(err.dirty), 409);
+    }
+    if (err instanceof UnsafeWorkdirError && !rollbackError) {
+      return c.json(unsafeWorkdirConflict(err), 409);
     }
     logger.error(
       {
@@ -3071,111 +2898,42 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
     200,
   );
 
-  // Agent conversation: query messages from the virtual chat_jid
-  if (agentIdParam) {
-    const agent = getAgent(agentIdParam);
-    if (!agent || agent.chat_jid !== jid) {
-      return c.json({ error: 'Agent not found' }, 404);
-    }
-
-    const virtualJid = `${jid}#agent:${agentIdParam}`;
-    const agentExposure = resolveTurnTraceExposure(group.folder, {
-      agentKind: agent.kind,
-    });
-    if (afterSequence !== undefined || after) {
-      const messages = await presentWebMessages(
-        markMessagesWithTrace(
-          attachSessionWorkflowRuns(
-            getMessagesAfter(virtualJid, after, limit, afterSequence),
-            { groupFolder: group.folder, agentId: agentIdParam },
-          ),
-          agentExposure,
-        ),
-        authUser,
-      );
-      return c.json({ messages });
-    }
-    const rows = getMessagesPage(virtualJid, before, limit + 1, beforeSequence);
-    const hasMore = rows.length > limit;
-    const messages = await presentWebMessages(
-      markMessagesWithTrace(
-        attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
-          groupFolder: group.folder,
-          agentId: agentIdParam,
-        }),
-        agentExposure,
-      ),
-      authUser,
-    );
-    return c.json({ messages, hasMore });
+  // A session's history lives under its own address; the workspace JID is
+  // no session.
+  if (!agentIdParam) {
+    return c.json({ error: 'Session required', code: 'session_required' }, 400);
+  }
+  const agent = getAgent(agentIdParam);
+  if (!agent || agent.chat_jid !== jid) {
+    return c.json({ error: 'Agent not found' }, 404);
   }
 
-  // is_home 群组合并查询：将同一 owner、同 folder 下的 Web 与 IM 消息合并展示。
-  const queryJids = resolveMessageQueryJids(jid, group);
-
-  // A turn's stored thinking/trace follows the workspace's current contract
-  // (a proactive workspace set to `hidden` lists only the turns whose progress
-  // statements it shows).
-  const exposure = resolveTurnTraceExposure(group.folder);
-
-  if (queryJids.length === 1) {
-    // 单 JID 走原路径
-    if (afterSequence !== undefined || after) {
-      const messages = await presentWebMessages(
-        markMessagesWithTrace(
-          attachSessionWorkflowRuns(
-            getMessagesAfter(jid, after, limit, afterSequence),
-            { groupFolder: group.folder, agentId: null },
-          ),
-          exposure,
-        ),
-        authUser,
-      );
-      return c.json({ messages });
-    }
-    const rows = getMessagesPage(jid, before, limit + 1, beforeSequence);
-    const hasMore = rows.length > limit;
-    const messages = await presentWebMessages(
-      markMessagesWithTrace(
-        attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
-          groupFolder: group.folder,
-          agentId: null,
-        }),
-        exposure,
-      ),
-      authUser,
-    );
-    return c.json({ messages, hasMore });
-  }
-
-  // 多 JID 合并查询
+  const virtualJid = `${jid}#agent:${agentIdParam}`;
+  const agentExposure = resolveTurnTraceExposure(group.folder, {
+    agentKind: agent.kind,
+  });
   if (afterSequence !== undefined || after) {
     const messages = await presentWebMessages(
       markMessagesWithTrace(
         attachSessionWorkflowRuns(
-          getMessagesAfterMulti(queryJids, after, limit, afterSequence),
-          { groupFolder: group.folder, agentId: null },
+          getMessagesAfter(virtualJid, after, limit, afterSequence),
+          { groupFolder: group.folder, agentId: agentIdParam },
         ),
-        exposure,
+        agentExposure,
       ),
       authUser,
     );
     return c.json({ messages });
   }
-  const rows = getMessagesPageMulti(
-    queryJids,
-    before,
-    limit + 1,
-    beforeSequence,
-  );
+  const rows = getMessagesPage(virtualJid, before, limit + 1, beforeSequence);
   const hasMore = rows.length > limit;
   const messages = await presentWebMessages(
     markMessagesWithTrace(
       attachSessionWorkflowRuns(hasMore ? rows.slice(0, limit) : rows, {
         groupFolder: group.folder,
-        agentId: null,
+        agentId: agentIdParam,
       }),
-      exposure,
+      agentExposure,
     ),
     authUser,
   );
@@ -3317,10 +3075,11 @@ groupRoutes.get(
     );
     if (!original) return c.json({ error: 'Attachment not found' }, 404);
 
-    // Same cache posture as the message list: originals are per-user content,
-    // so keep them out of shared caches while still allowing the viewer to
-    // reuse one within the session.
-    c.header('Cache-Control', 'private, max-age=300');
+    // Originals are per-user content, so keep them out of shared caches.
+    // A message's attachment never changes once stored, so the browser may
+    // keep it for good: reopening the viewer must not re-fetch over the slow
+    // public path (VPS + frp).
+    c.header('Cache-Control', 'private, max-age=31536000, immutable');
     c.header('Content-Type', original.mimeType);
     return c.body(
       original.buffer.buffer.slice(

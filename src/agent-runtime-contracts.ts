@@ -38,6 +38,12 @@ export interface ContainerOutput {
   providerQuotaObservation?: ProviderQuotaObservation;
   providerRateLimitResetsAt?: number;
   providerFailureNotice?: string;
+  /**
+   * The upstream's own words for a provider failure (Claude Code's
+   * `API Error: …` text), capped. The host reads a gateway's usage-limit
+   * wording from it; it is never shown as is.
+   */
+  providerErrorText?: string;
   providerRateLimitScope?: 'account' | 'model';
   providerRateLimitModel?: string;
   providerFailureClass?: 'account' | 'transient' | 'config';
@@ -58,6 +64,9 @@ export interface ContainerOutput {
   sourceKind?: Exclude<MessageSourceKind, 'user_command'>;
   finalizationReason?: 'completed' | 'interrupted' | 'error' | 'truncated';
   pendingBgTasks?: number;
+  /** Liveness only, from a Runner holding its result for background work:
+   * the idle close starts over and nothing else happens. */
+  backgroundHoldKeepalive?: true;
   inputTurnCompleted?: boolean;
   queryIdle?: boolean;
   ipcReceipts?: RuntimeIpcReceipt[];

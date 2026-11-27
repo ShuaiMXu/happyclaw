@@ -38,8 +38,10 @@ const web = await import('../src/web.js');
 const db = await import('../src/db.js');
 const auth = await import('../src/auth.js');
 const acl = await import('../src/group-acl.js');
+const guestAccess = await import('../src/guest-access.js');
 const { SESSION_COOKIE_NAME_PLAIN } = await import('../src/config.js');
-const { invalidateUserSessions } = await import('../src/web-context.js');
+const { invalidateUserSessions, wsClients } =
+  await import('../src/web-context.js');
 const automationRoutes = await import('../src/routes/automations.js');
 const { createAutomationCore } = await import('../src/automation-service.js');
 const { insertSessionWorktree } =
@@ -57,6 +59,10 @@ const UNGRANTED = 'web:flow-y';
 const FOREIGN = 'web:flow-z';
 const GUEST_PASSWORD = 'guest-pass-123';
 const WORKTREE_SESSION = 'wt-session';
+/** Each workspace's session; a workspace has no history of its own. */
+const sessionOf = (jid: string) => `${jid.slice(4)}-session`;
+const messagesOf = (jid: string) =>
+  `/api/groups/${jid}/messages?agentId=${sessionOf(jid)}`;
 const automations = harness.createFakeRuntime();
 const automationCore = createAutomationCore(automations.deps);
 const automationIds: Record<string, string> = {};
@@ -171,6 +177,28 @@ beforeAll(async () => {
   workspace(GRANTED, OWNER);
   workspace(UNGRANTED, OWNER);
   workspace(FOREIGN, OTHER);
+  for (const [jid, owner] of [
+    [HOME, OWNER],
+    [GRANTED, OWNER],
+    [UNGRANTED, OWNER],
+    [FOREIGN, OTHER],
+  ] as const) {
+    db.createAgent({
+      id: sessionOf(jid),
+      group_folder: jid.slice(4),
+      chat_jid: jid,
+      name: 'Session',
+      prompt: '',
+      status: 'idle',
+      kind: 'conversation',
+      created_by: owner,
+      created_at: new Date().toISOString(),
+      completed_at: null,
+      result_summary: null,
+      last_im_jid: null,
+      spawned_from_jid: null,
+    } as any);
+  }
   ownerCookie = mintCookie(OWNER);
   otherCookie = mintCookie(OTHER);
 
@@ -360,6 +388,14 @@ describe('guest guard: default deny', () => {
     ['POST', '/api/bug-report/submit'],
     ['PUT', '/api/auth/profile'],
     ['POST', '/api/auth/avatar'],
+    ['POST', '/api/auth/2fa/setup'],
+    ['POST', '/api/auth/2fa/enable'],
+    ['POST', '/api/auth/2fa/disable'],
+    ['POST', '/api/auth/2fa/recovery-codes'],
+    ['POST', '/api/auth/passkeys/options'],
+    ['POST', '/api/auth/passkeys'],
+    ['PATCH', '/api/auth/passkeys/c1'],
+    ['POST', '/api/auth/passkeys/c1/delete'],
     ['PUT', '/api/config/system'],
     ['POST', '/api/guests'],
     ['POST', '/api/admin/users'],
@@ -374,10 +410,10 @@ describe('guest guard: default deny', () => {
     `/api/groups/${GRANTED}/env`,
     `/api/groups/${GRANTED}/mcp`,
     `/api/groups/${GRANTED}/model-selection`,
+    `/api/groups/${GRANTED}/model-options`,
     `/api/groups/${GRANTED}/context-usage`,
     `/api/groups/${GRANTED}/git/status`,
     `/api/groups/${GRANTED}/git/diff?path=notes.txt`,
-    `/api/groups/${GRANTED}/workdir/peers`,
     `/api/groups/${GRANTED}/im-groups`,
     `/api/groups/${GRANTED}/delete-impact`,
     `/api/workspaces/${GRANTED}/channel-mounts`,
@@ -397,10 +433,34 @@ describe('guest guard: default deny', () => {
     '/api/browse/directories',
     '/api/guests',
     '/api/admin/users',
+    '/api/auth/2fa',
+    '/api/auth/passkeys',
   ];
   test.each(reads)('GET %s → 403', async (url) => {
     const res = await call(guestCookie, 'GET', url);
     expect(res.status).toBe(403);
+  });
+
+  test("an unbound IM chat of the granted Home folder is not the Home's to show", () => {
+    const imJid = 'feishu:oc_unbound_in_home';
+    db.setRegisteredGroup(imJid, {
+      name: 'Unbound chat',
+      folder: HOME.slice(4),
+      added_at: new Date().toISOString(),
+      created_by: OWNER,
+    } as any);
+    try {
+      const principal = { id: guestId, role: 'guest' as const };
+      const chat = db.getRegisteredGroup(imJid)!;
+      expect(guestAccess.resolveViewWorkspace(chat)).toBeNull();
+      expect(guestAccess.canViewGroup(principal, chat)).toBe(false);
+      // The Home itself stays visible.
+      expect(
+        guestAccess.canViewGroup(principal, db.getRegisteredGroup(HOME)!),
+      ).toBe(true);
+    } finally {
+      db.deleteRegisteredGroup(imJid);
+    }
   });
 
   test('owner-only predicates stay false for the guest', () => {
@@ -432,9 +492,9 @@ describe('guest reads: granted only', () => {
 
   test('history, sessions and queue of granted (incl. host Home)', async () => {
     for (const jid of [GRANTED, HOME]) {
-      expect(
-        (await call(guestCookie, 'GET', `/api/groups/${jid}/messages`)).status,
-      ).toBe(200);
+      expect((await call(guestCookie, 'GET', messagesOf(jid))).status).toBe(
+        200,
+      );
       expect(
         (await call(guestCookie, 'GET', `/api/groups/${jid}/sessions`)).status,
       ).toBe(200);
@@ -661,17 +721,15 @@ describe('guest reads: granted only', () => {
       workspace_jids: [HOME, GRANTED, UNGRANTED],
     });
     expect(patch.status).toBe(200);
-    expect(
-      (await call(guestCookie, 'GET', `/api/groups/${UNGRANTED}/messages`))
-        .status,
-    ).toBe(200);
+    expect((await call(guestCookie, 'GET', messagesOf(UNGRANTED))).status).toBe(
+      200,
+    );
     await call(ownerCookie, 'PATCH', `/api/guests/${guestId}`, {
       workspace_jids: [HOME, GRANTED],
     });
-    expect(
-      (await call(guestCookie, 'GET', `/api/groups/${UNGRANTED}/messages`))
-        .status,
-    ).toBe(404);
+    expect((await call(guestCookie, 'GET', messagesOf(UNGRANTED))).status).toBe(
+      404,
+    );
   });
 });
 
@@ -866,6 +924,50 @@ describe('receive-only WebSocket', () => {
     ws.close();
   });
 
+  test('a presence report is ignored for a guest and recorded for an account', async () => {
+    const report = {
+      type: 'presence',
+      visible: true,
+      chatJid: GRANTED,
+      agentId: 'agent-1',
+    };
+    const guest = await connect(guestCookie);
+    guest.ws.send(JSON.stringify(report));
+    guest.ws.send(JSON.stringify({ type: 'ping' }));
+    await until(() => guest.messages.some((m) => m.type === 'pong'));
+    expect(guest.messages.some((m) => m.type === 'ws_error')).toBe(false);
+    expect([...wsClients.values()].some((c) => c.presence)).toBe(false);
+    guest.ws.close();
+
+    const owner = await connect(ownerCookie);
+    const before = Date.now();
+    owner.ws.send(JSON.stringify(report));
+    await until(() => [...wsClients.values()].some((c) => c.presence));
+    const ownerClient = [...wsClients.values()].find((c) => c.userId === OWNER);
+    expect(ownerClient?.presence).toMatchObject({
+      visible: true,
+      chatJid: GRANTED,
+      agentId: 'agent-1',
+    });
+    expect(ownerClient!.presence!.at).toBeGreaterThanOrEqual(before);
+    // The latest report wins, and junk degrades to "nowhere".
+    owner.ws.send(
+      JSON.stringify({
+        type: 'presence',
+        visible: 'yes',
+        chatJid: 5,
+        agentId: '',
+      }),
+    );
+    await until(() => ownerClient?.presence?.visible === false);
+    expect(ownerClient?.presence).toMatchObject({
+      visible: false,
+      chatJid: null,
+      agentId: null,
+    });
+    owner.ws.close();
+  });
+
   test('automation events of granted workspaces reach the guest, redacted', async () => {
     const { ws, messages } = await connect(guestCookie);
     const run = {
@@ -1022,10 +1124,11 @@ describe('receive-only WebSocket', () => {
 
 describe('withheld from guests over REST', () => {
   test('messages carry no token usage, sessions no worktree', async () => {
-    db.ensureChatExists(GRANTED);
+    const grantedSession = `${GRANTED}#agent:${sessionOf(GRANTED)}`;
+    db.ensureChatExists(grantedSession);
     db.storeMessageDirect(
       'm-cost',
-      GRANTED,
+      grantedSession,
       'happyclaw-agent',
       'Agent',
       'answer',
@@ -1033,16 +1136,8 @@ describe('withheld from guests over REST', () => {
       true,
       { tokenUsage: JSON.stringify({ costUSD: 0.42 }) },
     );
-    const ownerView = await call(
-      ownerCookie,
-      'GET',
-      `/api/groups/${GRANTED}/messages`,
-    );
-    const guestView = await call(
-      guestCookie,
-      'GET',
-      `/api/groups/${GRANTED}/messages`,
-    );
+    const ownerView = await call(ownerCookie, 'GET', messagesOf(GRANTED));
+    const guestView = await call(guestCookie, 'GET', messagesOf(GRANTED));
     const ownerMessage = ownerView.body.messages.find(
       (m: any) => m.id === 'm-cost',
     );
@@ -1155,7 +1250,7 @@ describe('admin decisions and host grants', () => {
       expect(groups.status).toBe(200);
       expect(Object.keys(groups.body.groups)).toEqual([GRANTED]);
       for (const url of [
-        `/api/groups/${HOME}/messages`,
+        messagesOf(HOME),
         `/api/groups/${HOME}/files`,
         `/api/workspaces/${HOME}`,
       ]) {
@@ -1248,8 +1343,7 @@ describe('member guests and the per-owner cap', () => {
     const memberGuestId = created.body.guest.id;
     const memberGuestCookie = mintCookie(memberGuestId);
     expect(
-      (await call(memberGuestCookie, 'GET', `/api/groups/${FOREIGN}/messages`))
-        .status,
+      (await call(memberGuestCookie, 'GET', messagesOf(FOREIGN))).status,
     ).toBe(200);
     expect(getGroupAllowedUserIds(FOREIGN)?.has(memberGuestId)).toBe(true);
 

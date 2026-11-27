@@ -243,7 +243,7 @@ describe('handleNonZeroExit — provider failure lifecycle', () => {
             filePrefix: 'container',
             identifier: 'container-id',
             logsDir: '/tmp',
-            input: { prompt: 'prompt', isMain: true },
+            input: { prompt: 'prompt', agentId: 'session-1' },
             stdoutState,
             stderrState: createStderrState(),
             onOutput: async () => {},
@@ -287,7 +287,7 @@ describe('handleNonZeroExit — provider failure lifecycle', () => {
           filePrefix: 'container',
           identifier: 'container-id',
           logsDir: '/tmp',
-          input: { prompt: 'prompt', isMain: true },
+          input: { prompt: 'prompt', agentId: 'session-1' },
           stdoutState,
           stderrState: createStderrState(),
           onOutput: async () => {},
@@ -367,7 +367,7 @@ describe('close handlers — provider failure classification carryover', () => {
         filePrefix: 'host',
         identifier: 'proc-carryover',
         logsDir: '/tmp',
-        input: { prompt: 'prompt', isMain: false },
+        input: { prompt: 'prompt', agentId: 'session-1' },
         stdoutState,
         stderrState: createStderrState(),
         onOutput,
@@ -474,6 +474,7 @@ describe('close handlers — provider failure classification carryover', () => {
       providerRateLimitModel: 'claude-fable-5',
       providerRateLimitResetsAt: resetsAt,
       providerFailureNotice: 'model tier exhausted',
+      providerErrorText: 'API Error: 429 model tier exhausted',
     });
     const resolved: ContainerOutput[] = [];
 
@@ -484,7 +485,7 @@ describe('close handlers — provider failure classification carryover', () => {
         filePrefix: 'host',
         identifier: 'proc-2',
         logsDir: '/tmp',
-        input: { prompt: 'prompt', isMain: false },
+        input: { prompt: 'prompt', agentId: 'session-1' },
         stdoutState,
         stderrState: createStderrState(),
         onOutput: async () => {},
@@ -505,6 +506,8 @@ describe('close handlers — provider failure classification carryover', () => {
       providerRateLimitModel: 'claude-fable-5',
       providerRateLimitResetsAt: resetsAt,
       providerFailureNotice: 'model tier exhausted',
+      // The terminal notice is resolved again on this output and quotes it.
+      providerErrorText: 'API Error: 429 model tier exhausted',
     });
   });
 
@@ -532,7 +535,7 @@ describe('close handlers — provider failure classification carryover', () => {
         filePrefix: 'host',
         identifier: 'proc-3',
         logsDir: '/tmp',
-        input: { prompt: 'prompt', isMain: false },
+        input: { prompt: 'prompt', agentId: 'session-1' },
         stdoutState,
         stderrState: createStderrState(),
         onOutput: async () => {},

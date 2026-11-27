@@ -220,6 +220,22 @@ describe('schema version head', () => {
     // v87: team mode (team_mounts, work_items, work_item_subscriptions,
     // work_item_events, work_decisions, work_item_replies), created by
     // work-item-store.ts (schema-v87-work-items.test.ts).
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(87);
+    // v88: each workspace's main session becomes a legacy_main conversation
+    // session; its state moves to the session's address
+    // (legacy-main-session-migration.test.ts).
+    // v89: multi-task mode, workspace_agent_profiles.work_mode and
+    // work_items.origin / origin_agent_id / origin_input_id
+    // (schema-v89-multitask-mode.test.ts).
+    // v90: workspace_workdirs, the recorded directory of a Host workspace in
+    // the workspace root (schema-v90-workspace-workdirs.test.ts).
+    // v91: Web Push subscriptions, web_push_subscriptions, created by
+    // web-push-store.ts (schema-v91-web-push.test.ts).
+    // v92: automations.model_config_id / model / reasoning_effort, the model
+    // an automation's run sessions use (schema-v92-automation-model.test.ts).
+    // v93: second login factors, user_totp and user_recovery_codes, created
+    // by auth-factor-store.ts (schema-v93-auth-factors.test.ts).
+    // v94: passkeys, webauthn_credentials, created by auth-factor-store.ts
+    // (schema-v94-passkeys.test.ts).
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(94);
   });
 });

@@ -2,6 +2,18 @@
 
 import { z } from 'zod';
 import { AGENT_EFFORT_LEVELS } from './agent-effort.js';
+import {
+  MAX_CONCURRENT_SUBAGENTS,
+  MAX_SUBAGENT_DEFINITIONS,
+  MAX_SUBAGENT_DESCRIPTION_CHARS,
+  MAX_SUBAGENT_PROMPT_CHARS,
+  MAX_SUBAGENT_TOOL_CHARS,
+  MAX_SUBAGENT_TOOLS,
+  RESERVED_SUBAGENT_NAMES,
+  SUBAGENT_EFFORT_LEVELS,
+  SUBAGENT_NAME_RE,
+  SUBAGENT_TOOL_RE,
+} from './agent-subagents.js';
 import { ALL_PERMISSIONS } from './permissions.js';
 import type { Permission } from './types.js';
 import { MAX_GROUP_NAME_LEN } from './group-constants.js';
@@ -15,6 +27,9 @@ import {
   getModelPreset,
   isValidModelId,
   MAX_CONTEXT_WINDOW,
+  MAX_MODEL_DISPLAY_NAME_LENGTH,
+  MAX_MODEL_VENDOR_LENGTH,
+  MAX_OUTPUT_TOKENS_LIMIT,
   MAX_PROVIDER_MODEL_ID_LENGTH,
   MAX_PROVIDER_MODELS,
   MIN_CONTEXT_WINDOW,
@@ -88,6 +103,33 @@ const AutomationPreRunCheckSchema = z.object({
 });
 
 /**
+ * A model and an effort as a choice names them. The connection's model list
+ * (a ChatGPT catalog) decides which values are valid, so they are plain
+ * strings here.
+ */
+const ChoiceModelSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(MAX_PROVIDER_MODEL_ID_LENGTH)
+  .nullable()
+  .optional();
+const ChoiceEffortSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(32)
+  .nullable()
+  .optional();
+
+/** Checked against the connection like a pick in the chat (the service). */
+const AutomationModelChoiceSchema = z.object({
+  modelConfigId: z.string().trim().min(1).max(128),
+  model: ChoiceModelSchema,
+  effort: ChoiceEffortSchema,
+});
+
+/**
  * Shape and a generous size cap only: the automation service applies the
  * shared validateAutomationDraft rules, cron syntax and the permission
  * checks, so REST and the agent tools reject the same drafts with the same
@@ -110,6 +152,7 @@ const AutomationDraftFields = {
     .max(AUTOMATION_LIMITS.scriptCommandMax * 2)
     .nullable()
     .optional(),
+  model: AutomationModelChoiceSchema.nullable().optional(),
 };
 
 const AutomationSessionModeSchema = z.enum(['fresh', 'persistent', 'bound']);
@@ -218,17 +261,50 @@ const InteractionModeSchema = z
 /** How much of a proactive turn's process the Web shows (see ProcessVisibility). */
 export const ProcessVisibilitySchema = z.enum(['hidden', 'activity', 'full']);
 
+/** How a workspace's sessions take on work (see WorkMode). */
+export const WorkModeSchema = z.enum(['single', 'multi']);
+
 export const ChannelMountInteractionModePatchSchema = z
   .object({
     interaction_mode_override: z.enum(['assistant', 'proactive']).nullable(),
   })
   .strict();
 
-export const AdditionalMountCreateSchema = z
+export const AdditionalMountCreateSchema = z.union([
+  z
+    .object({
+      host_path: z.string().trim().min(1).max(4096),
+      container_path: z.string().trim().min(1).max(512),
+      readonly: z.boolean().optional().default(true),
+    })
+    .strict(),
+  z
+    .object({
+      source: z.string().trim().min(1).max(63),
+      sub_path: z.string().max(1024).optional(),
+      container_path: z.string().trim().min(1).max(512),
+      readonly: z.boolean().optional().default(true),
+    })
+    .strict(),
+]);
+
+/** Admin storage source editor; the id comes from the URL. */
+export const StorageSourceSaveSchema = z
   .object({
-    host_path: z.string().trim().min(1).max(4096),
-    container_path: z.string().trim().min(1).max(512),
-    readonly: z.boolean().optional().default(true),
+    type: z.enum(['nfs', 'cifs']),
+    server: z.string().trim().min(1).max(253),
+    exportPath: z.string().trim().min(1).max(1024).optional(),
+    nfsVersion: z.enum(['3', '4', '4.1', '4.2']).optional(),
+    share: z.string().trim().min(1).max(80).optional(),
+    username: z.string().trim().max(256).optional(),
+    domain: z.string().trim().max(256).optional(),
+    smbVersion: z.enum(['2.1', '3.0', '3.1.1']).optional(),
+    allowReadWrite: z.boolean(),
+    description: z.string().max(200).optional(),
+    // Write-only: omitted keeps the stored password, '' removes it.
+    password: z.string().max(1024).optional(),
+    // Confirms revoking read-write from workspaces that mount it read-write.
+    force: z.boolean().optional(),
   })
   .strict();
 
@@ -241,6 +317,7 @@ export const GroupCreateSchema = z.object({
   execution_mode: z.enum(['container', 'host']).optional(),
   interaction_mode: InteractionModeSchema.optional(),
   process_visibility: ProcessVisibilitySchema.optional(),
+  work_mode: WorkModeSchema.optional(),
   custom_cwd: z
     .string()
     .optional()
@@ -264,20 +341,25 @@ export const GroupAgentProfilePatchSchema = z.object({
  * Chat composer model picker: null returns the conversation to the default.
  * `model` picks inside any configuration, `effort` only inside a ChatGPT one;
  * the request replaces the whole choice, so leaving them out follows the
- * configuration's defaults. The configuration's model list (a ChatGPT
- * catalog) decides which values are valid, so they are plain strings here.
+ * configuration's defaults.
  */
 export const SessionModelSelectionSchema = z.object({
   agentId: z.string().trim().min(1).max(128).nullable().optional(),
   modelConfigId: z.string().trim().min(1).max(128).nullable(),
-  model: z
-    .string()
-    .trim()
-    .min(1)
-    .max(MAX_PROVIDER_MODEL_ID_LENGTH)
-    .nullable()
-    .optional(),
-  effort: z.string().trim().min(1).max(32).nullable().optional(),
+  model: ChoiceModelSchema,
+  effort: ChoiceEffortSchema,
+});
+
+/**
+ * The model a new session starts on (POST sessions): the same choice as the
+ * composer's, made before the session exists. Leaving the configuration out
+ * follows the default.
+ */
+export const SessionCreateModelChoiceSchema = SessionModelSelectionSchema.pick({
+  model: true,
+  effort: true,
+}).extend({
+  modelConfigId: SessionModelSelectionSchema.shape.modelConfigId.optional(),
 });
 
 /**
@@ -310,6 +392,71 @@ const McpPolicyReferenceSchema = z
     (reference) => reference.replace(/^(?:system|user):/, '').length <= 128,
     'MCP id is too long',
   );
+
+const SubagentModelSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(MAX_PROVIDER_MODEL_ID_LENGTH)
+  .nullable()
+  .optional();
+
+const AgentSubagentDefinitionSchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .regex(
+        SUBAGENT_NAME_RE,
+        '子代理名须为 2-48 位小写字母、数字或连字符，以字母开头',
+      )
+      .refine(
+        (name) => !RESERVED_SUBAGENT_NAMES.has(name),
+        '子代理名与内置子代理重名',
+      ),
+    description: z.string().trim().min(1).max(MAX_SUBAGENT_DESCRIPTION_CHARS),
+    prompt: z.string().trim().min(1).max(MAX_SUBAGENT_PROMPT_CHARS),
+    tools: z
+      .array(
+        z
+          .string()
+          .trim()
+          .min(1)
+          .max(MAX_SUBAGENT_TOOL_CHARS)
+          .regex(
+            SUBAGENT_TOOL_RE,
+            '工具须为工具名，可带括号里的参数（如 Bash(git log:*)），不能含逗号或换行',
+          ),
+      )
+      .max(MAX_SUBAGENT_TOOLS)
+      .nullable()
+      .optional(),
+    model: SubagentModelSchema,
+    effort: z.enum(SUBAGENT_EFFORT_LEVELS).nullable().optional(),
+  })
+  .strict();
+
+const AgentSubagentPolicySchema = z
+  .object({
+    model: SubagentModelSchema,
+    max_concurrent: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_CONCURRENT_SUBAGENTS)
+      .nullable()
+      .optional(),
+    definitions: z
+      .array(AgentSubagentDefinitionSchema)
+      .max(MAX_SUBAGENT_DEFINITIONS)
+      .refine(
+        (items) =>
+          new Set(items.map((item) => item.name)).size === items.length,
+        '子代理名不能重复',
+      )
+      .optional(),
+  })
+  .strict();
 
 export const AgentProfileRuntimePolicySchema = z
   .object({
@@ -357,6 +504,7 @@ export const AgentProfileRuntimePolicySchema = z
         ids: z.array(McpPolicyReferenceSchema).max(100).optional(),
       })
       .optional(),
+    subagents: AgentSubagentPolicySchema.nullable().optional(),
   })
   .strict();
 
@@ -716,6 +864,7 @@ export const GroupPatchSchema = z.object({
   execution_mode: z.enum(['container', 'host']).optional(),
   interaction_mode: InteractionModeSchema.optional(),
   process_visibility: ProcessVisibilitySchema.optional(),
+  work_mode: WorkModeSchema.optional(),
 });
 
 export const LoginSchema = z.object({
@@ -771,6 +920,9 @@ export const HostIntegrationSettingsSchema = z
     externalClaudeDir: z.string().max(512).optional(),
     pluginAutoScan: z.boolean().optional(),
     adminHostOnlyMode: z.boolean().optional(),
+    // '' clears the stored value; validated by src/workspace-root.ts.
+    workspaceRoot: z.string().max(1024).optional(),
+    deploymentMode: z.enum(['', 'multi_user', 'single_user_host']).optional(),
     mainAgentContextSource: z.enum(['managed', 'host_claude']).optional(),
     mainAgentAutoCompactWindow: z
       .number()
@@ -827,6 +979,32 @@ export const AppearanceConfigSchema = z.object({
     )
     .nullable()
     .optional(),
+});
+
+/** A TOTP code or a recovery code; long enough for either, bounded. */
+const SecondFactorCodeSchema = z.string().trim().min(6).max(32);
+
+export const LoginSecondFactorSchema = z.object({
+  challenge: z.string().min(16).max(128),
+  code: SecondFactorCodeSchema,
+});
+
+export const TwoFactorCodeSchema = z.object({
+  code: SecondFactorCodeSchema,
+});
+
+export const TwoFactorDisableSchema = z.object({
+  password: z.string().min(1).max(256),
+  code: SecondFactorCodeSchema,
+});
+
+/** Turning two-factor on: the password and the first authenticator code. */
+export const TwoFactorEnableSchema = TwoFactorDisableSchema;
+
+/** Adding a passkey: the password, and a code when two-factor is on. */
+export const PasskeyReauthSchema = z.object({
+  password: z.string().min(1).max(256),
+  code: SecondFactorCodeSchema.optional(),
 });
 
 export const ChangePasswordSchema = z.object({
@@ -893,6 +1071,8 @@ export const AdminPatchUserSchema = z.object({
   status: z.enum(['active', 'disabled', 'deleted']).optional(),
   display_name: z.string().max(64).optional(),
   password: z.string().min(8).max(128).optional(),
+  /** Required with `password` when the target is the caller. */
+  current_password: z.string().max(256).optional(),
   permissions: z
     .array(PermissionValueSchema)
     .max(ALL_PERMISSIONS.length)
@@ -1237,14 +1417,28 @@ const ProviderModelListSchema = z
         .min(MIN_CONTEXT_WINDOW)
         .max(MAX_CONTEXT_WINDOW)
         .optional(),
+      /** [] declares that the model takes no effort. */
       efforts: z
         .array(z.enum(MODEL_EFFORTS))
         .max(MODEL_EFFORTS.length)
         .optional(),
       defaultEffort: z.enum(MODEL_EFFORTS).optional(),
+      // What the vendor's list said; a write that leaves them out keeps the
+      // stored ones (carrySyncedModelFields).
+      displayName: z.string().max(MAX_MODEL_DISPLAY_NAME_LENGTH).optional(),
+      maxOutputTokens: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_OUTPUT_TOKENS_LIMIT)
+        .optional(),
+      vendor: z.string().max(MAX_MODEL_VENDOR_LENGTH).optional(),
+      thinks: z.boolean().optional(),
     }),
   )
   .max(MAX_PROVIDER_MODELS);
+
+const ToolSearchSettingSchema = z.enum(['on', 'off', 'default']);
 
 /** Each role names one of the connection's models; others are dropped. */
 const ConnectionModelRolesSchema = z.object({
@@ -1259,6 +1453,8 @@ const ProviderPresetIdSchema = z
   .trim()
   .refine((value) => !!getModelPreset(value), { message: '未知的厂商预设' });
 
+const WebFetchPreflightPolicySchema = z.enum(['check', 'skip']);
+
 export const UnifiedProviderCreateSchema = z
   .object({
     name: z.string().min(1).max(64),
@@ -1266,6 +1462,7 @@ export const UnifiedProviderCreateSchema = z
     anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
     anthropicAuthToken: z.string().max(2000).optional(),
     anthropicAuthMode: ProviderAuthModeSchema.optional(),
+    webFetchPreflightPolicy: WebFetchPreflightPolicySchema.optional(),
     anthropicModel: ProviderDefaultModelSchema.optional(),
     models: ProviderModelListSchema.optional(),
     presetId: ProviderPresetIdSchema.optional(),
@@ -1275,6 +1472,11 @@ export const UnifiedProviderCreateSchema = z
     claudeCredentialInput: ClaudeCredentialInputSchema.optional(),
     roles: ConnectionModelRolesSchema.optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
+    /** What a model list read before saving found the endpoint to be. */
+    gateway: z.literal('magpie').optional(),
+    toolSearch: ToolSearchSettingSchema.optional(),
+    /** magpie: new upstream models join the list by themselves. */
+    catalogAutoAdd: z.boolean().optional(),
     /** Accepted from older clients and ignored. */
     weight: z.number().int().min(1).max(100).optional(),
     enabled: z.boolean().optional(),
@@ -1299,12 +1501,15 @@ export const UnifiedProviderPatchSchema = z
     anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
     /** Null goes back to inferring the header style from the token. */
     anthropicAuthMode: ProviderAuthModeSchema.nullable().optional(),
+    webFetchPreflightPolicy: WebFetchPreflightPolicySchema.optional(),
     anthropicModel: ProviderDefaultModelSchema.optional(),
     /** The whole new list; models left out are removed. */
     models: ProviderModelListSchema.optional(),
     presetId: ProviderPresetIdSchema.nullable().optional(),
     roles: ConnectionModelRolesSchema.optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
+    toolSearch: ToolSearchSettingSchema.optional(),
+    catalogAutoAdd: z.boolean().optional(),
     /** Accepted from older clients and ignored. */
     weight: z.number().int().min(1).max(100).optional(),
     // Third-party edits save the token with the other fields in one request,
@@ -1317,11 +1522,14 @@ export const UnifiedProviderPatchSchema = z
       data.name !== undefined ||
       data.anthropicBaseUrl !== undefined ||
       data.anthropicAuthMode !== undefined ||
+      data.webFetchPreflightPolicy !== undefined ||
       data.anthropicModel !== undefined ||
       data.models !== undefined ||
       data.presetId !== undefined ||
       data.roles !== undefined ||
       data.customEnv !== undefined ||
+      data.toolSearch !== undefined ||
+      data.catalogAutoAdd !== undefined ||
       data.weight !== undefined ||
       data.anthropicAuthToken !== undefined ||
       data.clearAnthropicAuthToken === true,

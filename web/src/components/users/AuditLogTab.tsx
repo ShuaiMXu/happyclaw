@@ -30,6 +30,13 @@ const EVENT_TYPE_LABELS: Record<string, string> = {
   password_changed: '修改密码',
   profile_updated: '更新资料',
   recovery_reset: '恢复重置',
+  mfa_enabled: '开启二次验证',
+  mfa_disabled: '关闭二次验证',
+  mfa_reset: '重置二次验证',
+  mfa_recovery_codes_regenerated: '重新生成恢复码',
+  passkey_added: '添加通行密钥',
+  passkey_removed: '删除通行密钥',
+  passkeys_revoked: '撤销通行密钥',
   session_revoked: '撤销会话',
   user_created: '创建用户',
   user_updated: '更新用户',
@@ -43,6 +50,8 @@ const EVENT_TYPE_LABELS: Record<string, string> = {
   invite_deleted: '删除邀请码',
   system_settings_updated: '更新系统设置',
   host_integration_updated: '更新宿主机集成',
+  storage_source_saved: '保存存储源',
+  storage_source_deleted: '删除存储源',
 };
 
 const PAGE_SIZES = [50, 100, 200, 500];

@@ -56,6 +56,8 @@ const {
   rememberRecentModel,
   readRecentModels,
 } = await import('./ModelSelector');
+const { modelPinsKey, readModelPins, toggleModelPin } =
+  await import('./modelPins');
 
 (
   globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }
@@ -210,7 +212,7 @@ afterEach(async () => {
   document.body.innerHTML = '';
 });
 
-async function render(agentId: string | null, canChange = true) {
+async function render(agentId: string, canChange = true) {
   await act(async () => {
     root.render(
       <MemoryRouter>
@@ -227,7 +229,7 @@ async function render(agentId: string | null, canChange = true) {
 async function rerender(canChange = true) {
   await act(async () => root.unmount());
   root = createRoot(container);
-  await render(null, canChange);
+  await render('s0', canChange);
 }
 
 function trigger(): HTMLButtonElement {
@@ -440,9 +442,9 @@ describe('the trigger', () => {
 
   test('names the picked model and is read-only without Modify', async () => {
     mocks.get.mockResolvedValue(selection({ selectedModelConfigId: 'glm' }));
-    await render(null, false);
+    await render('s0', false);
     expect(mocks.get).toHaveBeenCalledWith(
-      '/api/groups/web%3Aws/model-selection',
+      '/api/groups/web%3Aws/model-selection?agentId=s0',
     );
     expect(trigger().textContent).toBe('glm-5.3');
     expect(trigger().disabled).toBe(true);
@@ -452,7 +454,7 @@ describe('the trigger', () => {
 
   test('is plain text at rest and filled on hover or while open', async () => {
     mocks.get.mockResolvedValue(connectionSelection());
-    await render(null);
+    await render('s0');
     const classes = [...trigger().classList];
     expect(classes).toEqual(
       expect.arrayContaining([
@@ -475,7 +477,7 @@ describe('the trigger', () => {
     mocks.get.mockResolvedValue(
       connectionSelection({ selectedModelConfigId: 'official' }),
     );
-    await render(null);
+    await render('s0');
     expect(
       trigger().querySelector('[data-vendor]')?.getAttribute('data-vendor'),
     ).toBe('anthropic');
@@ -498,7 +500,7 @@ describe('the trigger', () => {
         selectedModel: 'glm-4.6',
       }),
     );
-    await render(null);
+    await render('s0');
     expect(trigger().title).toBe('');
     await act(async () => trigger().focus());
     expect(
@@ -514,7 +516,7 @@ describe('the trigger', () => {
         selectedModel: 'sonnet',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     await click(row('sonnet'));
     expect(document.querySelector('[data-slot="tooltip-content"]')).toBeNull();
@@ -531,7 +533,7 @@ describe('the trigger', () => {
 
   test('stays hidden when no model configuration exists', async () => {
     mocks.get.mockResolvedValue(selection({ options: [] }));
-    await render(null);
+    await render('s0');
     expect(container.querySelector('button')).toBeNull();
   });
 });
@@ -544,7 +546,7 @@ describe('the panel', () => {
         selectedModel: 'glm-4.6',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(titles()).toEqual([
       '未选择模型',
@@ -579,7 +581,7 @@ describe('the panel', () => {
         },
       ],
     });
-    await render(null);
+    await render('s0');
     await open();
     const vendor = (element: Element | null | undefined) =>
       element?.querySelector('[data-vendor]')?.getAttribute('data-vendor') ??
@@ -595,7 +597,7 @@ describe('the panel', () => {
 
   test('the rail filters by connection and 全部 brings everything back', async () => {
     mocks.get.mockResolvedValue(connectionSelection());
-    await render(null);
+    await render('s0');
     await open();
     expect(railButton('全部')?.getAttribute('aria-pressed')).toBe('true');
     await click(railButton('GLM'));
@@ -607,7 +609,7 @@ describe('the panel', () => {
 
   test('search looks through every connection, whatever the rail shows', async () => {
     mocks.get.mockResolvedValue(connectionSelection());
-    await render(null);
+    await render('s0');
     await open();
     await click(railButton('GLM'));
     await search('SON');
@@ -622,7 +624,7 @@ describe('the panel', () => {
 
   test('offers 添加模型 to whoever may manage them', async () => {
     mocks.get.mockResolvedValue(connectionSelection());
-    await render(null);
+    await render('s0');
     await open();
     expect(
       [...document.querySelectorAll('button')].some(
@@ -656,7 +658,7 @@ describe('the panel', () => {
         ],
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(detail('glm-5.2')).toContain('缺少凭据');
     expect(row('glm-5.2')?.disabled).toBe(true);
@@ -691,12 +693,12 @@ describe('models of a configuration', () => {
         selectedModel: 'glm-4.6',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     await click(row('glm-4.6'));
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
-      { agentId: null, modelConfigId: 'glm', model: 'glm-4.6' },
+      { agentId: 's0', modelConfigId: 'glm', model: 'glm-4.6' },
     );
     expect(mocks.toastSuccess).toHaveBeenCalledWith(
       '已切换到「GLM · glm-4.6」，从下一条消息开始生效',
@@ -713,12 +715,12 @@ describe('models of a configuration', () => {
     mocks.put.mockResolvedValue(
       connectionSelection({ selectedModelConfigId: 'glm' }),
     );
-    await render(null);
+    await render('s0');
     await open();
     await click(row('glm-5.3'));
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
-      { agentId: null, modelConfigId: 'glm' },
+      { agentId: 's0', modelConfigId: 'glm' },
     );
   });
 
@@ -729,7 +731,7 @@ describe('models of a configuration', () => {
         selectedModel: 'haiku',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(titles()).toContain('haiku');
     expect(detail('haiku')).toBe('Claude 官方 · 上下文未知');
@@ -745,7 +747,7 @@ describe('models of a configuration', () => {
         selectedModel: 'glm-4.0',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(detail('glm-4.0')).toContain('不在模型列表里');
     expect(checked()[0].getAttribute('title')).toBe('glm-4.0');
@@ -760,7 +762,7 @@ describe('models of a configuration', () => {
       ...base,
       options: [base.options[0], { ...base.options[1], usable: false }],
     });
-    await render(null);
+    await render('s0');
     await open();
     expect(row('glm-4.6')?.disabled).toBe(true);
     expect(detail('glm-4.6')).toContain('缺少凭据');
@@ -781,12 +783,12 @@ describe('models of a configuration', () => {
       ],
     });
     mocks.put.mockResolvedValue(base);
-    await render(null);
+    await render('s0');
     await open();
     await click(row('由中转站决定'));
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
-      { agentId: null, modelConfigId: 'glm' },
+      { agentId: 's0', modelConfigId: 'glm' },
     );
   });
 
@@ -797,7 +799,7 @@ describe('models of a configuration', () => {
       message: 'model not in connection',
       body: { code: 'MODEL_NOT_IN_CONNECTION' },
     });
-    await render(null);
+    await render('s0');
     await open();
     await click(row('glm-4.6'));
     expect(mocks.toastError).toHaveBeenCalledWith(
@@ -810,7 +812,7 @@ describe('models of a configuration', () => {
 describe('ChatGPT models', () => {
   test('lists a login models by name only', async () => {
     mocks.get.mockResolvedValue(chatGptSelection());
-    await render(null);
+    await render('s0');
     await open();
     expect(titles()).toEqual([
       '未选择模型',
@@ -845,7 +847,7 @@ describe('ChatGPT models', () => {
         selectedModel: 'gpt-unlisted',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(checked()[0].getAttribute('title')).toBe('gpt-unlisted');
     expect(detail('gpt-unlisted')).toContain('不在账号的模型列表里');
@@ -899,13 +901,13 @@ describe('ChatGPT models', () => {
         selectedModel: 'gpt-5.5',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     await click(row('gpt-5.5'));
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
       {
-        agentId: null,
+        agentId: 's0',
         modelConfigId: 'chatgpt',
         model: 'gpt-5.5',
         effort: null,
@@ -926,12 +928,12 @@ describe('ChatGPT models', () => {
       }),
     );
     mocks.put.mockResolvedValue(chatGptSelection());
-    await render(null);
+    await render('s0');
     await open();
     await click(row('智能体默认'));
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
-      { agentId: null, modelConfigId: null },
+      { agentId: 's0', modelConfigId: null },
     );
     // The configuration's own model is a pick of the configuration alone.
     mocks.put.mockResolvedValue(
@@ -941,7 +943,7 @@ describe('ChatGPT models', () => {
     await click(row('gpt-6.1-sol'));
     expect(mocks.put).toHaveBeenLastCalledWith(
       '/api/groups/web%3Aws/model-selection',
-      { agentId: null, modelConfigId: 'chatgpt', model: null, effort: null },
+      { agentId: 's0', modelConfigId: 'chatgpt', model: null, effort: null },
     );
   });
 
@@ -949,7 +951,7 @@ describe('ChatGPT models', () => {
     mocks.get.mockResolvedValue(
       chatGptSelection({}, { needsReauth: true }, {}),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(row('gpt-6-astra')?.disabled).toBe(true);
     expect(detail('gpt-6-astra')).toContain('需重新登录');
@@ -958,7 +960,7 @@ describe('ChatGPT models', () => {
 
   test('looks again when the panel opens while the list is only a fallback', async () => {
     mocks.get.mockResolvedValue(chatGptSelection({}, { source: 'builtin' }));
-    await render(null);
+    await render('s0');
     expect(mocks.get).toHaveBeenCalledTimes(1);
     const live = chatGptSelection(
       {},
@@ -989,7 +991,7 @@ describe('ChatGPT models', () => {
       mocks.get.mockResolvedValueOnce(
         chatGptSelection({}, { source: 'builtin' }),
       );
-      await render(null);
+      await render('s0');
       vi.setSystemTime(Date.now() + 10_000);
       mocks.get.mockResolvedValue(live);
       await open();
@@ -1005,7 +1007,7 @@ describe('ChatGPT models', () => {
       mocks.get.mockResolvedValueOnce(
         chatGptSelection({}, { source: 'builtin' }),
       );
-      await render(null);
+      await render('s0');
       vi.setSystemTime(Date.now() + 10_000);
       // The look-up the panel starts is slow; the save overtakes it.
       let answerLookUp!: (value: SessionModelSelection) => void;
@@ -1037,7 +1039,7 @@ describe('reasoning effort', () => {
   test('appears only when the model in use takes efforts', async () => {
     // Older servers list no efforts for a connection's models.
     mocks.get.mockResolvedValue(connectionSelection());
-    await render(null);
+    await render('s0');
     expect(effortTrigger()).toBeNull();
 
     // Nothing to follow: no model, so no effort.
@@ -1070,7 +1072,7 @@ describe('reasoning effort', () => {
     mocks.get.mockResolvedValue(
       effortSelection({ selectedModelConfigId: 'official' }),
     );
-    await render(null);
+    await render('s0');
     expect(effortTrigger()!.textContent).toBe('超高');
     // Screen readers hear the level too.
     expect(effortTrigger()!.getAttribute('aria-label')).toBe(
@@ -1115,7 +1117,7 @@ describe('reasoning effort', () => {
       selectedModel: 'opus',
       selectedEffort: 'high',
     });
-    await render(null);
+    await render('s0');
     expect(effortTrigger()!.textContent).toBe('选择推理等级');
     expect(effortTrigger()!.getAttribute('aria-label')).toBe(
       '推理等级：默认，选择推理等级',
@@ -1132,7 +1134,7 @@ describe('reasoning effort', () => {
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
       {
-        agentId: null,
+        agentId: 's0',
         modelConfigId: 'official',
         model: 'opus',
         effort: 'high',
@@ -1196,7 +1198,7 @@ describe('reasoning effort', () => {
       selectedModel: 'opus',
       selectedEffort: 'max',
     });
-    await render(null);
+    await render('s0');
     // The default's own level (an Agent's, say) wins over the model's.
     expect(effortTrigger()!.textContent).toBe('高');
     await openEffort();
@@ -1208,7 +1210,7 @@ describe('reasoning effort', () => {
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
       {
-        agentId: null,
+        agentId: 's0',
         modelConfigId: 'official',
         model: 'opus',
         effort: 'max',
@@ -1226,13 +1228,13 @@ describe('reasoning effort', () => {
     mocks.put.mockResolvedValue(
       chatGptSelection({ selectedModelConfigId: 'chatgpt' }),
     );
-    await render(null);
+    await render('s0');
     expect(effortTrigger()!.textContent).toBe('最高');
     await openEffort();
     await click(effortItem('默认 · 低'));
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
-      { agentId: null, modelConfigId: 'chatgpt', model: null, effort: null },
+      { agentId: 's0', modelConfigId: 'chatgpt', model: null, effort: null },
     );
     expect(mocks.toastSuccess).toHaveBeenCalledWith(
       '已恢复默认推理等级，从下一条消息开始生效',
@@ -1246,7 +1248,7 @@ describe('reasoning effort', () => {
     });
     mocks.get.mockResolvedValue(pinned);
     mocks.put.mockResolvedValue({ ...pinned, selectedEffort: 'medium' });
-    await render(null);
+    await render('s0');
     const elsewhere = document.createElement('input');
     document.body.append(elsewhere);
     await openEffort();
@@ -1286,7 +1288,7 @@ describe('reasoning effort', () => {
         },
       ),
     );
-    await render(null);
+    await render('s0');
     await openEffort();
     expect(effortItem('极限')).toBeDefined();
 
@@ -1314,13 +1316,13 @@ describe('reasoning effort', () => {
         selectedModel: 'sonnet',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     await click(row('sonnet'));
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
       {
-        agentId: null,
+        agentId: 's0',
         modelConfigId: 'official',
         model: 'sonnet',
         effort: null,
@@ -1343,7 +1345,7 @@ describe('reasoning effort', () => {
     expect(mocks.put).toHaveBeenLastCalledWith(
       '/api/groups/web%3Aws/model-selection',
       {
-        agentId: null,
+        agentId: 's0',
         modelConfigId: 'official',
         model: 'sonnet',
         effort: 'high',
@@ -1355,7 +1357,7 @@ describe('reasoning effort', () => {
     mocks.get.mockResolvedValue(
       chatGptSelection({ selectedModelConfigId: 'chatgpt' }),
     );
-    await render(null, false);
+    await render('s0', false);
     expect(effortTrigger()!.disabled).toBe(true);
     // The level in use is still readable.
     expect(effortTrigger()!.textContent).toBe('低');
@@ -1377,7 +1379,7 @@ describe('reasoning effort', () => {
         selectedModel: 'gpt-unlisted',
       }),
     );
-    await render(null);
+    await render('s0');
     expect(trigger().textContent).toBe('gpt-unlisted');
     expect(effortTrigger()).toBeNull();
   });
@@ -1391,7 +1393,7 @@ describe('reasoning effort', () => {
       message: 'effort not supported',
       body: { code: 'EFFORT_NOT_SUPPORTED' },
     });
-    await render(null);
+    await render('s0');
     await openEffort();
     await click(effortItem('低'));
     expect(mocks.toastError).toHaveBeenCalledWith(
@@ -1442,7 +1444,7 @@ describe('on a phone', () => {
     mocks.get.mockResolvedValue(
       effortSelection({ selectedModelConfigId: 'official' }),
     );
-    await render(null);
+    await render('s0');
     expect(trigger()).toBe(pill());
     expect(effortTrigger()).toBeNull();
     expect(pill()!.textContent).toBe('opus·超高');
@@ -1481,21 +1483,23 @@ describe('on a phone', () => {
       efforts: ['low', 'high'],
     };
     mocks.get.mockResolvedValue(base);
-    await render(null);
+    await render('s0');
     expect(pill()!.textContent).toBe('opus');
     expect(pill()!.getAttribute('aria-label')).toBe(
       '模型：Claude 官方 · opus，推理等级：默认',
     );
   });
 
-  test('the sheet opens at half height with the levels under the model in use', async () => {
+  test('the sheet opens at full height with the levels under the model in use', async () => {
     const pinned = effortSelection({ selectedModelConfigId: 'official' });
     mocks.get.mockResolvedValue(pinned);
     mocks.put.mockResolvedValue({ ...pinned, selectedEffort: 'high' });
-    await render(null);
+    await render('s0');
     await open();
-    expect(sheet()?.dataset.snap).toBe('half');
-    expect(segments()?.previousElementSibling).toBe(checked()[0]);
+    expect(sheet()?.dataset.snap).toBe('full');
+    expect(segments()?.previousElementSibling?.contains(checked()[0])).toBe(
+      true,
+    );
     expect(checked()[0].getAttribute('title')).toBe('opus');
     expect(
       [...segments()!.querySelectorAll('button')].map(
@@ -1513,7 +1517,7 @@ describe('on a phone', () => {
     await click(segment('高'));
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
-      { agentId: null, modelConfigId: 'official', model: null, effort: 'high' },
+      { agentId: 's0', modelConfigId: 'official', model: null, effort: 'high' },
     );
     // Applied in place: the sheet stays, the pick is pressed.
     expect(sheet()).not.toBeNull();
@@ -1532,16 +1536,18 @@ describe('on a phone', () => {
     });
     mocks.get.mockResolvedValue(following);
     mocks.put.mockResolvedValue(following);
-    await render(null);
+    await render('s0');
     await open();
     expect(checked()[0].getAttribute('title')).toBe('跟随主 HappyClaw');
     expect(detail('跟随主 HappyClaw')).toBe('Claude 官方 · opus');
-    expect(segments()?.previousElementSibling).toBe(checked()[0]);
+    expect(segments()?.previousElementSibling?.contains(checked()[0])).toBe(
+      true,
+    );
     await click(segment('最高'));
     expect(mocks.put).toHaveBeenCalledWith(
       '/api/groups/web%3Aws/model-selection',
       {
-        agentId: null,
+        agentId: 's0',
         modelConfigId: 'official',
         model: 'opus',
         effort: 'max',
@@ -1556,7 +1562,7 @@ describe('on a phone', () => {
         selectedModel: 'haiku',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(checked()[0].getAttribute('title')).toBe('haiku');
     expect(segments()).toBeNull();
@@ -1569,7 +1575,7 @@ describe('on a phone', () => {
         { needsReauth: true },
       ),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(segments()!.disabled).toBe(true);
     await click(segment('高'));
@@ -1585,11 +1591,11 @@ describe('in a narrow window with a mouse', () => {
     mocks.get.mockResolvedValue(
       effortSelection({ selectedModelConfigId: 'official' }),
     );
-    await render(null);
+    await render('s0');
     expect(pill()).toBeNull();
     expect(effortTrigger()!.textContent).toBe('超高');
     await open();
-    expect(sheet()?.dataset.snap).toBe('half');
+    expect(sheet()?.dataset.snap).toBe('full');
     expect(segments()).toBeNull();
     expect(document.body.textContent).toContain('推理等级在输入框旁调整');
   });
@@ -1608,7 +1614,7 @@ describe('the default row', () => {
           default: { source, modelConfigId: 'glm', model: 'glm-4.6' },
         }),
       );
-      await render(null);
+      await render('s0');
       expect(trigger().textContent).toBe('glm-4.6');
       await open();
       expect(titles()[0]).toBe(label);
@@ -1623,7 +1629,7 @@ describe('the default row', () => {
         default: { source: 'workspace_env', modelConfigId: null, model: null },
       }),
     );
-    await render(null);
+    await render('s0');
     expect(trigger().textContent).toBe('工作区环境变量');
     await open();
     expect(titles()[0]).toBe('工作区环境变量');
@@ -1632,7 +1638,7 @@ describe('the default row', () => {
 
   test('nothing chosen reads 未选择模型', async () => {
     mocks.get.mockResolvedValue(connectionSelection());
-    await render(null);
+    await render('s0');
     await open();
     expect(titles()[0]).toBe('未选择模型');
     expect(detail('未选择模型')).toBe('请联系管理员添加模型');
@@ -1650,7 +1656,7 @@ describe('recently used models', () => {
         selectedModel: 'glm-4.6',
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     await click(recentButton());
     expect(rows()).toHaveLength(0);
@@ -1689,7 +1695,7 @@ describe('recently used models', () => {
       'haiku',
     ]);
     mocks.get.mockResolvedValue(connectionSelection());
-    await render(null);
+    await render('s0');
     await open();
     await click(railButton('最近'));
     // A connection that no longer exists is not listed.
@@ -1699,13 +1705,187 @@ describe('recently used models', () => {
   test('a failed save is not remembered, and broken storage reads as empty', async () => {
     mocks.get.mockResolvedValue(connectionSelection());
     mocks.put.mockRejectedValue(new Error('nope'));
-    await render(null);
+    await render('s0');
     await open();
     await click(row('glm-4.6'));
     expect(readRecentModels('user-1')).toEqual([]);
     storage.set(recentModelsKey('user-1'), '{not json');
     expect(readRecentModels('user-1')).toEqual([]);
     expect(readRecentModels(undefined)).toEqual([]);
+  });
+});
+
+describe('pinned models', () => {
+  const pinButton = (label: string) =>
+    document.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+  const headings = () =>
+    [...document.querySelectorAll('[role="radiogroup"] p')].map(
+      (item) => item.textContent,
+    );
+  const storedPins = () =>
+    JSON.parse(storage.get(modelPinsKey('user-1')) ?? '[]') as unknown;
+
+  test('a pin moves a model to 置顶 at the top, per user; unpinning puts it back', async () => {
+    mocks.get.mockResolvedValue(connectionSelection());
+    await render('s0');
+    await open();
+    expect(titles()).toEqual([
+      '未选择模型',
+      'opus',
+      'sonnet',
+      'haiku',
+      'glm-5.3',
+      'glm-4.6',
+    ]);
+    expect(headings()).toEqual([]);
+    // The default is no model to pin.
+    expect(pinButton('置顶「未选择模型」')).toBeNull();
+
+    await click(pinButton('置顶「GLM · glm-4.6」'));
+    await click(pinButton('置顶「Claude 官方 · sonnet」'));
+    // In the order they were pinned, above the default.
+    expect(titles()).toEqual([
+      'glm-4.6',
+      'sonnet',
+      '未选择模型',
+      'opus',
+      'haiku',
+      'glm-5.3',
+    ]);
+    expect(headings()).toEqual(['置顶', '其他模型']);
+    expect(
+      pinButton('取消置顶「GLM · glm-4.6」')?.getAttribute('aria-pressed'),
+    ).toBe('true');
+    expect(storedPins()).toEqual([
+      { modelConfigId: 'glm', model: 'glm-4.6' },
+      { modelConfigId: 'official', model: 'sonnet' },
+    ]);
+    expect(readModelPins('user-2')).toEqual([]);
+    // Pinning is no pick: nothing is saved and the panel stays open.
+    expect(mocks.put).not.toHaveBeenCalled();
+    expect(checked().map((item) => item.getAttribute('title'))).toEqual([
+      '未选择模型',
+    ]);
+
+    await click(pinButton('取消置顶「GLM · glm-4.6」'));
+    expect(titles()).toEqual([
+      'sonnet',
+      '未选择模型',
+      'opus',
+      'haiku',
+      'glm-5.3',
+      'glm-4.6',
+    ]);
+
+    await rerender();
+    await open();
+    expect(titles()[0]).toBe('sonnet');
+  });
+
+  test('pinned models lead a connection and a search; 最近 keeps its order', async () => {
+    toggleModelPin('user-1', { modelConfigId: 'glm', model: 'glm-4.6' });
+    toggleModelPin('user-1', { modelConfigId: 'official', model: 'haiku' });
+    rememberRecentModel('user-1', {
+      modelConfigId: 'official',
+      model: 'haiku',
+    });
+    rememberRecentModel('user-1', { modelConfigId: 'glm', model: 'glm-5.3' });
+    mocks.get.mockResolvedValue(connectionSelection());
+    await render('s0');
+    await open();
+
+    await click(railButton('GLM'));
+    expect(titles()).toEqual(['glm-4.6', 'glm-5.3']);
+    expect(headings()).toEqual(['置顶', '其他模型']);
+
+    await search('glm');
+    expect(titles()).toEqual(['glm-4.6', 'glm-5.3']);
+
+    await search('');
+    await click(railButton('最近'));
+    expect(titles()).toEqual(['glm-5.3', 'haiku']);
+    expect(headings()).toEqual([]);
+  });
+
+  test('a model gone or that cannot run is not shown as pinned', async () => {
+    for (const pin of [
+      { modelConfigId: 'gone', model: 'old' },
+      { modelConfigId: 'official', model: 'retired' },
+      { modelConfigId: 'glm', model: 'glm-5.3' },
+    ]) {
+      toggleModelPin('user-1', pin);
+    }
+    const base = connectionSelection({
+      // Still selected, so listed with its note, but no longer offered.
+      selectedModelConfigId: 'official',
+      selectedModel: 'retired',
+    });
+    mocks.get.mockResolvedValue({
+      ...base,
+      options: [base.options[0], { ...base.options[1], usable: false }],
+    });
+    await render('s0');
+    await open();
+    expect(headings()).toEqual([]);
+    expect(titles()).toEqual([
+      '未选择模型',
+      'retired',
+      'opus',
+      'sonnet',
+      'haiku',
+      'glm-5.3',
+      'glm-4.6',
+    ]);
+    // A row without credentials cannot be pinned, but a pin on it can go.
+    expect(pinButton('置顶「GLM · glm-4.6」')).toBeNull();
+    await click(pinButton('取消置顶「GLM · glm-5.3」'));
+    expect(storedPins()).toEqual([
+      { modelConfigId: 'gone', model: 'old' },
+      { modelConfigId: 'official', model: 'retired' },
+    ]);
+  });
+
+  describe('on a phone', () => {
+    beforeEach(() => emulate(PHONE, NARROW));
+    afterEach(() => vi.restoreAllMocks());
+
+    async function longPress(element: HTMLElement | undefined) {
+      if (!element) throw new Error('element not found');
+      await act(async () => {
+        element.dispatchEvent(
+          new PointerEvent('pointerdown', {
+            bubbles: true,
+            pointerId: 1,
+            pointerType: 'touch',
+            isPrimary: true,
+          }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 550));
+      });
+    }
+    const action = (label: string) =>
+      [...document.querySelectorAll<HTMLButtonElement>('button')].find(
+        (button) => button.textContent === label,
+      );
+
+    test('a long press in the sheet unpins, the sheet stays', async () => {
+      toggleModelPin('user-1', { modelConfigId: 'glm', model: 'glm-4.6' });
+      mocks.get.mockResolvedValue(connectionSelection());
+      await render('s0');
+      await open();
+      expect(titles()[0]).toBe('glm-4.6');
+      // No hover button on a phone: the pin is shown on the row.
+      expect(
+        row('glm-4.6')?.querySelector('[aria-label="已置顶"]'),
+      ).not.toBeNull();
+
+      await longPress(row('glm-4.6'));
+      await click(action('取消置顶「glm-4.6」'));
+      expect(sheet()).not.toBeNull();
+      expect(readModelPins('user-1')).toEqual([]);
+      expect(headings()).toEqual([]);
+      expect(titles()[0]).toBe('未选择模型');
+    });
   });
 });
 
@@ -1730,7 +1910,7 @@ describe('efforts come from the model list', () => {
     ['declared', '自定义'],
   ] as const)('%s efforts are marked 「%s」', async (source, badge) => {
     mocks.get.mockResolvedValue(sourced(source));
-    await render(null);
+    await render('s0');
     expect(effortTrigger()!.textContent).toBe('高');
     await openEffort();
     expect(effortItems().map((item) => item.textContent)).toEqual([
@@ -1745,7 +1925,7 @@ describe('efforts come from the model list', () => {
 
   test('registry efforts carry no badge', async () => {
     mocks.get.mockResolvedValue(sourced('registry'));
-    await render(null);
+    await render('s0');
     await openEffort();
     const menu = document.querySelector('[role="menu"]')?.textContent ?? '';
     expect(menu).not.toContain('推断');
@@ -1757,7 +1937,7 @@ describe('efforts come from the model list', () => {
       ...sourced('declared'),
       selectedModel: 'glm-4.6',
     });
-    await render(null);
+    await render('s0');
     expect(trigger().textContent).toBe('glm-4.6');
     expect(effortTrigger()).toBeNull();
   });
@@ -1777,7 +1957,7 @@ describe('a default that cannot run', () => {
         },
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(titles()[0]).toBe('智能体默认');
     expect(detail('智能体默认')).toBe('连接不可用，绑定的连接已删除或缺少凭据');
@@ -1799,7 +1979,7 @@ describe('a default that cannot run', () => {
         },
       }),
     );
-    await render(null);
+    await render('s0');
     expect(trigger().textContent).toBe('连接不可用');
     expect(trigger().querySelector('.text-warning')).not.toBeNull();
     expect(effortTrigger()).toBeNull();
@@ -1815,7 +1995,7 @@ describe('a default that cannot run', () => {
         default: { source: 'none', modelConfigId: null },
       }),
     );
-    await render(null);
+    await render('s0');
     await open();
     expect(detail('未选择模型')).toBe('请联系管理员添加模型');
     expect(row('未选择模型')!.disabled).toBe(true);
@@ -1835,7 +2015,7 @@ describe('a default that cannot run', () => {
 describe('context windows', () => {
   test('a declared window is shown; an undeclared one reads 上下文未知, whatever the registry knows', async () => {
     mocks.get.mockResolvedValue(connectionSelection());
-    await render(null);
+    await render('s0');
     await open();
     expect(detail('glm-5.3')).toBe('GLM · 1M 上下文');
     // opus has a registry window, but its entry declares none.
@@ -1844,8 +2024,168 @@ describe('context windows', () => {
 
   test('a ChatGPT login carries no window and says nothing about it', async () => {
     mocks.get.mockResolvedValue(chatGptSelection());
-    await render(null);
+    await render('s0');
     await open();
     expect(detail('gpt-6-astra')).toBe('ChatGPT 订阅');
+  });
+});
+
+describe('what a vendor says about its models', () => {
+  /** A magpie connection next to the official one. */
+  function magpieSelection(
+    overrides: Partial<SessionModelSelection> = {},
+  ): SessionModelSelection {
+    const base = connectionSelection(overrides);
+    return {
+      ...base,
+      options: [
+        base.options[0],
+        {
+          id: 'mp',
+          name: 'Magpie',
+          kind: 'third_party',
+          model: 'acme/vx-pro',
+          usable: true,
+          models: [
+            entry('acme/vx-pro', {
+              displayName: 'VX Pro',
+              vendor: 'Relay A',
+              efforts: ['low', 'high'],
+              effortsSource: 'declared',
+            }),
+            // Declared to take none.
+            entry('acme/vx-mini', {
+              displayName: 'VX Mini',
+              efforts: [],
+              effortsSource: 'declared',
+            }),
+            // Nothing known.
+            entry('acme/vx-lab', { efforts: [], effortsSource: 'none' }),
+          ],
+        },
+      ],
+    };
+  }
+
+  test('rows, the trigger and search use the vendor’s name; the id stays in view', async () => {
+    mocks.get.mockResolvedValue(
+      magpieSelection({ selectedModelConfigId: 'mp' }),
+    );
+    await render('s0');
+    // After the monogram of a relay the registry does not know.
+    expect(trigger().textContent).toBe('MVX Pro');
+    expect(trigger().getAttribute('aria-label')).toBe('模型：Magpie · VX Pro');
+    await open();
+    expect(titles()).toEqual([
+      '未选择模型',
+      'opus',
+      'sonnet',
+      'haiku',
+      'VX Pro',
+      'VX Mini',
+      // Without a name the id stands.
+      'acme/vx-lab',
+    ]);
+    expect(row('VX Pro')?.textContent).toContain(
+      'VX ProMagpie · acme/vx-pro · 上下文未知',
+    );
+    await search('vx mini');
+    expect(titles()).toEqual(['VX Mini']);
+    await search('acme/vx-pro');
+    expect(titles()).toEqual(['VX Pro']);
+  });
+
+  test('picking a named model names it in the confirmation', async () => {
+    mocks.get.mockResolvedValue(magpieSelection());
+    mocks.put.mockResolvedValue(
+      magpieSelection({
+        selectedModelConfigId: 'mp',
+        selectedModel: 'acme/vx-mini',
+      }),
+    );
+    await render('s0');
+    await open();
+    await click(row('VX Mini'));
+    expect(mocks.put).toHaveBeenCalledWith(
+      '/api/groups/web%3Aws/model-selection',
+      { agentId: 's0', modelConfigId: 'mp', model: 'acme/vx-mini' },
+    );
+    expect(mocks.toastSuccess).toHaveBeenCalledWith(
+      '已切换到「Magpie · VX Mini」，从下一条消息开始生效',
+    );
+  });
+
+  test('a model nothing is known about offers every level, marked 未验证', async () => {
+    mocks.get.mockResolvedValue(
+      magpieSelection({
+        selectedModelConfigId: 'mp',
+        selectedModel: 'acme/vx-lab',
+      }),
+    );
+    mocks.put.mockResolvedValue(
+      magpieSelection({
+        selectedModelConfigId: 'mp',
+        selectedModel: 'acme/vx-lab',
+        selectedEffort: 'xhigh',
+      }),
+    );
+    await render('s0');
+    await openEffort();
+    expect(effortItems().map((item) => item.textContent)).toEqual([
+      '默认',
+      '低',
+      '中',
+      '高',
+      '超高',
+      '最高',
+    ]);
+    expect(document.querySelector('[role="menu"]')?.textContent).toContain(
+      '未验证',
+    );
+    await click(effortItem('超高'));
+    expect(mocks.put).toHaveBeenCalledWith(
+      '/api/groups/web%3Aws/model-selection',
+      {
+        agentId: 's0',
+        modelConfigId: 'mp',
+        model: 'acme/vx-lab',
+        effort: 'xhigh',
+      },
+    );
+  });
+
+  test('a model declared to take no effort offers no effort choice', async () => {
+    mocks.get.mockResolvedValue(
+      magpieSelection({
+        selectedModelConfigId: 'mp',
+        selectedModel: 'acme/vx-mini',
+      }),
+    );
+    await render('s0');
+    // After the monogram of a relay the registry does not know.
+    expect(trigger().textContent).toBe('MVX Mini');
+    expect(effortTrigger()).toBeNull();
+  });
+
+  test('switching to an unknown model keeps the picked level', async () => {
+    mocks.get.mockResolvedValue(
+      magpieSelection({
+        selectedModelConfigId: 'mp',
+        selectedEffort: 'high',
+      }),
+    );
+    mocks.put.mockResolvedValue(magpieSelection());
+    await render('s0');
+    await open();
+    await click(row('acme/vx-lab'));
+    expect(mocks.put).toHaveBeenCalledWith(
+      '/api/groups/web%3Aws/model-selection',
+      {
+        agentId: 's0',
+        modelConfigId: 'mp',
+        model: 'acme/vx-lab',
+        effort: 'high',
+      },
+    );
   });
 });

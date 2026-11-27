@@ -165,7 +165,7 @@ export interface IMChannelConnectOpts {
   ) => Promise<string | null>;
   /** 根据 jid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (jid: string) => string | undefined;
-  /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
+  /** 将 IM chatJid 解析为它绑定的会话 JID（`<工作区JID>#agent:<id>`） */
   resolveEffectiveChatJid?: (
     chatJid: string,
     messageMeta?: ChannelMessageMeta,
@@ -262,6 +262,13 @@ export interface IMChannelConnectOpts {
   onTransportIssue?: (issue: FeishuTransportIssue | null) => void;
 }
 
+/**
+ * A reachability probe of one chat: `gone` only when the platform answered
+ * that the bot can no longer see it; `unknown` when the probe proved nothing
+ * (connection down, timeout, rate limit, missing permission).
+ */
+export type ChatReachability = 'reachable' | 'gone' | 'unknown';
+
 export interface IMChannel {
   readonly channelType: string;
   connect(opts: IMChannelConnectOpts): Promise<boolean>;
@@ -316,6 +323,7 @@ export interface IMChannel {
     chat_mode?: string;
     group_message_type?: string;
   } | null>;
+  probeChat?(chatId: string): Promise<ChatReachability>;
   /** Execute a credential-free operation through this exact Feishu Bot. */
   executeFeishuCapability?(
     context: ChannelTurnContext,
@@ -497,6 +505,11 @@ export function createFeishuChannel(config: FeishuChannelConfig): IMChannel {
     async getChatInfo(chatId: string) {
       if (!inner) return null;
       return inner.getChatInfo(chatId);
+    },
+
+    async probeChat(chatId: string) {
+      if (!inner) return 'unknown';
+      return inner.probeChat(chatId);
     },
 
     async executeFeishuCapability(context, request) {

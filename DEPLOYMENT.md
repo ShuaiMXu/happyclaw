@@ -149,3 +149,101 @@ curl -fsS http://127.0.0.1:3000/api/health
 所有者选择不保留数据备份，因此数据库迁移后不存在数据恢复路径。若迁移导致旧代码
 不兼容，应停止继续切换并以前向修复恢复服务，不得自行创建或恢复备份。回滚后重复第 4
 节的健康检查与真实功能测试，并明确报告仅发生了代码回滚。
+
+## 6. Office 文件预览（可选）
+
+文件面板把 doc/docx/xls/xlsx/ppt/pptx/odt/ods/odp 在服务端转成 PDF 预览。没有配置转换器
+时预览返回「未配置」，其他功能不受影响。配置写在现有 `.env` 里（同第 3 节，原地修改、
+不建备份），重启服务后生效：
+
+| 变量                               | 默认值  | 含义                                                                                 |
+| ---------------------------------- | ------- | ------------------------------------------------------------------------------------ |
+| `OFFICE_PREVIEW_STIRLING_URL`      | 未设置  | Stirling-PDF 兼容服务的完整转换地址（`.../api/v1/convert/file/pdf`）；设置后优先使用 |
+| `OFFICE_PREVIEW_STIRLING_KEY_FILE` | 未设置  | 可选，内容作为 `X-API-KEY` 发给该服务；密钥只从文件读取，文件应为 `600`              |
+| `OFFICE_PREVIEW_SOFFICE_BIN`       | 未设置  | 本机 LibreOffice `soffice` 的绝对路径；只有显式设置才启用，不搜索 PATH               |
+| `OFFICE_PREVIEW_MAX_MB`            | `50`    | 源文件上限；转换结果上限是它的 4 倍                                                  |
+| `OFFICE_PREVIEW_TIMEOUT_MS`        | `60000` | 单次转换超时                                                                         |
+| `OFFICE_PREVIEW_CACHE_MAX_MB`      | `1024`  | `data/cache/office-preview/` 的总量上限，超出时先淘汰最久未用的                      |
+
+同时最多 2 个转换、8 个排队，再多返回 503。缓存按源文件内容寻址、跨用户共享，可以随时
+删除，删除后下次打开重新转换。
+
+本机 LibreOffice 的安全前提：`soffice` 在宿主机上以 HappyClaw 服务的身份运行，解析的是
+工作区里的文档，包括 member 的 Container 工作区里由 Agent 或其他人写入的不可信文件。
+LibreOffice 的解析漏洞因此会以服务身份执行，能读到服务能读的一切（`data/`、`.env`、
+渠道凭据），越过「非 admin 的工作区在容器里运行」这条边界。HappyClaw 只给它最小环境
+（`PATH`、指向本次临时目录的 `HOME`/`TMPDIR`、`LANG`/`LC_ALL`），让它在独立进程组里
+运行并在超时时整组杀掉，但这不是沙箱。只有所有能预览文件的人都可信时（例如只有所有者
+自己使用的实例）才设置 `OFFICE_PREVIEW_SOFFICE_BIN`；Mac mini 上的路径是
+`/Applications/LibreOffice.app/Contents/MacOS/soffice`。
+
+多用户部署推荐 Stirling-PDF：把它作为独立容器运行在只有 HappyClaw 能访问的地址上，
+配置 `OFFICE_PREVIEW_STIRLING_URL` 和密钥文件，文档在它的容器里解析。两者都设置时使用
+Stirling。配置后在文件面板打开一个 docx 确认能预览；第二次打开应立即显示（命中缓存）。
+
+## 7. Web 推送通知（可选）
+
+用户在「设置 → 常规 → 推送通知」为当前设备开启后，Web 来源的回复完成或运行出错时，
+如果没有正在看该会话的可见页面，服务端会向这台设备发系统通知。部署侧需要确认：
+
+- 页面必须通过 HTTPS 访问（本机 `localhost` 除外）。HTTP 局域网地址不是安全上下文，浏览器
+  不提供推送，设置页无法开启。iPhone 和 iPad 只有添加到主屏幕的应用能收到推送。
+- 服务器要能访问推送服务：`fcm.googleapis.com`（Chrome、Edge、Android）、
+  `web.push.apple.com`（Safari、主屏幕应用）、`*.push.services.mozilla.com`（Firefox）、
+  `*.notify.windows.com`。大陆部署通常要在 `.env` 设置 `HTTPS_PROXY`；推送请求与其他出站
+  请求一样遵守 `NO_PROXY`。单次投递最长 10 秒。
+- 在 `.env` 设置 `WEB_PUSH_SUBJECT` 为本实例的联系地址（`mailto:ops@example.com` 或
+  `https://` 地址），推送服务在出现问题时用它联系部署方；未设置时使用本项目的 GitHub
+  地址。修改后重启服务生效。
+- 签名密钥在首次使用时生成到 `data/config/web-push-vapid.json`（权限 600）。迁移、恢复时
+  随 `data/` 保留；文件损坏时推送会被停用并在日志里报错，删除它会生成新密钥，所有设备都要
+  重新开启推送。
+
+验证：在 HTTPS 地址上开启推送后点「发送测试通知」（每个账号每分钟最多 3 次），应在几秒
+内收到一条通知；把页面切到后台再发一条消息，回复完成时应收到通知。退出登录会注销这台设备
+的推送订阅。
+
+## 8. 通行密钥（可选）
+
+用户在「设置 → 安全 → 通行密钥」添加后，可以在登录页用设备的指纹、面容或屏幕锁直接登录。
+部署侧需要确认：
+
+- 页面必须通过 HTTPS 域名访问（本机用 `localhost`）。IP 地址（包括 `127.0.0.1` 和 IPv6
+  地址）不能作为 RP ID，即使是 HTTPS 也会被拒绝（`PASSKEY_IP_HOST`），设置页和登录页会
+  提示改用 localhost 或域名；HTTP 的域名不是安全上下文，返回 `PASSKEY_INSECURE`。
+- 通行密钥绑定创建时的主机名。换域名后旧的通行密钥不能再用，需要用密码登录后重新添加。
+- 反向代理要原样转发 `Host`；改写了 `Host` 时，把公网地址（如 `https://claw.example.com`）
+  加进 `CORS_ALLOWED_ORIGINS`，否则会返回 `PASSKEY_NOT_ALLOWED`。`*` 不会放行通行密钥。
+- 在反向代理后面运行时设置 `TRUST_PROXY=true`。否则每个请求的来源都是代理的回环地址：
+  登录限流分不出客户端，未登录可取的通行密钥登录 challenge 也只能共用一个 50 个的名额，
+  任何人反复请求就能挤掉别人正在进行的通行密钥登录。
+
+验证：在 HTTPS 地址上添加一个通行密钥（需要输入当前密码，开了二次验证还要验证码），退出后
+在登录页点「使用通行密钥登录」，应直接进入。
+
+## 9. 二次验证的应急恢复
+
+用户在「设置 → 安全 → 二次验证」开启后，登录时除了密码还要输入验证器 App 的验证码或一个
+恢复码。部署侧需要知道：
+
+- 验证器密钥用 `data/config/claude-provider.key` 加密存放（与渠道账号凭据是同一把密钥）。
+  这个文件丢失或被替换后，验证器的验证码都无法校验：登录第二步返回
+  `MFA_SECRET_UNREADABLE`，日志里有对应错误。恢复码只存加盐哈希、不依赖这把密钥，仍可登录。
+  迁移、恢复时随 `data/` 一起保留它。
+- 普通用户丢失验证器且恢复码用完时，由有 `manage_users` 的人在「用户管理」里重置二次验证。
+- 唯一的管理员（或单人宿主机模式下的唯一账号）丢失验证器、恢复码用完、也没有能用的通行密钥
+  时，没有人能在 Web 上替他重置，只能在服务机上删除他的二次验证（需要 `sqlite3` 命令行工具，
+  macOS 自带；服务不必停止）：
+
+  ```bash
+  cd /Users/riba2534/airepo/happyclaw
+  sqlite3 data/db/messages.db <<'SQL'
+  DELETE FROM user_totp WHERE user_id = (SELECT id FROM users WHERE username = 'admin');
+  DELETE FROM user_recovery_codes WHERE user_id = (SELECT id FROM users WHERE username = 'admin');
+  SQL
+  ```
+
+  把 `admin` 换成实际用户名。之后只用密码即可登录，登录后在设置里重新开启。密码也忘了时，先用
+  `npm run reset:admin -- <用户名> <新密码>` 重置密码（它不动二次验证）。怀疑通行密钥落入他人
+  手中时，用同样的方式删除 `webauthn_credentials` 里该用户的行；其他用户的通行密钥由管理员在
+  「用户管理 → 撤销通行密钥」删除。

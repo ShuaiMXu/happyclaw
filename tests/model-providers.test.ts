@@ -19,6 +19,7 @@ import {
   parseModelList,
   presetModelEntry,
   autoCompactWindowFor,
+  keepsTwoHundredKWindow,
   buildConnectionModelEnv,
   launchModelName,
   normalizeConnectionModelRoles,
@@ -151,8 +152,14 @@ describe('presets', () => {
     for (const preset of MODEL_PRESETS) {
       expect(ids.has(preset.id)).toBe(false);
       ids.add(preset.id);
-      expect(normalizeProviderBaseUrl(preset.baseUrl)).toMatch(/^https:\/\//);
       expect(describeBaseUrlProblem(preset.baseUrl)).toBeNull();
+      if (preset.editableBaseUrl) {
+        // A gateway the user runs: its address is local, its models its own.
+        expect(preset.gateway).toBeTruthy();
+        expect(preset.models).toEqual([]);
+        continue;
+      }
+      expect(normalizeProviderBaseUrl(preset.baseUrl)).toMatch(/^https:\/\//);
       expect(preset.models.length).toBeGreaterThan(0);
       for (const model of preset.models) {
         expect(isValidModelId(presetModelEntry(model).id)).toBe(true);
@@ -518,7 +525,46 @@ describe('connection model env', () => {
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'plain',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'small',
       CLAUDE_CODE_SUBAGENT_MODEL: 'big[1m]',
+      CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
     });
+  });
+
+  // Claude Code 2.1.323+ assumes 1M for a model it does not recognize.
+  test('a launch without [1m] keeps the 200K ceiling next to its compact window', () => {
+    expect(buildConnectionModelEnv({ model: 'small', models })).toMatchObject({
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '128000',
+      CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
+    });
+    expect(
+      buildConnectionModelEnv({ model: 'big', models }),
+    ).not.toHaveProperty('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+  });
+
+  test('keepsTwoHundredKWindow', () => {
+    expect(keepsTwoHundredKWindow('glm-5', null)).toBe(true);
+    expect(keepsTwoHundredKWindow('glm-5', 128_000)).toBe(true);
+    expect(keepsTwoHundredKWindow('glm-5[1m]', 262_144)).toBe(false);
+    expect(keepsTwoHundredKWindow('anthropic/claude-opus-5-5', null)).toBe(
+      false,
+    );
+    expect(keepsTwoHundredKWindow('opus', null)).toBe(false);
+    expect(keepsTwoHundredKWindow('cursor/claude-opus-5-5@300k', null)).toBe(
+      false,
+    );
+    // Only Claude's own families: a name merely containing "claude" is not
+    // one Claude Code knows.
+    expect(keepsTwoHundredKWindow('claude-distill-qwen-72b', null)).toBe(true);
+    expect(keepsTwoHundredKWindow('myproxy/claude-coder', null)).toBe(true);
+    for (const id of [
+      'claude-mythos-5',
+      'anthropic.claude-sonnet-5-5',
+      'claude-haiku-4-5-20251001',
+      'claude-3-7-sonnet-latest',
+    ]) {
+      expect(keepsTwoHundredKWindow(id, null)).toBe(false);
+    }
+    expect(keepsTwoHundredKWindow('claude-opus-5-5', 200_000)).toBe(true);
+    expect(keepsTwoHundredKWindow('', null)).toBe(false);
   });
 
   test('a pass-through connection only gets the roles it names', () => {
@@ -573,6 +619,7 @@ describe('resolved capabilities', () => {
       defaultEffort: null,
       effortsSource: 'none',
       contextSource: 'none',
+      thinkingDisabled: false,
     });
   });
 

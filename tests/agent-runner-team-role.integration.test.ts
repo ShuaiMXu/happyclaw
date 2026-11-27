@@ -10,9 +10,10 @@ import type { TeamRole } from '../container/agent-runner/src/work-items.js';
 
 /**
  * Starts the real Agent Runner (tsx, bundled Claude Code CLI, real SDK) with
- * each team role and reads the first main-loop request it sends to a local
- * fake Anthropic endpoint: the tools the model is offered and the system
- * prompt it gets, exactly as upstream would see them.
+ * each team role, and as a multi-task workspace's conversation, and reads the
+ * first main-loop request it sends to a local fake Anthropic endpoint: the
+ * tools the model is offered and the system prompt it gets, exactly as
+ * upstream would see them.
  */
 
 const repoRoot = process.cwd();
@@ -57,7 +58,11 @@ function runnerEnv(
         typeof entry[1] === 'string' &&
         !entry[0].startsWith('HAPPYCLAW_') &&
         !entry[0].startsWith('ANTHROPIC_') &&
-        !['CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR'].includes(entry[0]),
+        ![
+          'CLAUDE_CODE_OAUTH_TOKEN',
+          'CLAUDE_CONFIG_DIR',
+          'ENABLE_TOOL_SEARCH',
+        ].includes(entry[0]),
     ),
   );
   return {
@@ -99,6 +104,7 @@ function answerMemoryRequests(tasksDir: string): void {
 async function firstMainRequest(
   name: string,
   teamRole: TeamRole | undefined,
+  workMode?: 'multi',
 ): Promise<MainRequest> {
   const scratch = path.join(scratchRoot, name);
   const dirs = {
@@ -113,6 +119,7 @@ async function firstMainRequest(
     fs.mkdirSync(dir, { recursive: true });
   }
   let captured: MainRequest | undefined;
+  let mcpConnected = false;
   const server = http.createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
@@ -127,13 +134,25 @@ async function firstMainRequest(
       } catch {
         // Not a message request.
       }
-      if (!captured && Array.isArray(body.tools) && body.tools.length > 0) {
+      // The main loop offers Bash; a side query may carry only Skill. Under
+      // a loaded machine the CLI can send its first request before the
+      // HappyClaw MCP server has connected, without its tools; the failed
+      // call is retried, so keep the latest request until one carries them.
+      if (
+        !mcpConnected &&
+        Array.isArray(body.tools) &&
+        body.tools.some((tool) => tool.name === 'Bash')
+      ) {
+        const tools = body.tools.map((tool) => tool.name);
         captured = {
           system: systemText(body.system),
-          tools: body.tools.map((tool) => tool.name),
+          tools,
           messages: JSON.stringify(body.messages ?? []),
         };
-        fs.writeFileSync(path.join(inputDir, '_close'), '');
+        if (tools.some((tool) => tool.startsWith('mcp__happyclaw__'))) {
+          mcpConnected = true;
+          fs.writeFileSync(path.join(inputDir, '_close'), '');
+        }
       }
       // Fail every call: only the request matters, and the runner exits.
       response.writeHead(500, { 'content-type': 'application/json' });
@@ -170,6 +189,7 @@ async function firstMainRequest(
         sourceJid: 'feishu:oc_team_role',
       },
       ...(teamRole ? { teamRole } : {}),
+      ...(workMode ? { workMode } : {}),
     }),
   );
   await new Promise((resolve) => child.once('close', resolve));
@@ -212,12 +232,27 @@ const AUTOMATION_TOOLS = [
   'automation_list_runs',
   'automation_notify_current_run',
   'automation_silence_current_run',
+  // Reading other sessions is for ordinary sessions of the owner only.
+  'session_list',
+  'session_get',
 ].map((name) => `mcp__happyclaw__${name}`);
+
+const DELEGATION_TOOLS = [
+  'work_delegate',
+  'work_delegations',
+  'work_stop',
+  'work_followup',
+].map((name) => `mcp__happyclaw__${name}`);
+
+const promptsDir = path.join(repoRoot, 'container', 'agent-runner', 'prompts');
+/** A prompt file as the PromptPlan wraps it. */
+const block = (tag: string, file: string) =>
+  `<${tag}>\n${fs.readFileSync(path.join(promptsDir, file), 'utf8').trimEnd()}\n</${tag}>`;
 
 const runs: Record<string, MainRequest> = {};
 
 beforeAll(async () => {
-  const [plain, router, writer, reader] = await Promise.all([
+  const [plain, router, writer, reader, multi, delegated] = await Promise.all([
     firstMainRequest('plain', undefined),
     firstMainRequest('router', { role: 'router' }),
     firstMainRequest('worker-writable', {
@@ -230,8 +265,22 @@ beforeAll(async () => {
       workItemId: 'item-2',
       writable: false,
     }),
+    firstMainRequest('multi', undefined, 'multi'),
+    firstMainRequest('worker-delegated', {
+      role: 'worker',
+      workItemId: 'item-3',
+      writable: true,
+      origin: 'delegated',
+    }),
   ]);
-  Object.assign(runs, { plain, router, writer, reader });
+  Object.assign(runs, {
+    plain,
+    router,
+    writer,
+    reader,
+    multi,
+    delegated,
+  });
 }, 90_000);
 
 afterAll(() => {
@@ -323,5 +372,57 @@ describe('Agent Runner team roles, as the model sees them', () => {
       const prefix = run.system.slice(0, run.system.indexOf(`<${own}>`));
       expect(runs.plain.system.startsWith(prefix)).toBe(true);
     }
+  });
+});
+
+describe('Agent Runner multi-task mode, as the model sees it', () => {
+  test('a multi-task conversation adds the delegation tools and removes nothing', () => {
+    expect(toolDelta(runs.multi)).toEqual({
+      added: [...DELEGATION_TOOLS].sort(),
+      removed: [],
+    });
+  });
+
+  test('its only prompt change is the background-task guidance', () => {
+    const single = block('background-tasks', 'background-tasks.md');
+    const multi = block('background-tasks', 'background-tasks.multi.md');
+    expect(runs.plain.system).toContain(single);
+    expect(runs.multi.system).toBe(runs.plain.system.replace(single, multi));
+  });
+
+  test("a delegated item's worker only reports, and loses what a team worker loses", () => {
+    expect(toolDelta(runs.delegated)).toEqual({
+      added: ['mcp__happyclaw__work_report'],
+      removed: [
+        'AskUserQuestion',
+        ...POSTING_TOOLS,
+        ...AUTOMATION_TOOLS,
+      ].sort(),
+    });
+  });
+
+  test('it gets the delegated worker section and background guidance, nothing built on send_message', () => {
+    const run = runs.delegated;
+    expect(run.system).toContain(
+      block('delegated-worker', 'delegated-worker.md'),
+    );
+    expect(run.system).toContain(
+      block('background-tasks', 'background-tasks.delegated.md'),
+    );
+    for (const tag of [
+      '<team-router>',
+      '<team-worker>',
+      '<output-contract>',
+      '<delivery-contract>',
+    ]) {
+      expect(run.system).not.toContain(tag);
+    }
+    expect(run.messages).not.toContain('<channel_format');
+    // Everything ahead of its section is the session without a role.
+    const prefix = run.system.slice(
+      0,
+      run.system.indexOf('<delegated-worker>'),
+    );
+    expect(runs.plain.system.startsWith(prefix)).toBe(true);
   });
 });

@@ -116,14 +116,13 @@ function vendorOfHost(baseUrl: string): VendorKind | null {
  * Null when nothing says (a relay of unknown models): show a monogram.
  */
 export function vendorOfConnection(connection: {
-  kind: 'official' | 'third_party' | 'codex' | 'gemini';
+  kind: 'official' | 'third_party' | 'codex';
   presetId?: string | null;
   baseUrl?: string;
   model?: string;
 }): VendorKind | null {
   if (connection.kind === 'official') return 'anthropic';
   if (connection.kind === 'codex') return 'openai';
-  if (connection.kind === 'gemini') return 'gemini';
   return (
     (connection.presetId ? VENDOR_BY_PRESET[connection.presetId] : null) ??
     (connection.baseUrl ? vendorOfHost(connection.baseUrl) : null) ??

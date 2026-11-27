@@ -25,23 +25,28 @@ import {
   CONTAINER_HTTPS_PROXY,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_HEADROOM,
+  CONTAINER_MEMORY_LIMIT,
   CONTAINER_NO_PROXY,
   DATA_DIR,
-  GROUPS_DIR,
   TIMEZONE,
   type ContainerProxyConfig,
 } from './config.js';
+import type { ContainerMemoryLimit } from './container-memory-limit.js';
+import { workspaceDirOf, workspaceLogsDirOf } from './workspace-dir.js';
+import { isSingleUserHost } from './deployment-mode.js';
+
+export const SINGLE_USER_HOST_CONTAINER_REFUSAL =
+  '单人宿主机模式不运行 Docker 工作区；请把工作区改为宿主机模式或切回多人模式。';
 import { logger } from './logger.js';
-import { isCodexGatewayBaseUrl } from './codex-gateway/resolve-gateway-url.js';
+import {
+  isCodexGatewayBaseUrl,
+  resolveCodexUsageAccountingMode,
+} from './codex-gateway/resolve-gateway-url.js';
 import {
   CodexGatewayRunnerLease,
   applyCodexGatewayNoProxy,
   resolveCodexGatewayLaunchConfig,
 } from './codex-gateway/runner-tokens.js';
-import {
-  isGeminiGatewayBaseUrl,
-  resolveGeminiGatewayLaunchConfig,
-} from './gemini-gateway/resolve-gateway-url.js';
 import {
   buildEffectiveMcpManifest,
   loadPluginMcpDefinitions,
@@ -59,8 +64,12 @@ import {
   clearInheritedClaudeProviderEnv,
   getClaudeProviderConfig,
   getContainerEnvConfig,
+  derivedMaxOutputTokens,
+  getProviderById,
   getProviders,
+  providerModels,
   providerHasCredentials,
+  providerToolSearchEnabled,
   getSystemSettings,
   getEffectiveExternalDir,
   hasExplicitWorkspaceClaudeAuth,
@@ -102,6 +111,15 @@ import {
   windowOf,
   type ModelEffort,
 } from './model-providers.js';
+import {
+  launchSubagentDefault,
+  resolveSubagentLaunch,
+  resolveSubagentLaunchWithoutConnection,
+  subagentLaunchModels,
+  subagentPolicyModels,
+  toollessSubagents,
+  type SubagentLaunch,
+} from './agent-subagents.js';
 import { recordUsageEventConnection } from './runtime-state-store.js';
 import {
   normalizeUsageLimitResetAt,
@@ -113,7 +131,7 @@ import {
   chatGptDefaultModel,
   chatGptLaunchModel,
   resolveAgentLaunchModel,
-  resolveLaunchEffort,
+  resolveLaunchReasoning,
   resolveSessionLaunchOverrides,
   sessionModelHasChanged,
   type SessionLaunchOverrides,
@@ -130,6 +148,8 @@ import type {
   ClaudeProviderConfig,
   UnifiedProvider,
 } from './runtime-config.js';
+import { resolveProviderWebFetchPreflightPolicy } from './provider-web-fetch-policy.js';
+import { attachMagpieUsageLimitReset } from './magpie-usage-limit.js';
 import {
   loadManagedMcpLayers,
   resolveManagedMcpPolicy,
@@ -163,15 +183,27 @@ import {
   sessionWorktreeRunError,
 } from './session-worktree.js';
 import { getSessionWorktree } from './session-worktree-store.js';
+import {
+  resolveNfsDirectMounts,
+  type NfsDirectMountResolution,
+} from './host-nfs-mounts.js';
+import {
+  ensureCifsVolume,
+  storageMountArg,
+  type VolumeMountStorage,
+} from './storage-volumes.js';
+import { isStorageSourceMount } from './storage-sources.js';
 import { RegisteredGroup } from './types.js';
 import type {
   AgentProfile,
   AgentProfileRuntimePolicy,
+  AgentSubagentPolicy,
   ChannelTurnContext,
   InteractionMode,
 } from './types.js';
 import type { TeamRole } from './work-items.js';
 import { validateSkillId, validateSkillPath } from './skill-utils.js';
+import { sessionClaudeDir, sessionIpcDir } from './utils.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import type { ContainerOutput } from './agent-runtime-contracts.js';
 export type { ContainerOutput } from './agent-runtime-contracts.js';
@@ -211,7 +243,10 @@ import {
   type FeishuCliRuntimeBinding,
 } from './feishu-cli-runtime.js';
 import { assertValidWorkspaceFolderName } from './workspace-folder.js';
-import { resolveRunnerLivenessTimeouts } from './runner-liveness.js';
+import {
+  resolveRunnerLivenessTimeouts,
+  type RunnerLivenessTimeouts,
+} from './runner-liveness.js';
 import {
   applyLaunchEffortEnv,
   resolveAgentSdkEffort,
@@ -662,6 +697,8 @@ function ensureSettingsJson(
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
+  /** Host-derived accounting semantics for the selected Codex gateway only. */
+  usageAccountingMode?: 'codex';
   /**
    * The effort the host resolved for this launch: Claude Code runs at it, and
    * null means none is sent at all, not even the Agent's own effort as the
@@ -670,20 +707,48 @@ export interface ContainerInput {
    * the Agent's effort then goes as before.
    */
   launchEffort?: string | null;
+  /**
+   * The Agent's sub-agents resolved for this launch's connection
+   * (agent-subagents.ts): SDK definitions and the concurrency cap.
+   */
+  subagents?: SubagentLaunch;
   /** Exact GroupQueue query attempt for Web stream fencing. */
   queryRunId?: string;
   groupFolder: string;
   chatJid: string;
   /** Workspace-scoped interaction contract for this public Agent turn. */
   interactionMode?: InteractionMode;
+  /** Set when the selected connection skips WebFetch's domain check; read at launch. */
+  webFetchPreflightPolicy?: 'skip';
+  /**
+   * Set when the launch's model is declared to take no effort and not to
+   * reason: the Runner turns Claude Code's thinking off for the run.
+   */
+  thinking?: 'disabled';
+  /**
+   * Set when the selected connection turns Claude Code's tool search on: the
+   * Runner pins ENABLE_TOOL_SEARCH=true in the flag settings. Read at launch.
+   */
+  toolSearch?: true;
+  /**
+   * The reply limit HappyClaw derived for this launch from its models'
+   * declarations (derivedMaxOutputTokens): the Runner pins it as
+   * CLAUDE_CODE_MAX_OUTPUT_TOKENS above every settings file. Absent when
+   * HappyClaw derived none, which leaves the key to the settings.
+   */
+  maxOutputTokens?: number;
+  /**
+   * The shortest silence the host tolerates before it closes the runner: the
+   * idle close of resolveRunnerLivenessTimeouts (the process watchdog is never
+   * shorter). The Runner paces its background-hold keepalive by it.
+   */
+  hostIdleCloseMs?: number;
   /** Source JID of the latest message that triggered this run (e.g. `discord:123…`).
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */
   currentSourceJid?: string;
   /** Sanitized provider identity for the exact input turn. */
   channelContext?: ChannelTurnContext;
-  /** @deprecated Use isHome + isAdminHome instead */
-  isMain: boolean;
   turnId?: string;
   /** Persisted message IDs already represented by this cold-run prompt. */
   readonly currentBatchMessageIds?: readonly string[];
@@ -696,8 +761,6 @@ export interface ContainerInput {
   workspaceMemoryMutationSigningSecret?: string;
   /** Public identity paired with the runner-private signing secret. */
   workspaceMemoryRunnerInstanceId?: string;
-  /** Claude session/provider namespace when it differs from agentId. */
-  sessionAgentId?: string;
   images?: Array<{ data: string; mimeType?: string }>;
   agentProfile?: {
     id: string;
@@ -744,7 +807,11 @@ export interface ContainerInput {
   happyClawOwnerProfileEnabled?: boolean;
   /** Host-derived capability flag for main-HappyClaw interactive sessions. */
   agentBuilderEnabled?: boolean;
-  agentId?: string;
+  /**
+   * The session this launch runs: its Claude session, IPC root and
+   * conversation-level choices are all keyed by it.
+   */
+  agentId: string;
   agentName?: string;
   /**
    * Claude Code plugins to inject into the SDK query (via `options.plugins`).
@@ -762,6 +829,12 @@ export interface ContainerInput {
    * from it. Absent for every other session.
    */
   teamRole?: TeamRole;
+  /**
+   * Multi-task mode (多任务模式): set for an ordinary conversation session
+   * (no team role) of a workspace whose work mode is `multi`. The Runner adds
+   * the delegation tools and their prompt section. Absent otherwise.
+   */
+  workMode?: 'multi';
 }
 
 /**
@@ -831,6 +904,29 @@ export function applyProviderFailureDisposition(
     !deferUsageLimitFailure(output, selectedProfileId, waitScope);
   applyKnownProviderFailureDisposition(output, terminal);
   return terminal;
+}
+
+/**
+ * applyProviderFailureDisposition for a launch on `model`, once magpie has
+ * said when a model it refused for its usage limit renews, so that the
+ * input can wait for it. The quotas read is bounded to a few seconds
+ * (MAGPIE_LIMIT_QUOTAS_TIMEOUT_MS) rather than deciding first and parking
+ * later: a decided failure has already been projected to the user, and a
+ * second, later verdict on the same input would be harder to keep right
+ * than a short wait before the one verdict.
+ */
+async function settleProviderFailure(
+  output: ContainerOutput,
+  selectedProfileId: string | null,
+  model: string | null | undefined,
+  input: ContainerInput,
+): Promise<boolean> {
+  await attachMagpieUsageLimitReset(output, selectedProfileId, model);
+  return applyProviderFailureDisposition(
+    output,
+    selectedProfileId,
+    usageLimitWaitScopeFor(input),
+  );
 }
 
 /** The lane and durable input a provider failure belongs to. */
@@ -973,9 +1069,14 @@ function providerFailureDispositionLogMessage(
 }
 
 export interface VolumeMount {
+  /** Host path of a bind, or a display label for a storage mount. */
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+  /** Mounted by Docker as a volume (NFS/SMB) instead of bound from the host. */
+  storage?: VolumeMountStorage;
+  /** Allowed root whose `nfsDirectMount` covers this host directory. */
+  nfsDirectMountRoot?: string;
 }
 
 export type AgentRunnerMode = 'image' | 'development';
@@ -1199,7 +1300,7 @@ function resolveRuntimeMcpServers(
   group: RegisteredGroup,
   agentProfile?: RunnerAgentProfile,
   /** The run's project root; see resolveWorkspaceProjectRoot. */
-  workspaceDir = path.join(GROUPS_DIR, group.folder),
+  workspaceDir = workspaceDirOf(group.folder),
 ): Record<string, Record<string, unknown>> {
   const managedLayers = group.created_by
     ? loadManagedMcpLayers(group.created_by, {
@@ -1466,6 +1567,8 @@ export interface ModelLaunch {
    * on a ChatGPT subscription, whose gateway applies the effort).
    */
   effort: ModelEffort | null;
+  /** The model is declared to take no effort and not to reason. */
+  thinkingDisabled?: true;
   /** ChatGPT only: the conversation's own effort pick. */
   sessionEffort?: string;
   /** ChatGPT only: the Agent's effort, else the inherited main Agent's. */
@@ -1478,8 +1581,10 @@ export interface ModelLaunch {
  * names none), else the model the supplying profile names, else the
  * connection's own. Effort: the conversation's pick, the Agent's explicit
  * effort, the inherited main Agent's, each only if the model takes it, else
- * the model's default; nothing for a model without efforts. With no model
- * at all (a pass-through relay) the Agent's explicit effort.
+ * the model's default (resolveLaunchReasoning): any of them as picked for a
+ * model whose efforts are unknown, nothing and thinking off for one declared
+ * to take none. With no model at all (a pass-through relay) the Agent's
+ * explicit effort.
  */
 export function resolveModelLaunch(
   binding: ModelBinding & { provider: UnifiedProvider },
@@ -1516,17 +1621,19 @@ export function resolveModelLaunch(
     };
   }
   const runs = model ?? provider.anthropicModel;
+  // A pass-through relay names no model: nothing is known to rule the
+  // Agent's explicit effort out, so it goes as set.
+  if (!runs)
+    return { ...(model ? { model } : {}), effort: agentEffort ?? null };
+  const reasoning = resolveLaunchReasoning(provider, runs, [
+    overrides.effort,
+    agentEffort,
+    binding.inheritedEffort,
+  ]);
   return {
     ...(model ? { model } : {}),
-    // A pass-through relay names no model: nothing is known to rule the
-    // Agent's explicit effort out, so it goes as set.
-    effort: runs
-      ? resolveLaunchEffort(provider, runs, [
-          overrides.effort,
-          agentEffort,
-          binding.inheritedEffort,
-        ])
-      : (agentEffort ?? null),
+    effort: reasoning.effort,
+    ...(reasoning.thinkingDisabled ? { thinkingDisabled: true as const } : {}),
   };
 }
 
@@ -1744,6 +1851,7 @@ export function trySelectPoolProvider(
   modelConfigId?: string | null,
   agentModel?: string | null,
   agentEffort?: SdkAgentEffort,
+  subagentPolicy?: AgentSubagentPolicy,
 ): PoolProviderSelection | null {
   const binding = resolveModelBinding(
     { modelConfigId, model: agentModel },
@@ -1768,13 +1876,31 @@ export function trySelectPoolProvider(
     getSystemSettings().fallbackModel,
     provider,
   );
+  const subagents = resolveConnectionSubagents(
+    subagentPolicy,
+    provider,
+    !!modelConfigId && modelConfigId === provider.id,
+    launch.model ?? provider.anthropicModel,
+    { groupFolder, agentId },
+  );
+  const subagentModels = subagentLaunchModels(subagents);
   return withSessionModel(
     {
       profileId: provider.id,
+      ...(Object.keys(subagents).length > 0 ? { subagents } : {}),
       resolved: {
-        config: launch.model
-          ? { ...resolved.config, anthropicModel: launch.model }
-          : resolved.config,
+        // The fallback and the sub-agents' models ride along so their reply
+        // limits count too; the Agent's default sub-agent model takes the
+        // connection's role.
+        config: {
+          ...resolved.config,
+          ...(launch.model ? { anthropicModel: launch.model } : {}),
+          ...(fallbackModel ? { fallbackModel } : {}),
+          ...(subagents.defaultModel
+            ? { subagentModel: subagents.defaultModel }
+            : {}),
+          ...(subagentModels.length > 0 ? { subagentModels } : {}),
+        },
         customEnv: resolved.customEnv,
         ...(launch.effort ? { launchEffort: launch.effort } : {}),
         ...(fallbackModel ? { fallbackModel } : {}),
@@ -1789,10 +1915,92 @@ export function trySelectPoolProvider(
       ...(provider.codexOAuthCredentials
         ? {}
         : { launchEffort: launch.effort }),
+      ...(launch.thinkingDisabled ? { thinkingDisabled: true as const } : {}),
     },
     groupFolder,
     agentId,
   );
+}
+
+/**
+ * Log the sub-agents a launch leaves out because none of their tools is one
+ * a session has (saved before such a list was refused, or the tools a
+ * session lacks changed since).
+ */
+function warnToollessSubagents(
+  policy: AgentSubagentPolicy | undefined,
+  context: { groupFolder: string; agentId?: string | null },
+): void {
+  const toolless = toollessSubagents(policy);
+  if (toolless.length === 0) return;
+  logger.warn(
+    {
+      groupFolder: context.groupFolder,
+      agentId: context.agentId || null,
+      subagents: toolless,
+    },
+    'Agent sub-agent has no tool a session offers; it is left out of the launch',
+  );
+}
+
+/**
+ * The Agent's sub-agents on a launch on `provider`. Names of the Agent's
+ * connection apply only there, and only while it offers them: a name it
+ * dropped is logged and the sub-agent inherits, as a dropped Agent model
+ * does. A ChatGPT subscription runs every tier on the turn's model, so no
+ * name or effort applies on it. An effort goes to the model a sub-agent runs
+ * on as the main model's would (resolveLaunchReasoning): a model declared to
+ * take none gets none, one nothing is known about gets it as picked.
+ */
+export function resolveConnectionSubagents(
+  policy: AgentSubagentPolicy | undefined,
+  provider: UnifiedProvider,
+  onAgentConnection: boolean,
+  turnModel: string,
+  context: { groupFolder: string; agentId?: string | null; warn?: boolean },
+): SubagentLaunch {
+  if (!policy) return {};
+  if (context.warn !== false) warnToollessSubagents(policy, context);
+  const chatGpt = !!provider.codexOAuthCredentials;
+  const models = providerModels(provider);
+  const appliesHere = onAgentConnection && !chatGpt && models.length > 0;
+  if (appliesHere && context.warn !== false) {
+    const gone = subagentPolicyModels(policy).filter(
+      (model) => !findModelEntry(models, model),
+    );
+    if (gone.length > 0) {
+      logger.warn(
+        {
+          groupFolder: context.groupFolder,
+          agentId: context.agentId || null,
+          providerId: provider.id,
+          models: gone,
+        },
+        'Agent sub-agent model is no longer offered by its configuration; the sub-agent follows the configuration',
+      );
+    }
+  }
+  const agentDefault =
+    appliesHere && policy.model
+      ? findModelEntry(models, policy.model)?.id
+      : undefined;
+  // A definition without a model runs the default sub-agent model, else the
+  // turn's (Claude Code's own choice only covers its built-in agents).
+  const inherited =
+    launchSubagentDefault(provider, agentDefault, turnModel).model ?? turnModel;
+  return resolveSubagentLaunch({
+    policy,
+    onAgentConnection: appliesHere,
+    models,
+    takesEffort: (model, effort) => {
+      const runs = model ?? inherited;
+      return (
+        !chatGpt &&
+        !!runs &&
+        resolveLaunchReasoning(provider, runs, [effort]).effort === effort
+      );
+    },
+  });
 }
 
 export interface PoolProviderSelection {
@@ -1817,6 +2025,10 @@ export interface PoolProviderSelection {
   gatewayAgentEffort?: string;
   /** ContainerInput.launchEffort for this launch; absent on ChatGPT. */
   launchEffort?: string | null;
+  /** ContainerInput.thinking for this launch. */
+  thinkingDisabled?: true;
+  /** ContainerInput.subagents for this launch. */
+  subagents?: SubagentLaunch;
 }
 
 /**
@@ -1839,20 +2051,34 @@ export function leaveSessionConnection(
   return { profileId: '', previousProviderId: boundId, resetSession: true };
 }
 
-/** The input a launch starts with: a connection switch, its effort. */
+/**
+ * The input a launch starts with: a connection switch, its effort, whether
+ * its model thinks and the Agent's sub-agents. A thinking flag or sub-agents
+ * the caller's input still carries from an earlier launch are replaced,
+ * never inherited.
+ */
 export function prepareLaunchInput(
   input: ContainerInput,
   selection: PoolProviderSelection | null,
-  sessionAgentId: string | undefined,
 ): ContainerInput {
   const switched = applyProviderSwitchToInput(
     input,
-    selection ?? leaveSessionConnection(input.groupFolder, sessionAgentId),
-    sessionAgentId,
+    selection ?? leaveSessionConnection(input.groupFolder, input.agentId),
   );
-  return selection?.launchEffort !== undefined
-    ? { ...switched, launchEffort: selection.launchEffort }
-    : switched;
+  const policy = input.agentProfile?.runtimePolicy?.subagents;
+  if (!selection) warnToollessSubagents(policy, input);
+  const subagents = selection
+    ? (selection.subagents ?? {})
+    : resolveSubagentLaunchWithoutConnection(policy);
+  const { thinking: _thinking, subagents: _subagents, ...rest } = switched;
+  return {
+    ...rest,
+    ...(Object.keys(subagents).length > 0 ? { subagents } : {}),
+    ...(selection?.launchEffort !== undefined
+      ? { launchEffort: selection.launchEffort }
+      : {}),
+    ...(selection?.thinkingDisabled ? { thinking: 'disabled' as const } : {}),
+  };
 }
 
 /**
@@ -1930,6 +2156,7 @@ export function prepareHostPlugins(
  * turn's model, with `[1m]` when the connection gives it a window above
  * Claude Code's default. On an official connection only a declared window
  * counts (`[1m]` there is the billed 1M opt-in); ChatGPT maps names itself.
+ * None on a magpie connection that does not list it.
  */
 export function fallbackLaunchModel(
   fallbackModel: string | null | undefined,
@@ -1939,11 +2166,50 @@ export function fallbackLaunchModel(
   if (!model) return undefined;
   if (!provider || provider.codexOAuthCredentials) return model;
   const models = effectiveProviderModels(provider);
+  // magpie hands a model it does not list to whatever its own Claude Code
+  // configuration names, so the global fallback goes there only by a name
+  // the connection lists.
+  if (provider.gateway === 'magpie' && !findModelEntry(models, model)) {
+    return undefined;
+  }
   return launchModelName(
     model,
     provider.anthropicBaseUrl
       ? windowOf(models, model)
       : findModelEntry(models, model)?.contextWindow,
+  );
+}
+
+/**
+ * ContainerInput.toolSearch for a launch on `providerId`: set when the
+ * connection turns Claude Code's tool search on. A launch on the
+ * Workspace's own environment follows Claude Code's settings.
+ */
+export function resolveProviderToolSearch(
+  providerId: string | null,
+): true | undefined {
+  const provider = providerId ? getProviderById(providerId) : null;
+  return provider && providerToolSearchEnabled(provider) ? true : undefined;
+}
+
+/**
+ * ContainerInput.maxOutputTokens for a launch on `resolved`: the reply limit
+ * HappyClaw derived (and wrote into the launch env), with the Workspace's
+ * own env override taken into account. None without a connection.
+ */
+export function resolveLaunchMaxOutputTokens(
+  resolved:
+    | Pick<PoolProviderSelection['resolved'], 'config' | 'customEnv'>
+    | undefined,
+  groupFolder: string,
+): number | undefined {
+  if (!resolved) return undefined;
+  return (
+    derivedMaxOutputTokens(
+      resolved.config,
+      resolved.customEnv,
+      getContainerEnvConfig(groupFolder).customEnv,
+    ) ?? undefined
   );
 }
 
@@ -1962,6 +2228,19 @@ export function applyFallbackModelToEnvLines(
   envLines.push(`HAPPYCLAW_FALLBACK_MODEL=${fallbackModel}`);
 }
 
+/**
+ * Create a session's owner-only IPC root (the runner's /workspace/ipc) and
+ * the directories the host and runner exchange files through.
+ */
+function ensureSessionIpcDir(groupFolder: string, agentId: string): string {
+  const ipcDir = sessionIpcDir(groupFolder, agentId);
+  mkdirForContainer(ipcDir);
+  for (const sub of ['messages', 'tasks', 'input']) {
+    mkdirForContainer(path.join(ipcDir, sub));
+  }
+  return ipcDir;
+}
+
 function assertRuntimeEnvPathSegment(value: string, label: string): string {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
     throw new Error(`Invalid ${label} for container environment isolation`);
@@ -1970,15 +2249,15 @@ function assertRuntimeEnvPathSegment(value: string, label: string): string {
 }
 
 /**
- * Keep generated env files isolated by both runtime and Feishu Bot identity.
+ * Keep generated env files isolated by both session and Feishu Bot identity.
  *
- * The main session and conversation agents can execute concurrently inside
- * one workspace. A bound channel account is also included so two Bots routed to
- * the same main workspace can never overwrite each other's credentials.
+ * The sessions of one workspace can execute concurrently, each from its own
+ * directory. A bound channel account is also included so two Bots routed to
+ * the same workspace can never overwrite each other's credentials.
  */
 export function getContainerRuntimeEnvDir(
   groupFolder: string,
-  ipcAgentId?: string,
+  agentId: string,
   feishuChannelAccountId?: string | null,
 ): string {
   const safeGroupFolder = assertValidWorkspaceFolderName(
@@ -1994,15 +2273,13 @@ export function getContainerRuntimeEnvDir(
         ),
       ]
     : ['default'];
-  const runtimePath = ipcAgentId
-    ? ['agents', assertRuntimeEnvPathSegment(ipcAgentId, 'agent id')]
-    : ['main'];
   return path.join(
     DATA_DIR,
     'env',
     safeGroupFolder,
     ...identityPath,
-    ...runtimePath,
+    'agents',
+    assertRuntimeEnvPathSegment(agentId, 'agent id'),
   );
 }
 
@@ -2017,8 +2294,9 @@ interface PreparedVolumeMounts {
   runtimeMcpServers: Record<string, Record<string, unknown>>;
   hostPlugins: SdkPluginConfig[];
   dockerOauthLaunch: OAuthLaunchSnapshot | null;
-  /** Selected provider routes through an embedded 订阅网关 (ChatGPT/Codex or Gemini); docker run needs host.docker.internal. */
-  usesEmbeddedGateway: boolean;
+  /** Selected provider routes through the ChatGPT/Codex 订阅网关; docker run needs host.docker.internal. */
+  usesCodexGateway: boolean;
+  usageAccountingMode?: 'codex';
   /** Selected provider endpoint was rewritten from host loopback to host.docker.internal. */
   providerNeedsHostGateway: boolean;
 }
@@ -2026,11 +2304,10 @@ interface PreparedVolumeMounts {
 function prepareVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
+  agentId: string,
   mountUserSkills = true,
-  sessionAgentId?: string,
   ownerHomeFolder?: string,
   resolvedProvider?: ResolvedProvider,
-  ipcAgentId?: string,
   agentProfile?: RunnerAgentProfile,
   channelContext?: ChannelTurnContext,
   containerProxy: ResolvedContainerProxyConfig = {
@@ -2083,31 +2360,21 @@ function prepareVolumeMounts(
 
     // Admin home also gets its group folder as the working directory
     mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
+      hostPath: workspaceDirOf(group.folder),
       containerPath: '/workspace/group',
       readonly: false,
     });
   } else {
     // Member home and non-home groups only get their own folder
     mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
+      hostPath: workspaceDirOf(group.folder),
       containerPath: '/workspace/group',
       readonly: false,
     });
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Sub-agents and task sessions get their own session dir under agents/{id}/.claude/
-  const groupSessionsDir = sessionAgentId
-    ? path.join(
-        DATA_DIR,
-        'sessions',
-        group.folder,
-        'agents',
-        sessionAgentId,
-        '.claude',
-      )
-    : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  // The session's own Claude directory, isolated from every other session.
+  const groupSessionsDir = sessionClaudeDir(group.folder, agentId);
   mkdirForContainer(groupSessionsDir);
   const userSkillsPolicy = resolveAgentProfileUserSkillsPolicy(
     ownerId,
@@ -2188,7 +2455,7 @@ function prepareVolumeMounts(
   // realpath(skillsDir), which would follow a planted symlink).
   let groupReal: string | null = null;
   try {
-    groupReal = fs.realpathSync(path.join(GROUPS_DIR, group.folder));
+    groupReal = fs.realpathSync(workspaceDirOf(group.folder));
   } catch {
     groupReal = null;
   }
@@ -2305,23 +2572,8 @@ function prepareVolumeMounts(
     });
   }
 
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // Sub-agents get their own IPC subdirectory under agents/{agentId}/
-  // Keep host IPC roots owner-only; the entrypoint applies the selected bridge.
-  const groupIpcDir = ipcAgentId
-    ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', ipcAgentId)
-    : path.join(DATA_DIR, 'ipc', group.folder);
-  mkdirForContainer(groupIpcDir);
-  // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
-  for (const sub of ['messages', 'tasks', 'input', 'agents'] as const) {
-    const subDir = path.join(groupIpcDir, sub);
-    fs.mkdirSync(subDir, { recursive: true });
-    try {
-      fs.chmodSync(subDir, 0o700);
-    } catch {
-      /* ignore if already correct */
-    }
-  }
+  // The session's own IPC root; the entrypoint applies the selected bridge.
+  const groupIpcDir = ensureSessionIpcDir(group.folder, agentId);
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -2332,36 +2584,33 @@ function prepareVolumeMounts(
   // Global config merged with per-container overrides.
   const envDir = getContainerRuntimeEnvDir(
     group.folder,
-    ipcAgentId,
+    agentId,
     feishuCliBinding?.source === 'channel_account'
       ? feishuCliBinding.accountId
       : null,
   );
   fs.mkdirSync(envDir, { recursive: true });
   const rawGlobalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
-  const gatewayLaunchConfig = resolveGeminiGatewayLaunchConfig(
-    resolveCodexGatewayLaunchConfig(
-      rawGlobalConfig,
-      'container',
-      codexGatewayLease,
-    ),
+  const codexLaunchConfig = resolveCodexGatewayLaunchConfig(
+    rawGlobalConfig,
     'container',
+    codexGatewayLease,
   );
-  // The gateways already resolve to host.docker.internal; this only rewrites
+  // The gateway already resolves to host.docker.internal; this only rewrites
   // a third-party relay configured on the host's loopback.
   const containerBaseUrl = resolveContainerProviderBaseUrl(
-    gatewayLaunchConfig.anthropicBaseUrl,
+    codexLaunchConfig.anthropicBaseUrl,
   );
   const globalConfig = {
-    ...gatewayLaunchConfig,
+    ...codexLaunchConfig,
     anthropicBaseUrl: containerBaseUrl.baseUrl,
   };
-  const usesEmbeddedGateway =
-    isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl) ||
-    isGeminiGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl);
+  const usesCodexGateway = isCodexGatewayBaseUrl(
+    rawGlobalConfig.anthropicBaseUrl,
+  );
   const providerNeedsHostGateway = containerBaseUrl.addHostGateway;
   const providerRoutedToHost =
-    containerBaseUrl.baseUrl !== gatewayLaunchConfig.anthropicBaseUrl;
+    containerBaseUrl.baseUrl !== codexLaunchConfig.anthropicBaseUrl;
   const containerOverride = getContainerEnvConfig(group.folder);
   const effectiveContainerOverride = resolvedProvider
     ? { customEnv: containerOverride.customEnv }
@@ -2399,15 +2648,19 @@ function prepareVolumeMounts(
   if (mcpPolicyMode !== 'inherit') {
     envLines.push(`HAPPYCLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
   }
+  // With a connection, its launch decided the fallback (none at all on a
+  // magpie connection that does not list it).
   applyFallbackModelToEnvLines(
     envLines,
-    resolvedProvider?.fallbackModel ?? getSystemSettings().fallbackModel,
+    resolvedProvider
+      ? (resolvedProvider.fallbackModel ?? '')
+      : getSystemSettings().fallbackModel,
   );
   applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
   applyContainerProxyEnvLines(envLines, containerProxy.envLines);
   // Both the gateway and a rewritten loopback relay live on
   // host.docker.internal, which a forwarded host proxy cannot resolve.
-  if (usesEmbeddedGateway || providerRoutedToHost) {
+  if (usesCodexGateway || providerRoutedToHost) {
     applyCodexGatewayNoProxyToEnvLines(envLines);
   }
   if (envLines.length > 0) {
@@ -2525,7 +2778,7 @@ function prepareVolumeMounts(
       group.name,
       group.is_home === true,
     );
-    mounts.push(...validatedMounts);
+    mounts.push(...withHostNfsSources(validatedMounts));
   }
 
   return {
@@ -2534,9 +2787,121 @@ function prepareVolumeMounts(
     runtimeMcpServers,
     hostPlugins: pluginSkills,
     dockerOauthLaunch,
-    usesEmbeddedGateway,
+    usesCodexGateway,
+    usageAccountingMode: resolveCodexUsageAccountingMode(
+      rawGlobalConfig.anthropicBaseUrl,
+      effectiveContainerOverride.anthropicBaseUrl,
+    ),
     providerNeedsHostGateway,
   };
+}
+
+/**
+ * A host directory on an NFS share whose allowed root sets `nfsDirectMount`
+ * is mounted by Docker from the same export directory instead of bound from
+ * the host mount, so a host remount cannot leave the container with a stale
+ * handle (see host-nfs-mounts.ts). Every other host directory stays a bind.
+ * An opted-in directory that cannot be mounted directly fails the launch.
+ */
+export function withHostNfsSources(
+  mounts: VolumeMount[],
+  resolve: (
+    hostPaths: string[],
+  ) => NfsDirectMountResolution[] = resolveNfsDirectMounts,
+): VolumeMount[] {
+  const candidates = mounts.filter(
+    (mount) => !mount.storage && mount.nfsDirectMountRoot,
+  );
+  if (candidates.length === 0) return mounts;
+  const results = resolve(candidates.map((mount) => mount.hostPath));
+  const byMount = new Map(
+    candidates.map((mount, index) => [mount, results[index]]),
+  );
+  const issues: string[] = [];
+  const converted = mounts.map((mount) => {
+    const result = byMount.get(mount);
+    if (!result || result.kind === 'bind') return mount;
+    if (result.kind === 'error') {
+      issues.push(
+        `${mount.hostPath} cannot be mounted directly from NFS: ${result.reason}. Set nfsDirectMount to false on allowed root "${mount.nfsDirectMountRoot}" to bind it from the host instead`,
+      );
+      return mount;
+    }
+    logger.info(
+      {
+        hostPath: mount.hostPath,
+        nfs: `${result.source.server}:${result.source.device}`,
+        options: result.source.options,
+        containerPath: mount.containerPath,
+      },
+      'Host directory is on NFS; mounting its export directly',
+    );
+    return { ...mount, storage: { type: 'nfs' as const, ...result.source } };
+  });
+  if (issues.length > 0) throw new AdditionalMountValidationError(issues);
+  return converted;
+}
+
+/** Named SMB volumes for a launch, keyed by the share path they mount. */
+export type StorageVolumeNames = Map<string, string | Error>;
+
+function cifsVolumeKey(storage: { device: string; sourceId: string }): string {
+  return `${storage.sourceId}\u0000${storage.device}`;
+}
+
+/**
+ * Creates the named volumes the group's SMB mounts need, so the password
+ * stays out of argv. Validation failures are left to prepareVolumeMounts,
+ * which reports them where every other mount error is reported.
+ */
+export async function ensureGroupStorageVolumes(
+  group: RegisteredGroup,
+  ensureVolume: typeof ensureCifsVolume = ensureCifsVolume,
+): Promise<StorageVolumeNames> {
+  const names: StorageVolumeNames = new Map();
+  if (group.containerConfigError) return names;
+  const configured = parseContainerConfig(group.containerConfig).config
+    ?.additionalMounts;
+  if (!configured?.some(isStorageSourceMount)) return names;
+  let validated: VolumeMount[];
+  try {
+    validated = validateAdditionalMounts(
+      configured,
+      group.name,
+      group.is_home === true,
+    );
+  } catch {
+    return names;
+  }
+  for (const mount of validated) {
+    if (mount.storage?.type !== 'cifs') continue;
+    const key = cifsVolumeKey(mount.storage);
+    if (names.has(key)) continue;
+    try {
+      names.set(key, await ensureVolume(mount.storage));
+    } catch (err) {
+      names.set(key, err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+  return names;
+}
+
+/** Points each SMB mount at its named volume; fails if it has none. */
+export function withNamedStorageVolumes(
+  mounts: VolumeMount[],
+  names: StorageVolumeNames,
+): VolumeMount[] {
+  return mounts.map((mount) => {
+    if (mount.storage?.type !== 'cifs') return mount;
+    const name = names.get(cifsVolumeKey(mount.storage));
+    if (name instanceof Error) throw name;
+    if (!name) {
+      throw new Error(
+        `SMB volume for ${mount.containerPath} was not prepared before launch`,
+      );
+    }
+    return { ...mount, storage: { type: 'named' as const, name } };
+  });
 }
 
 export function buildVolumeMounts(
@@ -2870,6 +3235,7 @@ export function buildContainerArgs(
   hostIdentity: ContainerHostIdentity = detectContainerHostIdentity(),
   networkConfig: ContainerNetworkConfig = { addHostGateway: false },
   containerImage = CONTAINER_IMAGE,
+  memoryLimit: ContainerMemoryLimit | null = CONTAINER_MEMORY_LIMIT,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
   // Hardening from the Agent SDK secure-deployment guidance that this image
@@ -2877,6 +3243,11 @@ export function buildContainerArgs(
   // --no-sandbox, so nothing needs a setuid privilege gain; the pids limit
   // only stops runaway forks and stays far above browser and build loads.
   args.push('--security-opt', 'no-new-privileges', '--pids-limit', '4096');
+  // Opt-in cap so one runaway agent cannot exhaust a shared Docker VM.
+  if (memoryLimit) {
+    const { dockerValue } = memoryLimit;
+    args.push('--memory', dockerValue, '--memory-swap', dockerValue);
+  }
 
   // Set timezone so container Node.js processes use local time (Asia/Shanghai)
   args.push('-e', `TZ=${tz}`);
@@ -2897,9 +3268,14 @@ export function buildContainerArgs(
     args.push('--add-host', 'host.docker.internal:host-gateway');
   }
 
-  // Docker: -v with :ro suffix for readonly
+  // Docker: -v with :ro suffix for readonly; storage mounts are volumes
   for (const mount of mounts) {
-    if (mount.readonly) {
+    if (mount.storage) {
+      args.push(
+        '--mount',
+        storageMountArg(mount.storage, mount.containerPath, mount.readonly),
+      );
+    } else if (mount.readonly) {
       args.push('-v', `${mount.hostPath}:${mount.containerPath}:ro`);
     } else {
       args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
@@ -2997,6 +3373,16 @@ export async function runContainerAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
+  // Single-user host mode never runs Docker, whatever a leftover Container
+  // row says (other users kept while the mode comes only from env).
+  if (isSingleUserHost()) {
+    return {
+      status: 'error',
+      result: SINGLE_USER_HOST_CONTAINER_REFUSAL,
+      // A deterministic configuration failure: settled at once, no retry.
+      error: `agent_profile_unavailable: ${SINGLE_USER_HOST_CONTAINER_REFUSAL}`,
+    };
+  }
   const startTime = Date.now();
   // Worktrees are host checkouts; a container would run this session in the
   // shared workspace directory instead, so refuse rather than substitute.
@@ -3010,25 +3396,28 @@ export async function runContainerAgent(
   // selection, so everything from selection to spawn stays one synchronous
   // step while the docker CLI round trip no longer blocks the event loop.
   const hostIdentity = await detectContainerHostIdentityAsync();
-  const sessionAgentId = input.sessionAgentId ?? input.agentId;
+  // SMB shares become named volumes through the Docker Engine API; that round
+  // trip also happens ahead of the selection-to-spawn block.
+  const storageVolumes = await ensureGroupStorageVolumes(group);
 
-  const groupDir = path.join(GROUPS_DIR, group.folder);
+  const groupDir = workspaceDirOf(group.folder);
   mkdirForContainer(groupDir);
   // Like the probe above, the host-owned OAuth renewal awaits ahead of the
   // synchronous selection-to-spawn block.
   await refreshLaunchOAuthCredentials(
     group.folder,
-    sessionAgentId,
+    input.agentId,
     input.agentProfile?.modelConfigId,
   );
 
   // ─── Model connection selection ───
   const poolResult = trySelectPoolProvider(
     group.folder,
-    sessionAgentId,
+    input.agentId,
     input.agentProfile?.modelConfigId,
     input.agentProfile?.model,
     resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
+    input.agentProfile?.runtimePolicy?.subagents,
   );
   const selectedProfileId = poolResult?.profileId ?? null;
   const selectedProviderQuotaEpoch = selectedProfileId
@@ -3041,11 +3430,11 @@ export async function runContainerAgent(
   let providerFailureDecision: ContainerOutput | undefined;
   let providerFailureMaintenance = false;
   let healthyInputTurnCompleted = false;
-  input = prepareLaunchInput(input, poolResult, sessionAgentId);
+  input = prepareLaunchInput(input, poolResult);
 
   const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
     groupFolder: group.folder,
-    agentId: input.agentId ?? null,
+    agentId: input.agentId,
   };
   const {
     runnerInstanceId: workspaceMemoryRunnerInstanceId,
@@ -3057,8 +3446,7 @@ export async function runContainerAgent(
   const codexGatewayLease = new CodexGatewayRunnerLease({
     kind: 'container',
     groupFolder: group.folder,
-    agentId: input.agentId ?? null,
-    sessionAgentId: sessionAgentId ?? null,
+    agentId: input.agentId,
     agentEffort:
       poolResult?.gatewayAgentEffort ??
       resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
@@ -3074,17 +3462,19 @@ export async function runContainerAgent(
     const preparedLaunch = prepareVolumeMounts(
       group,
       isAdminHome,
+      input.agentId,
       shouldMountUserSkills,
-      sessionAgentId,
       ownerHomeFolder,
       resolvedProvider,
-      input.agentId,
       input.agentProfile,
       input.channelContext,
       containerProxy,
       codexGatewayLease,
     );
-    const mounts = preparedLaunch.mounts;
+    const mounts = withNamedStorageVolumes(
+      preparedLaunch.mounts,
+      storageVolumes,
+    );
     const dockerPlugins = group.created_by
       ? loadUserPlugins(group.created_by, { runtime: 'docker' })
       : [];
@@ -3116,10 +3506,8 @@ export async function runContainerAgent(
     };
     const skillManifest = preparedLaunch.claudeContextPlan.effectiveSkills;
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-    const agentSuffix = sessionAgentId
-      ? `-${sessionAgentId.replace(/[^a-zA-Z0-9-]/g, '-')}`
-      : '';
-    const containerName = `happyclaw-${safeName}${agentSuffix}-${Date.now()}`;
+    const safeAgentId = input.agentId.replace(/[^a-zA-Z0-9-]/g, '-');
+    const containerName = `happyclaw-${safeName}-${safeAgentId}-${Date.now()}`;
     const containerArgs = buildContainerArgs(
       mounts,
       containerName,
@@ -3128,7 +3516,7 @@ export async function runContainerAgent(
       {
         addHostGateway:
           containerProxy.addHostGateway ||
-          preparedLaunch.usesEmbeddedGateway ||
+          preparedLaunch.usesCodexGateway ||
           preparedLaunch.providerNeedsHostGateway,
       },
       containerImage,
@@ -3152,14 +3540,15 @@ export async function runContainerAgent(
         group: group.name,
         containerName,
         mountCount: mounts.length,
-        isMain: input.isMain,
+        agentId: input.agentId,
         imageProfile:
           containerImage === CONTAINER_IMAGE_HEADROOM ? 'headroom' : 'core',
+        memoryLimit: CONTAINER_MEMORY_LIMIT?.dockerValue ?? null,
       },
       'Spawning container agent',
     );
 
-    const logsDir = path.join(GROUPS_DIR, group.folder, 'logs');
+    const logsDir = workspaceLogsDirOf(group.folder);
     fs.mkdirSync(logsDir, { recursive: true });
 
     const result = await new Promise<ContainerOutput>((resolve) => {
@@ -3180,10 +3569,20 @@ export async function runContainerAgent(
         );
         container.kill();
       });
+      const liveness = runnerLivenessFor(group);
       // Derive a new input with docker-runtime plugins injected; never mutate
       // the caller's `input` object (queue/log/retry paths reuse the same ref).
       const dockerInput: ContainerInput = {
         ...input,
+        usageAccountingMode: preparedLaunch.usageAccountingMode,
+        hostIdleCloseMs: liveness.idleCloseMs,
+        webFetchPreflightPolicy:
+          resolveProviderWebFetchPreflightPolicy(selectedProfileId),
+        toolSearch: resolveProviderToolSearch(selectedProfileId),
+        maxOutputTokens: resolveLaunchMaxOutputTokens(
+          resolvedProvider,
+          group.folder,
+        ),
         workspaceMemoryMutationSigningSecret,
         workspaceMemoryRunnerInstanceId,
         plugins: dockerPlugins,
@@ -3197,12 +3596,7 @@ export async function runContainerAgent(
       container.stdin.end();
 
       let timedOut = false;
-      const systemSettings = getSystemSettings();
-      const timeoutMs = resolveRunnerLivenessTimeouts({
-        executionTimeoutMs:
-          group.containerConfig?.timeout || systemSettings.containerTimeout,
-        idleTimeoutMs: systemSettings.idleTimeout,
-      }).watchdogMs;
+      const timeoutMs = liveness.watchdogMs;
 
       const killOnTimeout = () => {
         timedOut = true;
@@ -3362,10 +3756,11 @@ export async function runContainerAgent(
           );
         }
         if (output.providerFailure) {
-          const terminal = applyProviderFailureDisposition(
+          const terminal = await settleProviderFailure(
             output,
             selectedProfileId,
-            usageLimitWaitScopeFor(input),
+            resolvedProvider?.config.anthropicModel,
+            input,
           );
           providerFailureTerminal = terminal;
           providerFailureDecision = output;
@@ -3485,10 +3880,11 @@ export async function runContainerAgent(
     }
     if (result.providerFailure) {
       if (providerFailureTerminal === undefined) {
-        providerFailureTerminal = applyProviderFailureDisposition(
+        providerFailureTerminal = await settleProviderFailure(
           result,
           selectedProfileId,
-          usageLimitWaitScopeFor(input),
+          resolvedProvider?.config.anthropicModel,
+          input,
         );
       } else {
         applyKnownProviderFailureDisposition(result, providerFailureTerminal);
@@ -3522,16 +3918,17 @@ export interface AvailableGroup {
 }
 
 /**
- * Write available groups snapshot for the container to read.
- * Only admin home can see all available groups (for activation).
- * Other groups see nothing (they can't activate groups).
+ * Write the available groups snapshot into a session's IPC root (the runner's
+ * /workspace/ipc). Only admin home sees all available groups (for
+ * activation); other workspaces see nothing (they can't activate groups).
  */
 export function writeGroupsSnapshot(
   groupFolder: string,
+  agentId: string,
   isAdminHome: boolean,
   groups: AvailableGroup[],
 ): void {
-  const groupIpcDir = path.join(DATA_DIR, 'ipc', groupFolder);
+  const groupIpcDir = sessionIpcDir(groupFolder, agentId);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
   // Admin home sees all groups; others see nothing (they can't activate groups)
@@ -3887,7 +4284,6 @@ export async function runHostAgent(
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
-  const sessionAgentId = input.sessionAgentId ?? input.agentId;
   const setupInstallHint = 'npm --prefix container/agent-runner install';
   const setupBuildHint = 'npm --prefix container/agent-runner run build';
   const hostModeSetupError = (message: string): ContainerOutput => ({
@@ -3897,7 +4293,7 @@ export async function runHostAgent(
   });
 
   // 1. 确定工作目录
-  const defaultGroupDir = path.join(GROUPS_DIR, group.folder);
+  const defaultGroupDir = workspaceDirOf(group.folder);
   // A session that owns a worktree runs only there. A missing or damaged
   // checkout fails the run; falling back would put its edits in the main
   // checkout.
@@ -3999,43 +4395,14 @@ export async function runHostAgent(
     }
   }
 
-  // Always store logs in data/groups/{folder}/logs/, not in customCwd
-  const logsBaseDir = path.join(defaultGroupDir, 'logs');
+  // Logs never go to customCwd or a recorded workspace directory: they stay
+  // in data/groups/{folder}/logs/, or data/logs/{folder} (workspaceLogsDirOf).
+  const logsBaseDir = workspaceLogsDirOf(group.folder);
   fs.mkdirSync(logsBaseDir, { recursive: true });
 
-  // 2. 确保目录结构（宿主机模式下限制目录权限）
-  // Sub-agents get their own IPC and session directories
-  const groupIpcDir = input.agentId
-    ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', input.agentId)
-    : path.join(DATA_DIR, 'ipc', group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), {
-    recursive: true,
-    mode: 0o700,
-  });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), {
-    recursive: true,
-    mode: 0o700,
-  });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), {
-    recursive: true,
-    mode: 0o700,
-  });
-  // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
-  fs.mkdirSync(path.join(groupIpcDir, 'agents'), {
-    recursive: true,
-    mode: 0o700,
-  });
-
-  const groupSessionsDir = sessionAgentId
-    ? path.join(
-        DATA_DIR,
-        'sessions',
-        group.folder,
-        'agents',
-        sessionAgentId,
-        '.claude',
-      )
-    : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  // 2. 确保目录结构（宿主机模式下限制目录权限）：会话自己的 IPC 与 .claude 目录
+  const groupIpcDir = ensureSessionIpcDir(group.folder, input.agentId);
+  const groupSessionsDir = sessionClaudeDir(group.folder, input.agentId);
   fs.mkdirSync(groupSessionsDir, { recursive: true });
 
   // Symlink .claude.json 到宿主机 ~/.claude.json，确保 deviceId 一致
@@ -4126,16 +4493,17 @@ export async function runHostAgent(
   // ─── Model connection selection (host mode) ───
   await refreshLaunchOAuthCredentials(
     group.folder,
-    sessionAgentId,
+    input.agentId,
     input.agentProfile?.modelConfigId,
   );
   const containerOverride = getContainerEnvConfig(group.folder);
   const hostPoolResult = trySelectPoolProvider(
     group.folder,
-    sessionAgentId,
+    input.agentId,
     input.agentProfile?.modelConfigId,
     input.agentProfile?.model,
     resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
+    input.agentProfile?.runtimePolicy?.subagents,
   );
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const hostProviderQuotaEpoch = hostSelectedProfileId
@@ -4150,11 +4518,11 @@ export async function runHostAgent(
   let hostProviderFailureMaintenance = false;
   let hostHealthyInputTurnCompleted = false;
   let hostOauthLaunch: OAuthLaunchSnapshot | null = null;
-  input = prepareLaunchInput(input, hostPoolResult, sessionAgentId);
+  input = prepareLaunchInput(input, hostPoolResult);
 
   const workspaceMemoryCapabilityScope: WorkspaceMemoryCapabilityScope = {
     groupFolder: group.folder,
-    agentId: input.agentId ?? null,
+    agentId: input.agentId,
   };
   const {
     runnerInstanceId: workspaceMemoryRunnerInstanceId,
@@ -4166,8 +4534,7 @@ export async function runHostAgent(
   const codexGatewayLease = new CodexGatewayRunnerLease({
     kind: 'host',
     groupFolder: group.folder,
-    agentId: input.agentId ?? null,
-    sessionAgentId: sessionAgentId ?? null,
+    agentId: input.agentId,
     agentEffort:
       hostPoolResult?.gatewayAgentEffort ??
       resolveAgentSdkEffort(input.agentProfile?.runtimePolicy),
@@ -4175,13 +4542,10 @@ export async function runHostAgent(
   });
   try {
     // Minted inside try so the finally below always revokes the token.
-    const globalConfig = resolveGeminiGatewayLaunchConfig(
-      resolveCodexGatewayLaunchConfig(
-        rawGlobalConfig,
-        'host',
-        codexGatewayLease,
-      ),
+    const globalConfig = resolveCodexGatewayLaunchConfig(
+      rawGlobalConfig,
       'host',
+      codexGatewayLease,
     );
     // 配置层环境变量
     const envLines = buildContainerEnvLines(
@@ -4207,18 +4571,15 @@ export async function runHostAgent(
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
       }
     }
-    const hostFallbackModel =
-      hostPoolResult?.resolved.fallbackModel ??
-      getSystemSettings().fallbackModel?.trim();
+    const hostFallbackModel = hostPoolResult
+      ? hostPoolResult.resolved.fallbackModel
+      : getSystemSettings().fallbackModel?.trim();
     if (hostFallbackModel) {
       hostEnv['HAPPYCLAW_FALLBACK_MODEL'] = hostFallbackModel;
     } else {
       delete hostEnv['HAPPYCLAW_FALLBACK_MODEL'];
     }
-    if (
-      isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl) ||
-      isGeminiGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl)
-    ) {
+    if (isCodexGatewayBaseUrl(rawGlobalConfig.anthropicBaseUrl)) {
       applyCodexGatewayNoProxy(hostEnv, 'host');
     }
 
@@ -4468,7 +4829,7 @@ export async function runHostAgent(
       {
         group: group.name,
         workingDir: groupDir,
-        isMain: input.isMain,
+        agentId: input.agentId,
       },
       'Spawning host agent',
     );
@@ -4513,8 +4874,24 @@ export async function runHostAgent(
       // prepareHostPlugins mirrors the docker path's pre-spawn materialize so
       // a freshly-enabled v2 user (no runtime/ on disk yet) doesn't see 0
       // plugins.
+      const liveness = runnerLivenessFor(group);
       const hostInput: ContainerInput = {
         ...input,
+        usageAccountingMode: resolveCodexUsageAccountingMode(
+          rawGlobalConfig.anthropicBaseUrl,
+          hostSelectedProfileId
+            ? undefined
+            : containerOverride.anthropicBaseUrl,
+        ),
+        hostIdleCloseMs: liveness.idleCloseMs,
+        webFetchPreflightPolicy: resolveProviderWebFetchPreflightPolicy(
+          hostSelectedProfileId,
+        ),
+        toolSearch: resolveProviderToolSearch(hostSelectedProfileId),
+        maxOutputTokens: resolveLaunchMaxOutputTokens(
+          hostPoolResult?.resolved,
+          group.folder,
+        ),
         workspaceMemoryMutationSigningSecret,
         workspaceMemoryRunnerInstanceId,
         plugins: preparedHostPlugins,
@@ -4531,12 +4908,7 @@ export async function runHostAgent(
 
       // 9. 超时管理
       let timedOut = false;
-      const systemSettings = getSystemSettings();
-      const timeoutMs = resolveRunnerLivenessTimeouts({
-        executionTimeoutMs:
-          group.containerConfig?.timeout || systemSettings.containerTimeout,
-        idleTimeoutMs: systemSettings.idleTimeout,
-      }).watchdogMs;
+      const timeoutMs = liveness.watchdogMs;
 
       let killTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -4675,10 +5047,11 @@ export async function runHostAgent(
           );
         }
         if (output.providerFailure) {
-          const terminal = applyProviderFailureDisposition(
+          const terminal = await settleProviderFailure(
             output,
             hostSelectedProfileId,
-            usageLimitWaitScopeFor(input),
+            hostPoolResult?.resolved.config.anthropicModel,
+            input,
           );
           hostProviderFailureTerminal = terminal;
           hostProviderFailureDecision = output;
@@ -4787,10 +5160,11 @@ export async function runHostAgent(
     }
     if (hostResult.providerFailure) {
       if (hostProviderFailureTerminal === undefined) {
-        hostProviderFailureTerminal = applyProviderFailureDisposition(
+        hostProviderFailureTerminal = await settleProviderFailure(
           hostResult,
           hostSelectedProfileId,
-          usageLimitWaitScopeFor(input),
+          hostPoolResult?.resolved.config.anthropicModel,
+          input,
         );
       } else {
         applyKnownProviderFailureDisposition(
@@ -4821,6 +5195,22 @@ export async function runHostAgent(
 
 /** A concrete agent runner (Docker or host) — both share this signature. */
 export type AgentRunner = typeof runContainerAgent | typeof runHostAgent;
+
+/**
+ * The idle close and process watchdog of a runner launched for `group`. The
+ * host's idle close and the idle close the Runner is told
+ * (`ContainerInput.hostIdleCloseMs`) both come from here, for the same group.
+ */
+export function runnerLivenessFor(
+  group: Pick<RegisteredGroup, 'containerConfig'>,
+): RunnerLivenessTimeouts {
+  const systemSettings = getSystemSettings();
+  return resolveRunnerLivenessTimeouts({
+    executionTimeoutMs:
+      group.containerConfig?.timeout || systemSettings.containerTimeout,
+    idleTimeoutMs: systemSettings.idleTimeout,
+  });
+}
 
 /**
  * Model-tier fallback lives inside agent-runner, and provider failover for a
