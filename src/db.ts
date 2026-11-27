@@ -1,10 +1,14 @@
+import {
+  deleteAuthFactorsForUser,
+  initAuthFactorStore,
+} from './auth-factor-store.js';
 import { selectChannelReplyBatch } from './channel-reply-source.js';
 import crypto from 'crypto';
 import Database from './sqlite-compat.js';
 import fs from 'fs';
 import path from 'path';
 
-import { STORE_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
+import { STORE_DIR, TIMEZONE } from './config.js';
 import { normalizeAgentEffort } from './agent-effort.js';
 import { logger } from './logger.js';
 import { isValidWorkspaceFolderName } from './workspace-folder.js';
@@ -107,6 +111,12 @@ import {
 } from './owner-profile-store.js';
 import { initSessionWorktreeStore } from './session-worktree-store.js';
 import {
+  assignWorkspaceRootDirIfNew,
+  deleteRecordedWorkdir,
+  ensureWorkspaceDirs,
+  initWorkspaceDirStore,
+} from './workspace-dir.js';
+import {
   deleteWorkspaceAutomations,
   initAutomationStore,
   migrateLegacyScheduledTasks,
@@ -115,6 +125,27 @@ import {
   deleteWorkspaceWorkItems,
   initWorkItemStore,
 } from './work-item-store.js';
+import {
+  deleteWebPushSubscriptionsForUser,
+  initWebPushStore,
+  moveWebPushSubscriptionsToSession,
+} from './web-push-store.js';
+import {
+  DEFAULT_WORK_MODE,
+  parseWorkMode,
+  type WorkMode,
+} from './work-items.js';
+import {
+  migrateLegacyMainSessions,
+  forgetOrphanedLegacyMainState,
+  relocateLegacyMainSessionDirectories,
+  type LegacyMainSessionMigrationReport,
+} from './legacy-main-session-migration.js';
+import { LEGACY_MAIN_SESSION_KEY_PREFIX } from './legacy-main-session-checks.js';
+import {
+  normalizeSubagentPolicy,
+  subagentIdentity,
+} from './agent-subagents.js';
 import { keyPrefixRange } from './sql-key-prefix.js';
 import {
   clearAgentSessionHistoryReinjections,
@@ -609,8 +640,16 @@ const FK_CHECK_CLEAN_AT_KEY = 'foreign_key_check_clean_at';
 const FK_CHECK_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function initDatabase(
-  options: { requireCurrentSchema?: boolean } = {},
-): void {
+  options: {
+    requireCurrentSchema?: boolean;
+    /** False leaves session directories alone (the v88 report runs on a copy). */
+    relocateLegacySessionDirectories?: boolean;
+  } = {},
+): {
+  legacyMainSessions: LegacyMainSessionMigrationReport | null;
+  /** v88 mappings and OOM counters forgotten because their session is gone. */
+  forgottenLegacyMainState: { mappings: number; oomCounters: number };
+} {
   const dbPath = path.join(STORE_DIR, 'messages.db');
   assertDatabaseMaintenanceAccess(dbPath);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -996,7 +1035,27 @@ export function initDatabase(
     );
   `);
 
+  // User pinned sessions (per-user session pinning inside a workspace)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_pinned_sessions (
+      user_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      pinned_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, agent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_pinned_sessions_agent
+      ON user_pinned_sessions(agent_id);
+  `);
+
   initSessionWorktreeStore(db);
+  // v89 -> v90: workspace_workdirs, the recorded directory of a Host
+  // workspace created in the workspace root (workspace-dir.ts). Its own
+  // folder-keyed table: `workspaces` is keyed by jid and is a projection that
+  // reconcileCanonicalRuntimeProjections prunes and rebuilds from
+  // registered_groups, so it cannot be the only copy of where files live.
+  // Additive; every existing workspace has no record and stays in
+  // data/groups/<folder>.
+  initWorkspaceDirStore(db);
 
   // v65 -> v66: HappyClaw Owner Profile remains a reserved Workspace Memory
   // item; this table tracks only its one-shot onboarding lifecycle. Duplicate
@@ -2473,6 +2532,14 @@ export function initDatabase(
     'process_visibility',
     "TEXT NOT NULL DEFAULT 'hidden' CHECK (process_visibility IN ('hidden', 'activity', 'full'))",
   );
+  // v88 -> v89: how the workspace's sessions take on work (multi-task mode).
+  // Every existing workspace keeps working as before ('single'). Same row and
+  // same place as process_visibility: before the binding backfill below.
+  ensureColumn(
+    'workspace_agent_profiles',
+    'work_mode',
+    "TEXT NOT NULL DEFAULT 'single' CHECK (work_mode IN ('single', 'multi'))",
+  );
 
   db.exec('DROP TABLE IF EXISTS group_members');
   backfillAgentProfileDefaultsAndWorkspaceMappings();
@@ -2555,11 +2622,23 @@ export function initDatabase(
   createChannelReliabilitySchema(db);
   bindChannelReliabilityDatabase(db);
   initRuntimeStateStore(db);
+  // v91 -> v92: automations.model_config_id / model / reasoning_effort, the
+  // model an automation's run sessions use (automation-store.ts); every
+  // existing automation has none and keeps its sessions' default.
   initAutomationStore(db);
   // v86 -> v87: team mode (团队模式). work-item-store.ts owns its tables
   // (team_mounts, work_items, work_item_subscriptions, work_item_events,
   // work_decisions); they are new and additive, nothing is backfilled.
+  // v88 -> v89: work_items.origin / origin_agent_id / origin_input_id
+  // (multi-task mode); every existing item is a team item.
   initWorkItemStore(db);
+  // v90 -> v91: Web Push subscriptions (web_push_subscriptions). The table is
+  // new and additive, nothing is backfilled.
+  initWebPushStore(db);
+  // v92 -> v93: second login factors (user_totp, user_recovery_codes).
+  // v93 -> v94: passkeys (webauthn_credentials). The tables are new and
+  // additive, nothing is backfilled.
+  initAuthFactorStore(db);
 
   // v63 -> v64: early Feishu reply enrichment embedded quoted ancestors in
   // messages.content, leaking prompt scaffolding into Web history and then
@@ -2752,9 +2831,36 @@ export function initDatabase(
     })();
   }
 
+  // v87 -> v88: each workspace's implicit main session becomes an ordinary
+  // conversation session (legacy-main-session-migration.ts). Last, so every
+  // table it moves state between exists and the binding projections above
+  // have been rebuilt.
+  const legacyMainSessions =
+    rawSchemaVersionBeforeInit === null ||
+    Number(rawSchemaVersionBeforeInit) < 88
+      ? migrateLegacyMainSessions(db)
+      : null;
+
   prepareCached(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', String(CURRENT_SCHEMA_VERSION));
+
+  // Every startup, before any Runner: forgets v88 mappings and OOM counters
+  // of sessions that no longer exist (a database write), then finishes a
+  // directory move a crash interrupted. Maintenance bootstraps
+  // (requireCurrentSchema) do neither; relocateLegacySessionDirectories:
+  // false skips only the move.
+  let forgottenLegacyMainState: { mappings: number; oomCounters: number } = {
+    mappings: 0,
+    oomCounters: 0,
+  };
+  if (!options.requireCurrentSchema) {
+    forgottenLegacyMainState = forgetOrphanedLegacyMainState(db);
+    if (options.relocateLegacySessionDirectories !== false) {
+      relocateLegacyMainSessionDirectories(db);
+    }
+  }
+  return { legacyMainSessions, forgottenLegacyMainState };
 }
 
 const LEGACY_ROUTER_CURSOR_BLOBS: ReadonlyArray<
@@ -3644,6 +3750,24 @@ export function listQueuedFollowUps(chatJid: string): QueuedFollowUp[] {
   return rows.map(normalizeQueuedFollowUpRow);
 }
 
+/** How many inputs each chat has queued, in one read; absent means none. */
+export function countQueuedFollowUpsByChat(
+  chatJids: string[],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  if (chatJids.length === 0) return counts;
+  const rows = prepareCached(`SELECT chat_jid, COUNT(*) AS n
+       FROM messages
+       WHERE delivery_status IN ('queued', 'promoting')
+         AND chat_jid IN (SELECT value FROM json_each(?))
+       GROUP BY chat_jid`).all(JSON.stringify(chatJids)) as Array<{
+    chat_jid: string;
+    n: number;
+  }>;
+  for (const row of rows) counts.set(row.chat_jid, row.n);
+  return counts;
+}
+
 /**
  * Queued inputs that arrived from a channel chat, in queue order: the only
  * ones whose sender can leave a group's response audience. A Web-only
@@ -4054,9 +4178,11 @@ export function withdrawQueuedFollowUp(
 export function cancelQueuedFollowUpsAtCutoff(
   chatJid: string,
   updatedAt = new Date().toISOString(),
+  /** Queued inputs the cutoff leaves in the queue. */
+  keep: (item: QueuedFollowUp) => boolean = () => false,
 ): QueuedFollowUp[] {
   return db.transaction(() => {
-    const items = listQueuedFollowUps(chatJid);
+    const items = listQueuedFollowUps(chatJid).filter((item) => !keep(item));
     if (items.length === 0) return [];
     const cancelQueued = prepareCached(`UPDATE messages
        SET delivery_status = 'cancelled', delivery_updated_at = ?
@@ -4074,6 +4200,29 @@ export function cancelQueuedFollowUpsAtCutoff(
       cancelCoveredRoot.run(updatedAt, chatJid, item.id);
     }
     return items;
+  })();
+}
+
+/**
+ * Give stored messages new ingest sequences after every existing one in
+ * their chat, so a cursor that passed them while they waited in the queue
+ * reads them again once they are released.
+ */
+export function moveMessagesToIngestTail(
+  chatJid: string,
+  messageIds: readonly string[],
+): void {
+  const remove = prepareCached(
+    'DELETE FROM message_ingest_sequences WHERE chat_jid = ? AND message_id = ?',
+  );
+  const add = prepareCached(
+    'INSERT INTO message_ingest_sequences (chat_jid, message_id) VALUES (?, ?)',
+  );
+  db.transaction(() => {
+    for (const id of messageIds) {
+      remove.run(chatJid, id);
+      add.run(chatJid, id);
+    }
   })();
 }
 
@@ -5755,6 +5904,7 @@ type RuntimePolicyInput = Partial<{
       })
     | null;
   mcp: Partial<AgentProfileRuntimePolicy['mcp']> | null;
+  subagents: unknown;
 }>;
 
 function normalizeIdList(value: unknown): string[] {
@@ -5845,6 +5995,8 @@ export function normalizeAgentProfileRuntimePolicy(
       ids: normalizeIdList(raw.mcp?.ids),
     },
   };
+  const subagents = normalizeSubagentPolicy(raw.subagents);
+  if (subagents) normalized.subagents = subagents;
   if (normalized.context.auto_compact_percentage > 0) {
     normalized.context.auto_compact_window = 0;
   }
@@ -5905,6 +6057,8 @@ export function mergeAgentProfileRuntimePolicy(
       : current.context,
     skills: has('skills') ? mergeCapability('skills') : current.skills,
     mcp: has('mcp') ? mergeCapability('mcp') : current.mcp,
+    // Sub-agent settings are saved as one unit; null clears them.
+    subagents: has('subagents') ? patch.subagents : current.subagents,
   });
 }
 
@@ -6134,6 +6288,7 @@ export function computeAgentProfileIdentityHash(
     runtimePolicy?: Record<string, unknown>;
     name?: string;
   } = { prompts };
+  const subagents = subagentIdentity(normalizedPolicy.subagents);
   const identityPolicy = {
     ...(normalizedPolicy.reasoning.effort === 'inherit'
       ? {}
@@ -6141,6 +6296,7 @@ export function computeAgentProfileIdentityHash(
     context: { source: normalizedPolicy.context.source },
     skills: normalizedPolicy.skills,
     mcp: normalizedPolicy.mcp,
+    ...(subagents ? { subagents } : {}),
   };
   const defaultIdentityPolicy = {
     context: { source: DEFAULT_AGENT_PROFILE_RUNTIME_POLICY.context.source },
@@ -6579,7 +6735,9 @@ export function commitAgentBuilderDraft(
 }
 
 /** A model name as stored: never with Claude Code's `[1m]` switch. */
-function storedModelName(model: string | null | undefined): string | null {
+export function storedModelName(
+  model: string | null | undefined,
+): string | null {
   return (model && splitOneMillionSuffix(model).model) || null;
 }
 
@@ -7081,7 +7239,7 @@ export function getWorkspaceAgentProfileBinding(
   groupFolder: string,
 ): WorkspaceAgentProfileBinding | undefined {
   const row =
-    prepareCached(`SELECT group_folder, agent_profile_id, interaction_mode, process_visibility, created_at, updated_at
+    prepareCached(`SELECT group_folder, agent_profile_id, interaction_mode, process_visibility, work_mode, created_at, updated_at
        FROM workspace_agent_profiles
        WHERE group_folder = ?`).get(groupFolder) as
       | {
@@ -7089,6 +7247,7 @@ export function getWorkspaceAgentProfileBinding(
           agent_profile_id: string;
           interaction_mode: unknown;
           process_visibility: unknown;
+          work_mode: unknown;
           created_at: string;
           updated_at: string;
         }
@@ -7102,6 +7261,7 @@ export function getWorkspaceAgentProfileBinding(
       row.group_folder,
     ),
     process_visibility: parseProcessVisibility(row.process_visibility),
+    work_mode: parseWorkMode(row.work_mode) ?? DEFAULT_WORK_MODE,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -7113,13 +7273,28 @@ export function getWorkspaceAgentProfileId(
   return getWorkspaceAgentProfileBinding(groupFolder)?.agent_profile_id;
 }
 
+/**
+ * The modes on a Workspace's Agent binding, with their defaults when it has
+ * none, from one read of the row.
+ */
+export function getWorkspaceModes(
+  groupFolder: string,
+): Pick<
+  WorkspaceAgentProfileBinding,
+  'interaction_mode' | 'process_visibility' | 'work_mode'
+> {
+  const binding = getWorkspaceAgentProfileBinding(groupFolder);
+  return {
+    interaction_mode: binding?.interaction_mode ?? 'assistant',
+    process_visibility: binding?.process_visibility ?? 'hidden',
+    work_mode: binding?.work_mode ?? DEFAULT_WORK_MODE,
+  };
+}
+
 export function getWorkspaceInteractionMode(
   groupFolder: string,
 ): InteractionMode {
-  return (
-    getWorkspaceAgentProfileBinding(groupFolder)?.interaction_mode ??
-    'assistant'
-  );
+  return getWorkspaceModes(groupFolder).interaction_mode;
 }
 
 export function setWorkspaceInteractionMode(
@@ -7140,9 +7315,7 @@ export function setWorkspaceInteractionMode(
 export function getWorkspaceProcessVisibility(
   groupFolder: string,
 ): ProcessVisibility {
-  return (
-    getWorkspaceAgentProfileBinding(groupFolder)?.process_visibility ?? 'hidden'
-  );
+  return getWorkspaceModes(groupFolder).process_visibility;
 }
 
 /**
@@ -7157,6 +7330,29 @@ export function setWorkspaceProcessVisibility(
        SET process_visibility = ?, updated_at = ?
        WHERE group_folder = ?`).run(
     processVisibility,
+    new Date().toISOString(),
+    groupFolder,
+  );
+  return result.changes > 0;
+}
+
+/** How the Workspace's sessions take on work; `single` without a binding. */
+export function getWorkspaceWorkMode(groupFolder: string): WorkMode {
+  return getWorkspaceModes(groupFolder).work_mode;
+}
+
+/**
+ * Takes effect when a session's runner next starts: the runner reads it for
+ * its tools and prompt, nothing already running changes.
+ */
+export function setWorkspaceWorkMode(
+  groupFolder: string,
+  workMode: WorkMode,
+): boolean {
+  const result = prepareCached(`UPDATE workspace_agent_profiles
+       SET work_mode = ?, updated_at = ?
+       WHERE group_folder = ?`).run(
+    workMode,
     new Date().toISOString(),
     groupFolder,
   );
@@ -9495,7 +9691,7 @@ function ensureGroupDirExists(folder: string): void {
     return;
   }
   try {
-    fs.mkdirSync(path.join(GROUPS_DIR, folder, 'logs'), { recursive: true });
+    ensureWorkspaceDirs(folder);
   } catch (err) {
     logger.warn({ err, folder }, 'Failed to ensure group directory exists');
   }
@@ -9547,6 +9743,13 @@ export function ensureUserHomeGroup(
   };
 
   setRegisteredGroup(jid, group);
+  // A new admin home is a Host workspace without a custom directory: it lives
+  // in the workspace root.
+  try {
+    assignWorkspaceRootDirIfNew(jid, group);
+  } catch (err) {
+    logger.warn({ err, folder }, 'Failed to create the workspace directory');
+  }
   ensureGroupDirExists(folder);
   assignWorkspaceAgentProfile(
     folder,
@@ -9863,9 +10066,15 @@ export function deleteGroupData(
     prepareCached(
       'DELETE FROM workspace_runtime_sessions WHERE group_folder = ?',
     ).run(folder);
+    // The directory itself is removed after the commit (removeFlowArtifacts),
+    // which the caller hands the recorded path it read before.
+    deleteRecordedWorkdir(folder);
     // 4. 删除注册信息
     prepareCached('DELETE FROM registered_groups WHERE jid = ?').run(jid);
     // 5. 删除会话与 workspace-owned agents
+    prepareCached(
+      'DELETE FROM user_pinned_sessions WHERE agent_id IN (SELECT id FROM agents WHERE group_folder = ? OR chat_jid = ?)',
+    ).run(folder, jid);
     prepareCached('DELETE FROM sessions WHERE group_folder = ?').run(folder);
     prepareCached(
       'DELETE FROM session_model_selections WHERE group_folder = ?',
@@ -9889,6 +10098,14 @@ export function deleteGroupData(
     );
     // 7. 删除 pin 记录与访客授权
     prepareCached('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
+    // The workspace's v88 mapping and its sessions' OOM counters
+    // (`oom_exits:<folder>#<id>`), which deleteAgent clears one session at a time.
+    prepareCached('DELETE FROM router_state WHERE key = ?').run(
+      `${LEGACY_MAIN_SESSION_KEY_PREFIX}${jid}`,
+    );
+    prepareCached(
+      'DELETE FROM router_state WHERE key >= @from AND key < @to',
+    ).run(keyPrefixRange(`oom_exits:${folder}#`));
     prepareCached(
       'DELETE FROM guest_workspace_grants WHERE workspace_jid = ?',
     ).run(jid);
@@ -9919,6 +10136,32 @@ export function unpinGroup(userId: string, jid: string): void {
   prepareCached(
     'DELETE FROM user_pinned_groups WHERE user_id = ? AND jid = ?',
   ).run(userId, jid);
+}
+
+// --- User pinned sessions ---
+
+/** The sessions a user pinned, as agent id → pinned_at. */
+export function getUserPinnedSessions(userId: string): Record<string, string> {
+  const rows = prepareCached(
+    'SELECT agent_id, pinned_at FROM user_pinned_sessions WHERE user_id = ?',
+  ).all(userId) as Array<{ agent_id: string; pinned_at: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) result[row.agent_id] = row.pinned_at;
+  return result;
+}
+
+export function pinSession(userId: string, agentId: string): string {
+  const pinned_at = new Date().toISOString();
+  prepareCached(
+    'INSERT OR REPLACE INTO user_pinned_sessions (user_id, agent_id, pinned_at) VALUES (?, ?, ?)',
+  ).run(userId, agentId, pinned_at);
+  return pinned_at;
+}
+
+export function unpinSession(userId: string, agentId: string): void {
+  prepareCached(
+    'DELETE FROM user_pinned_sessions WHERE user_id = ? AND agent_id = ?',
+  ).run(userId, agentId);
 }
 
 // --- Web API accessors ---
@@ -10152,6 +10395,56 @@ export function getLatestMessagePreviewPerChat(
     result.set(row.chat_jid, {
       content: toUtf8String(row.content),
       timestamp: row.timestamp,
+    });
+  }
+  return result;
+}
+
+/**
+ * The newest message of each chat a reader would show, in one read: not a
+ * system row, not blank, and not an input cancelled before it ran
+ * (isCancelledInput). Newest by ingest order, like getMessagesPage; the
+ * content is cut to `maxChars` in SQL.
+ */
+export function getLatestVisibleMessagePerChat(
+  chatJids: string[],
+  maxChars: number,
+): Map<string, { content: string; timestamp: string; is_from_me: boolean }> {
+  const result = new Map<
+    string,
+    { content: string; timestamp: string; is_from_me: boolean }
+  >();
+  if (chatJids.length === 0) return result;
+  const rows = prepareCached(
+    `SELECT j.value AS chat_jid,
+            substr(CAST(m.content AS TEXT), 1, ?) AS content,
+            m.timestamp AS timestamp,
+            m.is_from_me AS is_from_me
+     FROM json_each(?) j
+     JOIN messages m ON m.rowid = (
+       SELECT x.rowid
+       FROM message_ingest_sequences seq
+       JOIN messages x ON x.chat_jid = seq.chat_jid AND x.id = seq.message_id
+       WHERE seq.chat_jid = j.value
+         AND x.sender <> '__system__'
+         AND NOT (x.is_from_me = 0
+                  AND COALESCE(x.delivery_status, '') = 'cancelled')
+         AND trim(CAST(COALESCE(x.content, '') AS TEXT),
+                  ' ' || char(9, 10, 13)) <> ''
+       ORDER BY seq.sequence DESC
+       LIMIT 1
+     )`,
+  ).all(Math.max(1, Math.trunc(maxChars)), JSON.stringify(chatJids)) as Array<{
+    chat_jid: string;
+    content: unknown;
+    timestamp: string;
+    is_from_me: number;
+  }>;
+  for (const row of rows) {
+    result.set(row.chat_jid, {
+      content: toUtf8String(row.content),
+      timestamp: row.timestamp,
+      is_from_me: !!row.is_from_me,
     });
   }
   return result;
@@ -10813,6 +11106,8 @@ export function deleteUser(id: string): void {
   const now = new Date().toISOString();
   const tx = db.transaction((userId: string) => {
     prepareCached('DELETE FROM user_sessions WHERE user_id = ?').run(userId);
+    deleteWebPushSubscriptionsForUser(userId);
+    deleteAuthFactorsForUser(userId);
     prepareCached(`UPDATE users
        SET status = 'deleted', deleted_at = ?, disable_reason = COALESCE(disable_reason, 'deleted_by_admin'), updated_at = ?
        WHERE id = ?`).run(now, now, userId);
@@ -10970,6 +11265,11 @@ export function deleteGuestUser(guestUserId: string): void {
         guestUserId,
       );
     }
+    if (tableExists('user_pinned_sessions')) {
+      prepareCached('DELETE FROM user_pinned_sessions WHERE user_id = ?').run(
+        guestUserId,
+      );
+    }
     deleteUser(guestUserId);
   })();
 }
@@ -11030,6 +11330,23 @@ export function deleteUserSession(sessionId: string): void {
 
 export function deleteUserSessionsByUserId(userId: string): void {
   prepareCached('DELETE FROM user_sessions WHERE user_id = ?').run(userId);
+}
+
+/**
+ * End every session of `userId` and sign the device of `currentSessionId` in
+ * again as `next` (a password change made on it). That device keeps its Web
+ * Push subscription; the other devices lose theirs with their sessions.
+ */
+export function replaceUserSessions(
+  userId: string,
+  currentSessionId: string,
+  next: UserSession,
+): void {
+  db.transaction(() => {
+    moveWebPushSubscriptionsToSession(userId, currentSessionId, next.id);
+    deleteUserSessionsByUserId(userId);
+    createUserSession(next);
+  })();
 }
 
 export function updateSessionLastActive(sessionId: string): void {
@@ -11722,6 +12039,17 @@ export function deleteAgent(id: string): void {
       'DELETE FROM usage_limit_waits WHERE substr(scope_key, -length(@suffix)) = @suffix',
     ).run({ suffix: `#agent:${id}` });
     clearAgentSessionHistoryReinjections(id);
+    prepareCached('DELETE FROM user_pinned_sessions WHERE agent_id = ?').run(
+      id,
+    );
+    // The session's v88 mapping and OOM counter (`oom_exits:<folder>#<id>`).
+    prepareCached(
+      'DELETE FROM router_state WHERE key >= @from AND key < @to AND value = @id',
+    ).run({ ...keyPrefixRange(LEGACY_MAIN_SESSION_KEY_PREFIX), id });
+    prepareCached(
+      `DELETE FROM router_state WHERE key >= @from AND key < @to
+         AND substr(key, -length(@suffix)) = @suffix`,
+    ).run({ ...keyPrefixRange('oom_exits:'), suffix: `#${id}` });
     // A product Session can own an SDK runtime resume row and channel mounts;
     // clear all three projections together so direct DB callers cannot leave
     // routable ghosts behind.
@@ -11791,6 +12119,27 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
     automation_id:
       typeof row.automation_id === 'string' ? row.automation_id : null,
   };
+}
+
+/** The conversation sessions of several workspaces at once, by workspace JID. */
+export function listConversationAgentsByJids(
+  chatJids: string[],
+): Map<string, SubAgent[]> {
+  const result = new Map<string, SubAgent[]>();
+  if (chatJids.length === 0) return result;
+  const rows = prepareCached(
+    `SELECT * FROM agents
+     WHERE kind = 'conversation'
+       AND chat_jid IN (SELECT value FROM json_each(?))
+     ORDER BY created_at DESC`,
+  ).all(JSON.stringify(chatJids)) as Array<Record<string, unknown>>;
+  for (const row of rows) {
+    const agent = mapAgentRow(row);
+    const list = result.get(agent.chat_jid);
+    if (list) list.push(agent);
+    else result.set(agent.chat_jid, [agent]);
+  }
+  return result;
 }
 
 export function deleteMessagesForChatJid(chatJid: string): void {
@@ -13292,8 +13641,11 @@ export function closeDatabase(): void {
   bindWorkspaceMemoryDatabase(null);
   bindOwnerProfileDatabase(null);
   initRuntimeStateStore(null);
+  initAuthFactorStore(null);
   initAutomationStore(null);
   initWorkItemStore(null);
+  initWebPushStore(null);
+  initWorkspaceDirStore(null);
   if (db) {
     db.close();
   }

@@ -211,6 +211,8 @@ export function normalizeChannelTurnContext(
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
+  /** Host-derived accounting semantics for the selected Codex gateway only. */
+  usageAccountingMode?: 'codex';
   /**
    * The effort the host resolved for this launch: Claude Code runs at it, and
    * null means none is sent at all, not even the Agent's own effort as the
@@ -219,6 +221,23 @@ export interface ContainerInput {
    * the Agent's effort then goes as before.
    */
   launchEffort?: string | null;
+  /**
+   * The Agent's sub-agents resolved by the host for this launch: SDK
+   * definitions (models already named for the connection) and the cap.
+   */
+  subagents?: {
+    maxConcurrent?: number;
+    agents?: Record<
+      string,
+      {
+        description: string;
+        prompt: string;
+        tools?: string[];
+        model?: string;
+        effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+      }
+    >;
+  };
   turnId?: string;
   /** Persisted message IDs already represented by the cold bootstrap prompt. */
   currentBatchMessageIds?: readonly string[];
@@ -228,12 +247,44 @@ export interface ContainerInput {
   chatJid: string;
   /** Workspace-scoped interaction contract for this public Agent turn. */
   interactionMode?: 'assistant' | 'proactive';
+  /** Set when the selected connection skips WebFetch's domain check. */
+  webFetchPreflightPolicy?: 'skip';
+  /**
+   * The launch's model is declared to take no effort and not to reason: the
+   * run's SDK `thinking` option is `{type: 'disabled'}`.
+   */
+  thinking?: 'disabled';
+  /**
+   * The connection turns Claude Code's tool search on: the flag settings pin
+   * ENABLE_TOOL_SEARCH=true.
+   */
+  toolSearch?: true;
+  /**
+   * The reply limit the host derived from the launch's models: the flag
+   * settings pin it as CLAUDE_CODE_MAX_OUTPUT_TOKENS. Absent leaves the key
+   * to the settings files and the environment.
+   */
+  maxOutputTokens?: number;
+  /**
+   * The shortest silence the host tolerates before it closes the runner: its
+   * idle close (the process watchdog is never shorter). While a result is held
+   * for background work the Runner sends keepalives well within it
+   * (BackgroundHoldKeepalive). Absent from an older host, which gets none.
+   */
+  hostIdleCloseMs?: number;
   /**
    * Team mode (团队模式): this session is a group's router or a work item's
    * worker. It picks the work tools, the team prompt section and the
    * disallowed tools; absent leaves the session exactly as it is.
    */
   teamRole?: TeamRole;
+  /**
+   * Multi-task mode (多任务模式): set only for an ordinary conversation of a
+   * multi-task workspace, never with a team role. It adds the delegation
+   * tools and their background-task guidance; absent leaves the session
+   * exactly as it is.
+   */
+  workMode?: 'multi';
   /** Source JID of the latest message that triggered this run (e.g. `discord:123…`).
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */
@@ -242,8 +293,6 @@ export interface ContainerInput {
    * current turn. This value is mutable on a warm runner and must be replaced
    * whenever a new IPC input becomes current. */
   channelContext?: ChannelTurnContext;
-  /** @deprecated Use isHome + isAdminHome instead. Kept for backward compatibility with older host processes. */
-  isMain?: boolean;
   /** Whether this is the user's home container (admin or member). */
   isHome?: boolean;
   /** Whether this is the admin's home container (full privileges). */
@@ -255,8 +304,6 @@ export interface ContainerInput {
   workspaceMemoryMutationSigningSecret?: string;
   /** Public identity paired with the runner-private signing secret. */
   workspaceMemoryRunnerInstanceId?: string;
-  /** Claude session/provider namespace selected by the host runner. */
-  sessionAgentId?: string;
   images?: Array<{ data: string; mimeType?: string }>;
   agentProfile?: {
     id: string;
@@ -364,6 +411,12 @@ export interface ContainerOutput {
    */
   providerFailureNotice?: string;
   /**
+   * The upstream's own words for the failure (Claude Code's `API Error: …`
+   * text of the assistant error or the error result), capped at 1000
+   * characters. The host reads a gateway's usage-limit wording from it.
+   */
+  providerErrorText?: string;
+  /**
    * Whether the rejection walled the whole account or just one model tier.
    * Model-scope walls quarantine the (account, model) pair only: the account's
    * other tiers and every other account's budget for this model stay usable.
@@ -442,6 +495,10 @@ export interface ContainerOutput {
    * >0 时主进程应把流式卡片保持在「后台任务运行中」而非定稿，后续 turn 的
    * 内容会继续追加到同一张卡。仅 sdk_final 类 result 携带。 */
   pendingBgTasks?: number;
+  /** Liveness only: a result is held for background work and the Runner is
+   * alive (BackgroundHoldKeepalive). The host starts its idle close over and
+   * does nothing else with it: no output, trace, card or Web frame. */
+  backgroundHoldKeepalive?: true;
   /** This SDK result durably completed the user-input turn associated with it.
    * False/absent for truncated, background-pending, interrupted, and error paths. */
   inputTurnCompleted?: boolean;

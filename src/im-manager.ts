@@ -6,6 +6,7 @@
  * to their home container.
  */
 import {
+  type ChatReachability,
   type IMChannel,
   type IMChannelConnectOpts,
   type ChannelMessageDeliveryOptions,
@@ -2317,12 +2318,13 @@ export class IMConnectionManager {
   }
 
   /**
-   * Get chat info for an IM group by JID, auto-routing to the correct connection.
-   * Used for health checks to detect disbanded groups.
+   * Get chat info for an IM group by JID, auto-routing to the correct
+   * connection, for binding and listing routes and backfill. The health
+   * check uses probeChat instead: a null here proves nothing about the chat.
    *
    * Returns:
-   * - object: chat info (reachable)
-   * - null: channel supports getChatInfo but chat is not reachable
+   * - object: chat info
+   * - null: the lookup failed or returned nothing (any reason)
    * - undefined: channel does not support getChatInfo (e.g. Telegram, QQ)
    */
   async getChatInfo(jid: string): Promise<
@@ -2346,6 +2348,20 @@ export class IMConnectionManager {
     }
     // Channel doesn't implement getChatInfo — not a reachability failure
     return undefined;
+  }
+
+  /**
+   * Probe whether an IM group is still visible to its bot, for the binding
+   * health check. `undefined` when the channel cannot probe (Telegram, QQ);
+   * `unknown` when no connection serves the JID right now.
+   */
+  async probeChat(jid: string): Promise<ChatReachability | undefined> {
+    const channelType = getChannelType(jid);
+    if (!channelType) return 'unknown';
+    const channel = this.findChannelForJid(jid, channelType);
+    if (!channel) return 'unknown';
+    if (!channel.probeChat) return undefined;
+    return channel.probeChat(extractProviderTarget(jid));
   }
 
   /** Get all user IDs with active connections */

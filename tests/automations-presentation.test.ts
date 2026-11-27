@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import {
+  automationTakesModel,
   validateAutomationDraft,
   type Automation,
   type AutomationRun,
@@ -15,11 +16,12 @@ import {
   emptyAutomationForm,
   fieldOfError,
   groupAutomationRuns,
+  modelPatchFromForm,
   scheduleFormFrom,
   scheduleFromForm,
   type ScheduleForm,
 } from '../web/src/lib/automation-presentation';
-import { partitionAutomationSessions } from '../web/src/lib/session-presentation';
+import { sessionListItems } from '../web/src/lib/session-presentation';
 import type { AgentInfo } from '../web/src/types';
 
 function automation(overrides: Partial<Automation> = {}): Automation {
@@ -221,6 +223,62 @@ describe('form draft', () => {
     expect(draftFromForm(values).endAt).toBe('2099-01-01T00:00:00.000Z');
   });
 
+  test('only agent runs in sessions of their own take a model', () => {
+    expect(
+      automationTakesModel({ execution: 'agent', sessionMode: 'fresh' }),
+    ).toBe(true);
+    expect(
+      automationTakesModel({ execution: 'agent', sessionMode: 'persistent' }),
+    ).toBe(true);
+    expect(
+      automationTakesModel({ execution: 'agent', sessionMode: 'bound' }),
+    ).toBe(false);
+    expect(
+      automationTakesModel({ execution: 'script', sessionMode: 'persistent' }),
+    ).toBe(false);
+  });
+
+  test('a creation names a model only when one is picked and applies', () => {
+    const model = { modelConfigId: 'glm', model: 'glm-5.3', effort: null };
+    const values = { ...emptyAutomationForm({ workspaceJid: 'web:home' }) };
+    expect(draftFromForm(values)).not.toHaveProperty('model');
+    expect(draftFromForm({ ...values, model }).model).toEqual(model);
+    expect(
+      draftFromForm({ ...values, model, sessionMode: 'bound' }),
+    ).not.toHaveProperty('model');
+    expect(
+      draftFromForm({
+        ...values,
+        model,
+        execution: 'script',
+        sessionMode: 'persistent',
+      }),
+    ).not.toHaveProperty('model');
+  });
+
+  test('an edit sends a changed model, and null where one no longer applies', () => {
+    const model = { modelConfigId: 'glm', model: 'glm-5.3', effort: 'high' };
+    const saved = automation({ sessionMode: 'persistent', model });
+    const values = automationFormFrom(saved);
+    expect(values.model).toEqual(model);
+    expect(modelPatchFromForm(values, saved)).toEqual({});
+    expect(
+      modelPatchFromForm(
+        { ...values, model: { ...model, effort: null } },
+        saved,
+      ),
+    ).toEqual({ model: { ...model, effort: null } });
+    expect(modelPatchFromForm({ ...values, model: null }, saved)).toEqual({
+      model: null,
+    });
+    expect(
+      modelPatchFromForm({ ...values, sessionMode: 'bound' }, saved),
+    ).toEqual({ model: null });
+    // Nothing to clear on an automation that never had one.
+    const plain = automation({ sessionMode: 'bound', model: null });
+    expect(modelPatchFromForm(automationFormFrom(plain), plain)).toEqual({});
+  });
+
   test.each([
     ['请填写名称', 'name'],
     ['请填写提示词', 'prompt'],
@@ -349,8 +407,12 @@ describe('runs and sessions', () => {
     expect(groupAutomationRuns(runs, 'fresh')).toHaveLength(4);
   });
 
-  test('sessions an automation opened are grouped per automation', () => {
-    const session = (id: string, automationId?: string): AgentInfo =>
+  test('sessions an automation opened fold into one row where its newest one is', () => {
+    const session = (
+      id: string,
+      automationId?: string,
+      pinned = false,
+    ): AgentInfo =>
       ({
         id,
         name: id,
@@ -360,20 +422,33 @@ describe('runs and sessions', () => {
         created_at: '2026-10-30T00:00:00Z',
         automation_id: automationId ?? null,
         automation_name: automationId ? `自动化 ${automationId}` : null,
+        pinned_at: pinned ? '2026-10-30T00:00:00Z' : null,
       }) as AgentInfo;
-    const { groups, others } = partitionAutomationSessions([
+    // Already in list order: pinned first, then by recent activity.
+    const items = sessionListItems([
+      session('p1', 'a1', true),
       session('s1', 'a2'),
       session('s2'),
       session('s3', 'a1'),
       session('s4', 'a2'),
     ]);
     expect(
-      groups.map((g) => [g.automationId, g.name, g.sessions.map((s) => s.id)]),
+      items.map((item) =>
+        item.kind === 'session'
+          ? item.session.id
+          : [
+              item.group.automationId,
+              item.group.name,
+              item.group.sessions.map((s) => s.id),
+            ],
+      ),
     ).toEqual([
+      // A pinned session stays a row of its own.
+      'p1',
       ['a2', '自动化 a2', ['s1', 's4']],
+      's2',
       ['a1', '自动化 a1', ['s3']],
     ]);
-    expect(others.map((s) => s.id)).toEqual(['s2']);
   });
 
   test('bound and persistent automations mark their session', () => {

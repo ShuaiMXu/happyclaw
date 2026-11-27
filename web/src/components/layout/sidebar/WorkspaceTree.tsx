@@ -21,6 +21,7 @@ import {
   Pin,
   Plus,
   RotateCcw,
+  SlidersHorizontal,
   Trash2,
 } from 'lucide-react';
 import {
@@ -35,7 +36,7 @@ import { cn } from '@/lib/utils';
 import { EmojiAvatar } from '../../common/EmojiAvatar';
 import { useAuthStore, type AppearanceConfig } from '../../../stores/auth';
 import { useChatStore } from '../../../stores/chat';
-import { useGroupsStore } from '../../../stores/groups';
+import { isWorkspaceRunning, useGroupsStore } from '../../../stores/groups';
 import type { GroupEntry } from '../../../utils/group-utils';
 import {
   type AgentWorkspaceSection,
@@ -49,6 +50,7 @@ import {
 } from '../../../utils/agent-identity';
 import { sidebarRowClass } from './SidebarItem';
 import { NewSessionDialog } from '../../chat/NewSessionDialog';
+import type { NewSessionOptions } from '../../../hooks/useSessionActions';
 import { useOpenedOnce } from '../../../lib/preloaded-component';
 import { ActionSheet } from '../../common/ActionSheet';
 import type { MenuAction } from '../../common/ResponsiveMenu';
@@ -131,7 +133,7 @@ export interface WorkspaceActions {
    */
   onCreateSession?: (
     group: GroupEntry,
-    options?: { name?: string; worktree?: boolean },
+    options?: NewSessionOptions,
   ) => Promise<boolean>;
   /** Open the create-workspace dialog with this agent preselected. */
   onCreateWorkspace?: (agentProfileId: string) => void;
@@ -436,8 +438,9 @@ function AgentGroup({
   const { directGroup, workspaces } = getAgentNavigationTargets(section);
   const runningCount = useGroupsStore(
     (s) =>
-      section.items.filter((item) => s.runnerStates[item.jid] === 'running')
-        .length,
+      section.items.filter((item) =>
+        isWorkspaceRunning(s.runnerStates, item.jid),
+      ).length,
   );
   // An agent that owns the home workspace opens it from its own row, like
   // the primary agent; otherwise the row only expands and collapses.
@@ -599,8 +602,8 @@ const WorkspaceRow = memo(function WorkspaceRow({
   actions: WorkspaceActions;
 }) {
   const currentUser = useAuthStore((s) => s.user);
-  const isRunning = useGroupsStore(
-    (s) => s.runnerStates[group.jid] === 'running',
+  const isRunning = useGroupsStore((s) =>
+    isWorkspaceRunning(s.runnerStates, group.jid),
   );
   const unread = useChatStore((s) => s.unreadReplies[group.jid] ?? 0);
   const touch = variant === 'mobile';
@@ -756,7 +759,13 @@ export function WorkspaceRowMenu({
   const canCreateWorktreeSession =
     canModify && canHost && !!actions.onCreateSession;
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  // Which item opened the dialog; kept while it closes.
+  const [newSessionWorktree, setNewSessionWorktree] = useState(false);
   const newSessionMounted = useOpenedOnce(newSessionOpen);
+  const openNewSession = (worktree: boolean) => {
+    setNewSessionWorktree(worktree);
+    setNewSessionOpen(true);
+  };
   // The row stands for its agent, so name the workspace in its actions.
   const noun = agentId ? '工作区' : '';
   if (!hasWorkspaceItems && !hasAgentItems) return null;
@@ -768,11 +777,19 @@ export function WorkspaceRowMenu({
       onSelect: () => void actions.onCreateSession!(group),
     });
   }
+  // The dialog: a name and a model for anyone who may add a session here.
+  if (canModify && actions.onCreateSession) {
+    create.push({
+      label: `${createSessionLabel(group)}…`,
+      icon: SlidersHorizontal,
+      onSelect: () => openNewSession(false),
+    });
+  }
   if (canCreateWorktreeSession) {
     create.push({
       label: '新建独立 worktree 会话…',
       icon: GitBranch,
-      onSelect: () => setNewSessionOpen(true),
+      onSelect: () => openNewSession(true),
     });
   }
   const organize: MenuAction[] = [];
@@ -833,6 +850,7 @@ export function WorkspaceRowMenu({
         <NewSessionDialog
           open={newSessionOpen}
           groupJid={group.jid}
+          offerWorktree={newSessionWorktree}
           onClose={() => setNewSessionOpen(false)}
           onCreate={(options) => actions.onCreateSession!(group, options)}
         />

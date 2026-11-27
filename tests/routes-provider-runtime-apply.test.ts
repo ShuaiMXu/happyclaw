@@ -17,6 +17,8 @@ const tmpDir = fs.mkdtempSync(
   path.join(os.tmpdir(), 'happyclaw-provider-runtime-apply-'),
 );
 
+const auth = vi.hoisted(() => ({ role: 'admin' as 'admin' | 'member' }));
+
 vi.mock('../src/config.js', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   DATA_DIR: tmpDir,
@@ -38,7 +40,7 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
         id: 'provider-runtime-admin',
         username: 'provider-runtime-admin',
         display_name: 'Provider Runtime Admin',
-        role: 'admin',
+        role: auth.role,
         status: 'active',
         permissions: [],
         must_change_password: false,
@@ -51,6 +53,7 @@ vi.mock('../src/middleware/auth.ts', async (importOriginal) => {
 const web = await import('../src/web.js');
 const db = await import('../src/db.js');
 const runtimeConfig = await import('../src/runtime-config.js');
+const automationStore = await import('../src/automation-store.js');
 const { GroupQueue } = await import('../src/group-queue.js');
 
 const app = web.createAppForTest({
@@ -131,6 +134,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  auth.role = 'admin';
   fs.rmSync(path.join(tmpDir, 'config'), { recursive: true, force: true });
   fs.rmSync(path.join(tmpDir, 'container-env'), {
     recursive: true,
@@ -147,6 +151,200 @@ afterEach(async () => {
 
 afterAll(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+describe('connection WebFetch policy API', () => {
+  function bindPolicyQueue() {
+    const folder = unique('webfetch-policy');
+    const jid = `web:${folder}`;
+    const group = registerWorkspace(jid, folder);
+    const queue = {
+      listDescendantJids: () => [],
+      pauseGroupsForMutation: vi.fn(() => ({ id: 9 })),
+      resumeGroupsAfterMutation: vi.fn(),
+      stopGroup: vi.fn(async () => {}),
+      drainProviderRunnersForCredentialRefresh: vi.fn((_id: string) => 0),
+    };
+    const sessionId = unique('preserved-session');
+    const sessions = { [folder]: sessionId };
+    db.setSession(folder, sessionId);
+    bindDeps({ [jid]: group }, queue, sessions);
+    return { folder, sessionId, sessions, queue };
+  }
+
+  function createPolicyProvider(webFetchPreflightPolicy?: 'check' | 'skip') {
+    return runtimeConfig.createProvider({
+      name: unique('policy-connection'),
+      type: 'third_party',
+      anthropicBaseUrl: 'https://webfetch.example.test',
+      anthropicAuthToken: 'test-policy-key',
+      anthropicModel: 'test-model',
+      webFetchPreflightPolicy,
+    });
+  }
+
+  test.each([
+    [undefined, 'skip', 1],
+    ['skip', 'check', 1],
+    [undefined, 'check', 0],
+    ['skip', 'skip', 0],
+  ] as const)(
+    'saving %s as %s drains this connection %i times after persistence and keeps its session',
+    async (from, to, drains) => {
+      const { folder, sessionId, sessions, queue } = bindPolicyQueue();
+      const target = createPolicyProvider(from);
+      const other = createPolicyProvider();
+      db.setSessionProviderId(folder, '', target.id);
+      queue.drainProviderRunnersForCredentialRefresh.mockImplementation(
+        (id: string) => {
+          expect(
+            runtimeConfig.toPublicProvider(runtimeConfig.getProviderById(id)!)
+              .webFetchPreflightPolicy,
+          ).toBe(to);
+          return 1;
+        },
+      );
+      const response = await patchProvider(target.id, {
+        webFetchPreflightPolicy: to,
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        provider: { id: target.id, webFetchPreflightPolicy: to },
+        applied: { success: true, persisted: true, stoppedCount: 0 },
+      });
+      expect(
+        runtimeConfig.getProviderById(other.id)!.webFetchPreflightPolicy,
+      ).toBeUndefined();
+      expect(queue.drainProviderRunnersForCredentialRefresh.mock.calls).toEqual(
+        Array(drains).fill([target.id]),
+      );
+      expect(queue.pauseGroupsForMutation).not.toHaveBeenCalled();
+      expect(queue.stopGroup).not.toHaveBeenCalled();
+      expect(db.getSession(folder)).toBe(sessionId);
+      expect(sessions[folder]).toBe(sessionId);
+    },
+  );
+
+  test.each(['official', 'third_party'] as const)(
+    'creation persists skip for %s connections',
+    async (type) => {
+      bindPolicyQueue();
+      const response = await app.request('/api/config/claude/providers', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: unique('created-policy'),
+          type,
+          ...(type === 'official'
+            ? { anthropicApiKey: 'test-key' }
+            : {
+                anthropicBaseUrl: 'https://test.example.test',
+                anthropicAuthToken: 'test-key',
+              }),
+          webFetchPreflightPolicy: 'skip',
+        }),
+      });
+      expect(response.status).toBe(201);
+      const created = await response.json();
+      expect(created.webFetchPreflightPolicy).toBe('skip');
+      expect(
+        runtimeConfig.getProviderById(created.id)!.webFetchPreflightPolicy,
+      ).toBe('skip');
+    },
+  );
+
+  test('lists a connection without a stored policy as check without rewriting it', async () => {
+    bindPolicyQueue();
+    const target = createPolicyProvider();
+    const file = path.join(tmpDir, 'config', 'claude-provider.json');
+    const original = fs.readFileSync(file, 'utf8');
+    const response = await app.request('/api/config/claude/providers');
+    expect(response.status).toBe(200);
+    const listed = await response.json();
+    expect(
+      listed.providers.find((item: { id: string }) => item.id === target.id),
+    ).toMatchObject({ webFetchPreflightPolicy: 'check' });
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+  });
+
+  test('rejects invalid policies and unauthorized users before saving or draining', async () => {
+    const { queue } = bindPolicyQueue();
+    const target = createPolicyProvider();
+    for (const policy of ['off', 'disabled', true, null]) {
+      expect(
+        (await patchProvider(target.id, { webFetchPreflightPolicy: policy }))
+          .status,
+      ).toBe(400);
+    }
+    auth.role = 'member';
+    expect(
+      (await patchProvider(target.id, { webFetchPreflightPolicy: 'skip' }))
+        .status,
+    ).toBe(403);
+    expect(
+      runtimeConfig.getProviderById(target.id)!.webFetchPreflightPolicy,
+    ).toBeUndefined();
+    expect(
+      queue.drainProviderRunnersForCredentialRefresh,
+    ).not.toHaveBeenCalled();
+  });
+
+  test('a persistence failure drains no runner and keeps the saved value', async () => {
+    const { queue } = bindPolicyQueue();
+    const target = createPolicyProvider();
+    const write = vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => {
+      throw new Error('simulated disk failure');
+    });
+    try {
+      expect(
+        (await patchProvider(target.id, { webFetchPreflightPolicy: 'skip' }))
+          .status,
+      ).toBe(400);
+    } finally {
+      write.mockRestore();
+    }
+    expect(
+      runtimeConfig.getProviderById(target.id)!.webFetchPreflightPolicy,
+    ).toBeUndefined();
+    expect(
+      queue.drainProviderRunnersForCredentialRefresh,
+    ).not.toHaveBeenCalled();
+  });
+
+  test('mixed protocol and policy edits keep the existing stop and session invalidation path', async () => {
+    const { folder, queue } = bindPolicyQueue();
+    const target = createPolicyProvider();
+    db.setSessionProviderId(folder, '', target.id);
+    const response = await patchProvider(target.id, {
+      anthropicAuthToken: 'another-policy-key',
+      webFetchPreflightPolicy: 'skip',
+    });
+    expect(response.status).toBe(200);
+    expect(queue.stopGroup).toHaveBeenCalled();
+    expect(
+      queue.drainProviderRunnersForCredentialRefresh,
+    ).not.toHaveBeenCalled();
+    expect(db.getSession(folder)).toBeUndefined();
+    expect(
+      runtimeConfig.getProviderById(target.id)!.webFetchPreflightPolicy,
+    ).toBe('skip');
+  });
+
+  test('a new address with a policy edit stops the runners and keeps the session', async () => {
+    const { folder, sessionId, queue } = bindPolicyQueue();
+    const target = createPolicyProvider();
+    db.setSessionProviderId(folder, '', target.id);
+    const response = await patchProvider(target.id, {
+      anthropicBaseUrl: 'https://new.example.test',
+      webFetchPreflightPolicy: 'skip',
+    });
+    expect(response.status).toBe(200);
+    expect(queue.stopGroup).toHaveBeenCalled();
+    expect(
+      queue.drainProviderRunnersForCredentialRefresh,
+    ).not.toHaveBeenCalled();
+    expect(db.getSession(folder)).toBe(sessionId);
+  });
 });
 
 describe('provider runtime apply is a lossless configuration mutation', () => {
@@ -254,6 +452,64 @@ describe('provider runtime apply is a lossless configuration mutation', () => {
     expect(db.archiveAgentProfile(profile.id, 'provider-runtime-admin')).toBe(
       'ok',
     );
+  });
+
+  test("blocks deleting an automation's connection until it is changed", async () => {
+    bindDeps(
+      {},
+      {
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 12 }),
+        resumeGroupsAfterMutation: vi.fn(),
+        stopGroup: vi.fn(async () => {}),
+      },
+    );
+    const target = runtimeConfig.createProvider({
+      name: unique('automation-model-target'),
+      type: 'official',
+      anthropicApiKey: 'target-key',
+    });
+    const at = new Date().toISOString();
+    const automation = {
+      id: unique('automation'),
+      workspaceJid: 'web:automation-model-ws',
+      workspaceFolder: 'automation-model-ws',
+      createdBy: 'provider-runtime-admin',
+      name: '日报',
+      prompt: '汇总',
+      stopWhen: null,
+      schedule: { kind: 'manual' as const },
+      endAt: null,
+      sessionMode: 'fresh' as const,
+      targetSessionJid: null,
+      model: { modelConfigId: target.id, model: null, effort: null },
+      deliveryRouteJid: null,
+      silentWhenIdle: false,
+      preRunCheck: null,
+      execution: 'agent' as const,
+      scriptCommand: null,
+      // A paused one can run again: it counts too.
+      status: 'paused' as const,
+      statusReason: null,
+      nextFireAt: null,
+      lastFiredAt: null,
+      lastFinishedAt: null,
+      revision: 1,
+      createdAt: at,
+      updatedAt: at,
+    };
+    automationStore.insertAutomation(automation);
+
+    const refused = await deleteProvider(target.id);
+    expect(refused.status).toBe(400);
+    expect(await refused.json()).toEqual({
+      error: '该模型配置仍被 1 个自动化使用，请先修改',
+    });
+    expect(runtimeConfig.getProviderById(target.id)).toBeTruthy();
+
+    automationStore.deleteAutomations([automation.id]);
+    expect((await deleteProvider(target.id)).status).toBe(200);
+    expect(runtimeConfig.getProviderById(target.id)).toBeFalsy();
   });
 
   test('keeps a capacity-queued descendant task instead of dropping it', async () => {
@@ -838,7 +1094,7 @@ describe('provider session invalidation only removes attributable sessions', () 
     expect(db.getSession(folder)).toBeUndefined();
   });
 
-  test('clears an unbound session unless every changed protocol field is overridden', async () => {
+  test('a new address does not clear an unbound session whose workspace overrides the changed model', async () => {
     const folder = unique('partial-protocol-override');
     const jid = `web:${folder}`;
     const sessionId = unique('partial-override-session');
@@ -862,7 +1118,7 @@ describe('provider session invalidation only removes attributable sessions', () 
     });
 
     expect(response.status).toBe(200);
-    expect(db.getSession(folder)).toBeUndefined();
+    expect(db.getSession(folder)).toBe(sessionId);
   });
 
   test('repairs a corrupt durable invalidation marker instead of leaving a permanent gate', async () => {

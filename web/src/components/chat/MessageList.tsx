@@ -23,7 +23,10 @@ import {
 } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { useFollowGlide } from '../../hooks/useFollowGlide';
-import { measureVisualViewport } from '../../hooks/useVisualViewport';
+import {
+  layoutViewportHeight,
+  measureVisualViewport,
+} from '../../hooks/useVisualViewport';
 import { useIsPhone } from '../layout/phone';
 import { resolveSystemMessage } from '../../lib/system-message-registry';
 import {
@@ -46,6 +49,10 @@ import {
 } from '../../lib/chat-date-label';
 import { useAuthStore } from '../../stores/auth';
 import type { InteractionMode } from '../../types';
+import type { WorkMode } from '../../work-items';
+import { sessionJidOf } from '../../lib/session-jid';
+import { DelegatedTaskCards } from './DelegatedTaskCards';
+import { lastPersonMessageAt } from '../../lib/multitask';
 
 interface MessageListProps {
   messages: Message[];
@@ -54,18 +61,20 @@ interface MessageListProps {
   onLoadMore: () => void;
   /** Increment to force scroll to bottom (e.g. after sending a message) */
   scrollTrigger?: number;
-  /** Current group JID — used to save/restore scroll position across group switches */
-  groupJid?: string;
+  /** The workspace of the session shown */
+  groupJid: string;
   /** Whether the agent is currently processing */
   isWaiting?: boolean;
-  /** If set, this MessageList is showing a sub-agent's messages */
-  agentId?: string;
+  /** The session shown */
+  agentId: string;
   /** Agent Profile identity for every conversation in this workspace */
   agentName?: string;
   agentAvatarUrl?: string | null;
   agentAvatarEmoji?: string | null;
   agentAvatarColor?: string | null;
   interactionMode?: InteractionMode;
+  /** Multi-task: the tasks this session delegated follow the transcript. */
+  workMode?: WorkMode;
 }
 
 type FlatItem =
@@ -154,6 +163,7 @@ export const MessageList = memo(function MessageList({
   agentAvatarEmoji,
   agentAvatarColor,
   interactionMode = 'assistant',
+  workMode = 'single',
 }: MessageListProps) {
   const { mode: displayMode } = useDisplayMode();
   const thinkingCache = useChatStore((s) => s.thinkingCache ?? {});
@@ -162,26 +172,26 @@ export const MessageList = memo(function MessageList({
   );
   const traceCache = useChatStore((s) => s.traceCache ?? {});
   const stepsCache = useChatStore((s) => s.stepsCache ?? {});
-  const hasWorkflowCard = useChatStore((state) => {
-    const current = agentId
-      ? state.agentStreaming[agentId]
-      : state.streaming[groupJid ?? ''];
-    return Object.values(current?.taskStates ?? {}).some(
+  const hasWorkflowCard = useChatStore((state) =>
+    Object.values(state.agentStreaming[agentId]?.taskStates ?? {}).some(
       (task) => task.taskType === 'local_workflow' && task.workflowRun,
-    );
-  });
+    ),
+  );
   // Spawn agents: selector returns stable reference (the agents array itself),
   // then useMemo filters for spawn kind. Direct .filter() in selector causes
   // infinite re-render because Zustand sees a new array reference every time.
-  const allAgentsForSpawn = useChatStore((s) =>
-    groupJid ? s.agents[groupJid] : undefined,
-  );
+  const allAgentsForSpawn = useChatStore((s) => s.agents[groupJid]);
+  const runtimeJid = sessionJidOf(groupJid, agentId);
+  // The /spawn agents this session started stream here until they report.
   const spawnAgents = useMemo(
     () =>
       (allAgentsForSpawn ?? []).filter(
-        (a) => a.kind === 'spawn' && a.status === 'running',
+        (a) =>
+          a.kind === 'spawn' &&
+          a.status === 'running' &&
+          a.spawned_from_jid === runtimeJid,
       ),
-    [allAgentsForSpawn],
+    [allAgentsForSpawn, runtimeJid],
   );
   const appearance = useAuthStore((state) => state.appearance);
   const agentIdentity = resolveAgentDisplayIdentity({
@@ -194,6 +204,12 @@ export const MessageList = memo(function MessageList({
   const timelineMessages = useMemo(
     () => orderMessagesForTimeline(messages),
     [messages],
+  );
+  // Multi-task: an ended task stays below the transcript until the person
+  // writes again.
+  const personWroteAt = useMemo(
+    () => (workMode === 'multi' ? lastPersonMessageAt(timelineMessages) : 0),
+    [workMode, timelineMessages],
   );
   const today = useLocalToday();
   const parentRef = useRef<HTMLDivElement>(null);
@@ -477,12 +493,7 @@ export const MessageList = memo(function MessageList({
   // seeded with the block's measured height instead of the length estimate,
   // which overshot by 1.2–1.6x and rolled a pinned reader back a screen; a
   // reader scrolled into the reply keeps the row where the block was.
-  const runtimeJid = agentId
-    ? `${groupJid}#agent:${agentId}`
-    : (groupJid ?? '');
-  const hasLive = useChatStore((s) =>
-    agentId ? !!s.agentStreaming[agentId] : !!s.streaming[groupJid ?? ''],
-  );
+  const hasLive = useChatStore((s) => !!s.agentStreaming[agentId]);
   // The previous run's settled card is keyed by its run, and the live card
   // by the active run: the card that settles keeps its element (and DOM)
   // while the next queued run streams into a card of its own below it.
@@ -1035,7 +1046,7 @@ export const MessageList = memo(function MessageList({
     const viewport = window.visualViewport;
     if (!isPhone || !viewport) return;
     const readInset = () =>
-      measureVisualViewport(window.innerHeight, viewport).keyboardInset;
+      measureVisualViewport(layoutViewportHeight(), viewport).keyboardInset;
     let inset = readInset();
     let frame = 0;
     const update = () => {
@@ -1211,7 +1222,7 @@ export const MessageList = memo(function MessageList({
     };
 
     const readStreaming = (state: ReturnType<typeof useChatStore.getState>) =>
-      agentId ? state.agentStreaming[agentId] : state.streaming[groupJid ?? ''];
+      state.agentStreaming[agentId];
 
     let prevText = readStreaming(useChatStore.getState())?.partialText ?? '';
     let prevThinking =
@@ -1261,7 +1272,9 @@ export const MessageList = memo(function MessageList({
     <div className="relative flex-1 overflow-hidden overflow-x-hidden">
       <div
         ref={parentRef}
-        className="h-full overflow-y-auto overflow-x-hidden pb-10"
+        // Room below the last row, unless a phone dock floating over the
+        // list already reserves it (--list-end-room, set by the dock).
+        className="h-full overflow-y-auto overflow-x-hidden pb-[var(--list-end-room,2.5rem)]"
       >
         {/* Clips the follow glide's translation of the content, which would
             otherwise add scroll range below it. A clip, unlike hidden, is
@@ -1464,7 +1477,7 @@ export const MessageList = memo(function MessageList({
             {/* The streaming cards: where the follow glide finds sticky rows. */}
             <div ref={streamCardsRef}>
               <div ref={streamingBlockRef} data-hc-streaming-block="">
-                {groupJid && settledRunKey !== null && (
+                {settledRunKey !== null && (
                   <div
                     key={`run:${settledRunKey}`}
                     data-hc-stream-card="settled"
@@ -1482,46 +1495,50 @@ export const MessageList = memo(function MessageList({
                     />
                   </div>
                 )}
-                {groupJid && (
-                  <div
-                    key={
-                      liveRunKey && liveRunKey !== settledRunKey
-                        ? `run:${liveRunKey}`
-                        : 'live'
-                    }
-                    data-hc-stream-card="live"
-                  >
-                    <StreamingDisplay
-                      groupJid={groupJid}
-                      isWaiting={!!isWaiting}
-                      agentId={agentId}
-                      senderName={agentIdentity.name}
-                      agentAvatarUrl={agentAvatarUrl}
-                      agentAvatarEmoji={agentAvatarEmoji}
-                      agentAvatarColor={agentAvatarColor}
-                      interactionMode={interactionMode}
-                    />
-                  </div>
-                )}
-              </div>
-
-              {/* Inline streaming for spawn agents — parallel tasks in same chat */}
-              {groupJid &&
-                !agentId &&
-                spawnAgents.map((a) => (
+                <div
+                  key={
+                    liveRunKey && liveRunKey !== settledRunKey
+                      ? `run:${liveRunKey}`
+                      : 'live'
+                  }
+                  data-hc-stream-card="live"
+                >
                   <StreamingDisplay
-                    key={a.id}
                     groupJid={groupJid}
-                    isWaiting={true}
-                    agentId={a.id}
-                    senderName={a.name}
+                    isWaiting={!!isWaiting}
+                    agentId={agentId}
+                    senderName={agentIdentity.name}
                     agentAvatarUrl={agentAvatarUrl}
                     agentAvatarEmoji={agentAvatarEmoji}
                     agentAvatarColor={agentAvatarColor}
                     interactionMode={interactionMode}
                   />
-                ))}
+                </div>
+              </div>
+
+              {/* Inline streaming for spawn agents — parallel tasks in same chat */}
+              {spawnAgents.map((a) => (
+                <StreamingDisplay
+                  key={a.id}
+                  groupJid={groupJid}
+                  isWaiting={true}
+                  agentId={a.id}
+                  senderName={a.name}
+                  agentAvatarUrl={agentAvatarUrl}
+                  agentAvatarEmoji={agentAvatarEmoji}
+                  agentAvatarColor={agentAvatarColor}
+                  interactionMode={interactionMode}
+                />
+              ))}
             </div>
+
+            {workMode === 'multi' && (
+              <DelegatedTaskCards
+                groupJid={groupJid}
+                sessionId={agentId}
+                personWroteAt={personWroteAt}
+              />
+            )}
           </div>
         </div>
       </div>

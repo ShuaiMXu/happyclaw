@@ -61,6 +61,7 @@ let blockedFetches = 0;
 let modelsCatalogFetches = 0;
 let blockedProxyRequests = 0;
 let unexpectedHttpRequests = 0;
+let ignoredPortProbes = 0;
 let sdkStderrBytes = 0;
 let sdkFreshInputTokens = 0;
 let sdkCachedInputTokens = 0;
@@ -75,6 +76,17 @@ let cliVersion;
 function check(name, condition) {
   checks[name] = Boolean(condition);
   assert.ok(condition, name);
+}
+
+// Local tools that watch for new listening ports (an IDE's port forwarder, a
+// desktop agent such as jarvisd's `jarvis-ports`) send a bare `GET /` to each
+// one. Neither the CLI nor the gateway requests a root path, and a client
+// using the deny proxy sends absolute-form URLs or CONNECT, so such a request
+// is not network from the system under test.
+function isPortProbe(method, target) {
+  if (method !== 'GET' || target !== '/') return false;
+  ignoredPortProbes++;
+  return true;
 }
 
 async function listen(server) {
@@ -435,6 +447,11 @@ try {
   });
 
   const upstream = createServer(async (request, response) => {
+    if (isPortProbe(request.method, request.url)) {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
     try {
       assert.equal(request.method, 'POST');
       assert.equal(request.url, '/responses');
@@ -552,8 +569,8 @@ try {
   // The native CLI is a subprocess, so a parent fetch wrapper cannot constrain
   // it. Disable nonessential traffic and give it a rejecting HTTP(S) proxy;
   // only the explicitly configured loopback gateway bypasses that proxy.
-  const denyProxy = createServer((_request, response) => {
-    blockedProxyRequests++;
+  const denyProxy = createServer((request, response) => {
+    if (!isPortProbe(request.method, request.url)) blockedProxyRequests++;
     response.writeHead(403);
     response.end();
   });
@@ -588,7 +605,9 @@ try {
   });
   app.route(CODEX_GATEWAY_ROUTE, codexGatewayApp);
   app.notFound((context) => {
-    unexpectedHttpRequests++;
+    if (!isPortProbe(context.req.method, context.req.path)) {
+      unexpectedHttpRequests++;
+    }
     return context.json({ error: 'Unexpected gateway path' }, 404);
   });
   const gateway = await new Promise((resolve, reject) => {
@@ -818,6 +837,40 @@ try {
       result.usage.output_tokens === 22 &&
       !result.usage.cache_creation_input_tokens,
   );
+  const { AssistantUsageCollector } = await import(
+    pathToFileURL(
+      path.join(repository, 'container/agent-runner/dist/assistant-usage.js'),
+    ).href
+  );
+  for (const codex of [true, false]) {
+    const collector = new AssistantUsageCollector({ codex });
+    for (const message of sdkMessages) {
+      collector.observeStreamEvent(message);
+      collector.ingest(message);
+    }
+    let input = 0,
+      cached = 0,
+      output = 0;
+    for (
+      let batch = collector.drain('e2e');
+      batch;
+      batch = collector.drain('e2e')
+    ) {
+      input += batch.tokens.inputTokens;
+      cached += batch.tokens.cacheReadInputTokens;
+      output += batch.tokens.outputTokens;
+    }
+    check(
+      codex
+        ? 'codexCollectorUsesFinalInputs'
+        : 'nonCodexCollectorKeepsExistingRule',
+      codex
+        ? input === sdkFreshInputTokens &&
+            cached === sdkCachedInputTokens &&
+            output === sdkOutputTokens
+        : input > sdkFreshInputTokens,
+    );
+  }
   check(
     'sdkCachedInputCountedOnce',
     result.usage.input_tokens +
@@ -847,15 +900,17 @@ try {
   abortController = new AbortController();
   timer = setTimeout(() => abortController.abort(), 60000);
   const pickedModel = 'gpt-6-astra';
+  // Every conversation is a session; its runner's grant names it.
   const conversation = {
     groupFolder: 'e2e-conversation',
-    sessionAgentId: null,
+    sessionAgentId: 'session-1',
   };
   // What a launch does for a pinned conversation: the picked effort is minted
   // into the runner's grant, the picked model becomes the runner's model.
   const pickLease = new CodexGatewayRunnerLease({
     kind: 'host',
-    ...conversation,
+    groupFolder: conversation.groupFolder,
+    agentId: conversation.sessionAgentId,
     sessionEffort: 'ultra',
   });
   overrideKey = resolveCodexGatewayLaunchConfig(
@@ -877,7 +932,7 @@ try {
     // The third-party default the host sets: the CLI sends max on its own.
     CLAUDE_CODE_EFFORT_LEVEL: 'max',
   };
-  const askOnce = async () => {
+  const askOnce = async (requestModel = pickedModel) => {
     const messages = [];
     querySession = query({
       prompt: 'Reply with the confirmation.',
@@ -885,7 +940,8 @@ try {
         cwd: workspace,
         env: pickEnv,
         pathToClaudeCodeExecutable: cli,
-        model: pickedModel,
+        model: requestModel,
+        includePartialMessages: true,
         systemPrompt: 'You are a controlled conversation-override test.',
         tools: [],
         allowedTools: [],
@@ -904,10 +960,13 @@ try {
     });
     for await (const message of querySession) messages.push(message);
     querySession.close();
-    return messages.find((message) => message.type === 'result');
+    return {
+      messages,
+      result: messages.find((message) => message.type === 'result'),
+    };
   };
 
-  const pickedResult = await askOnce();
+  const { result: pickedResult } = await askOnce();
   check(
     'conversationTurnCompleted',
     pickedResult?.subtype === 'success' &&
@@ -940,7 +999,7 @@ try {
     'liveEffortChangeReachesTheGrant',
     updateLiveSessionEffort(conversation, 'high') === 1,
   );
-  const changedResult = await askOnce();
+  const { result: changedResult } = await askOnce();
   check(
     'liveEffortChangeTurnCompleted',
     changedResult?.subtype === 'success' && !changedResult.is_error,
@@ -958,6 +1017,36 @@ try {
     'clearedEffortFallsBackToTheModelDefault',
     overrideUpstream.length === 3 &&
       overrideUpstream[2].reasoning?.effort === 'low',
+  );
+  // The SDK aggregates by request model; the per-message ledger sees the served model.
+  const alias = 'claude-haiku-5-5';
+  const { messages: aliasMessages, result: aliasResult } = await askOnce(alias);
+  const collector = new AssistantUsageCollector({ codex: true });
+  for (const message of aliasMessages) {
+    collector.observeStreamEvent(message);
+    collector.ingest(message);
+  }
+  const batch = collector.drain('alias');
+  check(
+    'sdkReportsRequestAndResponseUnderDifferentModels',
+    overrideRequests.at(-1).body.model === alias &&
+      overrideUpstream.at(-1).model === model &&
+      batch?.tokens.modelUsage[model]?.inputTokens === 30 &&
+      aliasResult?.modelUsage[alias]?.inputTokens === 30,
+  );
+  const { ResultUsageReconciler } = await import(
+    pathToFileURL(
+      path.join(repository, 'container/agent-runner/dist/result-usage.js'),
+    ).href
+  );
+  const reconciler = new ResultUsageReconciler();
+  reconciler.recordAccounted(batch.tokens.modelUsage, batch);
+  check(
+    'aliasedCallIsBilledOnce',
+    !reconciler.applyResult({
+      modelUsage: aliasResult.modelUsage,
+      fallbackModelKey: model,
+    }).residual && Object.keys(reconciler.pendingAccounted).length === 0,
   );
   clearTimeout(timer);
   pickLease.revoke();
@@ -1016,6 +1105,7 @@ console.log(
       modelsCatalogFetches,
       blockedProxyRequests,
       unexpectedHttpRequests,
+      ignoredPortProbes,
     },
     conversationCliEffort: observedCliEffort ?? null,
     statuses: gatewayStreams.map(({ status, errorType }) => ({

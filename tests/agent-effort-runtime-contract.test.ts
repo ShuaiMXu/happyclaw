@@ -43,7 +43,7 @@ describe('Agent effort runtime contracts', () => {
     const host = read('src/container-runner.ts');
     expect(
       host.match(
-        /input = prepareLaunchInput\(input, (?:hostPoolResult|poolResult), sessionAgentId\);/g,
+        /input = prepareLaunchInput\(input, (?:hostPoolResult|poolResult)\);/g,
       ),
     ).toHaveLength(2);
     expect(read('container/agent-runner/src/index.ts')).toContain(
@@ -54,5 +54,29 @@ describe('Agent effort runtime contracts', () => {
   test('runner passes the resolved value through the supported SDK option', () => {
     const runner = read('container/agent-runner/src/index.ts');
     expect(runner).toContain('...(agentEffort ? { effort: agentEffort } : {})');
+  });
+
+  test('host and container starts resolve the Agent’s sub-agents; the runner passes them', () => {
+    const host = read('src/container-runner.ts');
+    expect(
+      host.match(
+        /resolveAgentSdkEffort\(input\.agentProfile\?\.runtimePolicy\),\s*input\.agentProfile\?\.runtimePolicy\?\.subagents,/g,
+      ),
+    ).toHaveLength(2);
+    // What the runner does with them is tested in
+    // agent-runner-subagent-launch.test.ts; here, that it does it.
+    const runner = read('container/agent-runner/src/index.ts');
+    expect(runner).toContain(
+      'const subagentDefinitions = sdkSubagentDefinitions(containerInput);',
+    );
+    expect(runner).toContain(
+      '...(subagentDefinitions ? { agents: subagentDefinitions } : {}),',
+    );
+    expect(runner).toContain(
+      '...subagentConcurrencyEnv(containerInput.subagents),',
+    );
+    expect(runner).toMatch(
+      /pinSubagentConcurrency\(\s*pinMaxOutputTokens\([\s\S]*?\),\s*containerInput\.subagents,\s*\)/,
+    );
   });
 });

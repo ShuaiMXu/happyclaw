@@ -31,6 +31,8 @@ import {
 import { Callout } from '@/components/capabilities/capability-ui';
 import { cn } from '@/lib/utils';
 import { DirectoryBrowser } from '../shared/DirectoryBrowser';
+import { workspaceDirPlaceholder } from '../../lib/workspace-root';
+import { useIsSingleUserHost } from '../../lib/deployment-mode';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { useAgentProfilesStore } from '../../stores/agent-profiles';
@@ -42,6 +44,12 @@ import {
 import { workspaceCreationBlockReason } from '../../utils/agent-product';
 import { extractErrorMessage } from '../../utils/error';
 import { InteractionModeSelector } from './InteractionModeSelector';
+import { WorkModeSelector } from './WorkModeSelector';
+import {
+  listStorageSources,
+  type StorageSourceList,
+} from '../../lib/storage-sources';
+import { DEFAULT_WORK_MODE, type WorkMode } from '../../work-items';
 import {
   HostDirectoryMountEditor,
   type HostDirectoryMountDraft,
@@ -190,25 +198,17 @@ export function CreateContainerDialog({
   const [selectedAgentProfileId, setSelectedAgentProfileId] = useState('');
   const [interactionMode, setInteractionMode] =
     useState<InteractionMode>('assistant');
+  const [workMode, setWorkMode] = useState<WorkMode>(DEFAULT_WORK_MODE);
   const [hostMounts, setHostMounts] = useState<HostDirectoryMountDraft[]>([]);
+  const [storageSources, setStorageSources] =
+    useState<StorageSourceList | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   const createFlow = useChatStore((s) => s.createFlow);
-  // Same-directory workspaces are allowed; their edits may collide.
-  const sharedCwdNames = useChatStore((s) => {
-    const target = customCwd.trim().replace(/\/+$/, '');
-    if (!target) return '';
-    return Object.values(s.groups)
-      .filter(
-        (group) =>
-          group.execution_mode === 'host' &&
-          group.custom_cwd?.replace(/\/+$/, '') === target,
-      )
-      .map((group) => `「${group.name}」`)
-      .join('');
-  });
   const adminHostOnlyMode = useChatStore((s) => s.adminHostOnlyMode);
+  const workspaceRoot = useChatStore((s) => s.workspaceRoot);
+  const singleUserHost = useIsSingleUserHost();
   const canHostExec = useAuthStore((s) => s.user?.role === 'admin');
   const profiles = useAgentProfilesStore((s) => s.profiles);
   const profilesLoading = useAgentProfilesStore((s) => s.loading);
@@ -230,6 +230,25 @@ export function CreateContainerDialog({
   useEffect(() => {
     if (open) void loadProfiles();
   }, [open, loadProfiles]);
+
+  // Storage sources are admin-only; without them the editor offers host
+  // directories alone, so a failed load only hides the option.
+  const wantsStorageSources =
+    open && canHostExec && executionMode === 'container';
+  useEffect(() => {
+    if (!wantsStorageSources) return;
+    let cancelled = false;
+    listStorageSources()
+      .then((list) => {
+        if (!cancelled) setStorageSources(list);
+      })
+      .catch(() => {
+        if (!cancelled) setStorageSources(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [wantsStorageSources]);
 
   useEffect(() => {
     if (!open || selectedAgentProfileId || profiles.length === 0) return;
@@ -288,6 +307,7 @@ export function CreateContainerDialog({
     setInitGitUrl('');
     setSelectedAgentProfileId('');
     setInteractionMode('assistant');
+    setWorkMode(DEFAULT_WORK_MODE);
     setHostMounts([]);
     setSubmitError(null);
     setFieldErrors({});
@@ -315,7 +335,7 @@ export function CreateContainerDialog({
         : {};
     if (Object.keys(mountErrors).length > 0) {
       setFieldErrors(mountErrors);
-      setSubmitError('请检查宿主机目录挂载配置');
+      setSubmitError('请检查目录挂载配置');
       return;
     }
 
@@ -340,14 +360,11 @@ export function CreateContainerDialog({
       if (selectedAgentProfileId)
         options.agent_profile_id = selectedAgentProfileId;
       options.interaction_mode = interactionMode;
+      options.work_mode = workMode;
       const created = await createFlow(
         trimmed,
         Object.keys(options).length ? options : undefined,
       );
-      // The server compares real paths, so it also catches symlinked dirs.
-      if (created.warnings[0] && !sharedCwdNames) {
-        toast.warning(created.warnings[0].message);
-      }
       onCreated(created.jid, created.folder);
       handleClose();
     } catch (err) {
@@ -362,15 +379,13 @@ export function CreateContainerDialog({
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && handleClose()}>
-      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col sm:max-w-xl">
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-3 sm:max-w-md">
         <DialogHeader className="shrink-0">
           <DialogTitle>为智能体新建工作区</DialogTitle>
-          <DialogDescription>
-            选择智能体，并确认工作区的回复模式、运行位置和上下文。
-          </DialogDescription>
+          <DialogDescription>选择智能体并设置工作区名称。</DialogDescription>
         </DialogHeader>
 
-        <div className="-mx-4 min-h-0 flex-1 space-y-5 overflow-y-auto px-4 pb-1">
+        <div className="-mx-4 min-h-0 flex-1 space-y-3 overflow-y-auto px-4 pb-1">
           <div>
             <Label htmlFor="workspace-agent-profile" className="mb-1.5">
               智能体
@@ -430,7 +445,7 @@ export function CreateContainerDialog({
               </p>
             )}
             {profiles.length > 0 && (
-              <p className="mt-1.5 line-clamp-2 text-caption text-muted-foreground">
+              <p className="mt-1.5 line-clamp-1 text-caption text-muted-foreground">
                 {selectedProfile?.identity_prompt ||
                   '使用默认智能体行为，不追加额外身份提示词。'}
               </p>
@@ -441,6 +456,16 @@ export function CreateContainerDialog({
             value={interactionMode}
             onChange={setInteractionMode}
             name="create-workspace-interaction-mode"
+            compact
+            description="Assistant 回复一条最终消息；主动模式可在处理中多次发消息。"
+            disabled={loading}
+          />
+
+          <WorkModeSelector
+            value={workMode}
+            onChange={setWorkMode}
+            name="create-workspace-work-mode"
+            compact
             disabled={loading}
           />
 
@@ -465,7 +490,7 @@ export function CreateContainerDialog({
 
           {selectedProfile && (
             <div className="rounded-lg px-3 py-2.5 ring-1 ring-surface-border">
-              <dl className="grid gap-3 sm:grid-cols-3">
+              <dl className="grid grid-cols-3 gap-2">
                 <div className="min-w-0">
                   <dt className="text-micro text-muted-foreground">运行位置</dt>
                   <dd className="mt-1 flex items-center gap-1.5 text-label text-foreground">
@@ -496,13 +521,16 @@ export function CreateContainerDialog({
                   </dd>
                 </div>
               </dl>
-              <p className="mt-2.5 border-t border-surface-border pt-2 text-caption leading-5 text-muted-foreground">
-                {canHostExec
-                  ? inheritsHostClaude
-                    ? `运行位置只决定命令在哪里执行。该智能体会将完整 ~/.claude 作为用户配置层叠加，工作区仍是 cwd；宿主机 Skills：${hostSkillsMode === 'inherit' ? '全部使用' : hostSkillsMode === 'custom' ? `选择 ${selectedProfile?.runtime_policy.skills.host?.ids.length ?? 0} 项` : '不使用'}。`
-                    : '运行位置只决定命令在哪里执行。该智能体使用 HappyClaw 管理的上下文与附加能力。'
-                  : '工作区固定在 Docker 容器中运行，并使用 HappyClaw 管理的智能体上下文与附加能力。'}
-              </p>
+              {canHostExec && inheritsHostClaude && (
+                <p className="mt-2 text-micro text-muted-foreground">
+                  宿主机 Skills：
+                  {hostSkillsMode === 'inherit'
+                    ? '全部使用'
+                    : hostSkillsMode === 'custom'
+                      ? `选择 ${selectedProfile.runtime_policy.skills.host?.ids.length ?? 0} 项`
+                      : '不使用'}
+                </p>
+              )}
             </div>
           )}
 
@@ -569,7 +597,9 @@ export function CreateContainerDialog({
                   </div>
                   {canHostExec && adminHostOnlyMode && (
                     <Callout tone="warning" className="mt-2">
-                      管理员纯宿主机模式已开启，新工作区固定直接在服务器上运行。
+                      {singleUserHost
+                        ? '单人宿主机模式下，新工作区固定直接在服务器上运行。'
+                        : '管理员纯宿主机模式已开启，新工作区固定直接在服务器上运行。'}
                     </Callout>
                   )}
                 </fieldset>
@@ -672,6 +702,12 @@ export function CreateContainerDialog({
                           }}
                           fieldErrors={fieldErrors}
                           disabled={loading}
+                          storageSources={storageSources?.sources}
+                          storageReadWriteAllowed={
+                            storageSources
+                              ? !storageSources.nonMainReadOnly
+                              : false
+                          }
                         />
                       </div>
                     )}
@@ -690,15 +726,8 @@ export function CreateContainerDialog({
                       inputId="workspace-custom-cwd"
                       label="宿主机工作目录（可选）"
                       description="智能体将直接在 HappyClaw 服务器上的这个目录中运行。"
-                      placeholder="默认: data/groups/{folder}/"
+                      placeholder={workspaceDirPlaceholder(workspaceRoot)}
                     />
-                    {sharedCwdNames && (
-                      <Callout tone="warning">
-                        工作区{sharedCwdNames}
-                        已在使用这个目录。多个会话同时运行时改动可能互相覆盖；需要并行开发时，可以为会话开启独立
-                        worktree。
-                      </Callout>
-                    )}
                     <Callout tone="warning">
                       宿主机模式下智能体可访问完整文件系统和工具链，请谨慎使用。
                     </Callout>

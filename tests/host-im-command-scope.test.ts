@@ -18,6 +18,12 @@ import {
 import { isNativeContextContainer } from '../src/channel-mount-service.js';
 import { resolveNativeThreadContext } from '../src/channel-native-context.js';
 import { DefinitiveChannelDeliveryError } from '../src/channel-outbox-delivery.js';
+import { isCancelledInput } from '../src/follow-up-policy.js';
+import {
+  beginHostPrivilegeRevocation,
+  canExecuteOnHost,
+  endHostPrivilegeRevocation,
+} from '../src/host-execution-policy.js';
 import { getChannelType } from '../src/im-channel.js';
 import {
   OWNER_REQUIRED_IM_COMMANDS,
@@ -25,6 +31,7 @@ import {
   formatContextMessages,
   isDirectMessageJid,
   resolveBoundChatTarget,
+  resolveSessionTarget,
 } from '../src/im-command-utils.js';
 import { createRuntimeSourceHarness } from './helpers/runtime-source.js';
 
@@ -52,6 +59,7 @@ function commandLane(groups: Record<string, any>) {
     handleStatusCommand: vi.fn(() => 'STATUS'),
     handleWhereCommand: vi.fn(() => 'WHERE'),
     handleRecallCommand: vi.fn(async () => 'RECALL'),
+    handleModelCommand: vi.fn(() => 'MODEL'),
   };
   const globals: Record<string, any> = {
     logger,
@@ -226,12 +234,17 @@ function recallLane() {
       bindings[`${jid}|${contextId}`],
     buildResolveEffectiveChatJid: () => router,
     findGroupNameByFolder: () => 'Workspace',
+    resolveBoundChatTarget,
+    resolveSessionTarget,
     getMessagesPage,
+    isCancelledInput,
     summarizeWithClaude: vi.fn(async () => null),
     formatContextMessages,
   };
   const harness = createRuntimeSourceHarness(globals);
   for (const name of [
+    'UNBOUND_CHAT_REPLY',
+    'resolveCommandSession',
     'recallCooldowns',
     'resolveRecallTarget',
     'handleRecallCommand',
@@ -292,6 +305,319 @@ describe('/recall reads the Session this message routes to (P0-2)', () => {
       undefined,
       10,
     );
+  });
+
+  test('a cancelled input is left out of the summary and the raw fallback', async () => {
+    const l = recallLane();
+    const row = (id: string, content: string, extra: object = {}) => ({
+      id,
+      chat_jid: 'web:ws#agent:session-normal',
+      sender: 'u',
+      sender_name: 'User',
+      content,
+      is_from_me: false,
+      ...extra,
+    });
+    // Newest first, as getMessagesPage returns them.
+    l.getMessagesPage.mockReturnValueOnce([
+      row('m3', 'withdrawn secret', { delivery_status: 'cancelled' }),
+      row('m2', 'the answer', { is_from_me: true, sender_name: 'AI' }),
+      row('m1', 'the question', { delivery_status: 'subsumed' }),
+    ] as never);
+    const reply = await l.recall('feishu:oc_normal');
+    const transcript = l.globals.summarizeWithClaude.mock.calls[0][0];
+    expect(transcript).toContain('the question');
+    expect(transcript).toContain('the answer');
+    expect(transcript).not.toContain('withdrawn secret');
+    expect(reply).toContain('the answer');
+    expect(reply).not.toContain('withdrawn secret');
+  });
+
+  test('an unbound chat reads nothing and says so', async () => {
+    const l = recallLane();
+    l.globals.registeredGroups['feishu:oc_unbound'] = {
+      name: 'Unbound',
+      folder: 'home-u1',
+      feishu_chat_mode: 'p2p',
+    };
+    await expect(l.recall('feishu:oc_unbound')).resolves.toBe(
+      '本聊天未绑定会话。',
+    );
+    expect(l.getMessagesPage).not.toHaveBeenCalled();
+  });
+});
+
+/** The generic `/clear` and `/fresh` handlers of handleCommand. */
+function slashResetLane(groups: Record<string, any>) {
+  const executeSessionReset = vi.fn(async () => {});
+  const executeFreshWindowReset = vi.fn(async () => {});
+  const globals: Record<string, any> = {
+    logger,
+    path: { join: (...parts: string[]) => parts.join('/') },
+    GROUPS_DIR: '/groups',
+    registeredGroups: groups,
+    getRegisteredGroup: (jid: string) => groups[jid],
+    getAgent: (id: string) =>
+      id === 'session-dm'
+        ? { id, chat_jid: 'web:ws', name: 'DM session', group_folder: 'ws' }
+        : undefined,
+    isNativeContextContainer,
+    resolveNativeThreadContext,
+    getImContextBinding: () => undefined,
+    findGroupNameByFolder: () => 'Workspace',
+    resolveBoundChatTarget,
+    resolveSessionTarget,
+    queue: {},
+    sessions: {},
+    broadcastNewMessage: vi.fn(),
+    setCursors: vi.fn(),
+    executeSessionReset,
+    executeFreshWindowReset,
+    captureWorkspaceSnapshot: async () => ({}),
+    resolveWorkspaceProjectRoot: () => '/groups/ws',
+    formatFreshWindowHandoff: () => 'handoff',
+    FRESH_WINDOW_SUCCESS_REPLY: 'FRESH_OK',
+    FRESH_WINDOW_FAILURE_REPLY: 'FRESH_FAILED',
+  };
+  const harness = createRuntimeSourceHarness(globals);
+  for (const name of [
+    'UNBOUND_CHAT_REPLY',
+    'resolveCommandSession',
+    'handleClearCommand',
+    'handleFreshCommand',
+  ]) {
+    harness.install(name);
+  }
+  return {
+    executeSessionReset,
+    executeFreshWindowReset,
+    clear: (jid: string) => globals.handleClearCommand(jid) as Promise<string>,
+    fresh: (jid: string) =>
+      globals.handleFreshCommand(jid, '') as Promise<string>,
+  };
+}
+
+describe('slash /clear and /fresh act on the bound session only', () => {
+  const groups = () => ({
+    // An unbound private chat whose row still records the Home folder.
+    'feishu:oc_unbound': {
+      name: 'unbound',
+      folder: 'home-u1',
+      feishu_chat_mode: 'p2p',
+      owner_im_id: OWNER,
+    },
+    // A stale workspace binding on an ordinary chat names no session.
+    'feishu:oc_stale': {
+      name: 'stale',
+      folder: 'ws',
+      feishu_chat_mode: 'group',
+      owner_im_id: OWNER,
+      target_main_jid: 'web:ws',
+    },
+    'feishu:oc_dm': {
+      name: 'dm',
+      folder: 'ws',
+      feishu_chat_mode: 'p2p',
+      owner_im_id: OWNER,
+      target_agent_id: 'session-dm',
+    },
+    'web:ws': { name: 'Workspace', folder: 'ws' },
+    'web:home-u1': { name: 'Home', folder: 'home-u1', is_home: true },
+  });
+
+  test.each(['feishu:oc_unbound', 'feishu:oc_stale', 'feishu:oc_missing'])(
+    '%s resets nothing and replies 本聊天未绑定会话。',
+    async (jid) => {
+      const l = slashResetLane(groups());
+      await expect(l.clear(jid)).resolves.toBe('本聊天未绑定会话。');
+      await expect(l.fresh(jid)).resolves.toBe('本聊天未绑定会话。');
+      expect(l.executeSessionReset).not.toHaveBeenCalled();
+      expect(l.executeFreshWindowReset).not.toHaveBeenCalled();
+    },
+  );
+
+  test('a bound chat resets exactly its session', async () => {
+    const l = slashResetLane(groups());
+    await expect(l.clear('feishu:oc_dm')).resolves.toBe(
+      'Session context cleared.',
+    );
+    expect(l.executeSessionReset).toHaveBeenCalledWith(
+      'web:ws',
+      'ws',
+      expect.anything(),
+      'session-dm',
+    );
+    await expect(l.fresh('feishu:oc_dm')).resolves.toBe('FRESH_OK');
+    expect(l.executeFreshWindowReset).toHaveBeenCalledWith(
+      'web:ws',
+      'ws',
+      expect.anything(),
+      expect.objectContaining({ agentId: 'session-dm' }),
+    );
+  });
+});
+
+describe('/model has the owner boundary of /clear', () => {
+  const groupJid = 'feishu:oc_group';
+  const unownedJid = 'feishu:oc_unowned';
+  const dmJid = 'telegram:12345';
+  const lane = () =>
+    commandLane({
+      [groupJid]: {
+        name: 'g',
+        folder: 'ws',
+        feishu_chat_mode: 'group',
+        owner_im_id: OWNER,
+      },
+      [unownedJid]: { name: 'u', folder: 'ws', feishu_chat_mode: 'group' },
+      [dmJid]: { name: 'dm', folder: 'ws' },
+    });
+
+  test('a group member is refused, even for the bare listing; the owner runs it', async () => {
+    const l = lane();
+    for (const command of ['model', 'model 2.1 high']) {
+      expect(await l.run(groupJid, command, MEMBER)).toBe(
+        '⚠️ 只有工作区 owner 才能执行此命令',
+      );
+    }
+    expect(l.handlers.handleModelCommand).not.toHaveBeenCalled();
+    expect(await l.run(groupJid, 'model 2.1 high', OWNER)).toBe('MODEL');
+    expect(l.handlers.handleModelCommand).toHaveBeenCalledWith(
+      groupJid,
+      '2.1 high',
+      undefined,
+    );
+  });
+
+  test('a group without a claimed owner refuses everyone and claims nobody', async () => {
+    const l = lane();
+    expect(await l.run(unownedJid, 'model', OWNER)).toContain('/owner_mention');
+    expect(l.globals.registeredGroups[unownedJid].owner_im_id).toBeUndefined();
+    expect(l.handlers.handleModelCommand).not.toHaveBeenCalled();
+  });
+
+  test('a private chat claims its sender on first use', async () => {
+    const l = lane();
+    expect(await l.run(dmJid, 'model', 'tg_user')).toBe('MODEL');
+    expect(l.globals.registeredGroups[dmJid].owner_im_id).toBe('tg_user');
+    // Claimed: someone else in the same chat id is not the owner.
+    expect(await l.run(dmJid, 'model', 'tg_other')).toBe(
+      '⚠️ 只有工作区 owner 才能执行此命令',
+    );
+  });
+});
+
+describe('/model acts on the session the chat routes to', () => {
+  const lane = (
+    owner: Record<string, unknown> | undefined,
+    executionMode: 'container' | 'host' = 'container',
+  ) => {
+    const groups: Record<string, any> = {
+      'feishu:oc_unbound': {
+        name: 'unbound',
+        folder: 'ws',
+        feishu_chat_mode: 'p2p',
+        owner_im_id: OWNER,
+      },
+      'feishu:oc_dm': {
+        name: 'dm',
+        folder: 'ws',
+        feishu_chat_mode: 'p2p',
+        owner_im_id: OWNER,
+        target_agent_id: 'session-dm',
+      },
+      'web:ws': {
+        name: 'Workspace',
+        folder: 'ws',
+        created_by: 'u1',
+        executionMode,
+      },
+    };
+    const runModelCommand = vi.fn(() => 'RAN');
+    const queue = { drainRunnersForModelSelection: vi.fn() };
+    const globals: Record<string, any> = {
+      logger,
+      registeredGroups: groups,
+      getRegisteredGroup: (jid: string) => groups[jid],
+      getAgent: (id: string) =>
+        id === 'session-dm'
+          ? { id, chat_jid: 'web:ws', name: 'DM session', group_folder: 'ws' }
+          : undefined,
+      getUserById: (id: string) => (id === 'u1' ? owner : undefined),
+      isNativeContextContainer,
+      resolveNativeThreadContext,
+      getImContextBinding: () => undefined,
+      findGroupNameByFolder: () => 'Workspace',
+      resolveBoundChatTarget,
+      resolveSessionTarget,
+      runModelCommand,
+      queue,
+      canExecuteOnHost,
+    };
+    const harness = createRuntimeSourceHarness(globals);
+    for (const name of [
+      'UNBOUND_CHAT_REPLY',
+      'resolveCommandSession',
+      'handleModelCommand',
+    ]) {
+      harness.install(name);
+    }
+    return {
+      runModelCommand,
+      queue,
+      model: (jid: string, args = '') =>
+        globals.handleModelCommand(jid, args) as string,
+    };
+  };
+  const owner = { id: 'u1', role: 'member', status: 'active', permissions: [] };
+
+  test('an unbound chat changes nothing and says so', () => {
+    const l = lane(owner);
+    expect(l.model('feishu:oc_unbound', '2.1')).toBe('本聊天未绑定会话。');
+    expect(l.model('feishu:oc_missing')).toBe('本聊天未绑定会话。');
+    expect(l.runModelCommand).not.toHaveBeenCalled();
+  });
+
+  test('a bound chat runs it on its session, the workspace owner choosing', () => {
+    const l = lane(owner);
+    expect(l.model('feishu:oc_dm', '2.1 high')).toBe('RAN');
+    expect(l.runModelCommand).toHaveBeenCalledWith({
+      args: '2.1 high',
+      workspace: expect.objectContaining({ folder: 'ws' }),
+      workspaceJid: 'web:ws',
+      agentId: 'session-dm',
+      chooser: owner,
+      runners: l.queue,
+    });
+  });
+
+  test('without an active workspace owner nothing is chosen', () => {
+    const l = lane({ ...owner, status: 'disabled' });
+    expect(l.model('feishu:oc_dm', '2.1')).toBe(
+      '⚠️ 无法确定工作区主人，不能切换模型',
+    );
+    expect(l.runModelCommand).not.toHaveBeenCalled();
+  });
+
+  test('a Host workspace needs an owner who may run on the host right now', () => {
+    const admin = { ...owner, role: 'admin' };
+    expect(lane(admin, 'host').model('feishu:oc_dm', '2.1')).toBe('RAN');
+    const member = lane(owner, 'host');
+    expect(member.model('feishu:oc_dm', '2.1')).toBe(
+      '⚠️ 宿主机工作区需要管理员权限',
+    );
+    expect(member.runModelCommand).not.toHaveBeenCalled();
+    // An admin whose Host privilege is being revoked no longer chooses.
+    beginHostPrivilegeRevocation('u1');
+    try {
+      const revoking = lane(admin, 'host');
+      expect(revoking.model('feishu:oc_dm', '2.1')).toBe(
+        '⚠️ 宿主机工作区需要管理员权限',
+      );
+      expect(revoking.runModelCommand).not.toHaveBeenCalled();
+    } finally {
+      endHostPrivilegeRevocation('u1');
+    }
   });
 });
 

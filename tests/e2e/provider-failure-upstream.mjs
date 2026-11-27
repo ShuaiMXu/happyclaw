@@ -52,13 +52,43 @@ const MODEL = 'stub-model';
 // Measured on Claude Code 2.1.238 and unchanged on 2.1.280. `expect` is the
 // providerFailureClass the runner must report; null means the turn has to
 // succeed normally.
+const QUOTED_OVERFLOW = 'Input is too long for requested model.';
+
 const SCENARIOS = [
   { mode: 'ok', expect: null, slow: false, note: 'healthy turn' },
+  // magpie answers deferred tools with this 400 on a route that cannot load
+  // them in place. Claude Code 2.1.327 and later ask again with every tool
+  // declared in full; 2.1.296 surfaced the 400 as the turn's error.
+  {
+    mode: 'refuse-deferred',
+    expect: null,
+    slow: false,
+    toolSearch: true,
+    expectRefusals: true,
+    note: 'deferred tools refused, sent again in full',
+  },
   {
     mode: 'http:404',
     expect: 'config',
     slow: false,
     note: 'unservable model name',
+  },
+  // Claude Code labels a refused request `unknown`; replaying it gets the
+  // same 400 (2.1.328).
+  // A normal answer may quote an upstream's overflow wording; only an
+  // error-shaped result is read as an overflow.
+  {
+    mode: 'quote-overflow',
+    expect: null,
+    slow: false,
+    answer: QUOTED_OVERFLOW,
+    note: 'answer quoting overflow wording',
+  },
+  {
+    mode: 'http:400',
+    expect: 'config',
+    slow: false,
+    note: 'request refused as sent',
   },
   {
     mode: 'hang',
@@ -86,8 +116,21 @@ const SCENARIOS = [
 
 // ── fake upstream ──────────────────────────────────────────────────────────
 
+const DEFERRED_REFUSAL =
+  'tools.defer_loading: deferred tools are not loaded in place on this route, so a tool loaded later would change the start of the prompt and lose its cache; ask again with every tool declared in full';
+
+function hasDeferredTool(body) {
+  try {
+    const tools = JSON.parse(body).tools;
+    return Array.isArray(tools) && tools.some((t) => t?.defer_loading === true);
+  } catch {
+    return false;
+  }
+}
+
 function startStub() {
   let mode = 'ok';
+  let refusedDeferred = 0;
   const okEvents = (text) => [
     {
       type: 'message_start',
@@ -144,6 +187,16 @@ function startStub() {
         return res.end(JSON.stringify({ input_tokens: 100 }));
       }
       if (mode === 'hang') return; // never respond
+      if (mode === 'refuse-deferred' && hasDeferredTool(body)) {
+        refusedDeferred += 1;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(
+          JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: DEFERRED_REFUSAL },
+          }),
+        );
+      }
       if (mode.startsWith('http:')) {
         const status = Number(mode.split(':')[1] || 500);
         const type =
@@ -153,9 +206,11 @@ function startStub() {
               ? 'rate_limit_error'
               : status === 404
                 ? 'not_found_error'
-                : status === 401
-                  ? 'authentication_error'
-                  : 'api_error';
+                : status === 400
+                  ? 'invalid_request_error'
+                  : status === 401
+                    ? 'authentication_error'
+                    : 'api_error';
         res.writeHead(status, { 'Content-Type': 'application/json' });
         return res.end(
           JSON.stringify({
@@ -169,7 +224,9 @@ function startStub() {
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
       });
-      for (const e of okEvents('STUB_OK'))
+      for (const e of okEvents(
+        mode === 'quote-overflow' ? QUOTED_OVERFLOW : 'STUB_OK',
+      ))
         res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
       res.end();
     });
@@ -180,7 +237,11 @@ function startStub() {
       resolve({
         server,
         port: server.address().port,
-        setMode: (m) => (mode = m),
+        setMode: (m) => {
+          mode = m;
+          refusedDeferred = 0;
+        },
+        refusedDeferred: () => refusedDeferred,
       }),
     );
   });
@@ -205,7 +266,7 @@ function parseFrames(buf) {
   return out;
 }
 
-async function runScenario({ mode, port, timeoutMs, tmp }) {
+async function runScenario({ mode, port, timeoutMs, tmp, toolSearch }) {
   const ipcDir = path.join(tmp, 'ipc');
   const workDir = path.join(tmp, 'workspace');
   fs.mkdirSync(ipcDir, { recursive: true });
@@ -239,11 +300,12 @@ async function runScenario({ mode, port, timeoutMs, tmp }) {
     JSON.stringify({
       prompt: 'reply with exactly: STUB_PROBE',
       groupFolder: 'hc-stub',
-      chatJid: 'web:hc-stub',
-      isMain: false,
+      chatJid: 'web:hc-stub#agent:session-1',
+      agentId: 'session-1',
       isHome: false,
       isAdminHome: false,
       turnId: `stub-${mode.replace(/[^a-z0-9]/gi, '-')}`,
+      toolSearch,
     }),
   );
 
@@ -263,7 +325,7 @@ async function runScenario({ mode, port, timeoutMs, tmp }) {
     elapsedSec: Math.round((Date.now() - startedAt) / 1000),
     actual: failure ? (failure.providerFailureClass ?? '(unclassified)') : null,
     livenessTimeout: failure?.providerLivenessTimeout === true,
-    answer: answered?.result?.slice(0, 40),
+    answer: answered?.result?.slice(0, 60),
     stderr: stderr.slice(-2000),
   };
 }
@@ -303,16 +365,21 @@ for (const scenario of selected) {
     port: stub.port,
     timeoutMs,
     tmp,
+    toolSearch: scenario.toolSearch,
   });
-  const ok =
+  // A refusal scenario that never saw a deferred tool proves nothing.
+  const refused = stub.refusedDeferred();
+  const answered =
     scenario.expect === null
-      ? r.actual === null && r.answer === 'STUB_OK'
+      ? r.actual === null && r.answer === (scenario.answer ?? 'STUB_OK')
       : r.actual === scenario.expect;
+  const ok = answered && (!scenario.expectRefusals || refused > 0);
   if (!ok) failed += 1;
   const detail =
-    scenario.expect === null
+    (scenario.expect === null
       ? `answer=${JSON.stringify(r.answer)}`
-      : `class=${r.actual}${r.livenessTimeout ? ' +livenessTimeout' : ''}`;
+      : `class=${r.actual}${r.livenessTimeout ? ' +livenessTimeout' : ''}`) +
+    (scenario.expectRefusals ? ` refused=${refused}` : '');
   console.log(
     `${ok ? 'PASS' : 'FAIL'}  ${scenario.mode.padEnd(12)} ${String(r.elapsedSec).padStart(3)}s  ` +
       `expect=${scenario.expect ?? 'no failure'}  ${detail}  (${scenario.note})`,
